@@ -7,14 +7,17 @@
 //! touching the UI.
 
 mod error;
+mod git;
 mod log;
 mod oid;
 mod refs;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::sync::Arc;
 
 pub use error::{Error, Result};
+pub use git::{Git, GitChoice, GitSource, GitVersion, Resolution};
 pub use log::{CommitInfo, LogOptions, LogStream};
 pub use oid::Oid;
 pub use refs::{Head, Ref, RefKind};
@@ -22,46 +25,59 @@ pub use refs::{Head, Ref, RefKind};
 /// An opened repository (work tree or bare).
 #[derive(Debug, Clone)]
 pub struct Repo {
+    git: Arc<Git>,
     /// Top of the work tree, or the git dir for bare repositories.
     root: PathBuf,
     git_dir: PathBuf,
+    /// `objects/info`, where the commit-graph lives.
+    objects_info: PathBuf,
 }
 
 impl Repo {
     /// Open the repository containing `path`.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let rev_parse = |args: &[&str]| -> Result<Option<String>> {
-            let out = git(path)
-                .arg("rev-parse")
-                .args(args)
-                .output()
-                .map_err(Error::Spawn)?;
-            Ok(out
-                .status
-                .success()
-                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned()))
-        };
-
-        let info = rev_parse(&[
-            "--path-format=absolute",
-            "--git-dir",
-            "--is-bare-repository",
-        ])?
-        .ok_or_else(|| Error::NotARepository(path.to_path_buf()))?;
-        let mut lines = info.lines();
-        let git_dir = PathBuf::from(lines.next().ok_or(Error::Parse("rev-parse output"))?);
-        let bare = lines.next() == Some("true");
-
-        // Bare repositories have no work tree; `--show-toplevel` would fail there.
-        let root = if bare {
-            git_dir.clone()
-        } else {
-            rev_parse(&["--show-toplevel"])?
+    pub fn open(git: Arc<Git>, path: impl AsRef<Path>) -> Result<Self> {
+        let out = git
+            .command()
+            .arg("-C")
+            .arg(path.as_ref())
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-path",
+                "objects/info",
+                "--is-bare-repository",
+                "--show-toplevel",
+            ])
+            .output()
+            .map_err(Error::Spawn)?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let lines: Vec<&str> = stdout.lines().collect();
+        let bare = lines.get(2) == Some(&"true");
+        // In a bare repository `--show-toplevel` fails (exit 128) after the
+        // other answers were already printed; anywhere else a failure is real
+        // and git's own message ("not a git repository", unknown extension,
+        // dubious ownership, ...) is what the user needs to see.
+        if !bare {
+            check_output(out, "rev-parse")?;
+        }
+        let line = |i: usize| {
+            lines
+                .get(i)
                 .map(PathBuf::from)
-                .ok_or_else(|| Error::NotARepository(path.to_path_buf()))?
+                .ok_or(Error::Parse("rev-parse output"))
         };
-        Ok(Self { root, git_dir })
+        let git_dir = line(0)?;
+        // Asked from git so GIT_OBJECT_DIRECTORY and linked worktrees (whose
+        // objects live in the common dir) are respected.
+        let objects_info = line(1)?;
+        let root = if bare { git_dir.clone() } else { line(3)? };
+        Ok(Self {
+            git,
+            root,
+            git_dir,
+            objects_info,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -73,8 +89,10 @@ impl Repo {
     }
 
     /// A `git` command already pointed at this repository.
-    pub fn command(&self) -> Command {
-        git(&self.root)
+    pub(crate) fn command(&self) -> Command {
+        let mut cmd = self.git.command();
+        cmd.arg("-C").arg(&self.root);
+        cmd
     }
 
     /// Stream commits in topological order. Commits arrive as git produces
@@ -90,7 +108,7 @@ impl Repo {
     /// app should call [`Repo::write_commit_graph`] in the background when
     /// this returns false.
     pub fn has_commit_graph(&self) -> bool {
-        let info = self.git_dir.join("objects").join("info");
+        let info = &self.objects_info;
         info.join("commit-graph").is_file() || info.join("commit-graphs").is_dir()
     }
 
@@ -108,14 +126,7 @@ impl Repo {
             ])
             .output()
             .map_err(Error::Spawn)?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(Error::Git {
-                command: "commit-graph write",
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            })
-        }
+        check_output(out, "commit-graph write").map(drop)
     }
 
     /// All branches, remote branches and tags.
@@ -129,29 +140,14 @@ impl Repo {
     }
 }
 
-/// Base `git` invocation with settings that make output stable to parse,
-/// whatever the user's config says.
-fn git(dir: &Path) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(dir)
-        .args([
-            "-c",
-            "core.quotepath=off",
-            "-c",
-            "color.ui=false",
-            "-c",
-            "log.showSignature=false",
-            "--no-pager",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C");
-    // Never pop up a console window on Windows.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+/// `out` if git succeeded, otherwise git's own message as an error.
+pub(crate) fn check_output(out: Output, command: &'static str) -> Result<Output> {
+    if out.status.success() {
+        Ok(out)
+    } else {
+        Err(Error::Git {
+            command,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
     }
-    cmd
 }

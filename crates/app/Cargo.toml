@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "gitlane"
+name = "gitwarp"
 path = "src/main.rs"
 
 [dependencies]

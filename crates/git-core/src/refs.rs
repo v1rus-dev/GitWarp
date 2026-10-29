@@ -1,4 +1,4 @@
-use crate::{Error, Oid, Repo, Result};
+use crate::{check_output, Error, Oid, Repo, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefKind {
@@ -37,12 +37,7 @@ pub(crate) fn list(repo: &Repo) -> Result<Vec<Ref>> {
         ])
         .output()
         .map_err(Error::Spawn)?;
-    if !out.status.success() {
-        return Err(Error::Git {
-            command: "for-each-ref",
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        });
-    }
+    let out = check_output(out, "for-each-ref")?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines()
         .filter(|l| !l.is_empty())

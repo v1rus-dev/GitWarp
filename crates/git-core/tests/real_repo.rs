@@ -3,8 +3,9 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
-use git_core::{Head, LogOptions, RefKind, Repo};
+use git_core::{Git, GitChoice, GitSource, Head, LogOptions, RefKind, Repo};
 use git_graph::GraphBuilder;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -27,6 +28,10 @@ fn git(dir: &Path, args: &[&str]) {
         .status()
         .expect("git is installed");
     assert!(status.success(), "git {args:?} failed");
+}
+
+fn open(path: &Path) -> git_core::Result<Repo> {
+    Repo::open(Arc::new(Git::resolve(GitChoice::System)?.git), path)
 }
 
 fn commit(dir: &Path, msg: &str) {
@@ -58,7 +63,7 @@ fn sample_repo() -> tempfile::TempDir {
 #[test]
 fn reads_log_in_topological_order() {
     let tmp = sample_repo();
-    let repo = Repo::open(tmp.path()).unwrap();
+    let repo = open(tmp.path()).unwrap();
     let commits: Vec<_> = repo
         .log(&LogOptions::default())
         .unwrap()
@@ -77,7 +82,7 @@ fn reads_log_in_topological_order() {
 #[test]
 fn log_streams_in_chunks_and_stops_early() {
     let tmp = sample_repo();
-    let repo = Repo::open(tmp.path()).unwrap();
+    let repo = open(tmp.path()).unwrap();
     let mut stream = repo.log(&LogOptions::default()).unwrap();
     assert_eq!(stream.next_chunk(4).unwrap().len(), 4);
     assert_eq!(stream.next_chunk(4).unwrap().len(), 2);
@@ -91,7 +96,7 @@ fn log_streams_in_chunks_and_stops_early() {
 #[test]
 fn lays_out_the_real_history() {
     let tmp = sample_repo();
-    let repo = Repo::open(tmp.path()).unwrap();
+    let repo = open(tmp.path()).unwrap();
     let mut graph = GraphBuilder::new();
     let rows: Vec<_> = repo
         .log(&LogOptions::default())
@@ -117,7 +122,7 @@ fn lays_out_the_real_history() {
 #[test]
 fn reads_refs_and_head() {
     let tmp = sample_repo();
-    let repo = Repo::open(tmp.path()).unwrap();
+    let repo = open(tmp.path()).unwrap();
     let refs = repo.refs().unwrap();
     let names: Vec<_> = refs.iter().map(|r| (r.kind, r.name.as_str())).collect();
     assert!(names.contains(&(RefKind::LocalBranch, "main")));
@@ -142,7 +147,7 @@ fn reads_refs_and_head() {
 fn empty_repository_has_empty_log() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q"]);
-    let repo = Repo::open(tmp.path()).unwrap();
+    let repo = open(tmp.path()).unwrap();
     let n = repo
         .log(&LogOptions {
             all: false,
@@ -156,9 +161,22 @@ fn empty_repository_has_empty_log() {
 }
 
 #[test]
+fn empty_repository_has_empty_log_with_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q"]);
+    let repo = open(tmp.path()).unwrap();
+    assert_eq!(repo.log(&LogOptions::default()).unwrap().count(), 0);
+}
+
+#[test]
 fn rejects_non_repository() {
     let tmp = tempfile::tempdir().unwrap();
-    assert!(Repo::open(tmp.path()).is_err());
+    match open(tmp.path()) {
+        Err(git_core::Error::Git { stderr, .. }) => {
+            assert!(stderr.contains("not a git repository"))
+        }
+        other => panic!("unexpected result {other:?}"),
+    }
 }
 
 #[test]
@@ -176,7 +194,7 @@ fn opens_bare_repository() {
             bare.to_str().unwrap(),
         ],
     );
-    let repo = Repo::open(&bare).unwrap();
+    let repo = open(&bare).unwrap();
     assert_eq!(repo.root(), repo.git_dir());
     assert_eq!(repo.log(&LogOptions::default()).unwrap().count(), 6);
 }
@@ -184,8 +202,68 @@ fn opens_bare_repository() {
 #[test]
 fn writes_commit_graph() {
     let tmp = sample_repo();
-    let repo = Repo::open(tmp.path()).unwrap();
+    let repo = open(tmp.path()).unwrap();
     // Fresh repos may or may not have one depending on git version/config.
     repo.write_commit_graph().unwrap();
     assert!(repo.has_commit_graph());
+}
+
+#[test]
+fn resolves_system_git() {
+    let git = Git::resolve(GitChoice::System).unwrap().git;
+    assert_eq!(git.source(), GitSource::System);
+    assert!(git.version() >= git_core::GitVersion::MIN);
+}
+
+#[test]
+fn commit_graph_is_found_from_a_linked_worktree() {
+    let tmp = sample_repo();
+    let main = open(tmp.path()).unwrap();
+    main.write_commit_graph().unwrap();
+
+    let wt = tempfile::tempdir().unwrap();
+    let wt_path = wt.path().join("wt");
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            wt_path.to_str().unwrap(),
+            "feature",
+        ],
+    );
+    let linked = open(&wt_path).unwrap();
+    // The linked worktree's git dir is `.git/worktrees/wt`; the commit-graph
+    // lives in the common dir.
+    assert_ne!(linked.git_dir(), main.git_dir());
+    assert!(linked.has_commit_graph());
+}
+
+#[test]
+fn revision_starting_with_a_dash_is_not_an_option() {
+    let tmp = sample_repo();
+    let repo = open(tmp.path()).unwrap();
+    let out = tmp.path().join("injected.txt");
+    let result = repo
+        .log(&LogOptions {
+            all: false,
+            revs: vec![format!("--output={}", out.display())],
+            ..Default::default()
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>();
+    assert!(result.is_err());
+    assert!(!out.exists());
+}
+
+#[test]
+fn open_failure_other_than_not_a_repository_keeps_gits_message() {
+    let tmp = sample_repo();
+    git(tmp.path(), &["config", "core.repositoryformatversion", "1"]);
+    git(tmp.path(), &["config", "extensions.frobnicate", "yes"]);
+    match open(tmp.path()) {
+        Err(git_core::Error::Git { stderr, .. }) => assert!(stderr.contains("frobnicate")),
+        other => panic!("unexpected result {other:?}"),
+    }
 }
