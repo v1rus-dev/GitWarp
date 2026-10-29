@@ -40,8 +40,9 @@ Claude never accepts a step on OpenCode's own report. Before acceptance:
 
 1. Read the full `git diff` of the step: scope matches the brief, no stray files,
    no new dependencies beyond the approved ones.
-2. `cargo build -p app` (and `cargo test` when core crates changed), `cargo clippy --workspace`,
-   `cargo fmt --check`.
+2. `cargo build -p app`, `cargo build -p ui --examples`, `cargo clippy --workspace --all-targets -- -D warnings`,
+   `cargo fmt --all -- --check`, `cargo test` and `cargo test -p ui` (`ui` and `app` are not default members,
+   so plain `cargo test` skips them).
 3. UI steps: run the app and compare against the design snapshot in `docs/design`.
 4. Findings go back to OpenCode as a fix round; after two failed rounds on the same issue
    Claude stops and reports to the user.
