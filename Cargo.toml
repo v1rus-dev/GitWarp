@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/git-graph",
+    "crates/git-core",
+    "crates/app",
+]
+# `cargo test` / `cargo build` without -p skip the GPUI app:
+# the core crates stay fast to build and test.
+default-members = [
+    "crates/git-graph",
+    "crates/git-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+git-graph = { path = "crates/git-graph" }
+git-core = { path = "crates/git-core" }
+
+# UI: Zed's GPUI. Pinned on purpose, its API still moves between releases.
+gpui = "=0.2.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Keep dev builds of the heavy UI deps optimized: GPUI is very slow at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2
+
+# gpui 0.2.2 → zed-async-tar → xattr 0.2.3, which no longer builds with current
+# libc on Linux (ENOATTR was removed; on Linux it is ENODATA). Remove this once
+# GPUI is bumped to a release without the old xattr.
+[patch.crates-io]
+xattr = { path = "patches/xattr-0.2.3" }

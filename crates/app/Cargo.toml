@@ -1,0 +1,18 @@
+[package]
+name = "app"
+description = "The desktop client (GPUI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gitlane"
+path = "src/main.rs"
+
+[dependencies]
+git-core.workspace = true
+git-graph.workspace = true
+gpui.workspace = true
+env_logger = "0.11"
+log = "0.4"

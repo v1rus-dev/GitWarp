@@ -1,0 +1,13 @@
+[package]
+name = "git-core"
+description = "Repository access: streaming log, refs. Reads via the git CLI for now"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+git-graph.workspace = true
+tempfile = "3"

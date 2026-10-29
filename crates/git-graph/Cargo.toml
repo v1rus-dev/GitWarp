@@ -1,0 +1,9 @@
+[package]
+name = "git-graph"
+description = "Incremental commit-graph lane layout, UI-agnostic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
