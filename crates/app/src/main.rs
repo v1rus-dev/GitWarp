@@ -45,6 +45,7 @@ fn main() {
         .map_err(|e| e.to_string());
 
     Application::new().run(move |cx: &mut App| {
+        ui::theme::init(cx);
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         cx.open_window(
             WindowOptions {
@@ -56,7 +57,10 @@ fn main() {
                 app_id: Some("dev.v1rus.gitwarp".into()),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| HistoryView::open(path.clone(), git.clone(), cx)),
+            |window, cx| {
+                ui::theme::follow_system(window, cx);
+                cx.new(|cx| HistoryView::open(path.clone(), git.clone(), cx))
+            },
         )
         .expect("failed to open the main window");
         cx.activate(true);

@@ -12,6 +12,7 @@ use gpui::{
 
 use git_core::{CommitInfo, Git, Head, LogOptions, LogStream, Oid, Repo};
 use git_graph::{GraphBuilder, Row};
+use ui::ActiveTheme;
 
 use crate::graph_paint::{graph_width, paint_row};
 use crate::theme;
@@ -164,6 +165,8 @@ impl HistoryView {
         range: std::ops::Range<usize>,
         cx: &mut Context<Self>,
     ) -> Vec<impl IntoElement> {
+        let colors = cx.theme().colors;
+        let ui_theme = cx.theme().clone();
         let graph_w = graph_width(self.max_lanes);
         range
             .map(|ix| {
@@ -172,10 +175,11 @@ impl HistoryView {
                 let selected = self.selected == Some(ix);
                 let c = &item.commit;
                 let background = if selected {
-                    theme::selection()
+                    colors.selection
                 } else {
-                    theme::background()
+                    colors.bg
                 };
+                let row_theme = ui_theme.clone();
 
                 div()
                     .id(ix)
@@ -184,8 +188,8 @@ impl HistoryView {
                     .flex()
                     .items_center()
                     .text_sm()
-                    .when(selected, |d| d.bg(theme::selection()))
-                    .when(!selected, |d| d.hover(|d| d.bg(theme::hover())))
+                    .when(selected, |d| d.bg(colors.selection))
+                    .when(!selected, |d| d.hover(|d| d.bg(colors.hover)))
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.selected = Some(ix);
                         cx.notify();
@@ -193,7 +197,9 @@ impl HistoryView {
                     .child(
                         canvas(
                             |_, _, _| {},
-                            move |bounds, _, window, _| paint_row(&row, bounds, background, window),
+                            move |bounds, _, window, _| {
+                                paint_row(&row, bounds, background, &row_theme, window)
+                            },
                         )
                         .w(graph_w)
                         .h_full()
@@ -205,7 +211,7 @@ impl HistoryView {
                             .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .text_color(theme::text())
+                            .text_color(colors.text)
                             .child(c.summary.clone()),
                     )
                     .child(
@@ -215,7 +221,7 @@ impl HistoryView {
                             .px_2()
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .text_color(theme::text_muted())
+                            .text_color(colors.muted)
                             .child(c.author_name.clone()),
                     )
                     .child(
@@ -223,7 +229,7 @@ impl HistoryView {
                             .w(px(150.))
                             .flex_none()
                             .px_2()
-                            .text_color(theme::text_muted())
+                            .text_color(colors.muted)
                             .child(format_time(c.author_time)),
                     )
                     .child(
@@ -232,7 +238,7 @@ impl HistoryView {
                             .flex_none()
                             .px_2()
                             .font_family("monospace")
-                            .text_color(theme::text_muted())
+                            .text_color(colors.muted)
                             .child(c.id.short()),
                     )
             })
@@ -242,6 +248,7 @@ impl HistoryView {
 
 impl Render for HistoryView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
         let git = &self.git_suffix;
         let status: SharedString = match (&self.error, self.loading) {
             (Some(e), _) => format!("{e}{git}"),
@@ -254,8 +261,8 @@ impl Render for HistoryView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme::background())
-            .text_color(theme::text())
+            .bg(colors.bg)
+            .text_color(colors.text)
             .child(
                 div()
                     .h(px(36.))
@@ -263,9 +270,9 @@ impl Render for HistoryView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .bg(theme::surface())
+                    .bg(colors.surface)
                     .border_b_1()
-                    .border_color(theme::border())
+                    .border_color(colors.border)
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -275,9 +282,9 @@ impl Render for HistoryView {
                         div()
                             .text_sm()
                             .text_color(if self.error.is_some() {
-                                theme::error()
+                                colors.error
                             } else {
-                                theme::text_muted()
+                                colors.muted
                             })
                             .child(status),
                     ),

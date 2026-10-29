@@ -125,6 +125,7 @@ dependencies = [
  "git-graph",
  "gpui",
  "log",
+ "ui",
 ]
 
 [[package]]
@@ -5884,6 +5885,13 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
 ]
 
 [[package]]
