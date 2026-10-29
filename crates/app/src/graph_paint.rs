@@ -47,7 +47,7 @@ pub fn paint_row(row: &Row<Oid>, bounds: Bounds<Pixels>, window: &mut Window) {
             gpui::fill(dot, lane_color(row.color))
                 .corner_radii(r)
                 .border_widths(if row.is_tip { px(0.) } else { px(1.5) })
-                .border_color(gpui::rgb(0x1e2025)),
+                .border_color(crate::theme::background()),
         );
     }
 }

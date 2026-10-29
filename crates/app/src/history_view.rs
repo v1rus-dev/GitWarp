@@ -2,10 +2,14 @@
 //! and painted through a virtualized list (only visible rows are built).
 
 use std::rc::Rc;
+use std::sync::Arc;
 
-use gpui::{canvas, div, prelude::*, px, uniform_list, Context, IntoElement, SharedString, Window};
+use gpui::{
+    canvas, div, prelude::*, px, uniform_list, AsyncApp, BackgroundExecutor, Context, IntoElement,
+    SharedString, WeakEntity, Window,
+};
 
-use git_core::{CommitInfo, Head, LogOptions, LogStream, Oid, Repo};
+use git_core::{CommitInfo, Git, GitChoice, Head, LogOptions, LogStream, Oid, Repo};
 use git_graph::{GraphBuilder, Row};
 
 use crate::graph_paint::{graph_width, paint_row};
@@ -23,6 +27,8 @@ struct Item {
 
 pub struct HistoryView {
     title: SharedString,
+    /// e.g. `git 2.56.0 (system)`, known once git is resolved.
+    git_label: Option<SharedString>,
     items: Vec<Item>,
     max_lanes: usize,
     selected: Option<usize>,
@@ -31,81 +37,107 @@ pub struct HistoryView {
 }
 
 impl HistoryView {
-    pub fn open(path: &str, cx: &mut Context<Self>) -> Self {
-        let mut view = Self {
-            title: path.to_owned().into(),
+    /// Starts in the loading state; resolving git, opening the repository and
+    /// reading HEAD all run in the background and fill in the title or error.
+    pub fn open(path: String, choice: GitChoice, cx: &mut Context<Self>) -> Self {
+        let view = Self {
+            title: path.clone().into(),
+            git_label: None,
             items: Vec::new(),
             max_lanes: 1,
             selected: None,
             loading: true,
             error: None,
         };
-        match Repo::open(path) {
-            Ok(repo) => {
-                view.title = title_for(&repo).into();
-                view.load(repo, cx);
+        cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let opened = executor
+                .spawn(async move {
+                    let git = Git::resolve(choice)?;
+                    let label = format!("git {} ({})", git.version(), git.source());
+                    let repo = Repo::open(Arc::new(git), &path)?;
+                    let title = title_for(&repo);
+                    Ok::<_, git_core::Error>((repo, title, label))
+                })
+                .await;
+            match opened {
+                Ok((repo, title, label)) => {
+                    let shown = this.update(cx, |view, cx| {
+                        view.title = title.into();
+                        view.git_label = Some(label.into());
+                        cx.notify();
+                    });
+                    if shown.is_ok() {
+                        Self::load(repo, executor, &this, cx).await;
+                    }
+                }
+                Err(e) => {
+                    this.update(cx, |view, cx| view.fail(e.to_string(), cx))
+                        .ok();
+                }
             }
-            Err(e) => {
-                view.loading = false;
-                view.error = Some(e.to_string().into());
-            }
-        }
+        })
+        .detach();
         view
     }
 
-    fn load(&mut self, repo: Repo, cx: &mut Context<Self>) {
-        let executor = cx.background_executor().clone();
-
+    async fn load(
+        repo: Repo,
+        executor: BackgroundExecutor,
+        this: &WeakEntity<Self>,
+        cx: &mut AsyncApp,
+    ) {
         // Without a commit-graph file the first screen waits for the whole
         // history walk. Write one for next time, in parallel with this load.
         if !repo.has_commit_graph() {
             let repo = repo.clone();
             executor
-                .spawn(async move { repo.write_commit_graph() })
+                .spawn(async move {
+                    if let Err(e) = repo.write_commit_graph() {
+                        log::warn!("could not write the commit-graph: {e}");
+                    }
+                })
                 .detach();
         }
 
-        cx.spawn(async move |this, cx| {
-            // Both the git process and the layout run off the UI thread; the
-            // UI thread only appends finished pages and repaints.
-            let opened = executor
-                .spawn(async move { repo.log(&LogOptions::default()) })
+        // Both the git process and the layout run off the UI thread; the
+        // UI thread only appends finished pages and repaints.
+        let opened = executor
+            .spawn(async move { repo.log(&LogOptions::default()) })
+            .await;
+        let mut state = match opened {
+            Ok(stream) => Some((stream, GraphBuilder::new())),
+            Err(e) => {
+                this.update(cx, |view, cx| view.fail(e.to_string(), cx))
+                    .ok();
+                return;
+            }
+        };
+
+        while let Some((stream, graph)) = state.take() {
+            let (stream, graph, page) = executor
+                .spawn(async move { next_page(stream, graph) })
                 .await;
-            let mut state = match opened {
-                Ok(stream) => Some((stream, GraphBuilder::new())),
+            let done = match page {
+                Ok(page) if page.is_empty() => true,
+                Ok(page) => {
+                    let alive = this.update(cx, |view, cx| view.append(page, cx)).is_ok();
+                    !alive // the window was closed: stop reading
+                }
                 Err(e) => {
-                    this.update(cx, |view, cx| view.fail(e.to_string(), cx))
-                        .ok();
+                    this.update(cx, |view, cx| view.fail(e, cx)).ok();
                     return;
                 }
             };
-
-            while let Some((stream, graph)) = state.take() {
-                let (stream, graph, page) = executor
-                    .spawn(async move { next_page(stream, graph) })
-                    .await;
-                let done = match page {
-                    Ok(page) if page.is_empty() => true,
-                    Ok(page) => {
-                        let alive = this.update(cx, |view, cx| view.append(page, cx)).is_ok();
-                        !alive // the window was closed: stop reading
-                    }
-                    Err(e) => {
-                        this.update(cx, |view, cx| view.fail(e, cx)).ok();
-                        return;
-                    }
-                };
-                if !done {
-                    state = Some((stream, graph));
-                }
+            if !done {
+                state = Some((stream, graph));
             }
-            this.update(cx, |view, cx| {
-                view.loading = false;
-                cx.notify();
-            })
-            .ok();
+        }
+        this.update(cx, |view, cx| {
+            view.loading = false;
+            cx.notify();
         })
-        .detach();
+        .ok();
     }
 
     fn append(&mut self, page: Vec<(CommitInfo, Row<Oid>)>, cx: &mut Context<Self>) {
@@ -203,11 +235,14 @@ impl HistoryView {
 
 impl Render for HistoryView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let status: SharedString = match (&self.error, self.loading) {
+        let mut status: SharedString = match (&self.error, self.loading) {
             (Some(e), _) => e.clone(),
             (None, true) => format!("Loading… {} commits", self.items.len()).into(),
             (None, false) => format!("{} commits", self.items.len()).into(),
         };
+        if let (None, Some(git)) = (&self.error, &self.git_label) {
+            status = format!("{status} · {git}").into();
+        }
 
         div()
             .size_full()

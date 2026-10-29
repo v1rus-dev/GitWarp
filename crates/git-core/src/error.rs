@@ -1,6 +1,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::GitVersion;
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
@@ -8,6 +10,13 @@ pub enum Error {
     /// `git` could not be started (not installed, not on PATH).
     Spawn(std::io::Error),
     Io(std::io::Error),
+    /// No git executable at the requested place (the string says where).
+    GitNotFound(String),
+    /// The git executable is older than the minimum the app relies on.
+    UnsupportedGit {
+        found: GitVersion,
+        required: GitVersion,
+    },
     NotARepository(PathBuf),
     /// `git` exited with an error; `stderr` is its message.
     Git {
@@ -22,6 +31,10 @@ impl fmt::Display for Error {
         match self {
             Error::Spawn(e) => write!(f, "could not run git: {e}"),
             Error::Io(e) => write!(f, "I/O error: {e}"),
+            Error::GitNotFound(what) => write!(f, "git not found: {what}"),
+            Error::UnsupportedGit { found, required } => {
+                write!(f, "git {found} is too old, {required} or newer is required")
+            }
             Error::NotARepository(p) => write!(f, "not a git repository: {}", p.display()),
             Error::Git { command, stderr } => write!(f, "git {command} failed: {}", stderr.trim()),
             Error::Parse(what) => write!(f, "could not parse {what}"),

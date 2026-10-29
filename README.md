@@ -26,6 +26,24 @@ cargo test                                   # core crates only (fast, no GPUI)
 cargo run --release -p app -- /path/to/repo  # the app
 ```
 
+### Which git
+
+The app runs a `git` executable (minimum version 2.31). Pick it with
+`--git <auto|system|bundled|PATH>` or the `GITLANE_GIT` environment variable
+(the flag wins); the default `auto` uses the bundled git if present, else the
+one on `PATH`. The header shows what is in use, e.g. `git 2.56.0 (system)`.
+
+The bundled git is looked up next to the app binary:
+
+| OS | Path |
+|---|---|
+| Windows | `<app dir>/git/cmd/git.exe` (MinGit) |
+| macOS | `<app dir>/../Resources/git/bin/git` |
+| Linux | `<app dir>/git/bin/git`, then `<app dir>/../lib/gitlane/git/bin/git` |
+
+Packaging the bundle is not done yet; only the lookup exists, so dev builds
+fall back to the system git.
+
 System packages for the app on Linux (Debian/Ubuntu names):
 
 ```sh

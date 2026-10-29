@@ -5,10 +5,12 @@
 //! The number that matters most for the UI is "first screen": how long until
 //! the first 100 rows are laid out and could be painted.
 
+use std::mem::size_of;
+use std::sync::Arc;
 use std::time::Instant;
 
-use git_core::{LogOptions, Repo};
-use git_graph::GraphBuilder;
+use git_core::{Git, GitChoice, LogOptions, Repo};
+use git_graph::{GraphBuilder, Segment};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -18,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => 0,
     };
 
-    let repo = Repo::open(&path)?;
+    let repo = Repo::open(Arc::new(Git::resolve(GitChoice::Auto)?), &path)?;
     if !repo.has_commit_graph() {
         eprintln!("note: no commit-graph file; the first screen will be slow.");
         eprintln!(
@@ -29,12 +31,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = GraphBuilder::new();
     let mut first_screen = None;
     let mut max_width = 0;
+    let mut segments = 0usize;
     let mut drawn = Vec::new();
 
     for commit in repo.log(&LogOptions::default())? {
         let commit = commit?;
         let row = graph.push(commit.id, &commit.parents);
         max_width = max_width.max(row.width);
+        segments += row.above.len() + row.below.len();
         if drawn.len() < draw {
             drawn.push((row, format!("{} {}", commit.id.short(), commit.summary)));
         }
@@ -59,5 +63,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("first screen {:?}", first_screen.unwrap_or(total));
     println!("total        {total:?}");
     println!("max width    {max_width} lanes");
+    // Segment payload plus the two Vec headers per row; ignores allocator slack.
+    let bytes = segments * size_of::<Segment>() + graph.len() * 2 * size_of::<Vec<Segment>>();
+    println!("segments     {segments}");
+    println!("row memory   ~{:.1} MiB", bytes as f64 / (1 << 20) as f64);
     Ok(())
 }

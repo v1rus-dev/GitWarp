@@ -7,14 +7,17 @@
 //! touching the UI.
 
 mod error;
+mod git;
 mod log;
 mod oid;
 mod refs;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 pub use error::{Error, Result};
+pub use git::{Git, GitChoice, GitSource, GitVersion};
 pub use log::{CommitInfo, LogOptions, LogStream};
 pub use oid::Oid;
 pub use refs::{Head, Ref, RefKind};
@@ -22,17 +25,20 @@ pub use refs::{Head, Ref, RefKind};
 /// An opened repository (work tree or bare).
 #[derive(Debug, Clone)]
 pub struct Repo {
+    git: Arc<Git>,
     /// Top of the work tree, or the git dir for bare repositories.
     root: PathBuf,
     git_dir: PathBuf,
+    /// Shared by all linked worktrees; objects and the commit-graph live here.
+    common_dir: PathBuf,
 }
 
 impl Repo {
     /// Open the repository containing `path`.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(git: Arc<Git>, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let rev_parse = |args: &[&str]| -> Result<Option<String>> {
-            let out = git(path)
+            let out = git_command(git.exe(), path)
                 .arg("rev-parse")
                 .args(args)
                 .output()
@@ -46,11 +52,13 @@ impl Repo {
         let info = rev_parse(&[
             "--path-format=absolute",
             "--git-dir",
+            "--git-common-dir",
             "--is-bare-repository",
         ])?
         .ok_or_else(|| Error::NotARepository(path.to_path_buf()))?;
         let mut lines = info.lines();
         let git_dir = PathBuf::from(lines.next().ok_or(Error::Parse("rev-parse output"))?);
+        let common_dir = PathBuf::from(lines.next().ok_or(Error::Parse("rev-parse output"))?);
         let bare = lines.next() == Some("true");
 
         // Bare repositories have no work tree; `--show-toplevel` would fail there.
@@ -61,7 +69,12 @@ impl Repo {
                 .map(PathBuf::from)
                 .ok_or_else(|| Error::NotARepository(path.to_path_buf()))?
         };
-        Ok(Self { root, git_dir })
+        Ok(Self {
+            git,
+            root,
+            git_dir,
+            common_dir,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -72,9 +85,13 @@ impl Repo {
         &self.git_dir
     }
 
+    pub fn git(&self) -> &Git {
+        &self.git
+    }
+
     /// A `git` command already pointed at this repository.
     pub fn command(&self) -> Command {
-        git(&self.root)
+        git_command(self.git.exe(), &self.root)
     }
 
     /// Stream commits in topological order. Commits arrive as git produces
@@ -90,7 +107,7 @@ impl Repo {
     /// app should call [`Repo::write_commit_graph`] in the background when
     /// this returns false.
     pub fn has_commit_graph(&self) -> bool {
-        let info = self.git_dir.join("objects").join("info");
+        let info = self.common_dir.join("objects").join("info");
         info.join("commit-graph").is_file() || info.join("commit-graphs").is_dir()
     }
 
@@ -131,8 +148,8 @@ impl Repo {
 
 /// Base `git` invocation with settings that make output stable to parse,
 /// whatever the user's config says.
-fn git(dir: &Path) -> Command {
-    let mut cmd = Command::new("git");
+fn git_command(exe: &Path, dir: &Path) -> Command {
+    let mut cmd = Command::new(exe);
     cmd.arg("-C")
         .arg(dir)
         .args([

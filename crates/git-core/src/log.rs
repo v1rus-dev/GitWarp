@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, ChildStdout, Stdio};
+use std::thread::JoinHandle;
 
 use crate::{Error, Oid, Repo, Result};
 
@@ -48,6 +49,9 @@ impl Default for LogOptions {
 pub struct LogStream {
     child: Child,
     reader: BufReader<ChildStdout>,
+    /// Drained on its own thread: a full stderr pipe would block git while we
+    /// are still reading stdout.
+    stderr: Option<JoinHandle<String>>,
     buf: Vec<u8>,
     finished: bool,
 }
@@ -63,6 +67,8 @@ impl LogStream {
         if let Some(n) = options.max_count {
             cmd.arg(format!("--max-count={n}"));
         }
+        // A rev starting with `-` must not be taken for an option.
+        cmd.arg("--end-of-options");
         cmd.args(&options.revs);
         cmd.arg("--");
         cmd.args(&options.paths);
@@ -74,8 +80,16 @@ impl LogStream {
             .spawn()
             .map_err(Error::Spawn)?;
         let stdout = child.stdout.take().ok_or(Error::Parse("git log stdout"))?;
+        let stderr = child.stderr.take().map(|mut e| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = e.read_to_string(&mut text);
+                text
+            })
+        });
         Ok(Self {
             child,
+            stderr,
             reader: BufReader::with_capacity(256 * 1024, stdout),
             buf: Vec::with_capacity(256),
             finished: false,
@@ -94,11 +108,14 @@ impl LogStream {
 
     fn finish(&mut self) -> Option<Error> {
         self.finished = true;
-        let mut stderr = String::new();
-        if let Some(mut e) = self.child.stderr.take() {
-            let _ = e.read_to_string(&mut stderr);
-        }
-        match self.child.wait() {
+        let status = self.child.wait();
+        // The child has exited, so its stderr hits EOF and the thread ends.
+        let stderr = self
+            .stderr
+            .take()
+            .and_then(|t| t.join().ok())
+            .unwrap_or_default();
+        match status {
             Ok(status) if status.success() => None,
             // An empty repository has no HEAD yet: that's an empty log, not an error.
             Ok(_) if stderr.contains("does not have any commits yet") => None,
@@ -142,6 +159,8 @@ impl Iterator for LogStream {
 impl Drop for LogStream {
     fn drop(&mut self) {
         if !self.finished {
+            // Kill first: the stderr thread only ends once git closes the pipe,
+            // so it is left to finish on its own instead of being joined.
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
