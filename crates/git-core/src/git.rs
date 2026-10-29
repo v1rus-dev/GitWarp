@@ -3,9 +3,10 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-use crate::{base_command, check_output, Error, Result};
+use crate::{check_output, Error, Result};
 
 /// Where the resolved executable came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +59,7 @@ impl GitChoice {
 }
 
 /// `major.minor.patch` of a git executable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GitVersion {
     pub major: u32,
     pub minor: u32,
@@ -113,14 +114,24 @@ pub struct Resolution {
     pub fallback: Option<Error>,
 }
 
+/// How long `git --version` may take before the executable is declared broken.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl Git {
     /// Find the executable for `choice`, run `--version` and check the floor.
     pub fn resolve(choice: GitChoice) -> Result<Resolution> {
-        Self::resolve_with(choice, bundled_path())
+        Self::resolve_with(choice, bundled_path(), "git".as_ref(), PROBE_TIMEOUT)
     }
 
-    /// [`Git::resolve`] with the bundled location injected (for tests).
-    pub(crate) fn resolve_with(choice: GitChoice, bundled: Option<PathBuf>) -> Result<Resolution> {
+    /// [`Git::resolve`] with the bundled location, the system executable and
+    /// the probe timeout injected (for tests).
+    pub(crate) fn resolve_with(
+        choice: GitChoice,
+        bundled: Option<PathBuf>,
+        system: &Path,
+        timeout: Duration,
+    ) -> Result<Resolution> {
+        let system = || Self::probe(system.into(), GitSource::System, timeout);
         let found = |git| Resolution {
             git,
             fallback: None,
@@ -129,51 +140,98 @@ impl Git {
             GitChoice::Auto => match bundled {
                 // A broken bundle must not leave the app without git: fall
                 // back to the system one and let the caller report why.
-                Some(exe) => match Self::probe(exe, GitSource::Bundled) {
+                Some(exe) => match Self::probe(exe, GitSource::Bundled, timeout) {
                     Ok(git) => Ok(found(git)),
-                    Err(e) => Ok(Resolution {
-                        git: Self::system()?,
-                        fallback: Some(e),
-                    }),
+                    Err(bundled) => match system() {
+                        Ok(git) => Ok(Resolution {
+                            git,
+                            fallback: Some(bundled),
+                        }),
+                        Err(system) => Err(Error::NoUsableGit {
+                            bundled: Box::new(bundled),
+                            system: Box::new(system),
+                        }),
+                    },
                 },
-                None => Self::system().map(found),
+                None => system().map(found),
             },
             GitChoice::Bundled => {
-                let exe = bundled.ok_or_else(|| Error::GitNotFound("bundled git".into()))?;
-                Self::probe(exe, GitSource::Bundled).map(found)
+                let exe = bundled.ok_or_else(|| Error::GitNotFound {
+                    source: GitSource::Bundled,
+                    path: PathBuf::new(),
+                })?;
+                Self::probe(exe, GitSource::Bundled, timeout).map(found)
             }
-            GitChoice::System => Self::system().map(found),
-            GitChoice::Custom(exe) => Self::probe(exe, GitSource::Custom).map(found),
+            // Resolved through PATH by the OS (`git.exe` on Windows).
+            GitChoice::System => system().map(found),
+            GitChoice::Custom(exe) => Self::probe(exe, GitSource::Custom, timeout).map(found),
         }
     }
 
-    /// Resolved through PATH by the OS (`git.exe` on Windows).
-    fn system() -> Result<Self> {
-        Self::probe("git".into(), GitSource::System)
-    }
-
-    fn probe(exe: PathBuf, source: GitSource) -> Result<Self> {
-        let out = base_command(&exe)
+    fn probe(exe: PathBuf, source: GitSource, timeout: Duration) -> Result<Self> {
+        let mut git = Self {
+            exe,
+            version: GitVersion::default(),
+            source,
+        };
+        let mut child = git
+            .command()
             .arg("--version")
             .stdin(Stdio::null())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => Error::GitNotFound(exe.display().to_string()),
+                std::io::ErrorKind::NotFound => Error::GitNotFound {
+                    source,
+                    path: git.exe.clone(),
+                },
                 _ => Error::Spawn(e),
             })?;
-        let out = check_output(out, "--version")?;
+        // A hung executable (e.g. a stalled network mount) must not hang the
+        // app: poll, and kill it when the time is up.
+        let deadline = Instant::now() + timeout;
+        while child.try_wait()?.is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Git {
+                    command: "--version",
+                    stderr: format!("timed out after {timeout:?}"),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let out = check_output(child.wait_with_output()?, "--version")?;
         let text = String::from_utf8_lossy(&out.stdout);
-        let version = GitVersion::parse(&text).ok_or(Error::Parse("git --version output"))?;
-        check_floor(version)?;
-        Ok(Self {
-            exe,
-            version,
-            source,
-        })
+        git.version = GitVersion::parse(&text).ok_or(Error::Parse("git --version output"))?;
+        check_floor(git.version)?;
+        Ok(git)
     }
 
-    pub(crate) fn exe(&self) -> &Path {
-        &self.exe
+    /// A `git` process with settings that make output stable to parse,
+    /// whatever the user's config says.
+    pub(crate) fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.exe);
+        cmd.args([
+            "-c",
+            "core.quotepath=off",
+            "-c",
+            "color.ui=false",
+            "-c",
+            "log.showSignature=false",
+            "--no-pager",
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C");
+        // Never pop up a console window on Windows.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd
     }
 
     pub fn version(&self) -> GitVersion {
@@ -298,7 +356,7 @@ mod tests {
         let missing = PathBuf::from("/nonexistent/definitely/not/git");
         assert!(matches!(
             Git::resolve(GitChoice::Custom(missing)),
-            Err(Error::GitNotFound(_))
+            Err(Error::GitNotFound { .. })
         ));
     }
 
@@ -332,12 +390,57 @@ mod tests {
         let fake = tmp.path().join("git");
         std::fs::write(&fake, "not executable").unwrap();
 
-        let r = Git::resolve_with(GitChoice::Auto, Some(fake.clone())).unwrap();
+        let r = Git::resolve_with(
+            GitChoice::Auto,
+            Some(fake.clone()),
+            "git".as_ref(),
+            PROBE_TIMEOUT,
+        )
+        .unwrap();
         assert_eq!(r.git.source(), GitSource::System);
         assert!(r.fallback.is_some());
 
-        assert!(Git::resolve_with(GitChoice::Bundled, Some(fake)).is_err());
-        assert!(Git::resolve_with(GitChoice::Bundled, None).is_err());
+        assert!(Git::resolve_with(
+            GitChoice::Bundled,
+            Some(fake),
+            "git".as_ref(),
+            PROBE_TIMEOUT
+        )
+        .is_err());
+        assert!(
+            Git::resolve_with(GitChoice::Bundled, None, "git".as_ref(), PROBE_TIMEOUT).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_reports_both_causes_when_nothing_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("git");
+        std::fs::write(&fake, "not executable").unwrap();
+        let missing = tmp.path().join("no-such-git");
+        let err =
+            Git::resolve_with(GitChoice::Auto, Some(fake), &missing, PROBE_TIMEOUT).unwrap_err();
+        assert!(matches!(err, Error::NoUsableGit { .. }));
+        let text = err.to_string();
+        assert!(
+            text.contains("bundled:") && text.contains("system:"),
+            "{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_executable_times_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("git");
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 5\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let err = Git::probe(script, GitSource::Custom, Duration::from_millis(200)).unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

@@ -36,7 +36,10 @@ pub struct Repo {
 impl Repo {
     /// Open the repository containing `path`.
     pub fn open(git: Arc<Git>, path: impl AsRef<Path>) -> Result<Self> {
-        let out = git_command(git.exe(), path.as_ref())
+        let out = git
+            .command()
+            .arg("-C")
+            .arg(path.as_ref())
             .args([
                 "rev-parse",
                 "--path-format=absolute",
@@ -86,8 +89,10 @@ impl Repo {
     }
 
     /// A `git` command already pointed at this repository.
-    pub fn command(&self) -> Command {
-        git_command(self.git.exe(), &self.root)
+    pub(crate) fn command(&self) -> Command {
+        let mut cmd = self.git.command();
+        cmd.arg("-C").arg(&self.root);
+        cmd
     }
 
     /// Stream commits in topological order. Commits arrive as git produces
@@ -133,37 +138,6 @@ impl Repo {
     pub fn head(&self) -> Result<Head> {
         refs::head(self)
     }
-}
-
-/// A bare `git` process with settings that make output stable to parse,
-/// whatever the user's config says.
-pub(crate) fn base_command(exe: &Path) -> Command {
-    let mut cmd = Command::new(exe);
-    cmd.args([
-        "-c",
-        "core.quotepath=off",
-        "-c",
-        "color.ui=false",
-        "-c",
-        "log.showSignature=false",
-        "--no-pager",
-    ])
-    .env("GIT_TERMINAL_PROMPT", "0")
-    .env("LC_ALL", "C");
-    // Never pop up a console window on Windows.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd
-}
-
-fn git_command(exe: &Path, dir: &Path) -> Command {
-    let mut cmd = base_command(exe);
-    cmd.arg("-C").arg(dir);
-    cmd
 }
 
 /// `out` if git succeeded, otherwise git's own message as an error.
