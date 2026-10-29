@@ -21,7 +21,7 @@ use ui::{
     Checkbox, Chip, ChipKind, CountPill, Counter, Dialog, DialogFocus, EmptyState, FileRow, Icon,
     IconName, Kbd, ListRow, MenuEntry, MenuItem, Progress, Radio, RefBadge, RefKind, SearchField,
     SegmentItem, Segmented, Select, Skeleton, Spinner, Splitter, StatusGlyph, Switch, Tab, Tabs,
-    TextInput, TextInputEvent, ToastKind, Tree, TreeNodeData,
+    TextInput, TextInputEvent, ToastKind, Tree, TreeNodeData, WindowControls,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1061,6 +1061,20 @@ fn buttons_section(colors: ThemeColors) -> impl IntoElement {
                                 .label("Stash")
                                 .counter(Counter::new("1")),
                         ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .w_full()
+                        .h(BAR)
+                        .pl(px(12.))
+                        .bg(colors.bg)
+                        .border_b_1()
+                        .border_color(colors.border)
+                        .child("Titlebar")
+                        .child(div().flex_1())
+                        .child(WindowControls::new("gallery-window-controls")),
                 ),
         )
 }

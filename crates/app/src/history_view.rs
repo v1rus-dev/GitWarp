@@ -247,7 +247,7 @@ impl HistoryView {
 }
 
 impl Render for HistoryView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         let git = &self.git_suffix;
         let status: SharedString = match (&self.error, self.loading) {
@@ -300,8 +300,9 @@ impl Render for HistoryView {
                 .w_full(),
             );
 
-        let root = ui::focus::track_pointer(ui::actions::tab_navigation(root));
-        root.child(ui::overlay::render_overlays(window, cx))
+        // The workspace that hosts this view owns the overlay host and the
+        // shared root focus handling.
+        root
     }
 }
 

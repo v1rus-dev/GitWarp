@@ -2,10 +2,12 @@ mod graph_paint;
 mod history_view;
 mod settings;
 mod theme;
+mod welcome;
+mod workspace;
 
 use gpui::{
-    prelude::*, px, size, App, Application, Bounds, Global, TitlebarOptions, WindowBounds,
-    WindowOptions,
+    prelude::*, px, size, App, Application, Bounds, Global, TitlebarOptions,
+    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
 
 use std::ffi::OsString;
@@ -13,8 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use git_core::{Git, GitChoice};
-use history_view::HistoryView;
 use settings::{Settings, SettingsStore, ThemePref};
+use workspace::Workspace;
 
 /// The loaded settings and where they are saved.
 struct AppSettings {
@@ -43,7 +45,9 @@ const USAGE: &str = "Usage: gitwarp [--git <auto|system|bundled|PATH>] [REPO]
 
 Options:
   --git <VALUE>  Which git to run (default: auto; env: GITWARP_GIT, the flag wins)
-  -h, --help     Print this help";
+  -h, --help     Print this help
+
+Without REPO the welcome screen opens.";
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -92,12 +96,23 @@ fn main() {
                 path: config_path,
                 settings: loaded,
             });
-            let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+            let window_size = if path.is_some() {
+                size(px(1200.), px(800.))
+            } else {
+                size(px(960.), px(620.))
+            };
+            let bounds = Bounds::centered(None, window_size, cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    // Always request client-side decorations: on GNOME Wayland
+                    // server-side ones leave the window without any frame.
+                    window_decorations: Some(WindowDecorations::Client),
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    window_min_size: Some(size(px(620.), px(420.))),
                     titlebar: Some(TitlebarOptions {
                         title: Some("GitWarp".into()),
+                        appears_transparent: true,
                         ..Default::default()
                     }),
                     app_id: Some("dev.v1rus.gitwarp".into()),
@@ -105,7 +120,7 @@ fn main() {
                 },
                 |window, cx| {
                     ui::theme::follow_system(window, cx);
-                    cx.new(|cx| HistoryView::open(path.clone(), git.clone(), cx))
+                    cx.new(|cx| Workspace::new(path, git, window, cx))
                 },
             )
             .expect("failed to open the main window");
@@ -115,12 +130,15 @@ fn main() {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Cli {
-    Run { path: PathBuf, git: GitChoice },
+    Run {
+        path: Option<PathBuf>,
+        git: GitChoice,
+    },
     Help,
 }
 
 /// `[--git <auto|system|bundled|PATH>] [repo]`. The flag wins over
-/// `GITWARP_GIT`; the repo defaults to the current directory.
+/// `GITWARP_GIT`; without a repo the welcome screen opens.
 fn parse_args(
     mut args: impl Iterator<Item = OsString>,
     env_git: Option<OsString>,
@@ -142,7 +160,7 @@ fn parse_args(
         }
     }
     Ok(Cli::Run {
-        path: path.unwrap_or_else(|| ".".into()),
+        path,
         git: git.unwrap_or_default(),
     })
 }
@@ -155,28 +173,28 @@ mod tests {
         parse_args(args.iter().map(OsString::from), env.map(OsString::from))
     }
 
-    fn run(path: &str, git: GitChoice) -> Result<Cli, String> {
+    fn run(path: Option<&str>, git: GitChoice) -> Result<Cli, String> {
         Ok(Cli::Run {
-            path: path.into(),
+            path: path.map(Into::into),
             git,
         })
     }
 
     #[test]
     fn flag_wins_over_env() {
-        assert_eq!(parse(&[], None), run(".", GitChoice::Auto));
+        assert_eq!(parse(&[], None), run(None, GitChoice::Auto));
         assert_eq!(
             parse(&["repo"], Some("system")),
-            run("repo", GitChoice::System)
+            run(Some("repo"), GitChoice::System)
         );
-        assert_eq!(parse(&[], Some("")), run(".", GitChoice::Auto));
+        assert_eq!(parse(&[], Some("")), run(None, GitChoice::Auto));
         assert_eq!(
             parse(&["--git", "bundled", "repo"], Some("system")),
-            run("repo", GitChoice::Bundled)
+            run(Some("repo"), GitChoice::Bundled)
         );
         assert_eq!(
             parse(&["repo", "--git=/opt/git"], None),
-            run("repo", GitChoice::Custom("/opt/git".into()))
+            run(Some("repo"), GitChoice::Custom("/opt/git".into()))
         );
     }
 
@@ -197,7 +215,7 @@ mod tests {
         assert_eq!(
             cli,
             Ok(Cli::Run {
-                path: raw.into(),
+                path: Some(raw.into()),
                 git: GitChoice::Auto
             })
         );
