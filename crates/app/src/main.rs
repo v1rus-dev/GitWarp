@@ -1,9 +1,11 @@
 mod graph_paint;
 mod history_view;
+mod settings;
 mod theme;
 
 use gpui::{
-    prelude::*, px, size, App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
+    prelude::*, px, size, App, Application, Bounds, Global, TitlebarOptions, WindowBounds,
+    WindowOptions,
 };
 
 use std::ffi::OsString;
@@ -12,6 +14,30 @@ use std::sync::Arc;
 
 use git_core::{Git, GitChoice};
 use history_view::HistoryView;
+use settings::{Settings, SettingsStore, ThemePref};
+
+/// The loaded settings and where they are saved.
+struct AppSettings {
+    path: Option<PathBuf>,
+    settings: Settings,
+}
+
+impl Global for AppSettings {}
+
+/// Applies `f` to the loaded settings and saves them.
+#[allow(dead_code)] // used by the window shell (stage 2.2+)
+fn update_settings(cx: &mut App, f: impl FnOnce(&mut Settings)) {
+    if cx.try_global::<AppSettings>().is_none() {
+        return;
+    }
+    let state = cx.global_mut::<AppSettings>();
+    f(&mut state.settings);
+    if let Some(path) = &state.path {
+        if let Err(e) = SettingsStore::new(path.clone()).save(&state.settings) {
+            log::warn!("failed to save settings to {}: {e}", path.display());
+        }
+    }
+}
 
 const USAGE: &str = "Usage: gitwarp [--git <auto|system|bundled|PATH>] [REPO]
 
@@ -44,12 +70,28 @@ fn main() {
         })
         .map_err(|e| e.to_string());
 
+    let config_path = settings::config_dir().map(|dir| dir.join("settings.json"));
+    let loaded = match &config_path {
+        Some(path) => SettingsStore::new(path.clone()).load(),
+        None => {
+            log::warn!("no configuration directory found; using default settings");
+            Settings::default()
+        }
+    };
+
     Application::new()
         .with_assets(ui::Assets)
         .run(move |cx: &mut App| {
             if let Err(e) = ui::init(cx) {
                 log::warn!("failed to load the bundled fonts: {e}");
             }
+            if loaded.theme != ThemePref::System {
+                ui::theme::set_mode(loaded.theme.into(), cx);
+            }
+            cx.set_global(AppSettings {
+                path: config_path,
+                settings: loaded,
+            });
             let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
             cx.open_window(
                 WindowOptions {

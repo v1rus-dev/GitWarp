@@ -134,6 +134,8 @@ dependencies = [
  "git-graph",
  "gpui",
  "log",
+ "serde",
+ "serde_json",
  "ui",
 ]
 
