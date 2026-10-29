@@ -1,6 +1,6 @@
 //! Context menus and dropdown menus.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder;
@@ -11,7 +11,7 @@ use gpui::{
 };
 use gpui::{InteractiveElement, StatefulInteractiveElement};
 
-use crate::actions::{Confirm, SelectNext, SelectPrev};
+use crate::actions::{Confirm, FocusNext, FocusPrev, SelectNext, SelectPrev};
 use crate::icon::{Icon, IconName};
 use crate::metrics::{FONT_UI, FS_BASE, FS_SM, R_MD, R_SM};
 use crate::overlay::{self, LayerId};
@@ -144,6 +144,25 @@ struct MenuRegistry {
 }
 
 impl Global for MenuRegistry {}
+
+/// Drops the remembered menu of windows that no longer exist.
+pub(crate) fn init(cx: &mut App) {
+    cx.on_window_closed(|cx| {
+        let live: HashSet<WindowId> = cx
+            .windows()
+            .iter()
+            .map(|handle| handle.window_id())
+            .collect();
+        if cx.try_global::<MenuRegistry>().is_some() {
+            cx.update_global::<MenuRegistry, _>(|registry, _| prune_registry(registry, &live));
+        }
+    })
+    .detach();
+}
+
+fn prune_registry(registry: &mut MenuRegistry, live: &HashSet<WindowId>) {
+    registry.by_window.retain(|id, _| live.contains(id));
+}
 
 /// Opens a menu at the pointer, clamped 4px inside the window.
 pub fn open_context_menu(
@@ -278,9 +297,17 @@ impl Render for MenuView {
             .key_context("ui-menu")
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.step(true, cx)))
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.step(false, cx)))
+            // An open menu absorbs Tab so focus cannot escape behind it: a
+            // menu that is no longer focused cannot handle Esc any more.
+            .on_action(cx.listener(|_, _: &FocusNext, _, _| {}))
+            .on_action(cx.listener(|_, _: &FocusPrev, _, _| {}))
             .on_action(cx.listener(|this, _: &Confirm, window, cx| {
                 if let Some(index) = this.nav.highlight() {
+                    // Enter closes the menu on key-down; the paired key-up
+                    // must not activate the opener that regains focus.
+                    overlay::defer_focus_restore(window, cx);
                     this.activate(index, window, cx);
+                    overlay::clear_deferred_focus_restore(window, cx);
                 }
             }));
 
@@ -431,5 +458,21 @@ mod tests {
         assert_eq!(nav.highlight(), None);
         nav.prev(&enabled);
         assert_eq!(nav.highlight(), None);
+    }
+
+    #[test]
+    fn pruning_drops_the_menu_of_a_closed_window() {
+        let mut registry = MenuRegistry::default();
+        registry
+            .by_window
+            .insert(WindowId::from(1), LayerId::for_test(1));
+        registry
+            .by_window
+            .insert(WindowId::from(2), LayerId::for_test(2));
+
+        prune_registry(&mut registry, &HashSet::from([WindowId::from(2)]));
+
+        assert!(!registry.by_window.contains_key(&WindowId::from(1)));
+        assert!(registry.by_window.contains_key(&WindowId::from(2)));
     }
 }

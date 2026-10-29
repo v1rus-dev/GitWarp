@@ -30,6 +30,7 @@ pub fn init(cx: &mut App) -> gpui::Result<()> {
     actions::bind_keys(cx);
     components::bind_text_input_keys(cx);
     components::toast::init(cx);
+    components::menu::init(cx);
     overlay::init(cx);
     fonts::load(cx)
 }

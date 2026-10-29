@@ -5,11 +5,12 @@ mod model;
 use std::ops::Range;
 
 use gpui::{
-    actions, div, fill, point, px, relative, size, App, Bounds, BoxShadow, ClipboardItem, Context,
-    CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, GlobalElementId, Hsla, InteractiveElement, IntoElement, KeyBinding,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
-    Pixels, Point, Render, ShapedLine, SharedString, Style, Styled, TextRun, UTF16Selection,
+    actions, div, fill, point, px, relative, size, App, AppContext, Bounds, BoxShadow,
+    ClipboardItem, Context, CursorStyle, DragMoveEvent, Element, ElementId, ElementInputHandler,
+    EmptyView, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId,
+    Hsla, InteractiveElement, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, ShapedLine,
+    SharedString, StatefulInteractiveElement, Style, Styled, TextRun, UTF16Selection,
     UnderlineStyle, Window,
 };
 
@@ -51,6 +52,10 @@ pub enum TextInputEvent {
     Submit,
 }
 
+/// The id of the input that owns the active selection drag.
+#[derive(Clone)]
+struct TextDrag(ElementId);
+
 /// A single-line text field with selection, IME and horizontal scrolling.
 pub struct TextInput {
     focus_handle: FocusHandle,
@@ -87,6 +92,11 @@ impl TextInput {
 
     pub fn text(&self) -> &str {
         &self.model.text
+    }
+
+    /// The horizontal offset used to keep the cursor visible.
+    pub fn scroll_offset(&self) -> Pixels {
+        px(self.scroll_offset)
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -280,11 +290,27 @@ impl TextInput {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.extend_selection(event.position, cx);
+    }
+
+    /// Extends the selection while the pointer is down. Mouse-move listeners
+    /// on the element only fire while it is hovered, so the drag path below
+    /// also routes moves that happen outside the field.
+    fn extend_selection(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         if self.is_selecting {
-            let index = self.index_for_mouse_position(event.position);
+            let index = self.index_for_mouse_position(position);
             self.model.select_to(index);
             cx.notify();
         }
+    }
+
+    fn on_drag_move(
+        &mut self,
+        event: &DragMoveEvent<TextDrag>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.extend_selection(event.event.position, cx);
     }
 
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
@@ -380,19 +406,8 @@ impl EntityInputHandler for TextInput {
             .or_else(|| self.model.marked.clone())
             .unwrap_or_else(|| self.model.selection.clone());
         let before = self.model.text.clone();
-        let inserted = self.model.replace_range(range, new_text);
-
-        if !new_text.is_empty() {
-            self.model.set_marked(Some(inserted.clone()));
-        }
-        if let Some(selected) = new_selected_range_utf16 {
-            let start = utf16_to_utf8(new_text, selected.start);
-            let end = utf16_to_utf8(new_text, selected.end);
-            let start = (inserted.start + start).min(self.model.text.len());
-            let end = (inserted.start + end).min(self.model.text.len()).max(start);
-            self.model.selection = start..end;
-            self.model.reversed = false;
-        }
+        self.model
+            .replace_and_mark(range, new_text, new_selected_range_utf16);
         self.after_edit(before, cx);
     }
 
@@ -690,7 +705,9 @@ impl Render for TextInput {
             None
         };
 
+        let input_id = ElementId::Name(format!("text-input-{}", cx.entity_id()).into());
         let mut root = div()
+            .id(input_id.clone())
             .relative()
             .h(CTL)
             .flex()
@@ -728,6 +745,7 @@ impl Render for TextInput {
         if self.disabled {
             root = root.cursor_not_allowed();
         } else {
+            let drag_id = input_id.clone();
             root = root
                 .cursor(CursorStyle::IBeam)
                 .track_focus(&self.focus_handle)
@@ -756,7 +774,18 @@ impl Render for TextInput {
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                .on_mouse_move(cx.listener(Self::on_mouse_move));
+                .on_mouse_move(cx.listener(Self::on_mouse_move))
+                .on_drag(TextDrag(drag_id.clone()), |_, _, _, cx| {
+                    cx.new(|_| EmptyView)
+                })
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<TextDrag>, window, cx| {
+                        if event.drag(cx).0 != drag_id {
+                            return;
+                        }
+                        this.on_drag_move(event, window, cx);
+                    },
+                ));
         }
 
         root.child(
@@ -805,17 +834,4 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-v", Paste, Some("TextInput")),
         KeyBinding::new("enter", Submit, Some("TextInput")),
     ]);
-}
-
-fn utf16_to_utf8(text: &str, offset: usize) -> usize {
-    let mut utf16 = 0;
-    let mut utf8 = 0;
-    for ch in text.chars() {
-        if utf16 >= offset {
-            break;
-        }
-        utf16 += ch.len_utf16();
-        utf8 += ch.len_utf8();
-    }
-    utf8
 }

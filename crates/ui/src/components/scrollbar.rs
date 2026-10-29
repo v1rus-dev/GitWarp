@@ -111,8 +111,10 @@ struct DragState {
     retried: bool,
 }
 
-/// A zero-sized value carried by the active drag.
-struct ScrollbarDrag;
+/// The id of the scrollbar whose drag is active, so one scrollbar's drag never
+/// moves another one's thumb.
+#[derive(Clone)]
+struct ScrollbarDrag(ElementId);
 
 /// A vertical or horizontal scrollbar for a [`ScrollHandle`].
 #[derive(IntoElement)]
@@ -220,14 +222,20 @@ impl RenderOnce for Scrollbar {
                     },
                 );
             }
-            thumb = thumb.on_drag(ScrollbarDrag, |_, _, _, cx| cx.new(|_| EmptyView));
+            thumb = thumb.on_drag(ScrollbarDrag(self.id.clone()), |_, _, _, cx| {
+                cx.new(|_| EmptyView)
+            });
             {
                 let state = state.clone();
                 let handle = handle.clone();
+                let drag_id = self.id.clone();
                 thumb = thumb.on_drag_move(
                     move |event: &DragMoveEvent<ScrollbarDrag>,
                           window: &mut Window,
                           cx: &mut App| {
+                        if event.drag(cx).0 != drag_id {
+                            return;
+                        }
                         let (Some(start), start_scroll, dragging) = ({
                             let state = state.read(cx);
                             (state.start, state.start_scroll, state.dragging)
@@ -264,7 +272,10 @@ impl RenderOnce for Scrollbar {
                 thumb = thumb.on_mouse_up(
                     MouseButton::Left,
                     move |_, window: &mut Window, cx: &mut App| {
-                        up_state.update(cx, |state, _| state.dragging = false);
+                        up_state.update(cx, |state, _| {
+                            state.dragging = false;
+                            state.start = None;
+                        });
                         window.refresh();
                     },
                 );
@@ -272,7 +283,10 @@ impl RenderOnce for Scrollbar {
                 thumb = thumb.on_mouse_up_out(
                     MouseButton::Left,
                     move |_, window: &mut Window, cx: &mut App| {
-                        out_state.update(cx, |state, _| state.dragging = false);
+                        out_state.update(cx, |state, _| {
+                            state.dragging = false;
+                            state.start = None;
+                        });
                         window.refresh();
                     },
                 );

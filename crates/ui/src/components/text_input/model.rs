@@ -90,6 +90,34 @@ impl EditModel {
         self.replace_range(self.selection.clone(), text)
     }
 
+    /// IME replacement: like [`replace_range`](Self::replace_range), then
+    /// mark the inserted text and apply the IME's selected range.
+    ///
+    /// `max_len` may truncate `new_text`, so both selection ends are clamped
+    /// to the inserted range. That keeps the selection on a char boundary;
+    /// otherwise a later `text[selection]` (copy, cut, layout) would panic.
+    pub(super) fn replace_and_mark(
+        &mut self,
+        range: Range<usize>,
+        new_text: &str,
+        selected_utf16: Option<Range<usize>>,
+    ) -> Range<usize> {
+        let inserted = self.replace_range(range, new_text);
+        if !new_text.is_empty() {
+            self.set_marked(Some(inserted.clone()));
+        }
+        if let Some(selected) = selected_utf16 {
+            let start = utf16_to_utf8(new_text, selected.start);
+            let end = utf16_to_utf8(new_text, selected.end);
+            let start = (inserted.start + start).min(inserted.end);
+            let end = (inserted.start + end).min(inserted.end).max(start);
+            debug_assert!(self.text.is_char_boundary(start) && self.text.is_char_boundary(end));
+            self.selection = start..end;
+            self.reversed = false;
+        }
+        inserted
+    }
+
     pub(super) fn set_marked(&mut self, range: Option<Range<usize>>) {
         self.marked = range.map(|range| {
             let start = range.start.min(self.text.len());
@@ -291,6 +319,20 @@ impl EditModel {
     }
 }
 
+/// Converts a UTF-16 offset in `text` to a UTF-8 byte offset.
+fn utf16_to_utf8(text: &str, offset: usize) -> usize {
+    let mut utf16 = 0;
+    let mut utf8 = 0;
+    for ch in text.chars() {
+        if utf16 >= offset {
+            break;
+        }
+        utf16 += ch.len_utf16();
+        utf8 += ch.len_utf8();
+    }
+    utf8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +465,21 @@ mod tests {
         let m = model("git push --force origin");
         assert_eq!(m.word_range(6), 4..8);
         assert_eq!(m.word_range(13), 9..16);
+    }
+
+    #[test]
+    fn ime_selection_stays_on_a_char_boundary_when_max_len_truncates() {
+        let mut m = model("X😀😀Z");
+        m.max_len = Some(4);
+
+        // The IME asks to replace the first emoji with "aé" and select all of
+        // it. Only "a" fits, so the selected end must clamp to the inserted
+        // text instead of landing inside the following emoji.
+        m.replace_and_mark(1..5, "aé", Some(0..3));
+
+        assert_eq!(m.text, "Xa😀Z");
+        assert!(m.text.is_char_boundary(m.selection.start));
+        assert!(m.text.is_char_boundary(m.selection.end));
+        assert_eq!(&m.text[m.selection.clone()], "a");
     }
 }

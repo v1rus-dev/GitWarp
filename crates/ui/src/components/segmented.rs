@@ -1,5 +1,6 @@
 //! Segmented controls.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder;
@@ -15,6 +16,7 @@ use crate::theme::ActiveTheme;
 
 /// One option of a [`Segmented`] control.
 pub struct SegmentItem {
+    id: Option<ElementId>,
     label: Option<SharedString>,
     icon: Option<IconName>,
 }
@@ -22,6 +24,7 @@ pub struct SegmentItem {
 impl SegmentItem {
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
+            id: None,
             label: Some(label.into()),
             icon: None,
         }
@@ -29,9 +32,17 @@ impl SegmentItem {
 
     pub fn icon(icon: IconName) -> Self {
         Self {
+            id: None,
             label: None,
             icon: Some(icon),
         }
+    }
+
+    /// A stable identity for the segment; defaults to its label or icon, so
+    /// focus stays on the same segment when items are added or removed.
+    pub fn id(mut self, id: impl Into<ElementId>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     pub fn with_icon(mut self, icon: IconName) -> Self {
@@ -98,6 +109,7 @@ impl RenderOnce for Segmented {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors;
         let id_name = self.id.to_string();
+        let bar_id = self.id.clone();
         let count = self.items.len();
         let height = if self.small { CTL_SM } else { px(24.) };
         let padding = if self.small { px(8.) } else { px(10.) };
@@ -112,14 +124,27 @@ impl RenderOnce for Segmented {
             .border_color(colors.border_strong)
             .bg(colors.bg);
 
+        let mut label_occurrences: HashMap<String, usize> = HashMap::new();
         for (index, item) in self.items.into_iter().enumerate() {
             let selected = index == self.selected;
+            // Key by identity, not position; duplicate labels/icons get
+            // `label#n` so each item keeps its own focus handle.
+            let key = match &item.id {
+                Some(id) => id.to_string(),
+                None => {
+                    let base = item
+                        .label
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("{:?}", item.icon));
+                    let occurrence = label_occurrences.entry(base.clone()).or_insert(0);
+                    *occurrence += 1;
+                    format!("{base}#{occurrence}")
+                }
+            };
+            let child_id = ElementId::NamedChild(Box::new(bar_id.clone()), SharedString::from(key));
             let focus = window
-                .use_keyed_state(
-                    ElementId::named_usize(id_name.clone(), index),
-                    cx,
-                    |_, cx| cx.focus_handle(),
-                )
+                .use_keyed_state(child_id.clone(), cx, |_, cx| cx.focus_handle())
                 .read(cx)
                 .clone()
                 .tab_stop(!self.disabled);
@@ -131,7 +156,7 @@ impl RenderOnce for Segmented {
             };
 
             let mut segment = div()
-                .id(ElementId::named_usize(id_name.clone(), index))
+                .id(child_id)
                 .debug_selector({
                     let name = format!("{id_name}-segment-{index}");
                     move || name

@@ -4,8 +4,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    div, prelude::*, px, Context, Entity, IntoElement, Render, TestAppContext, VisualTestContext,
-    Window,
+    div, point, prelude::*, px, Context, Entity, EntityInputHandler, IntoElement, Modifiers,
+    MouseButton, Render, TestAppContext, VisualTestContext, Window,
 };
 
 use ui::actions::{Cancel, SelectFirst};
@@ -179,6 +179,83 @@ fn copy_and_paste_use_the_clipboard(cx: &mut TestAppContext) {
 
     cx.simulate_keystrokes("end secondary-v");
     assert_eq!(text(cx, &view), "hellohello");
+}
+
+#[gpui::test]
+fn ime_max_len_truncation_keeps_the_selection_on_a_char_boundary(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx, |input, cx| {
+        input.set_text("X😀😀Z", cx);
+        input.set_max_len(Some(4), cx);
+    });
+    let input = cx.read(|app| view.read(app).input.clone());
+
+    // Replace the emoji with "aé" and select all of it; only "a" fits. The
+    // selection must not end inside the following emoji.
+    cx.update(|window, app| {
+        input.update(app, |input, cx| {
+            input.replace_and_mark_text_in_range(Some(1..3), "aé", Some(0..3), window, cx);
+        })
+    });
+
+    cx.simulate_keystrokes("secondary-c");
+    let clipboard = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("nothing was copied; the selection is not on a char boundary");
+    assert_eq!(
+        clipboard, "a",
+        "the selection does not cover the inserted text"
+    );
+}
+
+#[gpui::test]
+fn dragging_the_selection_past_the_right_edge_keeps_extending(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx, |_, _| {});
+    let long = "abcdefghij".repeat(20);
+    let input = cx.read(|app| view.read(app).input.clone());
+    cx.update(|_, app| input.update(app, |input, cx| input.set_text(long.clone(), cx)));
+    cx.simulate_keystrokes("home");
+
+    cx.simulate_mouse_down(
+        point(px(45.), px(53.)),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    cx.simulate_mouse_move(
+        point(px(45.), px(53.)),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    cx.simulate_mouse_move(
+        point(px(1200.), px(53.)),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    cx.simulate_mouse_move(
+        point(px(2000.), px(53.)),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        point(px(2000.), px(53.)),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+
+    cx.simulate_keystrokes("secondary-c");
+    let clipboard = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("nothing was selected: the drag stopped at the field edge");
+    assert_eq!(
+        clipboard, long,
+        "dragging past the right edge must select to the end of the text"
+    );
+    let scroll = cx.read(|app| view.read(app).input.read(app).scroll_offset());
+    assert!(
+        scroll > px(0.),
+        "the text did not scroll to keep the dragged cursor visible"
+    );
 }
 
 #[gpui::test]

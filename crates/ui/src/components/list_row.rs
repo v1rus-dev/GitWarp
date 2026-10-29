@@ -98,6 +98,7 @@ impl RenderOnce for ListRow {
             colors.text
         };
 
+        let debug = format!("list-row-{}", self.id);
         let mut row = div()
             .id(self.id)
             .relative()
@@ -105,9 +106,11 @@ impl RenderOnce for ListRow {
             .items_center()
             .gap(px(6.))
             .h(ROW)
+            // A uniform_list lays each item out as a root with a definite
+            // width and does not stretch its children, so the row itself must
+            // fill its wrapper. The wrapper below owns the 6px side gutters.
             .w_full()
-            .ml(px(6.))
-            .mr(px(6.))
+            .debug_selector(move || debug.clone())
             .rounded(R_MD)
             .font_family(FONT_UI)
             .text_size(FS_BASE)
@@ -128,6 +131,9 @@ impl RenderOnce for ListRow {
             row = row.child(focus::focus_ring(RingOffset::Inset2, R_MD, cx));
         }
 
-        row
+        // Padding (rather than margins on the row) works in both a plain flex
+        // column and a uniform_list, where the item root is laid out with a
+        // definite width and does not flex-stretch its child.
+        div().w_full().px(px(6.)).child(row)
     }
 }

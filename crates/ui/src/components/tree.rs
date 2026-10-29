@@ -8,8 +8,8 @@ use std::rc::Rc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, App, ElementId, FocusHandle, FontWeight, Hsla, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Styled,
-    Window,
+    MouseButton, ParentElement, RenderOnce, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, Window,
 };
 use gpui::{MouseDownEvent, Pixels, Point};
 
@@ -36,6 +36,9 @@ pub enum TreeNodeTrailing {
 /// One visible row of a [`Tree`].
 #[derive(Clone, Debug)]
 pub struct TreeNodeData {
+    /// Identifies the node across renders and reordering. Defaults to the
+    /// label; set an explicit key when two rows may share a label.
+    pub key: SharedString,
     pub label: SharedString,
     pub level: usize,
     pub icon: Option<IconName>,
@@ -50,8 +53,10 @@ pub struct TreeNodeData {
 
 impl TreeNodeData {
     pub fn new(label: impl Into<SharedString>) -> Self {
+        let label = label.into();
         Self {
-            label: label.into(),
+            key: label.clone(),
+            label,
             level: 0,
             icon: None,
             has_children: false,
@@ -68,6 +73,13 @@ impl TreeNodeData {
         let mut node = Self::new(label);
         node.section = true;
         node
+    }
+
+    /// A stable identity, used to keep the keyboard marker on the same node
+    /// when rows above it are collapsed or removed.
+    pub fn key(mut self, key: impl Into<SharedString>) -> Self {
+        self.key = key.into();
+        self
     }
 
     pub fn level(mut self, level: usize) -> Self {
@@ -140,7 +152,38 @@ type ContextHandler = Rc<dyn Fn(usize, Point<Pixels>, &mut Window, &mut App) + '
 
 struct TreeState {
     focus: FocusHandle,
-    keyboard_index: usize,
+    scroll: ScrollHandle,
+    /// The marker follows a node key, not a row index, so collapsing or
+    /// removing rows above it keeps it on the same node.
+    marker_key: Option<SharedString>,
+    marker_index: usize,
+}
+
+/// The row index of the marker.
+///
+/// Before any keyboard move (`key` is `None`) the marker starts on the
+/// caller's selected node, then on the first row. Once a key exists it wins,
+/// with the last known index as the fallback when that node has gone.
+fn marker_index(
+    keys: &[SharedString],
+    selected: Option<usize>,
+    key: Option<&SharedString>,
+    fallback: usize,
+) -> Option<usize> {
+    if keys.is_empty() {
+        None
+    } else {
+        Some(
+            match key {
+                Some(key) => keys
+                    .iter()
+                    .position(|candidate| candidate == key)
+                    .unwrap_or(fallback),
+                None => selected.unwrap_or(fallback),
+            }
+            .min(keys.len() - 1),
+        )
+    }
 }
 
 /// A flat, visible list of tree nodes.
@@ -150,6 +193,7 @@ pub struct Tree {
     nodes: Vec<TreeNodeData>,
     nav: bool,
     focus_handle: Option<FocusHandle>,
+    scroll_handle: Option<ScrollHandle>,
     on_activate: Option<NodeHandler>,
     on_toggle: Option<NodeHandler>,
     on_expand: Option<NodeHandler>,
@@ -165,6 +209,7 @@ impl Tree {
             nodes,
             nav: false,
             focus_handle: None,
+            scroll_handle: None,
             on_activate: None,
             on_toggle: None,
             on_expand: None,
@@ -183,6 +228,14 @@ impl Tree {
     /// Uses an existing focus handle instead of the tree's own keyed one.
     pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
         self.focus_handle = Some(handle);
+        self
+    }
+
+    /// Uses an existing scroll handle, so a [`Scrollbar`](crate::Scrollbar)
+    /// can share it. Without one the tree keeps its own handle and still
+    /// scrolls the keyboard marker into view.
+    pub fn scroll_handle(mut self, handle: ScrollHandle) -> Self {
+        self.scroll_handle = Some(handle);
         self
     }
 
@@ -235,22 +288,33 @@ impl Tree {
 impl RenderOnce for Tree {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors;
-        let count = self.nodes.len();
         let id_name = self.id.to_string();
+        let keys: Vec<SharedString> = self.nodes.iter().map(|node| node.key.clone()).collect();
         let state = window.use_keyed_state(self.id.clone(), cx, |_, cx| TreeState {
             focus: cx.focus_handle(),
-            keyboard_index: 0,
+            scroll: ScrollHandle::new(),
+            marker_key: None,
+            marker_index: 0,
         });
         let focus = self
             .focus_handle
             .clone()
             .unwrap_or_else(|| state.read(cx).focus.clone())
             .tab_stop(true);
+        let scroll = self
+            .scroll_handle
+            .clone()
+            .unwrap_or_else(|| state.read(cx).scroll.clone());
         let ring_visible = focus::focus_visible(&focus, window, cx);
-        let keyboard_index = if count == 0 {
-            None
-        } else {
-            Some(state.read(cx).keyboard_index.min(count - 1))
+        let selected_index = self.nodes.iter().position(|node| node.selected);
+        let keyboard_index = {
+            let state = state.read(cx);
+            marker_index(
+                &keys,
+                selected_index,
+                state.marker_key.as_ref(),
+                state.marker_index,
+            )
         };
 
         let mut root = div()
@@ -260,6 +324,7 @@ impl RenderOnce for Tree {
             .flex_col()
             .h_full()
             .pb(px(8.))
+            .track_scroll(&scroll)
             .overflow_y_scroll()
             .key_context("ui-tree")
             .track_focus(&focus);
@@ -268,50 +333,95 @@ impl RenderOnce for Tree {
         // ← / → collapse or expand an expandable row.
         {
             let state = state.clone();
+            let keys = keys.clone();
+            let scroll = scroll.clone();
             root = root.on_action(move |_: &SelectNext, window: &mut Window, cx: &mut App| {
-                state.update(cx, |state, _| {
-                    if let Some(last) = count.checked_sub(1) {
-                        state.keyboard_index = (state.keyboard_index + 1).min(last);
-                    }
-                });
+                let next = {
+                    let state = state.read(cx);
+                    marker_index(
+                        &keys,
+                        selected_index,
+                        state.marker_key.as_ref(),
+                        state.marker_index,
+                    )
+                };
+                if let Some(current) = next {
+                    let next = (current + 1).min(keys.len() - 1);
+                    state.update(cx, |state, _| {
+                        state.marker_key = Some(keys[next].clone());
+                        state.marker_index = next;
+                    });
+                    scroll.scroll_to_item(next);
+                }
                 window.refresh();
             });
         }
         {
             let state = state.clone();
+            let keys = keys.clone();
+            let scroll = scroll.clone();
             root = root.on_action(move |_: &SelectPrev, window: &mut Window, cx: &mut App| {
-                state.update(cx, |state, _| {
-                    state.keyboard_index = state.keyboard_index.saturating_sub(1);
-                });
+                let current = {
+                    let state = state.read(cx);
+                    marker_index(
+                        &keys,
+                        selected_index,
+                        state.marker_key.as_ref(),
+                        state.marker_index,
+                    )
+                };
+                if let Some(current) = current {
+                    let next = current.saturating_sub(1);
+                    state.update(cx, |state, _| {
+                        state.marker_key = Some(keys[next].clone());
+                        state.marker_index = next;
+                    });
+                    scroll.scroll_to_item(next);
+                }
                 window.refresh();
             });
         }
         {
             let state = state.clone();
+            let keys = keys.clone();
             let on_activate = self.on_activate.clone();
             root = root.on_action(move |_: &Confirm, window: &mut Window, cx: &mut App| {
-                let index = state.read(cx).keyboard_index.min(count.saturating_sub(1));
-                if count > 0 {
-                    if let Some(listener) = &on_activate {
-                        listener(index, window, cx);
-                    }
+                let index = {
+                    let state = state.read(cx);
+                    marker_index(
+                        &keys,
+                        selected_index,
+                        state.marker_key.as_ref(),
+                        state.marker_index,
+                    )
+                };
+                if let (Some(index), Some(listener)) = (index, &on_activate) {
+                    listener(index, window, cx);
                 }
             });
         }
         {
             let state = state.clone();
+            let keys = keys.clone();
             let on_activate = self.on_activate.clone();
             root = root.on_action(move |_: &TreeActivate, window: &mut Window, cx: &mut App| {
-                let index = state.read(cx).keyboard_index.min(count.saturating_sub(1));
-                if count > 0 {
-                    if let Some(listener) = &on_activate {
-                        listener(index, window, cx);
-                    }
+                let index = {
+                    let state = state.read(cx);
+                    marker_index(
+                        &keys,
+                        selected_index,
+                        state.marker_key.as_ref(),
+                        state.marker_index,
+                    )
+                };
+                if let (Some(index), Some(listener)) = (index, &on_activate) {
+                    listener(index, window, cx);
                 }
             });
         }
         {
             let state = state.clone();
+            let keys = keys.clone();
             let on_collapse = self.on_collapse.clone();
             let flags: Vec<(bool, bool)> = self
                 .nodes
@@ -319,16 +429,27 @@ impl RenderOnce for Tree {
                 .map(|node| (node.has_children, node.expanded))
                 .collect();
             root = root.on_action(move |_: &TreeCollapse, window: &mut Window, cx: &mut App| {
-                let index = state.read(cx).keyboard_index.min(count.saturating_sub(1));
-                if count > 0 && flags[index] == (true, true) {
-                    if let Some(listener) = &on_collapse {
-                        listener(index, window, cx);
+                let index = {
+                    let state = state.read(cx);
+                    marker_index(
+                        &keys,
+                        selected_index,
+                        state.marker_key.as_ref(),
+                        state.marker_index,
+                    )
+                };
+                if let Some(index) = index {
+                    if flags[index] == (true, true) {
+                        if let Some(listener) = &on_collapse {
+                            listener(index, window, cx);
+                        }
                     }
                 }
             });
         }
         {
             let state = state.clone();
+            let keys = keys.clone();
             let on_expand = self.on_expand.clone();
             let flags: Vec<(bool, bool)> = self
                 .nodes
@@ -336,10 +457,20 @@ impl RenderOnce for Tree {
                 .map(|node| (node.has_children, node.expanded))
                 .collect();
             root = root.on_action(move |_: &TreeExpand, window: &mut Window, cx: &mut App| {
-                let index = state.read(cx).keyboard_index.min(count.saturating_sub(1));
-                if count > 0 && flags[index] == (true, false) {
-                    if let Some(listener) = &on_expand {
-                        listener(index, window, cx);
+                let index = {
+                    let state = state.read(cx);
+                    marker_index(
+                        &keys,
+                        selected_index,
+                        state.marker_key.as_ref(),
+                        state.marker_index,
+                    )
+                };
+                if let Some(index) = index {
+                    if flags[index] == (true, false) {
+                        if let Some(listener) = &on_expand {
+                            listener(index, window, cx);
+                        }
                     }
                 }
             });
@@ -480,13 +611,21 @@ impl RenderOnce for Tree {
 
             {
                 let state = state.clone();
+                let focus = focus.clone();
+                let key = node.key.clone();
                 let on_open = self.on_open.clone();
                 let on_toggle = self.on_toggle.clone();
                 let on_activate = self.on_activate.clone();
                 row = row.on_mouse_down(
                     MouseButton::Left,
                     move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
-                        state.update(cx, |state, _| state.keyboard_index = index);
+                        // Focus the tree ourselves: the listeners below may
+                        // open a menu or dialog that must keep the focus.
+                        window.focus(&focus);
+                        state.update(cx, |state, _| {
+                            state.marker_key = Some(key.clone());
+                            state.marker_index = index;
+                        });
                         if event.click_count >= 2 {
                             if let Some(listener) = &on_open {
                                 listener(index, window, cx);
@@ -498,19 +637,29 @@ impl RenderOnce for Tree {
                         } else if let Some(listener) = &on_activate {
                             listener(index, window, cx);
                         }
+                        // Stop the tree's own track_focus handler from taking
+                        // focus back from a dialog/menu opened above.
+                        window.prevent_default();
                     },
                 );
             }
             {
                 let state = state.clone();
+                let focus = focus.clone();
+                let key = node.key.clone();
                 let on_context_menu = self.on_context_menu.clone();
                 row = row.on_mouse_down(
                     MouseButton::Right,
                     move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
-                        state.update(cx, |state, _| state.keyboard_index = index);
+                        window.focus(&focus);
+                        state.update(cx, |state, _| {
+                            state.marker_key = Some(key.clone());
+                            state.marker_index = index;
+                        });
                         if let Some(listener) = &on_context_menu {
                             listener(index, event.position, window, cx);
                         }
+                        window.prevent_default();
                     },
                 );
             }

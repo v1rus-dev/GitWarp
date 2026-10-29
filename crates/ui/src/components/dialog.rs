@@ -122,6 +122,10 @@ impl Dialog {
     }
 
     /// Disables Esc, the scrim, Enter and the close button.
+    ///
+    /// The builder runs on every frame, so `.busy(state.running)` takes effect
+    /// as soon as `state.running` changes; [`set_busy`] remains available for
+    /// callers that do not rebuild the dialog from state.
     pub fn busy(mut self, busy: bool) -> Self {
         self.busy = busy;
         self
@@ -134,6 +138,12 @@ impl Dialog {
     }
 
     /// The dialog's focus stops, in Tab order.
+    ///
+    /// Tab and Shift-Tab cycle **only** through these handles. Any other
+    /// focusable content placed in the body or footer (`Select`, `Tree`, …)
+    /// is not reachable with the keyboard unless it is listed here; add its
+    /// focus handles, with [`DialogFocus::control`] for controls and
+    /// [`DialogFocus::input`] for text inputs.
     pub fn focus_order(mut self, focus: impl IntoIterator<Item = DialogFocus>) -> Self {
         self.focus = focus.into_iter().collect();
         self
@@ -145,7 +155,11 @@ impl Dialog {
         self
     }
 
-    /// The button Enter activates. Danger defaults are never activated.
+    /// The caller's visual default and the initial-focus fallback.
+    ///
+    /// Enter does **not** activate this button by itself: set
+    /// [`on_default`](Self::on_default) for Enter to do anything. Danger
+    /// defaults are never activated.
     pub fn default_button(mut self, handle: FocusHandle) -> Self {
         self.default_button = Some(handle);
         self
@@ -156,7 +170,13 @@ impl Dialog {
         self
     }
 
-    /// Runs when Enter reaches the dialog rather than a control.
+    /// What Enter runs when it reaches the dialog rather than a control.
+    ///
+    /// This is the only thing Enter runs: without it, Enter does nothing in
+    /// the dialog, even when [`default_button`](Self::default_button) is set.
+    /// Enter inside a [`TextInput`](crate::TextInput) is consumed by the
+    /// dialog: `on_default` runs and no `TextInputEvent::Submit` reaches other
+    /// subscribers.
     pub fn on_default(mut self, listener: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_default = Some(Rc::new(listener));
         self
@@ -181,7 +201,9 @@ pub struct DialogHost {
     build: DialogBuilder,
     focus: FocusHandle,
     layer: Option<LayerId>,
-    busy: bool,
+    /// Imperative override set by [`set_busy`]; when `None` the builder's
+    /// `Dialog::busy` is authoritative on every render.
+    busy_override: Option<bool>,
 }
 
 /// Opens a dialog and returns its layer.
@@ -208,7 +230,7 @@ pub fn open_with_view(
         build: host_build,
         focus: cx.focus_handle().tab_stop(false),
         layer: None,
-        busy,
+        busy_override: None,
     });
     let layer = overlay::open_modal(host.clone().into(), window, cx);
     host.update(cx, |host, _| host.layer = Some(layer));
@@ -231,7 +253,7 @@ pub fn set_busy(id: LayerId, busy: bool, window: &mut Window, cx: &mut App) {
     let Ok(host) = view.downcast::<DialogHost>() else {
         return;
     };
-    host.update(cx, |host, _| host.busy = busy);
+    host.update(cx, |host, _| host.busy_override = Some(busy));
     overlay::set_dismiss_on_outside_click(id, !busy, window, cx);
     window.refresh();
 }
@@ -240,8 +262,14 @@ impl Render for DialogHost {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dialog = (self.build)(window, cx);
         let colors = cx.theme().colors;
-        let busy = self.busy;
+        // The builder is the source of truth: stage 2 writes `.busy(running)`
+        // and the state changes without ever calling `set_busy`. An explicit
+        // `set_busy` overrides the builder until called again.
+        let busy = self.busy_override.unwrap_or(dialog.busy);
         let layer = self.layer;
+        if let Some(layer) = layer {
+            overlay::set_dismiss_on_outside_click(layer, !busy, window, cx);
+        }
         let handles: Vec<FocusHandle> = dialog
             .focus
             .iter()
@@ -368,11 +396,20 @@ impl Render for DialogHost {
             .track_focus(&self.focus)
             .key_context("ui-dialog")
             .on_action(move |_: &Confirm, window: &mut Window, cx: &mut App| {
+                // Enter closes on key-down; defer the focus restore so the
+                // paired key-up cannot activate the restored opener.
+                overlay::defer_focus_restore(window, cx);
                 default_for_confirm(window, cx);
+                overlay::clear_deferred_focus_restore(window, cx);
             })
             .capture_action(
                 move |_: &TextInputSubmit, window: &mut Window, cx: &mut App| {
+                    overlay::defer_focus_restore(window, cx);
                     default_for_submit(window, cx);
+                    overlay::clear_deferred_focus_restore(window, cx);
+                    // The dialog owns Enter inside its inputs: do not also
+                    // emit `TextInputEvent::Submit` to other subscribers.
+                    cx.stop_propagation();
                 },
             )
             .on_action(move |_: &FocusNext, window: &mut Window, cx: &mut App| {

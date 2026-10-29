@@ -1,5 +1,6 @@
 //! Tab bars.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder;
@@ -16,6 +17,7 @@ use crate::theme::ActiveTheme;
 
 /// One tab in a [`Tabs`] bar.
 pub struct Tab {
+    id: Option<ElementId>,
     label: SharedString,
     icon: Option<IconName>,
     closable: bool,
@@ -24,10 +26,19 @@ pub struct Tab {
 impl Tab {
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
+            id: None,
             label: label.into(),
             icon: None,
             closable: false,
         }
+    }
+
+    /// A stable identity for the tab. Focus and element state are keyed by
+    /// this (or by the label when unset), so closing another tab keeps the
+    /// keyboard focus on the same tab. Set it when labels can repeat.
+    pub fn id(mut self, id: impl Into<ElementId>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     pub fn icon(mut self, icon: IconName) -> Self {
@@ -99,7 +110,7 @@ impl Tabs {
 impl RenderOnce for Tabs {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors;
-        let id_name = self.id.to_string();
+        let bar_id = self.id.clone();
 
         let mut bar = div()
             .id(self.id)
@@ -112,9 +123,22 @@ impl RenderOnce for Tabs {
             .border_b_1()
             .border_color(colors.border);
 
+        let mut label_occurrences: HashMap<SharedString, usize> = HashMap::new();
         for (index, tab) in self.tabs.into_iter().enumerate() {
             let selected = index == self.selected;
-            let child_id = ElementId::named_usize(id_name.clone(), index);
+            // Key by the tab's own identity, never by its position: removing
+            // a tab must not hand its focus handle to the next tab. Duplicate
+            // labels get `label#n` so they do not share a focus handle.
+            let key = match &tab.id {
+                Some(id) => id.to_string(),
+                None => {
+                    let occurrence = label_occurrences.entry(tab.label.clone()).or_insert(0);
+                    *occurrence += 1;
+                    format!("{}#{}", tab.label, *occurrence)
+                }
+            };
+            let child_id =
+                ElementId::NamedChild(Box::new(bar_id.clone()), SharedString::from(key.clone()));
             let focus = window
                 .use_keyed_state(child_id.clone(), cx, |_, cx| cx.focus_handle())
                 .read(cx)
@@ -149,7 +173,10 @@ impl RenderOnce for Tabs {
 
             if tab.closable {
                 let mut close = div()
-                    .id(ElementId::named_usize(format!("{id_name}-close"), index))
+                    .id(ElementId::NamedChild(
+                        Box::new(child_id.clone()),
+                        SharedString::from("close"),
+                    ))
                     .flex()
                     .items_center()
                     .justify_center()

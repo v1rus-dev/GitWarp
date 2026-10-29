@@ -8,7 +8,7 @@ use gpui::{
     Render, TestAppContext, VisualTestContext, Window,
 };
 
-use ui::{actions, focus, Button, Checkbox, SegmentItem, Segmented};
+use ui::{actions, focus, Button, Checkbox, SegmentItem, Segmented, Tab, Tabs};
 
 fn init(cx: &mut TestAppContext) {
     cx.update(ui::init).expect("ui::init");
@@ -225,6 +225,169 @@ fn clicking_a_segment_selects_it(cx: &mut TestAppContext) {
     cx.simulate_click(bounds.center(), Modifiers::default());
 
     assert_eq!(cx.read(|app| view.read(app).selected.get()), Some(2));
+}
+
+struct TabsRoot {
+    labels: Vec<&'static str>,
+    selected: Rc<Cell<Option<usize>>>,
+}
+
+impl Render for TabsRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.selected.clone();
+        let tabs = Tabs::new("tabs")
+            .tabs(
+                self.labels
+                    .iter()
+                    .map(|label| Tab::new(*label).id(*label).closable()),
+            )
+            .selected(0)
+            .on_select(move |index, _, _| selected.set(Some(index)));
+        let content = div().size_full().relative().child(
+            div()
+                .absolute()
+                .left(px(40.))
+                .top(px(40.))
+                .w(px(320.))
+                .child(tabs),
+        );
+        focus::track_pointer(actions::tab_navigation(content))
+    }
+}
+
+#[gpui::test]
+fn closing_a_tab_keeps_focus_on_the_same_tab(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx, |_| TabsRoot {
+        labels: vec!["One", "Two", "Three"],
+        selected: Rc::new(Cell::new(None)),
+    });
+
+    // Focus the second tab and select it.
+    cx.simulate_keystrokes("tab tab");
+    press(cx, "enter");
+    assert_eq!(
+        cx.read(|app| view.read(app).selected.get()),
+        Some(1),
+        "enter did not select the focused tab"
+    );
+
+    // Closing the first tab shifts "Two" to index 0. Focus must stay on it,
+    // so Enter selects index 0 rather than the tab that took index 1.
+    cx.update(|_, app| {
+        view.update(app, |root, cx| {
+            root.labels.remove(0);
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+
+    press(cx, "enter");
+    assert_eq!(
+        cx.read(|app| view.read(app).selected.get()),
+        Some(0),
+        "focus moved to a different tab when tab 1 closed"
+    );
+}
+
+struct DuplicateTabsRoot {
+    selected: Rc<Cell<Option<usize>>>,
+}
+
+impl Render for DuplicateTabsRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.selected.clone();
+        let tabs = Tabs::new("duplicate-tabs")
+            .tabs([Tab::new("README.md"), Tab::new("README.md")])
+            .selected(0)
+            .on_select(move |index, _, _| selected.set(Some(index)));
+        let content = div().size_full().relative().child(
+            div()
+                .absolute()
+                .left(px(40.))
+                .top(px(40.))
+                .w(px(320.))
+                .child(tabs),
+        );
+        focus::track_pointer(actions::tab_navigation(content))
+    }
+}
+
+#[gpui::test]
+fn duplicate_tab_labels_get_distinct_focus_handles(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx, |_| DuplicateTabsRoot {
+        selected: Rc::new(Cell::new(None)),
+    });
+
+    // Tab once: the first "README.md". Enter selects it.
+    cx.simulate_keystrokes("tab");
+    press(cx, "enter");
+    assert_eq!(
+        cx.read(|app| view.read(app).selected.get()),
+        Some(0),
+        "the first duplicate tab was not focused"
+    );
+
+    // Tab again: the second "README.md" must be a separate focus stop.
+    cx.simulate_keystrokes("tab");
+    press(cx, "enter");
+    assert_eq!(
+        cx.read(|app| view.read(app).selected.get()),
+        Some(1),
+        "both duplicate tabs share one focus handle"
+    );
+}
+
+struct SegmentedRemoveRoot {
+    labels: Vec<&'static str>,
+    selected: Rc<Cell<Option<usize>>>,
+}
+
+impl Render for SegmentedRemoveRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.selected.clone();
+        let segmented = Segmented::new("seg-remove")
+            .items(self.labels.iter().copied().map(SegmentItem::new))
+            .selected(0)
+            .on_select(move |index, _, _| selected.set(Some(index)));
+        let content = div()
+            .size_full()
+            .relative()
+            .child(div().absolute().left(px(40.)).top(px(40.)).child(segmented));
+        focus::track_pointer(actions::tab_navigation(content))
+    }
+}
+
+#[gpui::test]
+fn segmented_focus_survives_removing_an_earlier_item(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx, |_| SegmentedRemoveRoot {
+        labels: vec!["One", "Two", "Three"],
+        selected: Rc::new(Cell::new(None)),
+    });
+
+    // Focus the second segment and select it.
+    cx.simulate_keystrokes("tab tab");
+    press(cx, "enter");
+    assert_eq!(
+        cx.read(|app| view.read(app).selected.get()),
+        Some(1),
+        "enter did not select the focused segment"
+    );
+
+    // Removing the first item shifts "Two" to index 0; focus must stay on it.
+    cx.update(|_, app| {
+        view.update(app, |root, cx| {
+            root.labels.remove(0);
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+
+    press(cx, "enter");
+    assert_eq!(
+        cx.read(|app| view.read(app).selected.get()),
+        Some(0),
+        "focus moved to a different segment when an earlier item was removed"
+    );
 }
 
 #[gpui::test]

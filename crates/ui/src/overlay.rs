@@ -28,6 +28,13 @@ pub enum LayerKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LayerId(u64);
 
+#[cfg(test)]
+impl LayerId {
+    pub(crate) fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 /// One open overlay.
 struct Layer {
     kind: LayerKind,
@@ -37,22 +44,58 @@ struct Layer {
 }
 
 /// Per-window ordered overlay stack.
-#[derive(Default)]
 pub struct Overlays {
     layers: LayerStack<Layer>,
+    /// Holds focus while a keyboard-triggered close waits for its key-up.
+    focus: FocusHandle,
+    /// Set by a menu or dialog that handles Enter; the next close may then
+    /// defer its focus restore until the matching key-up.
+    defer_restore_once: bool,
+    /// The focus to restore on the next key-up; the outer `Option` records
+    /// that a restore is pending, the inner one may be `None` (blur).
+    pending_restore: Option<Option<FocusHandle>>,
 }
 
 impl Overlays {
+    fn new(focus: FocusHandle) -> Self {
+        Self {
+            layers: LayerStack::default(),
+            focus,
+            defer_restore_once: false,
+            pending_restore: None,
+        }
+    }
+
     fn open(&mut self, layer: Layer) -> LayerId {
+        // A new layer takes focus itself; never let an older deferred restore
+        // steal it back.
+        self.pending_restore = None;
+        self.defer_restore_once = false;
         self.layers.open(layer)
     }
 
-    fn close(&mut self, id: LayerId) -> Option<Layer> {
-        self.layers.close(id)
+    /// Removes `id`; also reports whether it was the topmost layer.
+    fn close(&mut self, id: LayerId) -> Option<(Layer, bool)> {
+        let was_top = self.layers.is_top(id);
+        self.layers.close(id).map(|layer| (layer, was_top))
     }
 
     fn close_top(&mut self) -> Option<Layer> {
+        self.clear_deferred_restore();
+        self.pending_restore = None;
         self.layers.close_top()
+    }
+
+    fn defer_restore(&mut self) {
+        self.defer_restore_once = true;
+    }
+
+    fn clear_deferred_restore(&mut self) {
+        self.defer_restore_once = false;
+    }
+
+    fn take_pending_restore(&mut self) -> Option<Option<FocusHandle>> {
+        self.pending_restore.take()
     }
 }
 
@@ -85,6 +128,12 @@ impl<T> LayerStack<T> {
             .iter()
             .position(|(layer_id, _)| *layer_id == id)?;
         Some(self.entries.remove(index).1)
+    }
+
+    fn is_top(&self, id: LayerId) -> bool {
+        self.entries
+            .last()
+            .is_some_and(|(layer_id, _)| *layer_id == id)
     }
 
     fn close_top(&mut self) -> Option<T> {
@@ -125,9 +174,26 @@ pub(crate) fn init(cx: &mut App) {
     .detach();
 }
 
+/// The focus a new layer should return to when it closes.
+///
+/// If focus is currently on the overlay sentinel while a keyboard-triggered
+/// restore is pending, the real opener is used instead.
+fn restore_target(window: &Window, cx: &mut App) -> Option<FocusHandle> {
+    let focused = window.focused(cx);
+    let Some(overlays) = try_entity(window, cx) else {
+        return focused;
+    };
+    let overlays = overlays.read(cx);
+    if focused.as_ref() == Some(&overlays.focus) {
+        overlays.pending_restore.clone().flatten().or(focused)
+    } else {
+        focused
+    }
+}
+
 /// Opens a centred modal with a full-window scrim.
 pub fn open_modal(view: AnyView, window: &mut Window, cx: &mut App) -> LayerId {
-    let restore_focus = window.focused(cx);
+    let restore_focus = restore_target(window, cx);
     let id = entity(window, cx).update(cx, |overlays, _| {
         overlays.open(Layer {
             kind: LayerKind::Modal,
@@ -147,7 +213,7 @@ pub fn open_popover(
     window: &mut Window,
     cx: &mut App,
 ) -> LayerId {
-    let restore_focus = window.focused(cx);
+    let restore_focus = restore_target(window, cx);
     let id = entity(window, cx).update(cx, |overlays, _| {
         overlays.open(Layer {
             kind: LayerKind::Popover { position },
@@ -160,14 +226,53 @@ pub fn open_popover(
     id
 }
 
+/// Defers the focus restore of the next close until the key-up of the key
+/// press that triggered it. Call this from an Enter/Space handler before
+/// closing: GPUI activates a focused button on key-up, so restoring focus
+/// immediately would activate the opener a second time.
+pub fn defer_focus_restore(window: &Window, cx: &mut App) {
+    if let Some(overlays) = try_entity(window, cx) {
+        overlays.update(cx, |overlays, _| overlays.defer_restore());
+    }
+}
+
+/// Cancels a deferral registered by [`defer_focus_restore`] when the key
+/// press did not end up closing a layer.
+pub fn clear_deferred_focus_restore(window: &Window, cx: &mut App) {
+    if let Some(overlays) = try_entity(window, cx) {
+        overlays.update(cx, |overlays, _| overlays.clear_deferred_restore());
+    }
+}
+
 /// Closes the layer with `id`, restoring the focus saved when it opened.
+///
+/// Closing a layer that is not on top leaves the top layer's focus alone.
 pub fn close(id: LayerId, window: &mut Window, cx: &mut App) {
     let Some(overlays) = try_entity(window, cx) else {
         return;
     };
-    let closed = overlays.update(cx, |overlays, _| overlays.close(id));
-    if let Some(layer) = closed {
-        restore(layer, window);
+    let mut deferred = false;
+    let closed = overlays.update(cx, |overlays, _| {
+        let Some((layer, was_top)) = overlays.close(id) else {
+            overlays.clear_deferred_restore();
+            return None;
+        };
+        if was_top && overlays.defer_restore_once {
+            overlays.clear_deferred_restore();
+            overlays.pending_restore = Some(layer.restore_focus.clone());
+            deferred = true;
+        } else {
+            overlays.clear_deferred_restore();
+        }
+        Some((layer, was_top))
+    });
+    if let Some((layer, was_top)) = closed {
+        if deferred {
+            let focus = overlays.read(cx).focus.clone();
+            window.focus(&focus);
+        } else if was_top {
+            restore(layer, window);
+        }
         window.refresh();
     }
 }
@@ -195,6 +300,7 @@ fn restore(layer: Layer, window: &mut Window) {
 pub fn render_overlays(window: &mut Window, cx: &mut App) -> impl IntoElement {
     let overlays = entity(window, cx);
     let colors = cx.theme().colors;
+    let focus = overlays.read(cx).focus.clone();
     let layers: Vec<(LayerId, LayerKind, AnyView, bool)> = overlays
         .read(cx)
         .layers
@@ -210,7 +316,31 @@ pub fn render_overlays(window: &mut Window, cx: &mut App) -> impl IntoElement {
         })
         .collect();
 
-    let mut root = div().absolute().inset_0();
+    // A zero-sized focus sentinel receives the key-up of a keyboard-triggered
+    // close and only then returns focus to the opener, so that key-up cannot
+    // activate it. It must not cover the window: that would steal mouse-down
+    // focus from everything underneath the overlay root.
+    let key_up_overlays = overlays.clone();
+    let sentinel_focus = focus.clone();
+    let sentinel = div()
+        .size(px(0.))
+        .track_focus(&focus)
+        .capture_key_up(move |_, window, cx| {
+            let pending = key_up_overlays.update(cx, |overlays, _| overlays.take_pending_restore());
+            // Something else took focus deliberately (for example a menu
+            // action); leave it alone.
+            if window.focused(cx).as_ref() != Some(&sentinel_focus) {
+                return;
+            }
+            if let Some(handle) = pending {
+                match handle {
+                    Some(handle) => window.focus(&handle),
+                    None => window.blur(),
+                }
+                window.refresh();
+            }
+        });
+    let mut root = div().absolute().inset_0().child(sentinel);
     for (index, (id, kind, view, dismiss)) in layers.into_iter().enumerate() {
         let layer = layer_element(id, kind, view, dismiss, colors);
         root = root.child(deferred(layer).with_priority(index));
@@ -316,7 +446,7 @@ fn entity(window: &Window, cx: &mut App) -> Entity<Overlays> {
     if cx.try_global::<OverlayRegistry>().is_none() {
         cx.set_global(OverlayRegistry::default());
     }
-    let entity = cx.new(|_| Overlays::default());
+    let entity = cx.new(|cx| Overlays::new(cx.focus_handle().tab_stop(false)));
     cx.update_global::<OverlayRegistry, _>(|registry, _| {
         registry.by_window.insert(window_id, entity.clone());
     });

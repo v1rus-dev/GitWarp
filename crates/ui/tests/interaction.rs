@@ -237,6 +237,29 @@ fn escape_closes_only_the_top_layer(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn closing_a_lower_layer_keeps_focus_on_the_top_layer(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    // Focus something behind the layers, so a restore of the lower layer's
+    // saved focus would be observable.
+    cx.simulate_keystrokes("tab");
+
+    let (lower, lower_focus) = new_panel(cx, 360., 160.);
+    let lower_layer = cx.update(|window, cx| overlay::open_modal(AnyView::from(lower), window, cx));
+    cx.update(|window, _| window.focus(&lower_focus));
+
+    let (top, top_focus) = new_panel(cx, 220., 80.);
+    cx.update(|window, cx| overlay::open_modal(AnyView::from(top), window, cx));
+    cx.update(|window, _| window.focus(&top_focus));
+    cx.run_until_parked();
+    assert_eq!(stack_len(cx), 2);
+
+    cx.update(|window, cx| overlay::close(lower_layer, window, cx));
+
+    assert_eq!(stack_len(cx), 1);
+    assert_focused(cx, &top_focus);
+}
+
+#[gpui::test]
 fn popover_closes_on_an_outside_click_only(cx: &mut TestAppContext) {
     let (_, cx) = start(cx);
 

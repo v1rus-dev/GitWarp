@@ -28,8 +28,12 @@ struct SplitterState {
     dragging: bool,
 }
 
-/// A zero-sized value carried by the active drag.
-struct SplitterDrag;
+/// The id of the splitter whose drag is active.
+///
+/// `on_drag_move` fires on every splitter as soon as any drag is active, so
+/// the payload must say which one owns it.
+#[derive(Clone)]
+struct SplitterDrag(ElementId);
 
 /// Clamp a drag delta to the panel's allowed range.
 ///
@@ -191,12 +195,18 @@ impl RenderOnce for Splitter {
             );
         }
 
-        handle = handle.on_drag(SplitterDrag, |_, _, _, cx| cx.new(|_| EmptyView));
+        handle = handle.on_drag(SplitterDrag(self.id.clone()), |_, _, _, cx| {
+            cx.new(|_| EmptyView)
+        });
         {
             let state = state.clone();
             let on_resize = self.on_resize.clone();
+            let drag_id = self.id.clone();
             handle = handle.on_drag_move(
                 move |event: &DragMoveEvent<SplitterDrag>, window: &mut Window, cx: &mut App| {
+                    if event.drag(cx).0 != drag_id {
+                        return;
+                    }
                     let Some(start) = state.read(cx).start else {
                         return;
                     };
@@ -220,7 +230,10 @@ impl RenderOnce for Splitter {
             handle = handle.on_mouse_up(
                 MouseButton::Left,
                 move |_, window: &mut Window, cx: &mut App| {
-                    up_state.update(cx, |state, _| state.dragging = false);
+                    up_state.update(cx, |state, _| {
+                        state.dragging = false;
+                        state.start = None;
+                    });
                     window.refresh();
                 },
             );
@@ -228,7 +241,10 @@ impl RenderOnce for Splitter {
             handle = handle.on_mouse_up_out(
                 MouseButton::Left,
                 move |_, window: &mut Window, cx: &mut App| {
-                    out_state.update(cx, |state, _| state.dragging = false);
+                    out_state.update(cx, |state, _| {
+                        state.dragging = false;
+                        state.start = None;
+                    });
                     window.refresh();
                 },
             );

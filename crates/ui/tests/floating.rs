@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use gpui::{
     div, point, prelude::*, px, Context, Entity, FocusHandle, IntoElement, KeyUpEvent, Keystroke,
-    Modifiers, Render, TestAppContext, VisualTestContext, Window,
+    Modifiers, MouseButton, Render, TestAppContext, VisualTestContext, Window,
 };
 
 use ui::{
-    actions, dialog, focus, menu, overlay, toast, Dialog, DialogFocus, MenuEntry, MenuItem, Select,
-    TextInput, ToastKind,
+    actions, dialog, focus, menu, overlay, toast, Button, Dialog, DialogFocus, MenuEntry, MenuItem,
+    Select, TextInput, TextInputEvent, ToastKind, Tree, TreeNodeData,
 };
 
 fn init(cx: &mut TestAppContext) {
@@ -452,4 +452,365 @@ fn choosing_a_select_option_calls_on_change(cx: &mut TestAppContext) {
         "choosing an option did not report it"
     );
     assert_eq!(layer_count(cx), 0, "the select menu stayed open");
+}
+
+#[gpui::test]
+fn enter_that_closes_a_select_menu_does_not_reopen_it_on_key_up(cx: &mut TestAppContext) {
+    init(cx);
+    let chosen = Rc::new(Cell::new(None));
+    let (_, cx) = cx.add_window_view(|_, _| SelectRoot {
+        chosen: chosen.clone(),
+    });
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("tab");
+    press(cx, "enter");
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 1, "enter did not open the select");
+
+    cx.simulate_keystrokes("down");
+    press(cx, "enter");
+
+    assert_eq!(chosen.get(), Some(0), "the option was not chosen");
+    assert_eq!(
+        layer_count(cx),
+        0,
+        "the key-up after closing activated the Select again"
+    );
+}
+
+struct TreeMenuRoot {
+    focus: FocusHandle,
+    nodes: Vec<TreeNodeData>,
+    first: Rc<Cell<u32>>,
+    second: Rc<Cell<u32>>,
+}
+
+impl Render for TreeMenuRoot {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let first = self.first.clone();
+        let second = self.second.clone();
+        let tree = Tree::new("menu-tree", self.nodes.clone())
+            .focus_handle(self.focus.clone())
+            .on_context_menu(move |_, position, window, cx| {
+                menu::open_context_menu(
+                    position,
+                    vec![
+                        menu_item("First", true, &first),
+                        menu_item("Second", true, &second),
+                    ],
+                    window,
+                    cx,
+                );
+            });
+
+        let content = div().size_full().relative().child(
+            div()
+                .absolute()
+                .left(px(40.))
+                .top(px(40.))
+                .w(px(240.))
+                .h(px(320.))
+                .child(tree),
+        );
+        let content = focus::track_pointer(actions::tab_navigation(content));
+        content.child(overlay::render_overlays(window, cx))
+    }
+}
+
+#[gpui::test]
+fn a_tree_context_menu_takes_focus_from_the_tree(cx: &mut TestAppContext) {
+    init(cx);
+    let first = Rc::new(Cell::new(0));
+    let second = Rc::new(Cell::new(0));
+    let (_, cx) = cx.add_window_view(|_, cx| TreeMenuRoot {
+        focus: cx.focus_handle().tab_stop(true),
+        nodes: vec![
+            TreeNodeData::new("one"),
+            TreeNodeData::new("two"),
+            TreeNodeData::new("three"),
+        ],
+        first: first.clone(),
+        second: second.clone(),
+    });
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    let row = cx.debug_bounds("menu-tree-node-1").expect("no tree row");
+    cx.simulate_mouse_down(row.center(), MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 1, "the context menu did not open");
+
+    // Escape must reach the menu, not the tree.
+    cx.simulate_keystrokes("escape");
+    assert_eq!(layer_count(cx), 0, "escape did not close the context menu");
+
+    // ↓ must highlight a menu item, not move the tree marker; Enter runs it.
+    cx.simulate_mouse_down(row.center(), MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 1);
+
+    cx.simulate_keystrokes("down");
+    press(cx, "enter");
+
+    assert_eq!(first.get(), 1, "enter did not activate the menu item");
+    assert_eq!(layer_count(cx), 0, "the context menu stayed open");
+}
+
+struct DialogOpenerRoot {
+    opener: FocusHandle,
+    input: Entity<TextInput>,
+    layer: Rc<Cell<Option<overlay::LayerId>>>,
+    opens: Rc<Cell<u32>>,
+}
+
+impl Render for DialogOpenerRoot {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let layer = self.layer.clone();
+        let input = self.input.clone();
+        let input_focus = input.read(cx).focus_handle().clone();
+        let opens = self.opens.clone();
+        let opener = Button::new("dialog-opener")
+            .label("Open")
+            .focus_handle(self.opener.clone())
+            .on_click(move |_, window, cx| {
+                opens.set(opens.get() + 1);
+                let layer_in_dialog = layer.clone();
+                let body = input.clone();
+                let autofocus = input_focus.clone();
+                let id = dialog::open(window, cx, move |_, _| {
+                    Dialog::new("New branch")
+                        .body(body.clone())
+                        .focus_order([DialogFocus::input(autofocus.clone())])
+                        .autofocus(autofocus.clone())
+                        .on_default({
+                            let layer_in_dialog = layer_in_dialog.clone();
+                            move |window, cx| {
+                                if let Some(layer) = layer_in_dialog.get() {
+                                    dialog::close(layer, window, cx);
+                                }
+                            }
+                        })
+                });
+                layer.set(Some(id));
+            });
+
+        let content = div()
+            .size_full()
+            .relative()
+            .child(div().absolute().left(px(40.)).top(px(40.)).child(opener));
+        let content = focus::track_pointer(actions::tab_navigation(content));
+        content.child(overlay::render_overlays(window, cx))
+    }
+}
+
+#[gpui::test]
+fn enter_that_closes_a_dialog_does_not_reopen_it_on_key_up(cx: &mut TestAppContext) {
+    init(cx);
+    let layer = Rc::new(Cell::new(None));
+    let opens = Rc::new(Cell::new(0));
+    let (_, cx) = cx.add_window_view(|window, cx| DialogOpenerRoot {
+        opener: cx.focus_handle().tab_stop(true),
+        input: cx.new(|cx| TextInput::new(window, cx)),
+        layer: layer.clone(),
+        opens: opens.clone(),
+    });
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("tab");
+    press(cx, "enter");
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 1, "the dialog did not open");
+    assert_eq!(opens.get(), 1);
+
+    press(cx, "enter");
+
+    assert_eq!(layer_count(cx), 0, "enter did not close the dialog");
+    assert_eq!(
+        opens.get(),
+        1,
+        "the key-up after closing activated the opener again"
+    );
+}
+
+fn open_dynamic_busy_dialog(
+    cx: &mut VisualTestContext,
+    root: &Entity<TestRoot>,
+    busy: Rc<Cell<bool>>,
+) -> overlay::LayerId {
+    let a = cx.read(|app| root.read(app).a.clone());
+    cx.update(|window, app| {
+        dialog::open(window, app, move |_, _| {
+            Dialog::new("Busy dialog")
+                .body(focus_box("busy-body", &a))
+                .focus_order([DialogFocus::control(a.clone())])
+                .autofocus(a.clone())
+                .busy(busy.get())
+        })
+    })
+}
+
+#[gpui::test]
+fn a_dialog_rebuilt_as_busy_ignores_escape_and_the_scrim(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx);
+    let busy = Rc::new(Cell::new(false));
+    open_dynamic_busy_dialog(cx, &view, busy.clone());
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 1);
+
+    busy.set(true);
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("escape");
+    assert_eq!(layer_count(cx), 1, "escape closed a busy dialog");
+    cx.simulate_click(point(px(5.), px(5.)), Modifiers::default());
+    assert_eq!(layer_count(cx), 1, "the scrim closed a busy dialog");
+
+    busy.set(false);
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    assert_eq!(
+        layer_count(cx),
+        0,
+        "escape did not close after clearing busy"
+    );
+}
+
+#[gpui::test]
+fn enter_without_on_default_does_nothing_and_with_it_runs_once(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    let input = cx.update(|window, app| app.new(|cx| TextInput::new(window, cx)));
+    let input_focus = cx.read(|app| input.read(app).focus_handle().clone());
+    let default_focus = cx.read(|app| view.read(app).b.clone());
+
+    // `default_button` alone (no `on_default`): Enter does nothing.
+    let layer = cx.update(|window, app| {
+        let body = input.clone();
+        let autofocus = input_focus.clone();
+        let default = default_focus.clone();
+        let hits = hits.clone();
+        dialog::open(window, app, move |_, _| {
+            Dialog::new("Rename branch")
+                .body(body.clone())
+                .footer(
+                    Button::new("dialog-default")
+                        .label("OK")
+                        .focus_handle(default.clone())
+                        .on_click({
+                            let hits = hits.clone();
+                            move |_, _, _| hits.set(hits.get() + 1)
+                        }),
+                )
+                .focus_order([DialogFocus::input(autofocus.clone())])
+                .autofocus(autofocus.clone())
+                .default_button(default.clone())
+        })
+    });
+    cx.run_until_parked();
+
+    press(cx, "enter");
+    assert_eq!(
+        hits.get(),
+        0,
+        "enter activated default_button without on_default"
+    );
+    assert_eq!(layer_count(cx), 1, "enter closed the dialog on its own");
+
+    cx.update(|window, app| dialog::close(layer, window, app));
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 0);
+
+    // With `on_default`, the same Enter runs it exactly once.
+    cx.update(|window, app| {
+        let body = input.clone();
+        let autofocus = input_focus.clone();
+        let hits = hits.clone();
+        dialog::open(window, app, move |_, _| {
+            Dialog::new("Rename branch")
+                .body(body.clone())
+                .focus_order([DialogFocus::input(autofocus.clone())])
+                .autofocus(autofocus.clone())
+                .on_default({
+                    let hits = hits.clone();
+                    move |_, _| hits.set(hits.get() + 1)
+                })
+        });
+    });
+    cx.run_until_parked();
+
+    press(cx, "enter");
+    assert_eq!(hits.get(), 1, "enter did not run on_default exactly once");
+}
+
+#[gpui::test]
+fn enter_in_a_dialog_input_fires_the_default_once_and_swallows_submit(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    let submits = Rc::new(Cell::new(0));
+    let input = cx.update(|window, app| app.new(|cx| TextInput::new(window, cx)));
+    let focus = cx.read(|app| input.read(app).focus_handle().clone());
+    let _subscription = {
+        let submits = submits.clone();
+        cx.update(|_, app| {
+            app.subscribe(&input, move |_, event: &TextInputEvent, _| {
+                if matches!(event, TextInputEvent::Submit) {
+                    submits.set(submits.get() + 1);
+                }
+            })
+        })
+    };
+
+    cx.update(|window, app| {
+        let body = input.clone();
+        let autofocus = focus.clone();
+        let default = focus.clone();
+        let hits = hits.clone();
+        dialog::open(window, app, move |_, _| {
+            Dialog::new("Rename branch")
+                .body(body.clone())
+                .focus_order([DialogFocus::input(autofocus.clone())])
+                .autofocus(autofocus.clone())
+                .default_button(default.clone())
+                .on_default({
+                    let hits = hits.clone();
+                    move |_, _| hits.set(hits.get() + 1)
+                })
+        });
+    });
+    cx.run_until_parked();
+
+    press(cx, "enter");
+    assert_eq!(hits.get(), 1, "the default action did not run exactly once");
+    assert_eq!(
+        submits.get(),
+        0,
+        "the dialog must consume Enter instead of emitting Submit"
+    );
+}
+
+#[gpui::test]
+fn tab_inside_a_menu_does_not_move_focus_behind_it(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+
+    cx.update(|window, app| {
+        menu::open_context_menu(
+            point(px(40.), px(40.)),
+            vec![menu_item("Item", true, &hits)],
+            window,
+            app,
+        );
+    });
+    cx.run_until_parked();
+    let before = focused(cx);
+
+    cx.simulate_keystrokes("tab");
+
+    assert_eq!(focused(cx), before, "tab moved focus behind the menu");
+    assert_eq!(layer_count(cx), 1, "tab closed the menu");
 }
