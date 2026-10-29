@@ -159,13 +159,13 @@ impl RenderOnce for Scrollbar {
         let (viewport_len, content_len, scroll) = if vertical {
             (
                 viewport.height,
-                viewport.height + max.height,
+                viewport.height + max.y,
                 px(-f32::from(offset.y)),
             )
         } else {
             (
                 viewport.width,
-                viewport.width + max.width,
+                viewport.width + max.x,
                 px(-f32::from(offset.x)),
             )
         };
@@ -341,11 +341,11 @@ fn scroll_position(handle: &ScrollHandle, vertical: bool) -> Pixels {
     }
 }
 
-fn max_component(max: gpui::Size<Pixels>, vertical: bool) -> Pixels {
+fn max_component(max: Point<Pixels>, vertical: bool) -> Pixels {
     if vertical {
-        max.height
+        max.y
     } else {
-        max.width
+        max.x
     }
 }
 

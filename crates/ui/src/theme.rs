@@ -252,6 +252,7 @@ impl Theme {
                 offset: point(px(0.), shadow.offset_y),
                 blur_radius: shadow.blur,
                 spread_radius: shadow.spread,
+                inset: false,
             })
             .collect()
     }

@@ -4,10 +4,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, size, uniform_list, AnyElement, AnyView, App, Application,
-    Bounds, ClickEvent, Div, ElementId, Entity, FocusHandle, FontWeight, Hsla, IntoElement,
-    MouseButton, MouseDownEvent, Pixels, Render, ScrollStrategy, SharedString, Subscription,
-    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    canvas, div, point, prelude::*, px, size, uniform_list, AnyElement, AnyView, App, Bounds,
+    ClickEvent, Div, ElementId, Entity, FocusHandle, FontWeight, Hsla, IntoElement, MouseButton,
+    MouseDownEvent, Pixels, Render, ScrollStrategy, SharedString, Subscription, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 
 use ui::focus::RingOffset;
@@ -2264,7 +2264,7 @@ fn lists_section(
                 let view = rows_view.clone();
                 let focus = rows_focus.clone();
                 row.on_click(move |_, window, cx| {
-                    window.focus(&focus);
+                    window.focus(&focus, cx);
                     view.update(cx, |this, cx| {
                         this.list_selected = index;
                         this.list_keyboard = false;
@@ -2274,7 +2274,7 @@ fn lists_section(
             })
             .collect::<Vec<_>>()
     })
-    .track_scroll(list_scroll.clone())
+    .track_scroll(&list_scroll)
     .flex_1()
     .h_full();
 
@@ -2499,7 +2499,7 @@ fn open_modal_button(colors: ThemeColors, cx: &mut Context<Gallery>) -> impl Int
             let panel = cx.new(ModalPanel::new);
             let focus = panel.read(cx).focus.clone();
             overlay::open_modal(AnyView::from(panel), window, cx);
-            window.focus(&focus);
+            window.focus(&focus, cx);
         }))
         .child("Open modal")
 }
@@ -2607,7 +2607,7 @@ fn open_popover_button(colors: ThemeColors, cx: &mut Context<ModalPanel>) -> imp
             let panel = cx.new(PopoverPanel::new);
             let focus = panel.read(cx).focus.clone();
             overlay::open_popover(event.position(), AnyView::from(panel), window, cx);
-            window.focus(&focus);
+            window.focus(&focus, cx);
         }))
         .child("Open nested popover")
 }
@@ -2638,7 +2638,7 @@ fn parse_args() -> (ThemeMode, Option<Section>, Option<OpenOnStart>) {
 
 fn main() {
     let (mode, section, open) = parse_args();
-    Application::new()
+    gpui_platform::application()
         .with_assets(ui::Assets)
         .run(move |cx: &mut App| {
             if let Err(e) = ui::init(cx) {

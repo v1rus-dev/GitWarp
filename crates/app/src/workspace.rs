@@ -14,8 +14,9 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     canvas, div, point, px, App, AppContext, Bounds, Context, CursorStyle, Decorations, Div,
-    Entity, HitboxBehavior, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
-    Point, Render, ResizeEdge, SharedString, Styled, Subscription, Tiling, Window,
+    Entity, HitboxBehavior, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent,
+    ParentElement, Pixels, Point, Render, ResizeEdge, SharedString, Styled, Subscription, Tiling,
+    Window,
 };
 
 use git_core::Git;
@@ -41,6 +42,9 @@ enum Content {
 pub struct Workspace {
     content: Content,
     git: Result<Arc<Git>, String>,
+    /// The resize edge under the pointer in the frame's inset band, if any.
+    /// The band only repaints when this changes, so the cursor follows it.
+    last_resize_edge: Option<ResizeEdge>,
     /// Repaints when the decorations change (windows forced to server-side
     /// decorations, tiling on maximise/snap).
     _decorations: Subscription,
@@ -58,6 +62,7 @@ impl Workspace {
         let mut this = Self {
             content: Content::Welcome(cx.new(|cx| WelcomeView::new(git.clone(), cx))),
             git,
+            last_resize_edge: None,
             _decorations: decorations,
         };
         match path {
@@ -188,7 +193,14 @@ impl Render for Workspace {
                 .when(!tiling.bottom, |d| d.pb(INSET))
                 .when(!tiling.left, |d| d.pl(INSET))
                 .when(!tiling.right, |d| d.pr(INSET))
-                .on_mouse_move(|_, window, _| window.refresh())
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                    let size = window.window_bounds().get_bounds().size;
+                    let edge = resize_edge(event.position, INSET, size);
+                    if edge != this.last_resize_edge {
+                        this.last_resize_edge = edge;
+                        cx.notify();
+                    }
+                }))
                 .on_mouse_down(MouseButton::Left, |event, window, _| {
                     let size = window.window_bounds().get_bounds().size;
                     if let Some(edge) = resize_edge(event.position, INSET, size) {
@@ -209,7 +221,15 @@ impl Render for Workspace {
             .text_color(colors.text)
             .font_family(FONT_UI)
             .text_size(FS_BASE)
-            .on_mouse_move(|_, _, cx| cx.stop_propagation());
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
+                // The frame covers the whole padded area, so this is where the
+                // pointer leaves the resize band. Forget the edge so that
+                // re-entering the band repaints and restores the resize cursor.
+                cx.stop_propagation();
+                if this.last_resize_edge.take().is_some() {
+                    cx.notify();
+                }
+            }));
         if client {
             frame = frame
                 .border_color(colors.border)
@@ -252,7 +272,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 if let Some(handle) = this.with_repository(cx, |view, _| view.search_focus()) {
-                    window.focus(&handle);
+                    window.focus(&handle, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &OpenRepoSwitcher, window, cx| {

@@ -621,7 +621,7 @@ impl RenderOnce for Tree {
                     move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
                         // Focus the tree ourselves: the listeners below may
                         // open a menu or dialog that must keep the focus.
-                        window.focus(&focus);
+                        window.focus(&focus, cx);
                         state.update(cx, |state, _| {
                             state.marker_key = Some(key.clone());
                             state.marker_index = index;
@@ -651,7 +651,7 @@ impl RenderOnce for Tree {
                 row = row.on_mouse_down(
                     MouseButton::Right,
                     move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
-                        window.focus(&focus);
+                        window.focus(&focus, cx);
                         state.update(cx, |state, _| {
                             state.marker_key = Some(key.clone());
                             state.marker_index = index;

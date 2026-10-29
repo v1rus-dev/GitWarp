@@ -12,3 +12,4 @@ unicode-segmentation = "1.13"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+gpui_platform = { workspace = true, features = ["test-support"] }

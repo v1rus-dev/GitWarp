@@ -3,7 +3,11 @@
 //! The bindings are global for now; per-component key contexts come with the
 //! components themselves.
 
-use gpui::{actions, App, Div, InteractiveElement, KeyBinding, Window};
+use std::rc::Rc;
+
+use gpui::{
+    actions, Action, App, Div, InteractiveElement, KeyBinding, KeyBindingContextPredicate, Window,
+};
 
 actions!(
     ui,
@@ -21,6 +25,23 @@ actions!(
         TreeActivate,
     ]
 );
+
+/// Builds a keybinding, resolving `secondary-` for the host OS.
+///
+/// `KeyBinding::new` parses without an OS, so `secondary-` there is an error;
+/// bindings that name it must go through `KeyBinding::load`.
+pub(crate) fn key_binding(
+    cx: &App,
+    keystrokes: &str,
+    action: impl Action,
+    context: Option<&str>,
+) -> KeyBinding {
+    let context = context.map(|context| {
+        Rc::new(KeyBindingContextPredicate::parse(context).expect("valid key binding context"))
+    });
+    KeyBinding::load(keystrokes, Box::new(action), context, false, None, cx)
+        .expect("valid keystroke")
+}
 
 /// Binds the shared actions to their default keystrokes.
 pub(crate) fn bind_keys(cx: &mut App) {
@@ -52,11 +73,11 @@ fn move_focus(cx: &mut App, next: bool) {
         let Some(window) = window else {
             return;
         };
-        let _ = window.update(cx, |_, window, _| {
+        let _ = window.update(cx, |_, window, cx| {
             if next {
-                window.focus_next();
+                window.focus_next(cx);
             } else {
-                window.focus_prev();
+                window.focus_prev(cx);
             }
         });
     });
@@ -64,10 +85,10 @@ fn move_focus(cx: &mut App, next: bool) {
 
 /// Adds Tab/Shift-Tab focus traversal to a window root.
 pub fn tab_navigation(root: Div) -> Div {
-    root.on_action(|_: &FocusNext, window: &mut Window, _: &mut App| {
-        window.focus_next();
+    root.on_action(|_: &FocusNext, window: &mut Window, cx: &mut App| {
+        window.focus_next(cx);
     })
-    .on_action(|_: &FocusPrev, window: &mut Window, _: &mut App| {
-        window.focus_prev();
+    .on_action(|_: &FocusPrev, window: &mut Window, cx: &mut App| {
+        window.focus_prev(cx);
     })
 }

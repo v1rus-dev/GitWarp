@@ -67,6 +67,7 @@ pub struct Splitter {
     max: Pixels,
     inverted: bool,
     on_resize: Option<ResizeHandler>,
+    on_resize_end: Option<ResetHandler>,
     on_reset: Option<ResetHandler>,
 }
 
@@ -80,6 +81,7 @@ impl Splitter {
             max: px(420.),
             inverted: false,
             on_resize: None,
+            on_resize_end: None,
             on_reset: None,
         }
     }
@@ -112,6 +114,12 @@ impl Splitter {
 
     pub fn on_resize(mut self, listener: impl Fn(Pixels, &mut Window, &mut App) + 'static) -> Self {
         self.on_resize = Some(Rc::new(listener));
+        self
+    }
+
+    /// Called once when a drag that resized the panel ends.
+    pub fn on_resize_end(mut self, listener: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_resize_end = Some(Rc::new(listener));
         self
     }
 
@@ -227,24 +235,40 @@ impl RenderOnce for Splitter {
         }
         {
             let up_state = state.clone();
+            let on_resize_end = self.on_resize_end.clone();
             handle = handle.on_mouse_up(
                 MouseButton::Left,
                 move |_, window: &mut Window, cx: &mut App| {
-                    up_state.update(cx, |state, _| {
+                    let dragged = up_state.update(cx, |state, _| {
+                        let dragged = state.dragging;
                         state.dragging = false;
                         state.start = None;
+                        dragged
                     });
+                    if dragged {
+                        if let Some(listener) = &on_resize_end {
+                            listener(window, cx);
+                        }
+                    }
                     window.refresh();
                 },
             );
             let out_state = state.clone();
+            let on_resize_end = self.on_resize_end.clone();
             handle = handle.on_mouse_up_out(
                 MouseButton::Left,
                 move |_, window: &mut Window, cx: &mut App| {
-                    out_state.update(cx, |state, _| {
+                    let dragged = out_state.update(cx, |state, _| {
+                        let dragged = state.dragging;
                         state.dragging = false;
                         state.start = None;
+                        dragged
                     });
+                    if dragged {
+                        if let Some(listener) = &on_resize_end {
+                            listener(window, cx);
+                        }
+                    }
                     window.refresh();
                 },
             );

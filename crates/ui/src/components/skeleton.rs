@@ -1,8 +1,8 @@
 //! Loading skeletons.
 //!
-//! GPUI 0.2.2 has no animated gradient positions, so the shimmer pulses a
-//! `hover` overlay over an `active` base; the base keeps it visible even on the
-//! first frame.
+//! GPUI has no animated gradient positions, so the shimmer pulses a `hover`
+//! overlay over an `active` base; the base keeps it visible even on the first
+//! frame.
 
 use std::time::Duration;
 

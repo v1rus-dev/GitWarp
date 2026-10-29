@@ -7,7 +7,7 @@ mod welcome;
 mod workspace;
 
 use gpui::{
-    prelude::*, px, size, App, Application, Bounds, Global, KeyBinding, TitlebarOptions,
+    prelude::*, px, size, Action, App, Bounds, Global, KeyBinding, TitlebarOptions,
     WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
 
@@ -26,6 +26,11 @@ struct AppSettings {
 }
 
 impl Global for AppSettings {}
+
+/// A keybinding whose `secondary-` modifier is resolved for the host OS.
+fn binding(cx: &App, keystrokes: &str, action: impl Action) -> KeyBinding {
+    KeyBinding::load(keystrokes, Box::new(action), None, false, None, cx).expect("valid keystroke")
+}
 
 /// Applies `f` to the loaded settings and saves them.
 fn update_settings(cx: &mut App, f: impl FnOnce(&mut Settings)) {
@@ -83,7 +88,7 @@ fn main() {
         }
     };
 
-    Application::new()
+    gpui_platform::application()
         .with_assets(ui::Assets)
         .run(move |cx: &mut App| {
             if let Err(e) = ui::init(cx) {
@@ -95,13 +100,14 @@ fn main() {
             // Repository shortcuts. `secondary-` is Ctrl on Linux and Windows
             // and Cmd on macOS. The views handle them, with a window-root
             // fallback for when nothing holds the focus.
-            cx.bind_keys([
-                KeyBinding::new("secondary-b", repo_view::ToggleSidebar, None),
-                KeyBinding::new("secondary-j", repo_view::ToggleDetails, None),
-                KeyBinding::new("secondary-k", repo_view::FocusSearch, None),
-                KeyBinding::new("secondary-o", repo_view::OpenRepoSwitcher, None),
-                KeyBinding::new("secondary-shift-b", repo_view::OpenBranchSwitcher, None),
-            ]);
+            let shortcuts = [
+                binding(cx, "secondary-b", repo_view::ToggleSidebar),
+                binding(cx, "secondary-j", repo_view::ToggleDetails),
+                binding(cx, "secondary-k", repo_view::FocusSearch),
+                binding(cx, "secondary-o", repo_view::OpenRepoSwitcher),
+                binding(cx, "secondary-shift-b", repo_view::OpenBranchSwitcher),
+            ];
+            cx.bind_keys(shortcuts);
             cx.set_global(AppSettings {
                 path: config_path,
                 settings: loaded,

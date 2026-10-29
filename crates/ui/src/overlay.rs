@@ -4,7 +4,7 @@
 //! responsible for focusing the view they pass in; closing restores the focus
 //! that was active before the layer opened.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use gpui::{
     anchored, deferred, div, px, AnyView, App, AppContext, BorrowAppContext, Div, Entity,
@@ -154,20 +154,12 @@ struct OverlayRegistry {
 
 impl Global for OverlayRegistry {}
 
-/// Drops the overlay state of windows that no longer exist.
-///
-/// `on_window_closed` does not report which window closed, so prune the map
-/// against the windows that are still alive.
+/// Drops the overlay state of a window that closed.
 pub(crate) fn init(cx: &mut App) {
-    cx.on_window_closed(|cx| {
-        let live: HashSet<WindowId> = cx
-            .windows()
-            .iter()
-            .map(|handle| handle.window_id())
-            .collect();
+    cx.on_window_closed(|cx, window_id| {
         if cx.try_global::<OverlayRegistry>().is_some() {
             cx.update_global::<OverlayRegistry, _>(|registry, _| {
-                registry.by_window.retain(|id, _| live.contains(id));
+                registry.by_window.remove(&window_id);
             });
         }
     })
@@ -269,9 +261,9 @@ pub fn close(id: LayerId, window: &mut Window, cx: &mut App) {
     if let Some((layer, was_top)) = closed {
         if deferred {
             let focus = overlays.read(cx).focus.clone();
-            window.focus(&focus);
+            window.focus(&focus, cx);
         } else if was_top {
-            restore(layer, window);
+            restore(layer, window, cx);
         }
         window.refresh();
     }
@@ -285,14 +277,14 @@ pub fn close_top(window: &mut Window, cx: &mut App) -> bool {
     let Some(layer) = overlays.update(cx, |overlays, _| overlays.close_top()) else {
         return false;
     };
-    restore(layer, window);
+    restore(layer, window, cx);
     window.refresh();
     true
 }
 
-fn restore(layer: Layer, window: &mut Window) {
+fn restore(layer: Layer, window: &mut Window, cx: &mut App) {
     if let Some(handle) = layer.restore_focus {
-        window.focus(&handle);
+        window.focus(&handle, cx);
     }
 }
 
@@ -334,8 +326,8 @@ pub fn render_overlays(window: &mut Window, cx: &mut App) -> impl IntoElement {
             }
             if let Some(handle) = pending {
                 match handle {
-                    Some(handle) => window.focus(&handle),
-                    None => window.blur(),
+                    Some(handle) => window.focus(&handle, cx),
+                    None => window.blur(cx),
                 }
                 window.refresh();
             }

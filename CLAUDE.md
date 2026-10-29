@@ -30,7 +30,7 @@ Fix rounds are sent to the same terminal with `orca terminal send --terminal <ha
   commits, pushes, dependency additions not listed in the brief, and edits outside the repo.
 - The brief lives in `swarm-report/<stage>/<step>-brief.md` and is self-contained: goal,
   files to touch, the relevant design excerpt (tokens/spec values copied in, not "see the
-  design"), API notes for GPUI 0.2.2 found during planning, acceptance criteria, and the
+  design"), API notes for GPUI (gpui-pre, see Cargo.toml) found during planning, acceptance criteria, and the
   check commands to run before finishing.
 - One OpenCode session per step: fix rounds of that step go to the same terminal (the model keeps its
   context); once the step is accepted, close that terminal (`orca terminal close --terminal <handle>`) and

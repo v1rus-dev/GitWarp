@@ -137,8 +137,10 @@ impl RenderOnce for Tabs {
                     format!("{}#{}", tab.label, *occurrence)
                 }
             };
-            let child_id =
-                ElementId::NamedChild(Box::new(bar_id.clone()), SharedString::from(key.clone()));
+            let child_id = ElementId::NamedChild(
+                std::sync::Arc::new(bar_id.clone()),
+                SharedString::from(key.clone()),
+            );
             let focus = window
                 .use_keyed_state(child_id.clone(), cx, |_, cx| cx.focus_handle())
                 .read(cx)
@@ -174,7 +176,7 @@ impl RenderOnce for Tabs {
             if tab.closable {
                 let mut close = div()
                     .id(ElementId::NamedChild(
-                        Box::new(child_id.clone()),
+                        std::sync::Arc::new(child_id.clone()),
                         SharedString::from("close"),
                     ))
                     .flex()

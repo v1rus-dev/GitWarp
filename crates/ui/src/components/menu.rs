@@ -1,6 +1,6 @@
 //! Context menus and dropdown menus.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder;
@@ -145,23 +145,18 @@ struct MenuRegistry {
 
 impl Global for MenuRegistry {}
 
-/// Drops the remembered menu of windows that no longer exist.
+/// Drops the remembered menu of a window that closed.
 pub(crate) fn init(cx: &mut App) {
-    cx.on_window_closed(|cx| {
-        let live: HashSet<WindowId> = cx
-            .windows()
-            .iter()
-            .map(|handle| handle.window_id())
-            .collect();
+    cx.on_window_closed(|cx, window_id| {
         if cx.try_global::<MenuRegistry>().is_some() {
-            cx.update_global::<MenuRegistry, _>(|registry, _| prune_registry(registry, &live));
+            cx.update_global::<MenuRegistry, _>(|registry, _| forget(registry, window_id));
         }
     })
     .detach();
 }
 
-fn prune_registry(registry: &mut MenuRegistry, live: &HashSet<WindowId>) {
-    registry.by_window.retain(|id, _| live.contains(id));
+fn forget(registry: &mut MenuRegistry, closed: WindowId) {
+    registry.by_window.remove(&closed);
 }
 
 /// Opens a menu at the pointer, clamped 4px inside the window.
@@ -197,7 +192,7 @@ fn open_at(
     let id = overlay::open_popover(position, view.clone().into(), window, cx);
     view.update(cx, |menu, _| menu.layer = Some(id));
     remember(window, cx, id);
-    window.focus(&focus);
+    window.focus(&focus, cx);
     id
 }
 
@@ -470,7 +465,7 @@ mod tests {
             .by_window
             .insert(WindowId::from(2), LayerId::for_test(2));
 
-        prune_registry(&mut registry, &HashSet::from([WindowId::from(2)]));
+        forget(&mut registry, WindowId::from(1));
 
         assert!(!registry.by_window.contains_key(&WindowId::from(1)));
         assert!(registry.by_window.contains_key(&WindowId::from(2)));

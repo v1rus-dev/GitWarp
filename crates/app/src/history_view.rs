@@ -117,7 +117,7 @@ impl HistoryView {
         // The repository opened: remember it for the switcher, whatever the
         // history walk does next.
         let root = repo.root().to_path_buf();
-        let _ = cx.update(|cx| {
+        cx.update(|cx| {
             crate::update_settings(cx, |settings| {
                 settings.touch_recent(root.clone(), unix_now());
             });

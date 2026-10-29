@@ -236,7 +236,7 @@ pub fn open_with_view(
     host.update(cx, |host, _| host.layer = Some(layer));
     overlay::set_dismiss_on_outside_click(layer, !busy, window, cx);
     let target = initial.unwrap_or_else(|| host.read(cx).focus.clone());
-    window.focus(&target);
+    window.focus(&target, cx);
     (layer, host)
 }
 
@@ -437,7 +437,7 @@ fn cycle_focus(handles: &[FocusHandle], forward: bool, window: &mut Window, cx: 
         .focused(cx)
         .and_then(|focused| handles.iter().position(|handle| handle == &focused));
     if let Some(index) = next_focus_index(handles.len(), current, forward) {
-        window.focus(&handles[index]);
+        window.focus(&handles[index], cx);
     }
 }
 

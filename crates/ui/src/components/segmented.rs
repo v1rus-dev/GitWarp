@@ -162,7 +162,8 @@ impl RenderOnce for Segmented {
                     format!("{base}#{occurrence}")
                 }
             };
-            let child_id = ElementId::NamedChild(Box::new(bar_id.clone()), SharedString::from(key));
+            let child_id =
+                ElementId::NamedChild(std::sync::Arc::new(bar_id.clone()), SharedString::from(key));
             let focus = window
                 .use_keyed_state(child_id.clone(), cx, |_, cx| cx.focus_handle())
                 .read(cx)

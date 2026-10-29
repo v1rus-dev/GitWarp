@@ -543,16 +543,22 @@ impl RepositoryView {
 
     fn set_sidebar_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
         self.sidebar_width = f32::from(width).clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
-        let width = self.sidebar_width;
-        crate::update_settings(cx, |settings| settings.sidebar_width = width);
         cx.notify();
     }
 
     fn set_details_size(&mut self, size: Pixels, cx: &mut Context<Self>) {
         self.details_size = clamp_details(f32::from(size), self.dock);
-        let size = self.details_size;
-        crate::update_settings(cx, |settings| settings.details_size = Some(size));
         cx.notify();
+    }
+
+    /// Saves both panel sizes once a splitter drag ends.
+    fn persist_layout(&mut self, cx: &mut Context<Self>) {
+        let sidebar_width = self.sidebar_width;
+        let details_size = self.details_size;
+        crate::update_settings(cx, |settings| {
+            settings.sidebar_width = sidebar_width;
+            settings.details_size = Some(details_size);
+        });
     }
 
     fn reset_details_size(&mut self, cx: &mut Context<Self>) {
@@ -809,7 +815,7 @@ impl RepositoryView {
             div()
                 .id("toolbar-search-wrap")
                 .flex_basis(px(layout.search_basis))
-                .flex_shrink()
+                .flex_shrink(1.)
                 .min_w(px(layout.search_min))
                 .tooltip(Tooltip::with_kbd(
                     "Search commits, authors, hashes",
@@ -896,15 +902,20 @@ impl RepositoryView {
     fn render_sidebar_splitter(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let reset_view = view.clone();
+        let persist_view = view.clone();
         Splitter::vertical("sidebar-splitter")
             .size(px(self.sidebar_width))
             .bounds(px(SIDEBAR_WIDTH_MIN), px(SIDEBAR_WIDTH_MAX))
             .on_resize(move |size, _, cx| {
                 view.update(cx, |view, cx| view.set_sidebar_width(size, cx));
             })
+            .on_resize_end(move |_, cx| {
+                persist_view.update(cx, |view, cx| view.persist_layout(cx));
+            })
             .on_reset(move |_, cx| {
                 reset_view.update(cx, |view, cx| {
                     view.set_sidebar_width(px(SIDEBAR_WIDTH_DEFAULT), cx);
+                    view.persist_layout(cx);
                 });
             })
     }
@@ -918,6 +929,7 @@ impl RepositoryView {
         };
         let view = cx.entity();
         let reset_view = view.clone();
+        let persist_view = view.clone();
         splitter
             .size(size)
             .bounds(px(min), px(max))
@@ -926,6 +938,9 @@ impl RepositoryView {
             .inverted(true)
             .on_resize(move |size, _, cx| {
                 view.update(cx, |view, cx| view.set_details_size(size, cx));
+            })
+            .on_resize_end(move |_, cx| {
+                persist_view.update(cx, |view, cx| view.persist_layout(cx));
             })
             .on_reset(move |_, cx| {
                 reset_view.update(cx, |view, cx| view.reset_details_size(cx));
@@ -1207,7 +1222,7 @@ impl Render for RepositoryView {
             .on_action(cx.listener(|view, _: &ToggleDetails, _, cx| view.toggle_details(cx)))
             .on_action(cx.listener(|view, _: &FocusSearch, window, cx| {
                 let handle = view.search_focus();
-                window.focus(&handle);
+                window.focus(&handle, cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|view, _: &OpenRepoSwitcher, window, cx| {

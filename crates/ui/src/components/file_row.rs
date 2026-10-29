@@ -3,8 +3,8 @@
 use gpui::prelude::FluentBuilder;
 use gpui::{
     canvas, div, px, transparent_black, App, ElementId, InteractiveElement, IntoElement,
-    ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement, Styled, TextRun,
-    Window,
+    ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement, Styled, TextAlign,
+    TextRun, Window,
 };
 use gpui::{AnyElement, Font, Hsla};
 use unicode_segmentation::UnicodeSegmentation;
@@ -203,7 +203,7 @@ impl RenderOnce for FileRow {
                     .shape_line(SharedString::from(text), FS_BASE, &runs, None)
             },
             move |bounds, line, window, cx| {
-                let _ = line.paint(bounds.origin, ROW, window, cx);
+                let _ = line.paint(bounds.origin, ROW, TextAlign::Left, None, window, cx);
             },
         );
 

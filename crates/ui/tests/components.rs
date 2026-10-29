@@ -17,7 +17,7 @@ fn init(cx: &mut TestAppContext) {
 }
 
 /// `simulate_keystrokes` only sends key-down; GPUI's keyboard activation runs on key-up.
-fn press(cx: &mut VisualTestContext, keystroke: &str) {
+fn press(cx: &mut VisualTestContext, keystroke: &'static str) {
     cx.simulate_keystrokes(keystroke);
     cx.simulate_event(KeyUpEvent {
         keystroke: Keystroke::parse(keystroke).expect("valid keystroke"),

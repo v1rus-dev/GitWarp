@@ -190,7 +190,7 @@ fn escape_closes_the_modal_and_restores_focus(cx: &mut TestAppContext) {
     let (panel, panel_focus) = new_panel(cx, 360., 160.);
     cx.update(|window, cx| {
         overlay::open_modal(AnyView::from(panel), window, cx);
-        window.focus(&panel_focus);
+        window.focus(&panel_focus, cx);
     });
     cx.run_until_parked();
     assert_eq!(stack_len(cx), 1);
@@ -211,7 +211,7 @@ fn escape_closes_only_the_top_layer(cx: &mut TestAppContext) {
     let (modal, modal_focus) = new_panel(cx, 360., 160.);
     cx.update(|window, cx| {
         overlay::open_modal(AnyView::from(modal), window, cx);
-        window.focus(&modal_focus);
+        window.focus(&modal_focus, cx);
     });
 
     let (popover, popover_focus) = new_panel(cx, 220., 80.);
@@ -222,7 +222,7 @@ fn escape_closes_only_the_top_layer(cx: &mut TestAppContext) {
             window,
             cx,
         );
-        window.focus(&popover_focus);
+        window.focus(&popover_focus, cx);
     });
     cx.run_until_parked();
     assert_eq!(stack_len(cx), 2);
@@ -245,11 +245,11 @@ fn closing_a_lower_layer_keeps_focus_on_the_top_layer(cx: &mut TestAppContext) {
 
     let (lower, lower_focus) = new_panel(cx, 360., 160.);
     let lower_layer = cx.update(|window, cx| overlay::open_modal(AnyView::from(lower), window, cx));
-    cx.update(|window, _| window.focus(&lower_focus));
+    cx.update(|window, cx| window.focus(&lower_focus, cx));
 
     let (top, top_focus) = new_panel(cx, 220., 80.);
     cx.update(|window, cx| overlay::open_modal(AnyView::from(top), window, cx));
-    cx.update(|window, _| window.focus(&top_focus));
+    cx.update(|window, cx| window.focus(&top_focus, cx));
     cx.run_until_parked();
     assert_eq!(stack_len(cx), 2);
 
@@ -271,7 +271,7 @@ fn popover_closes_on_an_outside_click_only(cx: &mut TestAppContext) {
             window,
             cx,
         );
-        window.focus(&popover_focus);
+        window.focus(&popover_focus, cx);
     });
     cx.run_until_parked();
     assert_eq!(stack_len(cx), 1);
@@ -290,7 +290,7 @@ fn modal_closes_on_a_scrim_click_only(cx: &mut TestAppContext) {
     let (modal, modal_focus) = new_panel(cx, 360., 160.);
     cx.update(|window, cx| {
         overlay::open_modal(AnyView::from(modal), window, cx);
-        window.focus(&modal_focus);
+        window.focus(&modal_focus, cx);
     });
     cx.run_until_parked();
     assert_eq!(stack_len(cx), 1);

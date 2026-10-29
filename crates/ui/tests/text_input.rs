@@ -30,7 +30,7 @@ fn start(
     });
     cx.update(|window, _| window.activate_window());
     let handle = cx.read(|app| view.read(app).input.read(app).focus_handle().clone());
-    cx.update(|window, _| window.focus(&handle));
+    cx.update(|window, cx| window.focus(&handle, cx));
     cx.run_until_parked();
     (view, cx)
 }
