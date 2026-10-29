@@ -16,6 +16,9 @@ actions!(
         SelectLast,
         FocusNext,
         FocusPrev,
+        TreeExpand,
+        TreeCollapse,
+        TreeActivate,
     ]
 );
 
@@ -30,6 +33,9 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", SelectLast, None),
         KeyBinding::new("tab", FocusNext, None),
         KeyBinding::new("shift-tab", FocusPrev, None),
+        KeyBinding::new("right", TreeExpand, Some("ui-tree")),
+        KeyBinding::new("left", TreeCollapse, Some("ui-tree")),
+        KeyBinding::new("space", TreeActivate, Some("ui-tree")),
     ]);
 
     // Root handlers cannot run while nothing is focused: the dispatch path is

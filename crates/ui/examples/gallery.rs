@@ -4,10 +4,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, size, AnyElement, AnyView, App, Application, Bounds,
-    ClickEvent, Div, Entity, FocusHandle, FontWeight, Hsla, IntoElement, MouseButton,
-    MouseDownEvent, Pixels, Render, SharedString, Subscription, TitlebarOptions, Window,
-    WindowBounds, WindowOptions,
+    canvas, div, point, prelude::*, px, size, uniform_list, AnyElement, AnyView, App, Application,
+    Bounds, ClickEvent, Div, ElementId, Entity, FocusHandle, FontWeight, Hsla, IntoElement,
+    MouseButton, MouseDownEvent, Pixels, Render, ScrollStrategy, SharedString, Subscription,
+    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 
 use ui::focus::RingOffset;
@@ -18,10 +18,10 @@ use ui::metrics::{
 use ui::theme::{self, ActiveTheme, Theme, ThemeColors, ThemeMode};
 use ui::{
     actions, dialog, focus, menu, overlay, toast, Avatar, Banner, BannerKind, Button, ButtonSize,
-    Checkbox, Chip, ChipKind, CountPill, Counter, Dialog, DialogFocus, EmptyState, Icon, IconName,
-    Kbd, MenuEntry, MenuItem, Progress, Radio, RefBadge, RefKind, SearchField, SegmentItem,
-    Segmented, Select, Skeleton, Spinner, StatusGlyph, Switch, Tab, Tabs, TextInput,
-    TextInputEvent, ToastKind,
+    Checkbox, Chip, ChipKind, CountPill, Counter, Dialog, DialogFocus, EmptyState, FileRow, Icon,
+    IconName, Kbd, ListRow, MenuEntry, MenuItem, Progress, Radio, RefBadge, RefKind, SearchField,
+    SegmentItem, Segmented, Select, Skeleton, Spinner, Splitter, StatusGlyph, Switch, Tab, Tabs,
+    TextInput, TextInputEvent, ToastKind, Tree, TreeNodeData,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,6 +39,7 @@ enum Section {
     Banners,
     Inputs,
     Floating,
+    Lists,
 }
 
 impl Section {
@@ -57,6 +58,7 @@ impl Section {
             "banners" => Self::Banners,
             "inputs" => Self::Inputs,
             "floating" => Self::Floating,
+            "lists" => Self::Lists,
             _ => return None,
         })
     }
@@ -85,6 +87,57 @@ impl OpenOnStart {
 
 /// The Select's options; shared with the menu it opens.
 const SELECT_OPTIONS: [&str; 4] = ["main", "develop", "feat/lanes", "release/0.3"];
+
+/// The history sample: summary, author and relative date per row.
+const LIST_SUMMARIES: [&str; 6] = [
+    "Clip graph lanes at the viewport edge",
+    "Keep keyboard focus on the history row",
+    "Add worktree and stash sections to the sidebar",
+    "Fix selection colour in the light theme",
+    "Virtualise the changed-file list",
+    "Show ahead/behind counts on local branches",
+];
+const LIST_AUTHORS: [&str; 4] = ["Mira Chen", "Pablo Ruiz", "Ari Okafor", "Jun Park"];
+
+/// Changed-file sample rows: status, path, added, deleted.
+const FILE_ROWS: [(&str, &str, usize, usize); 6] = [
+    (
+        "M",
+        "crates/ui/src/components/file_row.rs",
+        48,
+        12,
+    ),
+    (
+        "A",
+        "crates/ui/src/components/scrollbar.rs",
+        210,
+        0,
+    ),
+    (
+        "M",
+        "crates/ui/src/components/splitter.rs",
+        96,
+        4,
+    ),
+    (
+        "D",
+        "crates/ui/src/components/legacy_row.rs",
+        0,
+        74,
+    ),
+    (
+        "?",
+        "crates/app/src/features/history/graph/lane_layout/virtualization/overscan/commit_graph_renderer/gpu_painter/lane_batching/segment_cache/incremental_rebuild/persistent_cache_writer.rs",
+        0,
+        0,
+    ),
+    (
+        "M",
+        "docs/design/components/lists.html",
+        18,
+        2,
+    ),
+];
 
 /// The four toast demos: id, label, kind and message.
 const TOAST_DEMOS: [(&str, &str, ToastKind, &str); 4] = [
@@ -123,6 +176,18 @@ struct Gallery {
     branch_subscription: Option<Subscription>,
     menu_area_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     select_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    sidebar_width: Pixels,
+    tree_branches_open: bool,
+    tree_feat_open: bool,
+    tree_remotes_open: bool,
+    tree_tags_open: bool,
+    tree_worktrees_open: bool,
+    tree_selected: Option<SharedString>,
+    tree_nodes: Vec<TreeNodeData>,
+    list_scroll: UniformListScrollHandle,
+    list_selected: usize,
+    list_keyboard: bool,
+    list_focus: FocusHandle,
 }
 
 impl Gallery {
@@ -149,6 +214,166 @@ impl Gallery {
             branch_subscription: None,
             menu_area_bounds: Rc::new(Cell::new(None)),
             select_bounds: Rc::new(Cell::new(None)),
+            sidebar_width: px(240.),
+            tree_branches_open: true,
+            tree_feat_open: true,
+            tree_remotes_open: true,
+            tree_tags_open: true,
+            tree_worktrees_open: true,
+            tree_selected: Some("idle-lanes".into()),
+            tree_nodes: Vec::new(),
+            list_scroll: UniformListScrollHandle::new(),
+            list_selected: 2,
+            list_keyboard: false,
+            list_focus: cx.focus_handle().tab_stop(true),
+        }
+    }
+
+    /// The flat, visible tree sample; expansion flags are kept on the gallery.
+    fn build_tree_nodes(&self) -> Vec<TreeNodeData> {
+        let selected = |label: &str| {
+            self.tree_selected
+                .as_ref()
+                .is_some_and(|value| value.as_str() == label)
+        };
+        let mut nodes = Vec::new();
+
+        nodes.push(
+            TreeNodeData::section("Local branches")
+                .has_children(true)
+                .expanded(self.tree_branches_open)
+                .count("2"),
+        );
+        if self.tree_branches_open {
+            nodes.push(
+                TreeNodeData::new("main")
+                    .level(1)
+                    .icon(IconName::Branch)
+                    .current()
+                    .ahead(4)
+                    .selected(selected("main")),
+            );
+            nodes.push(
+                TreeNodeData::new("feat/")
+                    .level(1)
+                    .icon(IconName::Folder)
+                    .has_children(true)
+                    .expanded(self.tree_feat_open)
+                    .count("2"),
+            );
+            if self.tree_feat_open {
+                nodes.push(
+                    TreeNodeData::new("idle-lanes")
+                        .level(2)
+                        .icon(IconName::Branch)
+                        .ahead(1)
+                        .selected(selected("idle-lanes")),
+                );
+                nodes.push(
+                    TreeNodeData::new("palette")
+                        .level(2)
+                        .icon(IconName::Branch)
+                        .behind(2)
+                        .selected(selected("palette")),
+                );
+            }
+        }
+
+        nodes.push(
+            TreeNodeData::section("Remotes")
+                .has_children(true)
+                .expanded(self.tree_remotes_open)
+                .count("1"),
+        );
+        if self.tree_remotes_open {
+            nodes.push(
+                TreeNodeData::new("origin")
+                    .level(1)
+                    .icon(IconName::Cloud)
+                    .selected(selected("origin")),
+            );
+        }
+
+        nodes.push(
+            TreeNodeData::section("Tags")
+                .has_children(true)
+                .expanded(self.tree_tags_open)
+                .count("1"),
+        );
+        if self.tree_tags_open {
+            nodes.push(
+                TreeNodeData::new("v0.3.0")
+                    .level(1)
+                    .icon(IconName::Tag)
+                    .selected(selected("v0.3.0")),
+            );
+        }
+
+        nodes.push(
+            TreeNodeData::section("Stashes")
+                .has_children(true)
+                .expanded(false)
+                .count("0"),
+        );
+
+        nodes.push(
+            TreeNodeData::section("Worktrees")
+                .has_children(true)
+                .expanded(self.tree_worktrees_open)
+                .count("1"),
+        );
+        if self.tree_worktrees_open {
+            nodes.push(
+                TreeNodeData::new("feature-side")
+                    .level(1)
+                    .icon(IconName::Worktree)
+                    .state("locked")
+                    .selected(selected("feature-side")),
+            );
+        }
+
+        nodes
+    }
+
+    /// Flip expansion for the node at `index` in the last rendered tree.
+    fn toggle_tree_node(&mut self, index: usize) {
+        let Some(label) = self.tree_nodes.get(index).map(|node| node.label.clone()) else {
+            return;
+        };
+        let open = match self.tree_expanded(&label) {
+            Some(open) => !open,
+            None => return,
+        };
+        self.set_tree_expanded(&label, open);
+    }
+
+    fn tree_expanded(&self, label: &str) -> Option<bool> {
+        Some(match label {
+            "Local branches" => self.tree_branches_open,
+            "feat/" => self.tree_feat_open,
+            "Remotes" => self.tree_remotes_open,
+            "Tags" => self.tree_tags_open,
+            "Worktrees" => self.tree_worktrees_open,
+            _ => return None,
+        })
+    }
+
+    fn set_tree_expanded(&mut self, label: &str, open: bool) {
+        match label {
+            "Local branches" => self.tree_branches_open = open,
+            "feat/" => self.tree_feat_open = open,
+            "Remotes" => self.tree_remotes_open = open,
+            "Tags" => self.tree_tags_open = open,
+            "Worktrees" => self.tree_worktrees_open = open,
+            _ => {}
+        }
+    }
+
+    fn select_tree_node(&mut self, index: usize) {
+        if let Some(node) = self.tree_nodes.get(index) {
+            if !node.has_children && !node.section {
+                self.tree_selected = Some(node.label.clone());
+            }
         }
     }
 
@@ -199,6 +424,9 @@ impl Render for Gallery {
         }
         if self.shows(Section::Floating) {
             sections.push(floating_section(self, colors, cx).into_any_element());
+        }
+        if self.shows(Section::Lists) {
+            sections.push(lists_section(self, colors, window, cx).into_any_element());
         }
         if self.shows(Section::Interaction) {
             sections.push(interaction_section(self, colors, window, cx).into_any_element());
@@ -1858,6 +2086,291 @@ impl Render for BranchFooter {
                     .on_click(move |_, window, cx| on_create.as_ref()(window, cx)),
             )
     }
+}
+
+fn lists_section(
+    gallery: &mut Gallery,
+    colors: ThemeColors,
+    window: &mut Window,
+    cx: &mut Context<Gallery>,
+) -> impl IntoElement {
+    let view = cx.entity();
+    let nodes = gallery.build_tree_nodes();
+    gallery.tree_nodes = nodes.clone();
+
+    let tree = Tree::new("gallery-tree", nodes)
+        .on_toggle({
+            let view = view.clone();
+            move |index, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.toggle_tree_node(index);
+                    cx.notify();
+                });
+            }
+        })
+        .on_activate({
+            let view = view.clone();
+            move |index, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.select_tree_node(index);
+                    cx.notify();
+                });
+            }
+        })
+        .on_expand({
+            let view = view.clone();
+            move |index, _, cx| {
+                view.update(cx, |this, cx| {
+                    if let Some(label) = this.tree_nodes.get(index).map(|node| node.label.clone()) {
+                        this.set_tree_expanded(&label, true);
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .on_collapse({
+            let view = view.clone();
+            move |index, _, cx| {
+                view.update(cx, |this, cx| {
+                    if let Some(label) = this.tree_nodes.get(index).map(|node| node.label.clone()) {
+                        this.set_tree_expanded(&label, false);
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .on_open({
+            let view = view.clone();
+            move |index, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.select_tree_node(index);
+                    cx.notify();
+                });
+            }
+        });
+
+    let sidebar = div()
+        .w(gallery.sidebar_width)
+        .h_full()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .bg(colors.sidebar)
+        .border_r_1()
+        .border_color(colors.border)
+        .child(tree);
+
+    let splitter = Splitter::vertical("gallery-sidebar-splitter")
+        .size(gallery.sidebar_width)
+        .bounds(px(160.), px(420.))
+        .on_resize({
+            let view = view.clone();
+            move |size, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.sidebar_width = size;
+                    cx.notify();
+                });
+            }
+        })
+        .on_reset({
+            let view = view.clone();
+            move |_, cx| {
+                view.update(cx, |this, cx| {
+                    this.sidebar_width = px(240.);
+                    cx.notify();
+                });
+            }
+        });
+
+    let list_focus = gallery.list_focus.clone();
+    let list_focused = list_focus.is_focused(window);
+    let selected = gallery.list_selected;
+    let keyboard_marker = gallery.list_keyboard && list_focused;
+    let list_scroll = gallery.list_scroll.clone();
+    let rows_view = view.clone();
+    let rows_focus = list_focus.clone();
+    let rows = uniform_list("gallery-list", 30, move |range, _, _cx| {
+        range
+            .map(|index| {
+                let is_selected = index == selected;
+                let secondary = ListRow::secondary_color(colors, is_selected, list_focused);
+                let summary = LIST_SUMMARIES[index % LIST_SUMMARIES.len()];
+                let author = LIST_AUTHORS[index % LIST_AUTHORS.len()];
+                let row = ListRow::new(ElementId::named_usize("gallery-list-row", index))
+                    .selected(is_selected)
+                    .list_focused(list_focused)
+                    .keyboard(is_selected && keyboard_marker)
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap(px(14.))
+                            .pl(px(14.))
+                            .pr(px(18.))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(54.))
+                                    .font_family(FONT_MONO)
+                                    .text_size(FS_SM)
+                                    .text_color(secondary)
+                                    .child(format!("{:07x}", 0x03a4_f2c1 + index * 0x101)),
+                            )
+                            .child(div().flex_1().min_w(px(0.)).truncate().child(summary))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(92.))
+                                    .text_size(FS_SM)
+                                    .text_color(secondary)
+                                    .truncate()
+                                    .child(author),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(52.))
+                                    .text_size(FS_SM)
+                                    .text_color(secondary)
+                                    .child(format!("{}d ago", 1 + index % 12)),
+                            ),
+                    );
+                let view = rows_view.clone();
+                let focus = rows_focus.clone();
+                row.on_click(move |_, window, cx| {
+                    window.focus(&focus);
+                    view.update(cx, |this, cx| {
+                        this.list_selected = index;
+                        this.list_keyboard = false;
+                        cx.notify();
+                    });
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .track_scroll(list_scroll.clone())
+    .flex_1()
+    .h_full();
+
+    let list_header = div()
+        .h(px(34.))
+        .px(px(14.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_between()
+        .border_b_1()
+        .border_color(colors.border)
+        .text_size(FS_SM)
+        .text_color(colors.muted)
+        .child("History")
+        .child("30 commits");
+
+    let list_area = div()
+        .id("gallery-list-area")
+        .flex_1()
+        .min_h(px(0.))
+        .flex()
+        .track_focus(&list_focus)
+        .on_action(cx.listener(|this, _: &actions::SelectNext, _, cx| {
+            this.list_selected = (this.list_selected + 1).min(29);
+            this.list_keyboard = true;
+            this.list_scroll
+                .scroll_to_item(this.list_selected, ScrollStrategy::Center);
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &actions::SelectPrev, _, cx| {
+            this.list_selected = this.list_selected.saturating_sub(1);
+            this.list_keyboard = true;
+            this.list_scroll
+                .scroll_to_item(this.list_selected, ScrollStrategy::Center);
+            cx.notify();
+        }))
+        .child(rows)
+        .child(ui::Scrollbar::uniform(
+            "gallery-list-scrollbar",
+            list_scroll,
+        ));
+
+    let list_pane = div()
+        .flex_1()
+        .min_w(px(0.))
+        .flex()
+        .flex_col()
+        .child(list_header)
+        .child(list_area);
+
+    let browser = div()
+        .w_full()
+        .h(px(360.))
+        .flex()
+        .rounded(R_MD)
+        .border_1()
+        .border_color(colors.border)
+        .overflow_hidden()
+        .child(sidebar)
+        .child(splitter)
+        .child(list_pane);
+
+    let mut files = div()
+        .flex()
+        .flex_col()
+        .rounded(R_MD)
+        .border_1()
+        .border_color(colors.border)
+        .overflow_hidden();
+    for (index, (status, path, added, deleted)) in FILE_ROWS.iter().enumerate() {
+        let row = FileRow::new(
+            ElementId::named_usize("gallery-file", index),
+            status.chars().next().unwrap_or('M'),
+            *path,
+        )
+        .added(*added)
+        .deleted(*deleted)
+        .selected(index == 2)
+        .action(
+            Button::ghost(ElementId::Name(format!("gallery-file-undo-{index}").into()))
+                .icon_only(IconName::Undo)
+                .size(ButtonSize::Xs)
+                .tooltip("Revert changes"),
+        )
+        .action(
+            Button::ghost(ElementId::Name(format!("gallery-file-copy-{index}").into()))
+                .icon_only(IconName::Copy)
+                .size(ButtonSize::Xs)
+                .tooltip("Copy path"),
+        )
+        .action(
+            Button::ghost(ElementId::Name(
+                format!("gallery-file-trash-{index}").into(),
+            ))
+            .icon_only(IconName::Trash)
+            .size(ButtonSize::Xs)
+            .tooltip("Discard changes"),
+        );
+        files = files.child(row);
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(24.))
+        .child(heading("Lists & rows"))
+        .child(browser)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_size(FS_XS)
+                        .text_color(colors.muted)
+                        .child("Changed files — start-truncated paths and hover actions"),
+                )
+                .child(files),
+        )
 }
 
 fn interaction_section(

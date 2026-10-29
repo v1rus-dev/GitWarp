@@ -96,13 +96,21 @@ impl RenderOnce for Kbd {
 #[derive(IntoElement)]
 pub struct CountPill {
     value: SharedString,
+    selected: bool,
 }
 
 impl CountPill {
     pub fn new(value: impl Into<SharedString>) -> Self {
         Self {
             value: value.into(),
+            selected: false,
         }
+    }
+
+    /// On a selected tree row: transparent fill, `selection_sub` text.
+    pub fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
     }
 }
 
@@ -111,8 +119,16 @@ impl RenderOnce for CountPill {
         let colors = cx.theme().colors;
         div()
             .text_size(FS_XS)
-            .text_color(colors.muted)
-            .bg(colors.active)
+            .text_color(if self.selected {
+                colors.selection_sub
+            } else {
+                colors.muted
+            })
+            .bg(if self.selected {
+                gpui::transparent_black()
+            } else {
+                colors.active
+            })
             .rounded(R_PILL)
             .px(px(6.))
             .child(self.value)
