@@ -44,23 +44,31 @@ fn main() {
         })
         .map_err(|e| e.to_string());
 
-    Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("GitWarp".into()),
+    Application::new()
+        .with_assets(ui::Assets)
+        .run(move |cx: &mut App| {
+            if let Err(e) = ui::init(cx) {
+                log::warn!("failed to load the bundled fonts: {e}");
+            }
+            let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("GitWarp".into()),
+                        ..Default::default()
+                    }),
+                    app_id: Some("dev.v1rus.gitwarp".into()),
                     ..Default::default()
-                }),
-                app_id: Some("dev.v1rus.gitwarp".into()),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|cx| HistoryView::open(path.clone(), git.clone(), cx)),
-        )
-        .expect("failed to open the main window");
-        cx.activate(true);
-    });
+                },
+                |window, cx| {
+                    ui::theme::follow_system(window, cx);
+                    cx.new(|cx| HistoryView::open(path.clone(), git.clone(), cx))
+                },
+            )
+            .expect("failed to open the main window");
+            cx.activate(true);
+        });
 }
 
 #[derive(Debug, PartialEq, Eq)]

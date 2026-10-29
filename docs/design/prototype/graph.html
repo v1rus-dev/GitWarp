@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — commit graph spec</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<style>
+  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
+  .themebox { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-lg); padding: 16px; }
+  .sw { display: grid; grid-template-columns: repeat(16, 1fr); gap: 6px; margin-top: 12px; }
+  .sw i { display: flex; flex-direction: column; align-items: center; gap: 2px; font-style: normal; font-size: 10px; color: var(--muted); }
+  .sw b { width: 16px; height: 16px; border-radius: 50%; background: hsl(var(--h) var(--graph-s) var(--graph-l)); }
+  .anat { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 24px; align-items: start; }
+  .zoom { width: 336px; height: 208px; position: relative; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
+  .zoom > div { transform: scale(4); transform-origin: 0 0; width: 84px; }
+  .zoom .lrow { display: block; height: 26px; padding: 0; }
+  .frame { height: 440px; border: 1px solid var(--border-strong); border-radius: var(--r-lg); overflow: hidden; display: flex; background: var(--bg); }
+  table.t { border-collapse: collapse; font-size: var(--fs-sm); width: 100%; } table.t td, table.t th { padding: 4px 8px; border-bottom: 1px solid var(--border); text-align: left; } table.t th { color: var(--muted); font-weight: 600; }
+  .ctl { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+</style>
+<script src="app.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL, ic = G.ic;
+  G.stagebar();
+  document.body.insertAdjacentHTML('beforeend', `<div class="page">
+  <h1>Commit graph</h1>
+  <p class="lead">Lane layout is git-log topo order: the first parent keeps the child's lane, additional parents take a free lane (or join an existing one). Colour belongs to the lane (column), so a branch keeps its hue while it lives.</p>
+
+  <h2>Anatomy</h2>
+  <div class="anat"><div><div class="zoom" aria-label="Graph rows at 4× zoom"><div id="zoomrows" class="hist" style="--row-bg:var(--bg)"></div></div><div class="cap">Rows 1–8 of the sample history at 4×.</div></div>
+  <table class="t"><tr><th>Element</th><th>Value</th></tr>
+    <tr><td>Lane width</td><td>14px; lane <i>n</i> centre = 14n + 7</td></tr>
+    <tr><td>Row height</td><td>26px; commit dot centred at y = 13</td></tr>
+    <tr><td>Dot</td><td>radius 4.5px, filled, 1.5px halo in the row background so lines never touch it</td></tr>
+    <tr><td>Merge commit</td><td>hollow ring: outer radius 4.5px, 2px stroke, row-colour fill</td></tr>
+    <tr><td>HEAD</td><td>extra 1.5px ring in the text colour, radius 7.5px</td></tr>
+    <tr><td>Line</td><td>2px, round joins; same-lane lines are vertical</td></tr>
+    <tr><td>Lane change</td><td>S-curve (cubic): control points at 7px / 20px so the bend completes inside the row</td></tr>
+    <tr><td>Colour</td><td>hue = lane × 137.508° · saturation 0.65 · lightness 0.62 dark / 0.46 light</td></tr>
+    <tr><td>Selection</td><td>row background changes, the dot halo follows it (--row-bg); lane colours never change</td></tr></table></div>
+
+  <h2>Lane palette — golden angle, unbounded</h2>
+  <p class="lead">Because hue = lane × 137.508° (mod 360), consecutive lanes are ~137° apart and no run of lanes repeats a hue; any number of lanes works. Lightness is the only theme-dependent value: 0.62 reads on dark; on light it drops to 0.46 so thin lines keep 3:1 against the surface. Computed contrast below is measured against each theme's background.</p>
+  <div class="two">
+    <div class="themebox" data-theme="dark"><b>Dark</b> <span class="cap" id="cd"></span><div class="sw" id="sd"></div></div>
+    <div class="themebox" data-theme="light"><b>Light</b> <span class="cap" id="cl"></span><div class="sw" id="sl"></div></div>
+  </div>
+
+  <h2>A very wide graph: clipping, widening, collapsing idle lanes</h2>
+  <p class="lead">This history has <b>241 lanes</b> (240 stale remote branch tips plus main). The graph column has a fixed width, so wide graphs are <b>clipped</b>: lanes fade out over the last 20px and the header shows a <b>+N</b> badge with the number of hidden lanes. The user can <b>drag the grip</b> on the column edge, <b>double-click</b> it (or click <b>+N</b>) to fit, or switch on <b>Collapse idle lanes</b>: runs of ≥3 lanes that only carry a single tip commit and then run straight down are folded into one 12px dashed gap lane, so the active lanes stay visible. Scroll the list to see the fan of tips.</p>
+  <div class="ctl"><div class="seg sm" role="group" aria-label="Graph width mode"><button id="m-clip" aria-pressed="true">Clipped · 112px</button><button id="m-wide" aria-pressed="false">Widened · 420px</button><button id="m-col" aria-pressed="false">Idle lanes collapsed</button></div><span class="muted" id="wstat"></span></div>
+  <div class="frame"><div id="wide" style="display:flex;flex:1;min-width:0"></div></div>
+  </div>`);
+
+  // sample anatomy
+  const zr = document.getElementById('zoomrows');
+  const lay = G.layout(G.commits), geo = G.geometry(lay, false);
+  zr.innerHTML = lay.rows.slice(0, 8).map((r, i) => `<div class="lrow">${G.rowSVG(r, geo, { head: i === 0 })}</div>`).join('');
+  zr.parentElement.style.height = '8px';
+  zr.parentElement.style.height = (8 * 26 * 4 / 4 * 1 + 0) + 'px';
+  zr.parentElement.style.height = '208px';
+
+  // palette + contrast, measured from computed colours (no hard-coded results)
+  const toRgb = (h, s, l) => { const a = s * Math.min(l, 1 - l), f = (n) => { const k = (n + h / 30) % 12; return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); }; return [f(0), f(8), f(4)]; };
+  const lum = ([r, g, b]) => { const c = (v) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)); return 0.2126 * c(r) + 0.7152 * c(g) + 0.0722 * c(b); };
+  [['sd', 'cd'], ['sl', 'cl']].forEach(([sid, cid]) => {
+    const box = document.getElementById(sid).parentElement, cs = getComputedStyle(box);
+    const bg = cs.backgroundColor.match(/\d+(\.\d+)?/g).slice(0, 3).map((v) => v / 255), L = parseFloat(cs.getPropertyValue('--graph-l')) / 100, S = parseFloat(cs.getPropertyValue('--graph-s')) / 100;
+    let min = 99;
+    for (let i = 0; i < 64; i++) { const a = lum(toRgb((i * 137.508) % 360, S, L)), b = lum(bg), c = (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05); if (c < min) min = c; }
+    document.getElementById(cid).textContent = `· s ${S} · l ${L} · lowest contrast over lanes 0–63: ${min.toFixed(2)}:1`;
+    document.getElementById(sid).innerHTML = Array.from({ length: 32 }, (_, i) => `<i><b style="--h:${G.hue(i)}"></b>${i}</i>`).join('');
+  });
+
+  // wide synthetic history
+  const names = ['Mira Okonkwo', 'Tomás Reyes', 'Lin Zhao', 'Priya Natarajan', 'Jonas Berg'];
+  const hx = (n) => (0x1000000 + n * 2654435761 % 0xfffffff).toString(16).slice(0, 7).padEnd(7, '0');
+  const C = []; let t = 5;
+  const mk = (id, parents, summary, refs) => C.push({ id, hash: hx(C.length + 7), parents, summary, author: names[C.length % 5], min: (t += 9), refs: refs || [], email: '', body: '', full: '' });
+  mk('m0', ['m1'], 'Merge branch ‘release/0.4’', [{ t: 'head', n: 'main' }]);
+  mk('m1', ['m2', 'f1'], 'Merge pull request #301 from feat/search');
+  mk('f1', ['m3'], 'feat(search): hash prefix lookup', [{ t: 'br', n: 'feat/search' }]);
+  mk('m2', ['m3'], 'fix(diff): keep scroll offset on mode toggle');
+  mk('m3', ['m4'], 'perf(history): chunked row models');
+  for (let k = 1; k <= 240; k++) mk('t' + k, ['x' + k], `WIP: experiment ${k}`, k < 4 ? [{ t: 'rm', n: 'origin/wip/' + k }] : []);
+  for (let k = 4; k <= 40; k++) mk('m' + k, k === 40 ? [] : ['m' + (k + 1)], k === 40 ? 'Initial commit' : `chore: housekeeping ${k}`);
+  const H = G.history(document.getElementById('wide'), C, { gw: 112 });
+  const geoW = H.geo(), btns = { clip: document.getElementById('m-clip'), wide: document.getElementById('m-wide'), col: document.getElementById('m-col') };
+  const stat = () => { const g = H.geo(); document.getElementById('wstat').textContent = `${geoW.xs.length} lanes · full width ${geoW.width}px${g.idle ? ` · collapsed width ${g.width}px (${g.idle} idle lanes folded)` : ''}`; };
+  const setM = (m) => { Object.entries(btns).forEach(([k, b]) => b.setAttribute('aria-pressed', k === m)); if (m === 'clip') { H.setCollapse(false); H.setWidth(112); } if (m === 'wide') { H.setCollapse(false); H.setWidth(420); } if (m === 'col') { H.setCollapse(true); H.setWidth(Math.min(420, H.geo().width + 8)); } stat(); };
+  btns.clip.onclick = () => setM('clip'); btns.wide.onclick = () => setM('wide'); btns.col.onclick = () => setM('col'); stat();
+})();
+</script>
+</body>
+</html>

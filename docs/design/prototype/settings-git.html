@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — Settings → Git</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<style>
+  .set { display: grid; grid-template-columns: 200px minmax(0, 1fr); min-height: 0; }
+  .snav { border-right: 1px solid var(--border); padding: 8px; background: var(--bg); }
+  .snav .node { border-radius: var(--r-sm); padding-left: 10px; }
+  .spane { overflow: auto; padding: 20px 28px; }
+  .spane h2 { margin: 0 0 4px; font-size: var(--fs-xl); }
+  .opt { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 4px 10px; align-items: start; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); cursor: default; }
+  .opt:hover { border-color: var(--border-strong); }
+  .opt.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); }
+  .opt:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .opt .dotbox { margin-top: 2px; }
+  .opt .sub { grid-column: 2 / 4; color: var(--muted); font-size: var(--fs-sm); }
+  .opt .ver { font-family: var(--font-mono); font-size: var(--fs-sm); text-align: right; }
+  .opt .ver.bad { color: var(--error); } .opt .ver.ok { color: var(--text); }
+  .active { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 4px 12px; padding: 12px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); font-size: var(--fs-sm); }
+  .active dt { color: var(--muted); } .active dd { margin: 0; font-family: var(--font-mono); overflow-wrap: anywhere; }
+  .ok-pill { display: inline-flex; align-items: center; gap: 4px; color: var(--success); font-family: var(--font-ui); }
+  .bad-pill { display: inline-flex; align-items: center; gap: 4px; color: var(--error); font-family: var(--font-ui); }
+  .scn { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; }
+  .scn select { height: 24px; background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--r-sm); }
+</style>
+<link rel="stylesheet" href="settings.css">
+<script src="app.js"></script>
+<script src="settings.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL, ic = G.ic, esc = G.esc, MIN = [2, 31];
+  /* Scenario switcher is a presentation aid: it feeds different detection results into the same page. */
+  const SC = {
+    ok:      { label: '1 · Auto, bundled git works', mode: 'auto', bundled: { ok: 1, v: '2.56.0', path: '/opt/gitwarp/git/bin/git' }, system: { ok: 1, v: '2.43.0', path: '/usr/bin/git' }, custom: { path: '' } },
+    fell:    { label: '2 · Auto fell back from broken bundled git', mode: 'auto', bundled: { ok: 0, exists: 1, err: 'exited with code 127 — error while loading shared libraries: libpcre2-8.so.0: cannot open shared object file', path: '/opt/gitwarp/git/bin/git' }, system: { ok: 1, v: '2.43.0', path: '/usr/bin/git' }, custom: { path: '' } },
+    old:     { label: '3 · Selected git older than 2.31', mode: 'system', bundled: { ok: 1, v: '2.56.0', path: '/opt/gitwarp/git/bin/git' }, system: { ok: 1, v: '2.28.1', path: '/usr/bin/git' }, custom: { path: '' } },
+    both:    { label: '4 · Bundled and system both unusable', mode: 'auto', bundled: { ok: 0, err: 'binary is missing (file not found)', path: '/opt/gitwarp/git/bin/git' }, system: { ok: 0, err: '“git” was not found in PATH', path: '' }, custom: { path: '' } },
+    custom:  { label: '5 · Custom path, valid', mode: 'custom', bundled: { ok: 1, v: '2.56.0', path: '/opt/gitwarp/git/bin/git' }, system: { ok: 1, v: '2.43.0', path: '/usr/bin/git' }, custom: { path: '/home/mira/.local/git-2.49/bin/git', ok: 1, v: '2.49.1' } },
+    badcust: { label: '6 · Custom path, invalid', mode: 'custom', bundled: { ok: 1, v: '2.56.0', path: '/opt/gitwarp/git/bin/git' }, system: { ok: 1, v: '2.43.0', path: '/usr/bin/git' }, custom: { path: '/home/mira/Downloads/git.tar.gz', ok: 0, err: 'not an executable file' } }
+  };
+  let key = 'ok', S = JSON.parse(JSON.stringify(SC.ok));
+  const old = (v) => { const [a, b] = v.split('.').map(Number); return a < MIN[0] || (a === MIN[0] && b < MIN[1]); };
+  function resolve() {
+    const out = { banners: [], active: null };
+    const { bundled: b, system: s, custom: c } = S;
+    const pick = (src, o) => { if (old(o.v)) { out.banners.push({ k: 'error', t: `git ${o.v} is too old`, d: `gitwarp needs git ${MIN.join('.')} or newer. Pick another executable below or update git.` }); out.active = { src, ...o, bad: 1 }; } else out.active = { src, ...o }; };
+    if (S.mode === 'auto') {
+      if (b.ok) pick('bundled', b);
+      else if (s.ok) { out.banners.push({ k: 'warn', t: 'Bundled git is broken — using system git', d: `Auto fell back to ${s.path} (${s.v}). Bundled git ${b.exists ? 'failed to start' : 'is unusable'}: ${b.err}.` }); pick('system', s); }
+      else out.banners.push({ k: 'error', t: 'No usable git found', d: 'Both bundled and system git are unusable.', list: [`Bundled (${b.path}): ${b.err}`, `System (PATH): ${s.err}`] });
+    } else if (S.mode === 'bundled') { if (b.ok) pick('bundled', b); else out.banners.push({ k: 'error', t: 'Bundled git is unusable', d: `${b.path}: ${b.err}` }); }
+    else if (S.mode === 'system') { if (s.ok) pick('system', s); else out.banners.push({ k: 'error', t: 'System git is unusable', d: s.err }); }
+    else { if (c.ok) pick('custom', { v: c.v, path: c.path }); else if (c.path) out.banners.push({ k: 'error', t: 'This file cannot be used as git', d: `${c.path}: ${c.err}` }); else out.banners.push({ k: 'error', t: 'No path chosen', d: 'Enter or browse to a git executable.' }); }
+    return out;
+  }
+  function opt(m, title, sub, d) {
+    const on = S.mode === m;
+    const ver = d ? (d.ok ? `<span class="ver ${old(d.v) ? 'bad' : 'ok'}">${old(d.v) ? ic('warn', 12) + ' ' : ''}${d.v}</span>` : `<span class="ver bad">${ic('err', 12)} unusable</span>`) : '<span class="ver muted">—</span>';
+    return `<div class="opt${on ? ' on' : ''}" role="radio" aria-checked="${on}" tabindex="0" data-m="${m}"><span class="dotbox">${on ? '<i style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></i>' : ''}</span><div><b>${title}</b></div>${ver}<div class="sub">${sub}</div></div>`;
+  }
+  function render() {
+    const r = resolve(), b = S.bundled, s = S.system, c = S.custom;
+    const customBlock = S.mode === 'custom' ? `<div style="grid-column:2/4;margin-top:6px"><div class="od-row"><input class="input mono ${c.ok || !c.path ? '' : 'error'}" value="${esc(c.path)}" placeholder="/path/to/git" aria-label="Custom git path" style="font-family:var(--font-mono);font-size:12px"><button class="btn">${ic('folder', 14)}Browse…</button><button class="btn" id="val">Validate</button></div>${c.path ? (c.ok ? `<div class="field-help" style="color:var(--success);display:flex;gap:4px;align-items:center">${ic('check', 12)}git version ${c.v} detected</div>` : `<div class="field-error">${ic('err', 12)}${esc(c.err)}</div>`) : `<div class="field-help">Pick the git executable (not a directory). It is validated by running <span class="mono">git --version</span>.</div>`}</div>` : '';
+    const body = `<h2>Git</h2><p class="muted" style="margin:0 0 16px;max-width:70ch">Choose which git executable gitwarp runs. Changes apply to all repositories after a restart of background operations.</p>
+      <div class="od-stack" style="--od-gap:12px;max-width:760px">
+      ${r.banners.map((x) => `<div class="banner ${x.k}" role="${x.k === 'error' ? 'alert' : 'status'}">${ic(x.k === 'error' ? 'err' : 'warn', 16)}<div><div class="b-title">${esc(x.t)}</div><div>${esc(x.d)}</div>${x.list ? `<ul>${x.list.map((l) => `<li>${esc(l)}</li>`).join('')}</ul>` : ''}</div></div>`).join('')}
+      <div class="od-stack" role="radiogroup" aria-label="Git executable" style="--od-gap:8px">
+        ${opt('auto', 'Auto', 'Use the bundled git if present and working, otherwise the one from PATH. Recommended.', b.ok ? b : s.ok ? s : null)}
+        ${opt('bundled', 'Bundled', `Shipped with gitwarp: <span class="mono">${esc(b.path)}</span>`, b.ok ? b : null)}
+        ${opt('system', 'System', `From PATH${s.path ? `: <span class="mono">${esc(s.path)}</span>` : ''}`, s.ok ? s : null)}
+        <div class="opt${S.mode === 'custom' ? ' on' : ''}" role="radio" aria-checked="${S.mode === 'custom'}" tabindex="0" data-m="custom"><span class="dotbox">${S.mode === 'custom' ? '<i style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></i>' : ''}</span><div><b>Custom path</b></div>${c.ok ? `<span class="ver ok">${c.v}</span>` : '<span class="ver muted">—</span>'}<div class="sub">Use a git you installed yourself.</div>${customBlock}</div>
+      </div>
+      <div><div class="field-label">In use</div>${r.active ? `<dl class="active"><dt>Executable</dt><dd>${esc(r.active.path)}</dd><dt>Version</dt><dd>${r.active.v} ${r.active.bad ? `<span class="bad-pill">${ic('err', 12)} below ${MIN.join('.')}</span>` : `<span class="ok-pill">${ic('check', 12)} supported</span>`}</dd><dt>Source</dt><dd>${r.active.src}${S.mode === 'auto' ? ' (auto)' : ''}</dd></dl>` : `<dl class="active"><dt>Executable</dt><dd class="bad-pill" style="font-family:var(--font-ui)">${ic('err', 12)} none — repositories cannot be opened</dd></dl>`}</div>
+      <div class="od-row"><button class="btn" id="redetect">${ic('fetch', 14)}Re-detect</button><span class="od-fill"></span><span class="muted" style="font-size:12px">Status bar shows: <span class="mono">git ${r.active ? r.active.v : '—'} · ${r.active ? r.active.src : 'not found'}</span></span></div>
+      </div>`;
+    pane.innerHTML = body;
+    sbtn.innerHTML = r.active ? `${ic('git', 12)}git ${r.active.v} · ${r.active.src}` : `${ic('err', 12)}git not found`;
+  }
+  G.stagebar('<label class="scn">Detection scenario <select id="scn" aria-label="Detection scenario">' + Object.entries(SC).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('') + '</select></label>');
+  const stage = G.h('<div class="stage"><div class="winwrap"></div></div>'); document.body.appendChild(stage);
+  const win = G.h(`<div class="win" style="width:1100px;height:760px;grid-template-rows:var(--bar) minmax(0,1fr) var(--status)">
+    <header class="titlebar"><span style="display:inline-flex;gap:8px;align-items:center;font-weight:600;padding-left:4px">${ic('gear', 14)}Settings</span><span class="od-fill"></span><div class="wc"><button class="btn btn-ghost" aria-label="Close">${ic('x', 14)}</button></div></header>
+    <div class="set">${GLS.nav('settings-git.html')}<div class="spane"></div></div>
+    <footer class="statusbar"><span class="od-fill"></span><button class="sb-btn" id="sbgit"></button></footer></div>`);
+  stage.firstChild.appendChild(win);
+  const pane = win.querySelector('.spane'), sbtn = win.querySelector('#sbgit');
+  pane.addEventListener('click', (e) => {
+    const o = e.target.closest('.opt'); if (o && !e.target.closest('input,button')) { S.mode = o.dataset.m; render(); }
+    if (e.target.closest('#redetect')) { G.toast(win, 'Re-detected git executables', 'info'); render(); }
+    if (e.target.closest('#val')) { const inp = pane.querySelector('input'); S.custom.path = inp.value; render(); }
+  });
+  pane.addEventListener('keydown', (e) => { const o = e.target.closest && e.target.closest('.opt'); if (o && (e.key === ' ' || e.key === 'Enter') && e.target === o) { e.preventDefault(); S.mode = o.dataset.m; render(); o && pane.querySelector(`[data-m=${o.dataset.m}]`).focus(); } });
+  document.getElementById('scn').addEventListener('change', (e) => { key = e.target.value; S = JSON.parse(JSON.stringify(SC[key])); render(); });
+  G.initTips(win); render(); G.fit(win);
+})();
+</script>
+</body>
+</html>

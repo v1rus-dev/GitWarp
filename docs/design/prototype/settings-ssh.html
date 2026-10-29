@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — Settings → SSH keys</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="settings.css">
+<link rel="stylesheet" href="dialogs.css">
+<script src="app.js"></script>
+<script src="settings.js"></script>
+<script src="dialogs.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const S = GLS, G = GL, D = GLD, ic = G.ic, esc = G.esc;
+  /* Demo state switcher feeds the page different situations; it is a presentation aid, not product UI. */
+  const DEMO = [['keys', 'Keys present'], ['empty', 'No keys yet'], ['agent', 'ssh-agent not running']];
+  const tests = {}; /* "keyId|host" -> run | ok | bad */
+  let hosts = D.HOSTS.slice(), ctx;
+  const RESULT = { 'github.com': ['ok', "Hi mira-k! You’ve successfully authenticated, but GitHub does not provide shell access."], 'gitlab.com': ['ok', 'Welcome to GitLab, @mira.kovalenko!'], 'git.corp.example': ['bad', 'Permission denied (publickey). The key is not registered on this host.'] };
+  const chip = (c, i, t) => `<span class="chip ${c}">${ic(i, 10)}${t}</span>`;
+  const keyCard = (k, agentUp) => `<div class="kcard" data-k="${k.id}"><span class="kic">${ic('key', 16)}</span><div class="od-stack" style="--od-gap:4px;min-width:0">
+      <div class="kname">${esc(k.name)} ${chip('', 'key', esc(k.type))}${agentUp && k.agent ? chip('ok', 'check', 'in ssh-agent') : ''}${k.pass ? chip('', 'lock', 'passphrase') : chip('warn', 'warn', 'no passphrase')}${k.legacy ? chip('warn', 'warn', 'weak: RSA 2048') : ''}</div>
+      <div class="kfp">${esc(k.fp)}</div>
+      <div class="kmeta"><span>Created ${esc(k.created)}</span><span>${k.hosts.length ? 'Used for ' + k.hosts.map(esc).join(', ') : 'Not tested against any host'}</span></div>
+      ${k.hosts.length ? `<div class="ktest" aria-live="polite">${k.hosts.map((h) => { const t = tests[k.id + '|' + h]; return t ? `<div class="${t === 'run' ? 'run' : t}">${t === 'run' ? ic('fetch', 12, 'spin') + 'Connecting to ' + esc(h) + '…' : t === 'ok' ? ic('check', 12) + esc(h) + ' — ' + esc(RESULT[h][1]) : ic('err', 12) + esc(h) + ' — ' + esc(RESULT[h][1])}</div>` : ''; }).join('')}</div>` : ''}
+      <div class="kact">
+        <button class="btn btn-sm" data-a="copy" data-id="${k.id}">${ic('copy', 12)}Copy public key</button>
+        <button class="btn btn-sm" data-a="test" data-id="${k.id}" ${k.hosts.length ? '' : 'disabled'}>${ic('fetch', 12)}Test connection</button>
+        <button class="btn btn-sm" data-a="agent" data-id="${k.id}" ${agentUp ? '' : 'disabled'}>${k.agent ? 'Remove from agent' : 'Add to agent'}</button>
+        <button class="btn btn-sm btn-danger" data-a="del" data-id="${k.id}">${ic('trash', 12)}Delete…</button></div></div></div>`;
+  ctx = S.mount('settings-ssh.html', 'SSH keys', () => {
+    const demo = S.get('ssh-demo', 'keys'), agentUp = demo !== 'agent';
+    const keys = demo === 'empty' ? [] : D.keys();
+    return `<h2>SSH keys</h2><p class="lead">Keys gitwarp can use to clone, fetch and push over SSH. Private keys stay in <span class="mono">~/.ssh</span>; only fingerprints and public keys are shown here.</p>
+      <div class="od-row" style="max-width:760px;margin-bottom:16px"><button class="btn btn-primary" data-a="gen">${ic('plus', 14)}Generate key…</button><button class="btn" data-a="imp">${ic('folder', 14)}Import…</button><span class="od-fill"></span><label class="scn" style="font-size:12px;display:inline-flex;gap:8px;align-items:center">Demo state ${S.sel('ssh-demo', demo, DEMO, 'Demo state')}</label></div>
+      ${agentUp ? S.banner('info', 'ssh-agent is running', keys.filter((k) => k.agent).length + ' of ' + keys.length + ' keys loaded. Loaded keys are offered to hosts automatically.') : S.banner('error', 'ssh-agent is not running', 'Keys protected by a passphrase cannot be used until it starts. Start it with eval "$(ssh-agent -s)" or enable the ssh-agent user service, then retry.')}
+      ${agentUp ? '' : `<div style="margin:-4px 0 12px"><button class="btn" data-a="retry">${ic('fetch', 14)}Check again</button></div>`}
+      <section class="sgroup"><h3>Your keys</h3><div class="slist">${keys.length ? keys.map((k) => keyCard(k, agentUp)).join('') : `<div class="empty">${ic('key', 24)}<b>No SSH keys yet</b><span style="max-width:46ch">Create a key and add its public half to GitHub, GitLab or your own server to clone private repositories without typing a password.</span><div class="od-row"><button class="btn btn-primary" data-a="gen">${ic('plus', 14)}Generate key…</button><button class="btn" data-a="imp">${ic('folder', 14)}Import existing key…</button></div></div>`}</div></section>
+      <section class="sgroup"><h3>Trusted hosts</h3><div class="slist">${hosts.length ? hosts.map((h, i) => `<div class="hostrow"><div style="min-width:0"><div class="hn">${esc(h.host)}</div><div class="hf">${esc(h.alg)} ${esc(h.fp)}</div></div><button class="btn btn-sm btn-ghost btn-icon" data-a="forget" data-i="${i}" aria-label="Forget ${esc(h.host)}" data-tip="Forget host">${ic('trash', 14)}</button></div>`).join('') : '<div class="empty"><b>No trusted hosts</b><span>Hosts appear here after you confirm their fingerprint on first connection.</span></div>'}</div>
+        <div class="field-help" style="margin-top:6px">Stored in <span class="mono">~/.ssh/known_hosts</span>. Preview the prompt: <button class="btn btn-sm" data-a="hk-new">New host</button> <button class="btn btn-sm" data-a="hk-changed">Changed key</button></div></section>`;
+  }, null);
+  const pane = ctx.pane, win = ctx.win;
+  const keyOf = (id) => D.keys().find((k) => k.id === id);
+  pane.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-a]'); if (!b || b.disabled) return;
+    const a = b.dataset.a, k = b.dataset.id && keyOf(b.dataset.id);
+    if (a === 'gen') D.sshGenerate(win, {}, () => ctx.draw());
+    else if (a === 'imp') D.sshImport(win, {}, () => ctx.draw());
+    else if (a === 'del') D.sshDelete(win, { key: k }, () => ctx.draw());
+    else if (a === 'copy') { try { navigator.clipboard.writeText(k.pub); } catch (x) {} ctx.toast('Public key of ' + k.name + ' copied', 'ok'); }
+    else if (a === 'agent') { const l = D.keys(); const t = l.find((x) => x.id === k.id); t.agent = !t.agent; D.saveKeys(l); ctx.toast(t.agent ? 'Added ' + t.name + ' to ssh-agent' : 'Removed ' + t.name + ' from ssh-agent', 'ok'); ctx.draw(); }
+    else if (a === 'test') k.hosts.forEach((h, i) => { tests[k.id + '|' + h] = 'run'; setTimeout(() => { tests[k.id + '|' + h] = RESULT[h] ? RESULT[h][0] : 'ok'; ctx.draw(); }, 700 + i * 500); }), ctx.draw();
+    else if (a === 'retry') ctx.toast('ssh-agent still not reachable at $SSH_AUTH_SOCK', 'error');
+    else if (a === 'forget') { hosts.splice(+b.dataset.i, 1); ctx.draw(); ctx.toast('Host forgotten — you will be asked to trust it again', 'info'); }
+    else if (a === 'hk-new') D.hostKey(win, { changed: false });
+    else if (a === 'hk-changed') D.hostKey(win, { changed: true });
+  });
+})();
+</script>
+</body>
+</html>

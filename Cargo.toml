@@ -4,6 +4,7 @@ members = [
     "crates/git-graph",
     "crates/git-core",
     "crates/app",
+    "crates/ui",
 ]
 # `cargo test` / `cargo build` without -p skip the GPUI app:
 # the core crates stay fast to build and test.
@@ -21,6 +22,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 git-graph = { path = "crates/git-graph" }
 git-core = { path = "crates/git-core" }
+ui = { path = "crates/ui" }
 
 # UI: Zed's GPUI. Pinned on purpose, its API still moves between releases.
 gpui = "=0.2.2"

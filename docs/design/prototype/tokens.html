@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — design tokens</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<style>
+  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 16px; }
+  .tb { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-lg); padding: 12px 16px; }
+  .tb h3 { margin-top: 4px; }
+  .tk { display: grid; grid-template-columns: 28px minmax(0, 1.2fr) minmax(0, 1fr) 70px 70px; gap: 8px; align-items: center; height: 28px; font-size: var(--fs-sm); border-bottom: 1px solid var(--border); }
+  .tk .chip { width: 22px; height: 18px; border-radius: var(--r-sm); border: 1px solid var(--border-strong); }
+  .tk code { font-family: var(--font-mono); font-size: 11px; }
+  .tk .r { text-align: right; font-variant-numeric: tabular-nums; }
+  .tk.hd { color: var(--muted); font-weight: 600; height: 22px; }
+  .pass { color: var(--success); } .fail { color: var(--warning); }
+  .type-row { display: grid; grid-template-columns: 150px minmax(0, 1fr) 120px; gap: 16px; align-items: baseline; padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .bar { background: var(--accent); height: 12px; border-radius: 2px; }
+  .rad { width: 72px; height: 48px; background: var(--surface); border: 1px solid var(--border-strong); display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--muted); }
+</style>
+<script src="app.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL;
+  G.stagebar();
+  const groups = [
+    ['Surfaces & lines', ['bg', 'surface', 'hover', 'active', 'selection', 'selection-inactive', 'border', 'border-strong'], 0],
+    ['Text', ['text', 'muted', 'disabled'], 1],
+    ['Accent & status', ['accent', 'accent-hover', 'focus', 'error', 'warning', 'success', 'info'], 1],
+    ['File status', ['st-added', 'st-modified', 'st-deleted', 'st-renamed', 'st-untracked', 'st-conflict'], 1],
+    ['Diff', ['diff-add-bg', 'diff-add-strong', 'diff-del-bg', 'diff-del-strong', 'diff-hunk-bg'], 0],
+    ['Code', ['code-kw', 'code-str', 'code-num', 'code-com', 'code-ty', 'code-fn'], 1]
+  ];
+  const html = `<div class="page"><h1>Design tokens</h1>
+  <p class="lead">Source: <span class="mono">tokens.css</span>. Dark and light share one geometry and define the same semantic names. Contrast columns are computed live against <span class="mono">--bg</span> and <span class="mono">--surface</span> of each theme; 4.5:1 is the AA bar for text, 3:1 for non-text. Disabled text is exempt by WCAG.</p>
+  <h2>Colour</h2><div class="two">${['dark', 'light'].map((t) => `<div class="tb" data-theme="${t}" id="tb-${t}"><b>${GL.THEMES[t]}</b>${groups.map(([n]) => `<div data-g="${n}"></div>`).join('')}</div>`).join('')}</div>
+  <p class="cap">Both themes use hairline borders and a muted-blue (dark) / pale-blue (light) selection instead of solid blue; every text pair is measured live below.</p>
+
+  <h2>Type scale</h2><div class="panel">
+    ${[['xs · 11px', 'var(--fs-xs)', 'Section labels, counters, key caps'], ['sm · 12px', 'var(--fs-sm)', 'Secondary meta, tooltips, columns'], ['base · 13px', 'var(--fs-base)', 'Default UI text, list rows, inputs'], ['md · 14px', 'var(--fs-md)', 'Dialog titles, palette input'], ['lg · 16px', 'var(--fs-lg)', 'Page headings'], ['xl · 20px', 'var(--fs-xl)', 'Welcome title']].map(([l, s, u]) => `<div class="type-row"><code>${l}</code><span style="font-size:${s}">The quick brown fox — fetch origin/main</span><span class="muted" style="font-size:12px">${u}</span></div>`).join('')}
+    <div class="type-row"><code>mono · 12px</code><span class="mono">e4f2a91  fn lane_x(&amp;self, col: usize) -&gt; f32</span><span class="muted" style="font-size:12px">Hashes, code, diffs only</span></div>
+    <p class="cap">UI face: Inter → Segoe UI → Cantarell → system-ui (weights 400 / 600 / 700). Mono: JetBrains Mono → Cascadia Mono → SF Mono. Row height 26px = 13px text on a 26px line; code line height 20px.</p></div>
+
+  <h2>Spacing (4px grid)</h2><div class="panel">${[['sp-1', 2], ['sp-2', 4], ['sp-3', 6], ['sp-4', 8], ['sp-5', 12], ['sp-6', 16], ['sp-7', 24], ['sp-8', 32]].map(([n, v]) => `<div class="type-row" style="grid-template-columns:150px 80px minmax(0,1fr);padding:4px 0"><code>--${n}</code><span class="mono">${v}px</span><span><div class="bar" style="width:${v * 4}px"></div></span></div>`).join('')}</div>
+
+  <h2>Radii, sizes, graph</h2><div class="panel">
+    <div class="od-cluster" style="--od-gap:16px">${[['xs', 3], ['sm', 5], ['md', 7], ['lg', 12]].map(([n, v]) => `<div><div class="rad" style="border-radius:${v}px">${v}px</div><div class="cap">--r-${n}</div></div>`).join('')}</div>
+    <table style="margin-top:16px;border-collapse:collapse;font-size:12px;width:100%">${[['--row', '26px', 'List / tree / file rows'], ['--ctl', '26px', 'Buttons, inputs (small: 22px)'], ['--bar', '40px', 'Toolbar / title bar'], ['--status', '24px', 'Status bar'], ['--lane-w', '14px', 'Graph lane width'], ['--dot-r', '4.5px', 'Graph dot radius'], ['--line-w', '2px', 'Graph line width'], ['Focus ring', '2px --focus, 1px offset (−2px inset in lists)', 'Keyboard only (:focus-visible)'], ['Motion', '120–150ms ease-out', 'Hover/press fades only; nothing animates layout']].map(([a, b, c]) => `<tr><td style="padding:4px 8px;border-bottom:1px solid var(--border)"><code>${a}</code></td><td style="padding:4px 8px;border-bottom:1px solid var(--border)">${b}</td><td class="muted" style="padding:4px 8px;border-bottom:1px solid var(--border)">${c}</td></tr>`).join('')}</table></div></div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
+
+  const parse = (s) => { s = s.trim(); if (s[0] === '#') { const h = s.slice(1); const n = h.length === 3 ? h.replace(/./g, '$&$&') : h; return [0, 2, 4].map((i) => parseInt(n.slice(i, i + 2), 16) / 255); } return null; };
+  const lum = (c) => { const f = (v) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)); return 0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2]); };
+  const ratio = (a, b) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+  ['dark', 'light'].forEach((t) => {
+    const box = document.getElementById('tb-' + t), cs = getComputedStyle(box), v = (n) => cs.getPropertyValue('--' + n).trim();
+    const bg = parse(v('bg')), sf = parse(v('surface'));
+    groups.forEach(([n, toks, text]) => {
+      const host = box.querySelector(`[data-g="${n}"]`);
+      host.innerHTML = `<h3>${n}</h3><div class="tk hd"><span></span><span>token</span><span>value</span><span class="r">on bg</span><span class="r">on surface</span></div>` + toks.map((k) => {
+        const val = v(k), c = parse(val);
+        const cell = (back) => { if (!c || !back) return '<span class="r muted">—</span>'; const r = ratio(c, back), need = text ? 4.5 : 3; const ok = r >= need || k === 'disabled'; return `<span class="r ${ok ? 'pass' : 'fail'}">${r.toFixed(1)}${k === 'disabled' ? '*' : ''}</span>`; };
+        return `<div class="tk"><span class="chip" style="background:var(--${k})"></span><code>--${k}</code><code>${val}</code>${text ? cell(bg) + cell(sf) : '<span class="r muted">—</span><span class="r muted">—</span>'}</div>`;
+      }).join('');
+    });
+  });
+})();
+</script>
+</body>
+</html>
