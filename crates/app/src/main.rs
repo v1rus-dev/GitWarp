@@ -6,12 +6,32 @@ use gpui::{
     prelude::*, px, size, App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
 };
 
+use std::ffi::OsString;
+use std::path::PathBuf;
+
 use git_core::GitChoice;
 use history_view::HistoryView;
 
+const USAGE: &str = "Usage: gitlane [--git <auto|system|bundled|PATH>] [REPO]
+
+Options:
+  --git <VALUE>  Which git to run (default: auto; env: GITLANE_GIT, the flag wins)
+  -h, --help     Print this help";
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-    let (path, git) = parse_args(std::env::args().skip(1), std::env::var("GITLANE_GIT").ok());
+    let (path, git) = match parse_args(std::env::args_os().skip(1), std::env::var_os("GITLANE_GIT"))
+    {
+        Ok(Cli::Run { path, git }) => (path, git),
+        Ok(Cli::Help) => {
+            println!("{USAGE}");
+            return;
+        }
+        Err(message) => {
+            eprintln!("gitlane: {message}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
@@ -32,46 +52,95 @@ fn main() {
     });
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Cli {
+    Run { path: PathBuf, git: GitChoice },
+    Help,
+}
+
 /// `[--git <auto|system|bundled|PATH>] [repo]`. The flag wins over
-/// `GITLANE_GIT`; the repo defaults to the current directory.
-fn parse_args(args: impl Iterator<Item = String>, env_git: Option<String>) -> (String, GitChoice) {
+/// `GITLANE_GIT` (empty means unset); the repo defaults to the current directory.
+fn parse_args(
+    mut args: impl Iterator<Item = OsString>,
+    env_git: Option<OsString>,
+) -> Result<Cli, String> {
     let mut path = None;
-    let mut git = env_git.map(|v| GitChoice::parse(&v));
-    let mut args = args;
+    let mut git = env_git
+        .filter(|v| !v.is_empty())
+        .map(|v| GitChoice::parse_os(&v));
     while let Some(arg) = args.next() {
-        if arg == "--git" {
-            git = args.next().map(|v| GitChoice::parse(&v)).or(git);
-        } else if let Some(v) = arg.strip_prefix("--git=") {
-            git = Some(GitChoice::parse(v));
-        } else {
-            path = Some(arg);
+        match arg.to_str() {
+            Some("-h" | "--help") => return Ok(Cli::Help),
+            Some("--git") => {
+                let value = args.next().ok_or("--git needs a value")?;
+                git = Some(GitChoice::parse_os(&value));
+            }
+            Some(a) if a.starts_with("--git=") => {
+                git = Some(GitChoice::parse(&a["--git=".len()..]));
+            }
+            Some(a) if a.starts_with('-') => return Err(format!("unknown option {a}")),
+            _ => path = Some(PathBuf::from(arg)),
         }
     }
-    (path.unwrap_or_else(|| ".".into()), git.unwrap_or_default())
+    Ok(Cli::Run {
+        path: path.unwrap_or_else(|| ".".into()),
+        git: git.unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str], env: Option<&str>) -> (String, GitChoice) {
-        parse_args(args.iter().map(|s| s.to_string()), env.map(str::to_owned))
+    fn parse(args: &[&str], env: Option<&str>) -> Result<Cli, String> {
+        parse_args(args.iter().map(OsString::from), env.map(OsString::from))
+    }
+
+    fn run(path: &str, git: GitChoice) -> Result<Cli, String> {
+        Ok(Cli::Run {
+            path: path.into(),
+            git,
+        })
     }
 
     #[test]
     fn flag_wins_over_env() {
-        assert_eq!(parse(&[], None), (".".into(), GitChoice::Auto));
+        assert_eq!(parse(&[], None), run(".", GitChoice::Auto));
         assert_eq!(
             parse(&["repo"], Some("system")),
-            ("repo".into(), GitChoice::System)
+            run("repo", GitChoice::System)
         );
+        assert_eq!(parse(&[], Some("")), run(".", GitChoice::Auto));
         assert_eq!(
             parse(&["--git", "bundled", "repo"], Some("system")),
-            ("repo".into(), GitChoice::Bundled)
+            run("repo", GitChoice::Bundled)
         );
         assert_eq!(
-            parse(&["repo", "--git=/opt/git"], None).1,
-            GitChoice::Custom("/opt/git".into())
+            parse(&["repo", "--git=/opt/git"], None),
+            run("repo", GitChoice::Custom("/opt/git".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_bad_options() {
+        assert!(parse(&["--git"], None).is_err());
+        assert!(parse(&["--frobnicate"], None).is_err());
+        assert_eq!(parse(&["-h"], None), Ok(Cli::Help));
+        assert_eq!(parse(&["x", "--help"], None), Ok(Cli::Help));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(vec![b'r', 0xff]);
+        let cli = parse_args([raw.clone()].into_iter(), None);
+        assert_eq!(
+            cli,
+            Ok(Cli::Run {
+                path: raw.into(),
+                git: GitChoice::Auto
+            })
         );
     }
 }

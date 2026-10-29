@@ -243,3 +243,14 @@ fn revision_starting_with_a_dash_is_not_an_option() {
     assert!(result.is_err());
     assert!(!out.exists());
 }
+
+#[test]
+fn open_failure_other_than_not_a_repository_keeps_gits_message() {
+    let tmp = sample_repo();
+    git(tmp.path(), &["config", "core.repositoryformatversion", "1"]);
+    git(tmp.path(), &["config", "extensions.frobnicate", "yes"]);
+    match open(tmp.path()) {
+        Err(git_core::Error::Git { stderr, .. }) => assert!(stderr.contains("frobnicate")),
+        other => panic!("unexpected result {other:?}"),
+    }
+}

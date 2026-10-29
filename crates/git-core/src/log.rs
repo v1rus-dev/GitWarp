@@ -54,6 +54,8 @@ pub struct LogStream {
     stderr: Option<JoinHandle<String>>,
     buf: Vec<u8>,
     finished: bool,
+    /// Whether the child has been reaped; `Drop` kills it otherwise.
+    waited: bool,
 }
 
 impl LogStream {
@@ -82,9 +84,9 @@ impl LogStream {
         let stdout = child.stdout.take().ok_or(Error::Parse("git log stdout"))?;
         let stderr = child.stderr.take().map(|mut e| {
             std::thread::spawn(move || {
-                let mut text = String::new();
-                let _ = e.read_to_string(&mut text);
-                text
+                let mut bytes = Vec::new();
+                let _ = e.read_to_end(&mut bytes);
+                String::from_utf8_lossy(&bytes).into_owned()
             })
         });
         Ok(Self {
@@ -93,6 +95,7 @@ impl LogStream {
             reader: BufReader::with_capacity(256 * 1024, stdout),
             buf: Vec::with_capacity(256),
             finished: false,
+            waited: false,
         })
     }
 
@@ -108,6 +111,7 @@ impl LogStream {
 
     fn finish(&mut self) -> Option<Error> {
         self.finished = true;
+        self.waited = true;
         let status = self.child.wait();
         // The child has exited, so its stderr hits EOF and the thread ends.
         let stderr = self
@@ -148,7 +152,9 @@ impl Iterator for LogStream {
                     return Some(parse_record(record));
                 }
                 Err(e) => {
+                    // The stream is unusable; stop git instead of leaking it.
                     self.finished = true;
+                    self.stop();
                     return Some(Err(Error::Io(e)));
                 }
             }
@@ -156,14 +162,22 @@ impl Iterator for LogStream {
     }
 }
 
-impl Drop for LogStream {
-    fn drop(&mut self) {
-        if !self.finished {
-            // Kill first: the stderr thread only ends once git closes the pipe,
-            // so it is left to finish on its own instead of being joined.
+impl LogStream {
+    /// Kill and reap the child unless it was already waited for. The stderr
+    /// thread is not joined: it only ends once git closes the pipe, and it
+    /// finishes on its own right after the kill.
+    fn stop(&mut self) {
+        if !self.waited {
+            self.waited = true;
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+}
+
+impl Drop for LogStream {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

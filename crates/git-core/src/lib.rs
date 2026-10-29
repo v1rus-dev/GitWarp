@@ -29,51 +29,61 @@ pub struct Repo {
     /// Top of the work tree, or the git dir for bare repositories.
     root: PathBuf,
     git_dir: PathBuf,
-    /// Shared by all linked worktrees; objects and the commit-graph live here.
-    common_dir: PathBuf,
+    /// `objects/info`, where the commit-graph lives.
+    objects_info: PathBuf,
 }
 
 impl Repo {
     /// Open the repository containing `path`.
     pub fn open(git: Arc<Git>, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let rev_parse = |args: &[&str]| -> Result<Option<String>> {
+        let rev_parse = |args: &[&str]| -> Result<String> {
             let out = git_command(git.exe(), path)
                 .arg("rev-parse")
                 .args(args)
                 .output()
                 .map_err(Error::Spawn)?;
-            Ok(out
-                .status
-                .success()
-                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned()))
+            if out.status.success() {
+                return Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned());
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            // Other failures (unknown extension, dubious ownership, ...) must
+            // not be reported as "not a repository": the message is the fix.
+            Err(if stderr.contains("not a git repository") {
+                Error::NotARepository(path.to_path_buf())
+            } else {
+                Error::Git {
+                    command: "rev-parse",
+                    stderr,
+                }
+            })
         };
 
         let info = rev_parse(&[
             "--path-format=absolute",
             "--git-dir",
-            "--git-common-dir",
+            "--git-path",
+            "objects/info",
             "--is-bare-repository",
-        ])?
-        .ok_or_else(|| Error::NotARepository(path.to_path_buf()))?;
+        ])?;
         let mut lines = info.lines();
         let git_dir = PathBuf::from(lines.next().ok_or(Error::Parse("rev-parse output"))?);
-        let common_dir = PathBuf::from(lines.next().ok_or(Error::Parse("rev-parse output"))?);
+        // Asked from git so GIT_OBJECT_DIRECTORY and linked worktrees (whose
+        // objects live in the common dir) are respected.
+        let objects_info = PathBuf::from(lines.next().ok_or(Error::Parse("rev-parse output"))?);
         let bare = lines.next() == Some("true");
 
         // Bare repositories have no work tree; `--show-toplevel` would fail there.
         let root = if bare {
             git_dir.clone()
         } else {
-            rev_parse(&["--show-toplevel"])?
-                .map(PathBuf::from)
-                .ok_or_else(|| Error::NotARepository(path.to_path_buf()))?
+            PathBuf::from(rev_parse(&["--show-toplevel"])?)
         };
         Ok(Self {
             git,
             root,
             git_dir,
-            common_dir,
+            objects_info,
         })
     }
 
@@ -83,10 +93,6 @@ impl Repo {
 
     pub fn git_dir(&self) -> &Path {
         &self.git_dir
-    }
-
-    pub fn git(&self) -> &Git {
-        &self.git
     }
 
     /// A `git` command already pointed at this repository.
@@ -107,7 +113,7 @@ impl Repo {
     /// app should call [`Repo::write_commit_graph`] in the background when
     /// this returns false.
     pub fn has_commit_graph(&self) -> bool {
-        let info = self.common_dir.join("objects").join("info");
+        let info = &self.objects_info;
         info.join("commit-graph").is_file() || info.join("commit-graphs").is_dir()
     }
 
@@ -146,23 +152,21 @@ impl Repo {
     }
 }
 
-/// Base `git` invocation with settings that make output stable to parse,
+/// A bare `git` process with settings that make output stable to parse,
 /// whatever the user's config says.
-fn git_command(exe: &Path, dir: &Path) -> Command {
+pub(crate) fn base_command(exe: &Path) -> Command {
     let mut cmd = Command::new(exe);
-    cmd.arg("-C")
-        .arg(dir)
-        .args([
-            "-c",
-            "core.quotepath=off",
-            "-c",
-            "color.ui=false",
-            "-c",
-            "log.showSignature=false",
-            "--no-pager",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C");
+    cmd.args([
+        "-c",
+        "core.quotepath=off",
+        "-c",
+        "color.ui=false",
+        "-c",
+        "log.showSignature=false",
+        "--no-pager",
+    ])
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("LC_ALL", "C");
     // Never pop up a console window on Windows.
     #[cfg(windows)]
     {
@@ -170,5 +174,11 @@ fn git_command(exe: &Path, dir: &Path) -> Command {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    cmd
+}
+
+fn git_command(exe: &Path, dir: &Path) -> Command {
+    let mut cmd = base_command(exe);
+    cmd.arg("-C").arg(dir);
     cmd
 }

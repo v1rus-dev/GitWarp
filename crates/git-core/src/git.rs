@@ -3,9 +3,9 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
-use crate::{Error, Result};
+use crate::{base_command, Error, Result};
 
 /// Where the resolved executable came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,11 +39,23 @@ pub enum GitChoice {
 impl GitChoice {
     /// Parse a CLI/env value: `auto`, `bundled`, `system`, or a path.
     pub fn parse(value: &str) -> Self {
-        match value {
+        match value.trim() {
+            "" => GitChoice::Auto,
             "auto" => GitChoice::Auto,
             "bundled" => GitChoice::Bundled,
             "system" => GitChoice::System,
             path => GitChoice::Custom(PathBuf::from(path)),
+        }
+    }
+}
+
+impl GitChoice {
+    /// Like [`GitChoice::parse`] for values that may not be UTF-8: those can
+    /// only be paths.
+    pub fn parse_os(value: &std::ffi::OsStr) -> Self {
+        match value.to_str() {
+            Some(v) => Self::parse(v),
+            None => GitChoice::Custom(PathBuf::from(value)),
         }
     }
 }
@@ -98,18 +110,34 @@ pub struct Git {
     exe: PathBuf,
     version: GitVersion,
     source: GitSource,
+    /// Set when `Auto` found a bundled git that did not work and fell back.
+    fallback_reason: Option<String>,
 }
 
 impl Git {
     /// Find the executable for `choice`, run `--version` and check the floor.
     pub fn resolve(choice: GitChoice) -> Result<Self> {
+        Self::resolve_with(choice, bundled_path())
+    }
+
+    /// [`Git::resolve`] with the bundled location injected (for tests).
+    pub(crate) fn resolve_with(choice: GitChoice, bundled: Option<PathBuf>) -> Result<Self> {
         match choice {
-            GitChoice::Auto => match bundled_path() {
-                Some(exe) => Self::probe(exe, GitSource::Bundled),
+            GitChoice::Auto => match bundled {
+                // A broken bundle must not leave the app without git: fall
+                // back to the system one and let the caller report why.
+                Some(exe) => match Self::probe(exe, GitSource::Bundled) {
+                    Ok(git) => Ok(git),
+                    Err(e) => {
+                        let mut git = Self::probe("git".into(), GitSource::System)?;
+                        git.fallback_reason = Some(format!("bundled git unusable: {e}"));
+                        Ok(git)
+                    }
+                },
                 None => Self::probe("git".into(), GitSource::System),
             },
             GitChoice::Bundled => {
-                let exe = bundled_path().ok_or_else(|| Error::GitNotFound("bundled git".into()))?;
+                let exe = bundled.ok_or_else(|| Error::GitNotFound("bundled git".into()))?;
                 Self::probe(exe, GitSource::Bundled)
             }
             // Resolved through PATH by the OS (`git.exe` on Windows).
@@ -119,7 +147,7 @@ impl Git {
     }
 
     fn probe(exe: PathBuf, source: GitSource) -> Result<Self> {
-        let out = Command::new(&exe)
+        let out = base_command(&exe)
             .arg("--version")
             .stdin(Stdio::null())
             .output()
@@ -127,12 +155,19 @@ impl Git {
                 std::io::ErrorKind::NotFound => Error::GitNotFound(exe.display().to_string()),
                 _ => Error::Spawn(e),
             })?;
+        if !out.status.success() {
+            return Err(Error::Git {
+                command: "--version",
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
         let text = String::from_utf8_lossy(&out.stdout);
         let version = GitVersion::parse(&text).ok_or(Error::Parse("git --version output"))?;
         Ok(Self {
             exe,
             version: check_floor(version)?,
             source,
+            fallback_reason: None,
         })
     }
 
@@ -146,6 +181,11 @@ impl Git {
 
     pub fn source(&self) -> GitSource {
         self.source
+    }
+
+    /// Why `Auto` did not use the bundled git, if it had to fall back.
+    pub fn fallback_reason(&self) -> Option<&str> {
+        self.fallback_reason.as_deref()
     }
 }
 
@@ -166,6 +206,8 @@ fn check_floor(found: GitVersion) -> Result<GitVersion> {
 /// - Linux: `<app dir>/git/bin/git`, then `<app dir>/../lib/gitlane/git/bin/git`
 fn bundled_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
+    // A symlinked launcher must still find files next to the real binary.
+    let exe = exe.canonicalize().unwrap_or(exe);
     bundled_candidates(exe.parent()?)
         .into_iter()
         .find(|p| p.is_file())
@@ -227,6 +269,44 @@ mod tests {
             Git::resolve(GitChoice::Custom(missing)),
             Err(Error::GitNotFound(_))
         ));
+    }
+
+    #[test]
+    fn empty_choice_is_auto() {
+        assert_eq!(GitChoice::parse(""), GitChoice::Auto);
+        assert_eq!(GitChoice::parse("  "), GitChoice::Auto);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_version_command_is_a_git_error() {
+        let false_exe = ["/bin/false", "/usr/bin/false"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+            .expect("`false` is installed");
+        assert!(matches!(
+            Git::resolve(GitChoice::Custom(false_exe)),
+            Err(Error::Git {
+                command: "--version",
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_bundle_falls_back_in_auto_but_fails_when_explicit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("git");
+        std::fs::write(&fake, "not executable").unwrap();
+
+        let git = Git::resolve_with(GitChoice::Auto, Some(fake.clone())).unwrap();
+        assert_eq!(git.source(), GitSource::System);
+        assert!(git.fallback_reason().unwrap().contains("bundled git"));
+
+        assert!(Git::resolve_with(GitChoice::Bundled, Some(fake)).is_err());
+        assert!(Git::resolve_with(GitChoice::Bundled, None).is_err());
     }
 
     #[test]

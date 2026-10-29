@@ -1,6 +1,7 @@
 //! The history screen: commit graph + commit list, loaded in the background
 //! and painted through a virtualized list (only visible rows are built).
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -37,11 +38,12 @@ pub struct HistoryView {
 }
 
 impl HistoryView {
-    /// Starts in the loading state; resolving git, opening the repository and
-    /// reading HEAD all run in the background and fill in the title or error.
-    pub fn open(path: String, choice: GitChoice, cx: &mut Context<Self>) -> Self {
+    /// Starts in the loading state; resolving git, opening the repository,
+    /// reading HEAD and the history all run in the background and fill in the
+    /// label, title or error as they arrive.
+    pub fn open(path: PathBuf, choice: GitChoice, cx: &mut Context<Self>) -> Self {
         let view = Self {
-            title: path.clone().into(),
+            title: path.display().to_string().into(),
             git_label: None,
             items: Vec::new(),
             max_lanes: 1,
@@ -51,25 +53,49 @@ impl HistoryView {
         };
         cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
-            let opened = executor
-                .spawn(async move {
-                    let git = Git::resolve(choice)?;
-                    let label = format!("git {} ({})", git.version(), git.source());
-                    let repo = Repo::open(Arc::new(git), &path)?;
-                    let title = title_for(&repo);
-                    Ok::<_, git_core::Error>((repo, title, label))
+            let git = match executor.spawn(async { Git::resolve(choice) }).await {
+                Ok(git) => git,
+                Err(e) => {
+                    this.update(cx, |view, cx| view.fail(e.to_string(), cx))
+                        .ok();
+                    return;
+                }
+            };
+            if let Some(reason) = git.fallback_reason() {
+                log::warn!("{reason}");
+            }
+            // Shown even if opening the repository fails below.
+            let label = format!("git {} ({})", git.version(), git.source());
+            if this
+                .update(cx, |view, cx| {
+                    view.git_label = Some(label.into());
+                    cx.notify();
                 })
-                .await;
-            match opened {
-                Ok((repo, title, label)) => {
-                    let shown = this.update(cx, |view, cx| {
-                        view.title = title.into();
-                        view.git_label = Some(label.into());
-                        cx.notify();
-                    });
-                    if shown.is_ok() {
-                        Self::load(repo, executor, &this, cx).await;
-                    }
+                .is_err()
+            {
+                return;
+            }
+
+            let git = Arc::new(git);
+            match executor.spawn(async move { Repo::open(git, &path) }).await {
+                Ok(repo) => {
+                    // HEAD is only needed for the title: don't hold the log back.
+                    let head_repo = repo.clone();
+                    let title_this = this.clone();
+                    cx.spawn(async move |cx| {
+                        let title = cx
+                            .background_executor()
+                            .spawn(async move { title_for(&head_repo) })
+                            .await;
+                        title_this
+                            .update(cx, |view, cx| {
+                                view.title = title.into();
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .detach();
+                    Self::load(repo, executor, &this, cx).await;
                 }
                 Err(e) => {
                     this.update(cx, |view, cx| view.fail(e.to_string(), cx))
@@ -89,16 +115,16 @@ impl HistoryView {
     ) {
         // Without a commit-graph file the first screen waits for the whole
         // history walk. Write one for next time, in parallel with this load.
-        if !repo.has_commit_graph() {
-            let repo = repo.clone();
-            executor
-                .spawn(async move {
-                    if let Err(e) = repo.write_commit_graph() {
+        let writer = repo.clone();
+        executor
+            .spawn(async move {
+                if !writer.has_commit_graph() {
+                    if let Err(e) = writer.write_commit_graph() {
                         log::warn!("could not write the commit-graph: {e}");
                     }
-                })
-                .detach();
-        }
+                }
+            })
+            .detach();
 
         // Both the git process and the layout run off the UI thread; the
         // UI thread only appends finished pages and repaints.
@@ -169,6 +195,11 @@ impl HistoryView {
                 let row = item.row.clone();
                 let selected = self.selected == Some(ix);
                 let c = &item.commit;
+                let background = if selected {
+                    theme::selection()
+                } else {
+                    theme::background()
+                };
 
                 div()
                     .id(ix)
@@ -186,7 +217,7 @@ impl HistoryView {
                     .child(
                         canvas(
                             |_, _, _| {},
-                            move |bounds, _, window, _| paint_row(&row, bounds, window),
+                            move |bounds, _, window, _| paint_row(&row, bounds, background, window),
                         )
                         .w(graph_w)
                         .h_full()
@@ -240,7 +271,7 @@ impl Render for HistoryView {
             (None, true) => format!("Loading… {} commits", self.items.len()).into(),
             (None, false) => format!("{} commits", self.items.len()).into(),
         };
-        if let (None, Some(git)) = (&self.error, &self.git_label) {
+        if let Some(git) = &self.git_label {
             status = format!("{status} · {git}").into();
         }
 

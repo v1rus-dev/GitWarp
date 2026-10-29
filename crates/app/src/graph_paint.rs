@@ -3,7 +3,7 @@
 //! Every row draws only its own two halves (see `git_graph::Row`), so rows
 //! are independent and the virtualized list can paint any slice of history.
 
-use gpui::{point, px, size, Bounds, PathBuilder, Pixels, Point, Window};
+use gpui::{point, px, size, Bounds, PathBuilder, Pixels, Point, Rgba, Window};
 
 use git_core::Oid;
 use git_graph::{Row, Segment};
@@ -16,7 +16,8 @@ pub fn graph_width(lanes: usize) -> Pixels {
     GRAPH_PADDING * 2. + LANE_WIDTH * lanes.clamp(1, MAX_GRAPH_LANES) as f32
 }
 
-pub fn paint_row(row: &Row<Oid>, bounds: Bounds<Pixels>, window: &mut Window) {
+/// `background` is the row's fill; it colors the ring around the dot.
+pub fn paint_row(row: &Row<Oid>, bounds: Bounds<Pixels>, background: Rgba, window: &mut Window) {
     let x = |col: usize| bounds.origin.x + GRAPH_PADDING + LANE_WIDTH * (col as f32 + 0.5);
     let visible = |s: &Segment| s.from < MAX_GRAPH_LANES && s.to < MAX_GRAPH_LANES;
     let top = bounds.origin.y;
@@ -47,7 +48,7 @@ pub fn paint_row(row: &Row<Oid>, bounds: Bounds<Pixels>, window: &mut Window) {
             gpui::fill(dot, lane_color(row.color))
                 .corner_radii(r)
                 .border_widths(if row.is_tip { px(0.) } else { px(1.5) })
-                .border_color(crate::theme::background()),
+                .border_color(background),
         );
     }
 }

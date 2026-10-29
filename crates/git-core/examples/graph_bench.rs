@@ -9,8 +9,8 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
 
-use git_core::{Git, GitChoice, LogOptions, Repo};
-use git_graph::{GraphBuilder, Segment};
+use git_core::{Git, GitChoice, LogOptions, Oid, Repo};
+use git_graph::{GraphBuilder, Row, Segment};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -63,8 +63,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("first screen {:?}", first_screen.unwrap_or(total));
     println!("total        {total:?}");
     println!("max width    {max_width} lanes");
-    // Segment payload plus the two Vec headers per row; ignores allocator slack.
-    let bytes = segments * size_of::<Segment>() + graph.len() * 2 * size_of::<Vec<Segment>>();
+    // Row structs (with their Vec headers) plus segment payloads; ignores allocator slack.
+    let bytes = graph.len() * size_of::<Row<Oid>>() + segments * size_of::<Segment>();
     println!("segments     {segments}");
     println!("row memory   ~{:.1} MiB", bytes as f64 / (1 << 20) as f64);
     Ok(())
