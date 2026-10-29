@@ -1,28 +1,44 @@
 //! Visual catalogue of the design system tokens.
 
 use gpui::{
-    div, prelude::*, px, size, App, Application, Bounds, ClickEvent, FontWeight, Hsla, IntoElement,
-    Pixels, Render, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, size, AnyView, App, Application, Bounds, ClickEvent, FocusHandle,
+    FontWeight, Hsla, IntoElement, Pixels, Render, TitlebarOptions, Window, WindowBounds,
+    WindowOptions,
 };
 
+use ui::focus::RingOffset;
 use ui::metrics::{
-    BAR, CTL, DOT_R, FONT_MONO, FONT_UI, FS_BASE, FS_LG, FS_MD, FS_SM, FS_XL, FS_XS, MONO, R_SM,
-    R_XS,
+    BAR, CTL, DOT_R, FONT_MONO, FONT_UI, FS_BASE, FS_LG, FS_MD, FS_SM, FS_XL, FS_XS, MONO, R_LG,
+    R_MD, R_SM, R_XS,
 };
 use ui::theme::{self, ActiveTheme, Theme, ThemeColors, ThemeMode};
-use ui::{Icon, IconName};
+use ui::{actions, focus, overlay, Icon, IconName};
 
 struct Gallery {
     mode: ThemeMode,
+    focus_a: FocusHandle,
+    focus_b: FocusHandle,
+    focus_c: FocusHandle,
+}
+
+impl Gallery {
+    fn new(mode: ThemeMode, cx: &mut Context<Self>) -> Self {
+        Self {
+            mode,
+            focus_a: cx.focus_handle().tab_index(1).tab_stop(true),
+            focus_b: cx.focus_handle().tab_index(2).tab_stop(true),
+            focus_c: cx.focus_handle().tab_index(3).tab_stop(true),
+        }
+    }
 }
 
 impl Render for Gallery {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
         let colors = theme.colors;
         let mode = self.mode;
 
-        div()
+        let content = div()
             .size_full()
             .flex()
             .flex_col()
@@ -93,8 +109,12 @@ impl Render for Gallery {
                     .child(type_section(colors))
                     .child(fonts_section(colors))
                     .child(icons_section(colors))
-                    .child(lanes_section(theme)),
-            )
+                    .child(interaction_section(self, colors, window, cx))
+                    .child(lanes_section(&theme)),
+            );
+
+        let content = focus::track_pointer(actions::tab_navigation(content));
+        content.child(overlay::render_overlays(window, cx))
     }
 }
 
@@ -472,6 +492,112 @@ fn kebab(name: IconName) -> &'static str {
         .trim_end_matches(".svg")
 }
 
+fn interaction_section(
+    gallery: &Gallery,
+    colors: ThemeColors,
+    window: &Window,
+    cx: &mut Context<Gallery>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .child(heading("Interaction"))
+        .child(
+            div()
+                .text_size(FS_SM)
+                .text_color(colors.muted)
+                .child(format!(
+                    "Keyboard modality: {}",
+                    if focus::is_keyboard(cx) { "on" } else { "off" }
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .child(focus_box(
+                    "A",
+                    &gallery.focus_a,
+                    RingOffset::Outset1,
+                    colors,
+                    window,
+                    cx,
+                ))
+                .child(focus_box(
+                    "B",
+                    &gallery.focus_b,
+                    RingOffset::Outset2,
+                    colors,
+                    window,
+                    cx,
+                ))
+                .child(focus_box(
+                    "C",
+                    &gallery.focus_c,
+                    RingOffset::Inset2,
+                    colors,
+                    window,
+                    cx,
+                ))
+                .child(open_modal_button(colors, cx)),
+        )
+}
+
+fn focus_box(
+    label: &'static str,
+    handle: &FocusHandle,
+    offset: RingOffset,
+    colors: ThemeColors,
+    window: &Window,
+    cx: &App,
+) -> impl IntoElement {
+    let visible = focus::focus_visible(handle, window, cx);
+    let mut box_ = div()
+        .id(label)
+        .w(px(80.))
+        .h(px(26.))
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(R_SM)
+        .border_1()
+        .border_color(colors.border_strong)
+        .bg(colors.surface)
+        .track_focus(handle)
+        .child(label);
+    if visible {
+        box_ = box_.child(focus::focus_ring(offset, R_SM, cx));
+    }
+    box_
+}
+
+fn open_modal_button(colors: ThemeColors, cx: &mut Context<Gallery>) -> impl IntoElement {
+    div()
+        .id("open-modal")
+        .h(CTL)
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(R_SM)
+        .border_1()
+        .border_color(colors.border_strong)
+        .bg(colors.surface)
+        .text_color(colors.text)
+        .cursor_pointer()
+        .hover(move |style| style.bg(colors.hover))
+        .on_click(cx.listener(|_, _, window, cx| {
+            let panel = cx.new(ModalPanel::new);
+            let focus = panel.read(cx).focus.clone();
+            overlay::open_modal(AnyView::from(panel), window, cx);
+            window.focus(&focus);
+        }))
+        .child("Open modal")
+}
+
 fn lanes_section(theme: &Theme) -> impl IntoElement {
     div()
         .flex()
@@ -492,6 +618,92 @@ fn lanes_section(theme: &Theme) -> impl IntoElement {
                         .bg(theme.lane_color(lane))
                 })),
         )
+}
+
+struct ModalPanel {
+    focus: FocusHandle,
+}
+
+impl ModalPanel {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            focus: cx.focus_handle(),
+        }
+    }
+}
+
+impl Render for ModalPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        div()
+            .w(px(360.))
+            .h(px(160.))
+            .rounded(R_LG)
+            .border_1()
+            .border_color(colors.border_strong)
+            .bg(colors.surface)
+            .p(px(16.))
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .track_focus(&self.focus)
+            .child("Modal layer — Esc or click outside to close")
+            .child(open_popover_button(colors, cx))
+    }
+}
+
+struct PopoverPanel {
+    focus: FocusHandle,
+}
+
+impl PopoverPanel {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            focus: cx.focus_handle(),
+        }
+    }
+}
+
+impl Render for PopoverPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        div()
+            .w(px(220.))
+            .h(px(80.))
+            .rounded(R_MD)
+            .border_1()
+            .border_color(colors.border_strong)
+            .bg(colors.surface)
+            .p(px(12.))
+            .flex()
+            .items_center()
+            .track_focus(&self.focus)
+            .child("Popover layer — Esc or click outside to close")
+    }
+}
+
+fn open_popover_button(colors: ThemeColors, cx: &mut Context<ModalPanel>) -> impl IntoElement {
+    div()
+        .id("open-popover")
+        .h(CTL)
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(R_SM)
+        .border_1()
+        .border_color(colors.border_strong)
+        .bg(colors.bg)
+        .text_color(colors.text)
+        .cursor_pointer()
+        .hover(move |style| style.bg(colors.hover))
+        .on_click(cx.listener(|_, event: &ClickEvent, window, cx| {
+            let panel = cx.new(PopoverPanel::new);
+            let focus = panel.read(cx).focus.clone();
+            overlay::open_popover(event.position(), AnyView::from(panel), window, cx);
+            window.focus(&focus);
+        }))
+        .child("Open nested popover")
 }
 
 /// `--theme dark|light|system`; anything else stays on the system theme.
@@ -529,7 +741,7 @@ fn main() {
                 },
                 |window, cx| {
                     theme::follow_system(window, cx);
-                    cx.new(|_| Gallery { mode })
+                    cx.new(|cx| Gallery::new(mode, cx))
                 },
             )
             .expect("failed to open the gallery window");

@@ -5,21 +5,26 @@
 
 use gpui::App;
 
+pub mod actions;
 pub mod assets;
+pub mod focus;
 pub mod fonts;
 pub mod icon;
 pub mod metrics;
+pub mod overlay;
 pub mod theme;
 
 pub use assets::Assets;
 pub use icon::{Icon, IconName};
 pub use theme::{ActiveTheme, Appearance, Shadow, Theme, ThemeColors, ThemeMode};
 
-/// Installs the theme and loads the bundled fonts.
+/// Installs the theme and interaction infrastructure, then loads the fonts.
 ///
 /// The theme goes first: a font error is not fatal for the caller, and every
 /// view reads the theme global.
 pub fn init(cx: &mut App) -> gpui::Result<()> {
     theme::init(cx);
+    focus::init(cx);
+    actions::bind_keys(cx);
     fonts::load(cx)
 }
