@@ -8,8 +8,9 @@ use gpui::{
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use git_core::GitChoice;
+use git_core::{Git, GitChoice};
 use history_view::HistoryView;
 
 const USAGE: &str = "Usage: gitlane [--git <auto|system|bundled|PATH>] [REPO]
@@ -32,6 +33,16 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // Resolved once, before any window exists, so the probe cannot freeze the UI.
+    let git = Git::resolve(git)
+        .map(|r| {
+            if let Some(reason) = r.fallback {
+                log::warn!("bundled git unusable, using system git: {reason}");
+            }
+            Arc::new(r.git)
+        })
+        .map_err(|e| e.to_string());
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
@@ -59,15 +70,13 @@ enum Cli {
 }
 
 /// `[--git <auto|system|bundled|PATH>] [repo]`. The flag wins over
-/// `GITLANE_GIT` (empty means unset); the repo defaults to the current directory.
+/// `GITLANE_GIT`; the repo defaults to the current directory.
 fn parse_args(
     mut args: impl Iterator<Item = OsString>,
     env_git: Option<OsString>,
 ) -> Result<Cli, String> {
     let mut path = None;
-    let mut git = env_git
-        .filter(|v| !v.is_empty())
-        .map(|v| GitChoice::parse_os(&v));
+    let mut git = env_git.map(|v| GitChoice::parse_os(&v));
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-h" | "--help") => return Ok(Cli::Help),
@@ -75,10 +84,10 @@ fn parse_args(
                 let value = args.next().ok_or("--git needs a value")?;
                 git = Some(GitChoice::parse_os(&value));
             }
-            Some(a) if a.starts_with("--git=") => {
-                git = Some(GitChoice::parse(&a["--git=".len()..]));
-            }
-            Some(a) if a.starts_with('-') => return Err(format!("unknown option {a}")),
+            Some(a) if a.starts_with('-') => match a.strip_prefix("--git=") {
+                Some(v) => git = Some(GitChoice::parse(v)),
+                None => return Err(format!("unknown option {a}")),
+            },
             _ => path = Some(PathBuf::from(arg)),
         }
     }

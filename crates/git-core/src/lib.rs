@@ -13,11 +13,11 @@ mod oid;
 mod refs;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::Arc;
 
 pub use error::{Error, Result};
-pub use git::{Git, GitChoice, GitSource, GitVersion};
+pub use git::{Git, GitChoice, GitSource, GitVersion, Resolution};
 pub use log::{CommitInfo, LogOptions, LogStream};
 pub use oid::Oid;
 pub use refs::{Head, Ref, RefKind};
@@ -36,49 +36,39 @@ pub struct Repo {
 impl Repo {
     /// Open the repository containing `path`.
     pub fn open(git: Arc<Git>, path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let rev_parse = |args: &[&str]| -> Result<String> {
-            let out = git_command(git.exe(), path)
-                .arg("rev-parse")
-                .args(args)
-                .output()
-                .map_err(Error::Spawn)?;
-            if out.status.success() {
-                return Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned());
-            }
-            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-            // Other failures (unknown extension, dubious ownership, ...) must
-            // not be reported as "not a repository": the message is the fix.
-            Err(if stderr.contains("not a git repository") {
-                Error::NotARepository(path.to_path_buf())
-            } else {
-                Error::Git {
-                    command: "rev-parse",
-                    stderr,
-                }
-            })
+        let out = git_command(git.exe(), path.as_ref())
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-path",
+                "objects/info",
+                "--is-bare-repository",
+                "--show-toplevel",
+            ])
+            .output()
+            .map_err(Error::Spawn)?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let lines: Vec<&str> = stdout.lines().collect();
+        let bare = lines.get(2) == Some(&"true");
+        // In a bare repository `--show-toplevel` fails (exit 128) after the
+        // other answers were already printed; anywhere else a failure is real
+        // and git's own message ("not a git repository", unknown extension,
+        // dubious ownership, ...) is what the user needs to see.
+        if !bare {
+            check_output(out, "rev-parse")?;
+        }
+        let line = |i: usize| {
+            lines
+                .get(i)
+                .map(PathBuf::from)
+                .ok_or(Error::Parse("rev-parse output"))
         };
-
-        let info = rev_parse(&[
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-path",
-            "objects/info",
-            "--is-bare-repository",
-        ])?;
-        let mut lines = info.lines();
-        let git_dir = PathBuf::from(lines.next().ok_or(Error::Parse("rev-parse output"))?);
+        let git_dir = line(0)?;
         // Asked from git so GIT_OBJECT_DIRECTORY and linked worktrees (whose
         // objects live in the common dir) are respected.
-        let objects_info = PathBuf::from(lines.next().ok_or(Error::Parse("rev-parse output"))?);
-        let bare = lines.next() == Some("true");
-
-        // Bare repositories have no work tree; `--show-toplevel` would fail there.
-        let root = if bare {
-            git_dir.clone()
-        } else {
-            PathBuf::from(rev_parse(&["--show-toplevel"])?)
-        };
+        let objects_info = line(1)?;
+        let root = if bare { git_dir.clone() } else { line(3)? };
         Ok(Self {
             git,
             root,
@@ -131,14 +121,7 @@ impl Repo {
             ])
             .output()
             .map_err(Error::Spawn)?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(Error::Git {
-                command: "commit-graph write",
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            })
-        }
+        check_output(out, "commit-graph write").map(drop)
     }
 
     /// All branches, remote branches and tags.
@@ -181,4 +164,16 @@ fn git_command(exe: &Path, dir: &Path) -> Command {
     let mut cmd = base_command(exe);
     cmd.arg("-C").arg(dir);
     cmd
+}
+
+/// `out` if git succeeded, otherwise git's own message as an error.
+pub(crate) fn check_output(out: Output, command: &'static str) -> Result<Output> {
+    if out.status.success() {
+        Ok(out)
+    } else {
+        Err(Error::Git {
+            command,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
 }

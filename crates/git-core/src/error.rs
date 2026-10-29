@@ -1,7 +1,5 @@
-use std::fmt;
-use std::path::PathBuf;
-
 use crate::GitVersion;
+use std::fmt;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -17,7 +15,6 @@ pub enum Error {
         found: GitVersion,
         required: GitVersion,
     },
-    NotARepository(PathBuf),
     /// `git` exited with an error; `stderr` is its message.
     Git {
         command: &'static str,
@@ -35,7 +32,6 @@ impl fmt::Display for Error {
             Error::UnsupportedGit { found, required } => {
                 write!(f, "git {found} is too old, {required} or newer is required")
             }
-            Error::NotARepository(p) => write!(f, "not a git repository: {}", p.display()),
             Error::Git { command, stderr } => write!(f, "git {command} failed: {}", stderr.trim()),
             Error::Parse(what) => write!(f, "could not parse {what}"),
         }

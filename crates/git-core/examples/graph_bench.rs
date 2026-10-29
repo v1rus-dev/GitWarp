@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => 0,
     };
 
-    let repo = Repo::open(Arc::new(Git::resolve(GitChoice::Auto)?), &path)?;
+    let repo = Repo::open(Arc::new(Git::resolve(GitChoice::Auto)?.git), &path)?;
     if !repo.has_commit_graph() {
         eprintln!("note: no commit-graph file; the first screen will be slow.");
         eprintln!(

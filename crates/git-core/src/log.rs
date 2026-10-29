@@ -47,19 +47,29 @@ impl Default for LogOptions {
 
 /// Commits streamed from a running `git log`. Dropping the stream stops git.
 pub struct LogStream {
+    /// `None` once the log is over (or was empty from the start).
+    running: Option<Running>,
+    buf: Vec<u8>,
+}
+
+struct Running {
     child: Child,
     reader: BufReader<ChildStdout>,
     /// Drained on its own thread: a full stderr pipe would block git while we
     /// are still reading stdout.
     stderr: Option<JoinHandle<String>>,
-    buf: Vec<u8>,
-    finished: bool,
-    /// Whether the child has been reaped; `Drop` kills it otherwise.
-    waited: bool,
 }
 
 impl LogStream {
     pub(crate) fn spawn(repo: &Repo, options: &LogOptions) -> Result<Self> {
+        // `git log` on a repository without commits fails when it has to
+        // default to HEAD (`--all` just prints nothing): that is an empty log.
+        if !options.all && options.revs.is_empty() && !has_head(repo)? {
+            return Ok(Self {
+                running: None,
+                buf: Vec::new(),
+            });
+        }
         let mut cmd = repo.command();
         cmd.args(["log", "--topo-order", "--no-decorate", FORMAT]);
         if options.all {
@@ -90,12 +100,12 @@ impl LogStream {
             })
         });
         Ok(Self {
-            child,
-            stderr,
-            reader: BufReader::with_capacity(256 * 1024, stdout),
+            running: Some(Running {
+                child,
+                reader: BufReader::with_capacity(256 * 1024, stdout),
+                stderr,
+            }),
             buf: Vec::with_capacity(256),
-            finished: false,
-            waited: false,
         })
     }
 
@@ -110,19 +120,16 @@ impl LogStream {
     }
 
     fn finish(&mut self) -> Option<Error> {
-        self.finished = true;
-        self.waited = true;
-        let status = self.child.wait();
+        let mut run = self.running.take()?;
+        let status = run.child.wait();
         // The child has exited, so its stderr hits EOF and the thread ends.
-        let stderr = self
+        let stderr = run
             .stderr
             .take()
             .and_then(|t| t.join().ok())
             .unwrap_or_default();
         match status {
             Ok(status) if status.success() => None,
-            // An empty repository has no HEAD yet: that's an empty log, not an error.
-            Ok(_) if stderr.contains("does not have any commits yet") => None,
             Ok(_) => Some(Error::Git {
                 command: "log",
                 stderr,
@@ -132,16 +139,23 @@ impl LogStream {
     }
 }
 
+fn has_head(repo: &Repo) -> Result<bool> {
+    let out = repo
+        .command()
+        .args(["rev-parse", "-q", "--verify", "HEAD"])
+        .output()
+        .map_err(Error::Spawn)?;
+    Ok(out.status.success())
+}
+
 impl Iterator for LogStream {
     type Item = Result<CommitInfo>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
-            return None;
-        }
         loop {
+            let run = self.running.as_mut()?;
             self.buf.clear();
-            match self.reader.read_until(RECORD, &mut self.buf) {
+            match run.reader.read_until(RECORD, &mut self.buf) {
                 Ok(0) => return self.finish().map(Err),
                 Ok(_) => {
                     // git puts a newline between records; skip blank leftovers.
@@ -153,8 +167,7 @@ impl Iterator for LogStream {
                 }
                 Err(e) => {
                     // The stream is unusable; stop git instead of leaking it.
-                    self.finished = true;
-                    self.stop();
+                    self.running = None;
                     return Some(Err(Error::Io(e)));
                 }
             }
@@ -162,22 +175,13 @@ impl Iterator for LogStream {
     }
 }
 
-impl LogStream {
-    /// Kill and reap the child unless it was already waited for. The stderr
-    /// thread is not joined: it only ends once git closes the pipe, and it
-    /// finishes on its own right after the kill.
-    fn stop(&mut self) {
-        if !self.waited {
-            self.waited = true;
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-impl Drop for LogStream {
+impl Drop for Running {
+    /// Kill and reap the child. The stderr thread is not joined: it only ends
+    /// once git closes the pipe, and it finishes on its own right after the
+    /// kill. Harmless after `finish`: std ignores a kill of a reaped child.
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

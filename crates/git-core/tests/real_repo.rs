@@ -31,7 +31,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn open(path: &Path) -> git_core::Result<Repo> {
-    Repo::open(Arc::new(Git::resolve(GitChoice::System)?), path)
+    Repo::open(Arc::new(Git::resolve(GitChoice::System)?.git), path)
 }
 
 fn commit(dir: &Path, msg: &str) {
@@ -161,9 +161,22 @@ fn empty_repository_has_empty_log() {
 }
 
 #[test]
+fn empty_repository_has_empty_log_with_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q"]);
+    let repo = open(tmp.path()).unwrap();
+    assert_eq!(repo.log(&LogOptions::default()).unwrap().count(), 0);
+}
+
+#[test]
 fn rejects_non_repository() {
     let tmp = tempfile::tempdir().unwrap();
-    assert!(open(tmp.path()).is_err());
+    match open(tmp.path()) {
+        Err(git_core::Error::Git { stderr, .. }) => {
+            assert!(stderr.contains("not a git repository"))
+        }
+        other => panic!("unexpected result {other:?}"),
+    }
 }
 
 #[test]
@@ -197,7 +210,7 @@ fn writes_commit_graph() {
 
 #[test]
 fn resolves_system_git() {
-    let git = Git::resolve(GitChoice::System).unwrap();
+    let git = Git::resolve(GitChoice::System).unwrap().git;
     assert_eq!(git.source(), GitSource::System);
     assert!(git.version() >= git_core::GitVersion::MIN);
 }

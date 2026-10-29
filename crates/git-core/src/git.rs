@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use crate::{base_command, Error, Result};
+use crate::{base_command, check_output, Error, Result};
 
 /// Where the resolved executable came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,16 +40,13 @@ impl GitChoice {
     /// Parse a CLI/env value: `auto`, `bundled`, `system`, or a path.
     pub fn parse(value: &str) -> Self {
         match value.trim() {
-            "" => GitChoice::Auto,
-            "auto" => GitChoice::Auto,
+            "" | "auto" => GitChoice::Auto,
             "bundled" => GitChoice::Bundled,
             "system" => GitChoice::System,
             path => GitChoice::Custom(PathBuf::from(path)),
         }
     }
-}
 
-impl GitChoice {
     /// Like [`GitChoice::parse`] for values that may not be UTF-8: those can
     /// only be paths.
     pub fn parse_os(value: &std::ffi::OsStr) -> Self {
@@ -70,31 +67,27 @@ pub struct GitVersion {
 
 impl GitVersion {
     /// `rev-parse --path-format=absolute` needs 2.31; `--end-of-options` 2.24.
-    pub const MIN: GitVersion = GitVersion::new(2, 31, 0);
-
-    pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
-        Self {
-            major,
-            minor,
-            patch,
-        }
-    }
+    pub const MIN: GitVersion = GitVersion {
+        major: 2,
+        minor: 31,
+        patch: 0,
+    };
 
     /// Parse the output of `git --version`, e.g. `git version 2.39.3 (Apple
     /// Git-146)` or `git version 2.45.1.windows.1`. Only the leading numeric
     /// components count; a missing patch is 0.
-    pub fn parse(output: &str) -> Option<Self> {
+    pub(crate) fn parse(output: &str) -> Option<Self> {
         let token = output
             .trim()
             .strip_prefix("git version ")?
             .split_whitespace()
             .next()?;
         let mut parts = token.split('.').map_while(|p| p.parse::<u32>().ok());
-        Some(Self::new(
-            parts.next()?,
-            parts.next()?,
-            parts.next().unwrap_or(0),
-        ))
+        Some(Self {
+            major: parts.next()?,
+            minor: parts.next()?,
+            patch: parts.next().unwrap_or(0),
+        })
     }
 }
 
@@ -110,40 +103,53 @@ pub struct Git {
     exe: PathBuf,
     version: GitVersion,
     source: GitSource,
-    /// Set when `Auto` found a bundled git that did not work and fell back.
-    fallback_reason: Option<String>,
+}
+
+/// The outcome of [`Git::resolve`].
+#[derive(Debug)]
+pub struct Resolution {
+    pub git: Git,
+    /// Why `Auto` did not use the bundled git, if it had to fall back.
+    pub fallback: Option<Error>,
 }
 
 impl Git {
     /// Find the executable for `choice`, run `--version` and check the floor.
-    pub fn resolve(choice: GitChoice) -> Result<Self> {
+    pub fn resolve(choice: GitChoice) -> Result<Resolution> {
         Self::resolve_with(choice, bundled_path())
     }
 
     /// [`Git::resolve`] with the bundled location injected (for tests).
-    pub(crate) fn resolve_with(choice: GitChoice, bundled: Option<PathBuf>) -> Result<Self> {
+    pub(crate) fn resolve_with(choice: GitChoice, bundled: Option<PathBuf>) -> Result<Resolution> {
+        let found = |git| Resolution {
+            git,
+            fallback: None,
+        };
         match choice {
             GitChoice::Auto => match bundled {
                 // A broken bundle must not leave the app without git: fall
                 // back to the system one and let the caller report why.
                 Some(exe) => match Self::probe(exe, GitSource::Bundled) {
-                    Ok(git) => Ok(git),
-                    Err(e) => {
-                        let mut git = Self::probe("git".into(), GitSource::System)?;
-                        git.fallback_reason = Some(format!("bundled git unusable: {e}"));
-                        Ok(git)
-                    }
+                    Ok(git) => Ok(found(git)),
+                    Err(e) => Ok(Resolution {
+                        git: Self::system()?,
+                        fallback: Some(e),
+                    }),
                 },
-                None => Self::probe("git".into(), GitSource::System),
+                None => Self::system().map(found),
             },
             GitChoice::Bundled => {
                 let exe = bundled.ok_or_else(|| Error::GitNotFound("bundled git".into()))?;
-                Self::probe(exe, GitSource::Bundled)
+                Self::probe(exe, GitSource::Bundled).map(found)
             }
-            // Resolved through PATH by the OS (`git.exe` on Windows).
-            GitChoice::System => Self::probe("git".into(), GitSource::System),
-            GitChoice::Custom(exe) => Self::probe(exe, GitSource::Custom),
+            GitChoice::System => Self::system().map(found),
+            GitChoice::Custom(exe) => Self::probe(exe, GitSource::Custom).map(found),
         }
+    }
+
+    /// Resolved through PATH by the OS (`git.exe` on Windows).
+    fn system() -> Result<Self> {
+        Self::probe("git".into(), GitSource::System)
     }
 
     fn probe(exe: PathBuf, source: GitSource) -> Result<Self> {
@@ -155,23 +161,18 @@ impl Git {
                 std::io::ErrorKind::NotFound => Error::GitNotFound(exe.display().to_string()),
                 _ => Error::Spawn(e),
             })?;
-        if !out.status.success() {
-            return Err(Error::Git {
-                command: "--version",
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            });
-        }
+        let out = check_output(out, "--version")?;
         let text = String::from_utf8_lossy(&out.stdout);
         let version = GitVersion::parse(&text).ok_or(Error::Parse("git --version output"))?;
+        check_floor(version)?;
         Ok(Self {
             exe,
-            version: check_floor(version)?,
+            version,
             source,
-            fallback_reason: None,
         })
     }
 
-    pub fn exe(&self) -> &Path {
+    pub(crate) fn exe(&self) -> &Path {
         &self.exe
     }
 
@@ -182,21 +183,16 @@ impl Git {
     pub fn source(&self) -> GitSource {
         self.source
     }
-
-    /// Why `Auto` did not use the bundled git, if it had to fall back.
-    pub fn fallback_reason(&self) -> Option<&str> {
-        self.fallback_reason.as_deref()
-    }
 }
 
-fn check_floor(found: GitVersion) -> Result<GitVersion> {
+fn check_floor(found: GitVersion) -> Result<()> {
     if found < GitVersion::MIN {
         Err(Error::UnsupportedGit {
             found,
             required: GitVersion::MIN,
         })
     } else {
-        Ok(found)
+        Ok(())
     }
 }
 
@@ -233,18 +229,47 @@ mod tests {
     #[test]
     fn parses_version_output() {
         let v = |s| GitVersion::parse(s);
-        assert_eq!(v("git version 2.56.0\n"), Some(GitVersion::new(2, 56, 0)));
+        assert_eq!(
+            v("git version 2.56.0\n"),
+            Some(GitVersion {
+                major: 2,
+                minor: 56,
+                patch: 0
+            })
+        );
         assert_eq!(
             v("git version 2.39.3 (Apple Git-146)"),
-            Some(GitVersion::new(2, 39, 3))
+            Some(GitVersion {
+                major: 2,
+                minor: 39,
+                patch: 3
+            })
         );
         assert_eq!(
             v("git version 2.45.1.windows.1"),
-            Some(GitVersion::new(2, 45, 1))
+            Some(GitVersion {
+                major: 2,
+                minor: 45,
+                patch: 1
+            })
         );
-        assert_eq!(v("git version 2.31"), Some(GitVersion::new(2, 31, 0)));
+        assert_eq!(
+            v("git version 2.31"),
+            Some(GitVersion {
+                major: 2,
+                minor: 31,
+                patch: 0
+            })
+        );
         // A pre-release suffix on the last component is ignored.
-        assert_eq!(v("git version 2.50.0-rc1"), Some(GitVersion::new(2, 50, 0)));
+        assert_eq!(
+            v("git version 2.50.0-rc1"),
+            Some(GitVersion {
+                major: 2,
+                minor: 50,
+                patch: 0
+            })
+        );
         assert_eq!(v("something else"), None);
         assert_eq!(v(""), None);
     }
@@ -252,14 +277,20 @@ mod tests {
     #[test]
     fn rejects_versions_below_the_floor() {
         assert!(matches!(
-            check_floor(GitVersion::new(2, 30, 9)),
+            check_floor(GitVersion {
+                major: 2,
+                minor: 30,
+                patch: 9
+            }),
             Err(Error::UnsupportedGit { .. })
         ));
-        assert_eq!(
-            check_floor(GitVersion::new(2, 31, 0)).unwrap(),
-            GitVersion::MIN
-        );
-        assert!(check_floor(GitVersion::new(3, 0, 0)).is_ok());
+        assert!(check_floor(GitVersion::MIN).is_ok());
+        assert!(check_floor(GitVersion {
+            major: 3,
+            minor: 0,
+            patch: 0
+        })
+        .is_ok());
     }
 
     #[test]
@@ -301,9 +332,9 @@ mod tests {
         let fake = tmp.path().join("git");
         std::fs::write(&fake, "not executable").unwrap();
 
-        let git = Git::resolve_with(GitChoice::Auto, Some(fake.clone())).unwrap();
-        assert_eq!(git.source(), GitSource::System);
-        assert!(git.fallback_reason().unwrap().contains("bundled git"));
+        let r = Git::resolve_with(GitChoice::Auto, Some(fake.clone())).unwrap();
+        assert_eq!(r.git.source(), GitSource::System);
+        assert!(r.fallback.is_some());
 
         assert!(Git::resolve_with(GitChoice::Bundled, Some(fake)).is_err());
         assert!(Git::resolve_with(GitChoice::Bundled, None).is_err());
