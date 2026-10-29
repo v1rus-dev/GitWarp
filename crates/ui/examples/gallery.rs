@@ -1,9 +1,9 @@
 //! Visual catalogue of the design system tokens.
 
 use gpui::{
-    div, prelude::*, px, size, AnyView, App, Application, Bounds, ClickEvent, FocusHandle,
-    FontWeight, Hsla, IntoElement, Pixels, Render, TitlebarOptions, Window, WindowBounds,
-    WindowOptions,
+    div, prelude::*, px, size, AnyView, App, Application, Bounds, ClickEvent, Div, FocusHandle,
+    FontWeight, Hsla, IntoElement, Pixels, Render, SharedString, TitlebarOptions, Window,
+    WindowBounds, WindowOptions,
 };
 
 use ui::focus::RingOffset;
@@ -12,13 +12,26 @@ use ui::metrics::{
     R_MD, R_SM, R_XS,
 };
 use ui::theme::{self, ActiveTheme, Theme, ThemeColors, ThemeMode};
-use ui::{actions, focus, overlay, Icon, IconName};
+use ui::{
+    actions, focus, overlay, Avatar, Banner, BannerKind, Button, ButtonSize, Checkbox, Chip,
+    ChipKind, CountPill, Counter, EmptyState, Icon, IconName, Kbd, Progress, Radio, RefBadge,
+    RefKind, SegmentItem, Segmented, Skeleton, Spinner, StatusGlyph, Switch, Tab, Tabs,
+};
 
 struct Gallery {
     mode: ThemeMode,
     focus_a: FocusHandle,
     focus_b: FocusHandle,
     focus_c: FocusHandle,
+    checkbox_off: bool,
+    checkbox_on: bool,
+    checkbox_mixed: bool,
+    radio: usize,
+    switch_a: bool,
+    switch_b: bool,
+    segmented: usize,
+    tab: usize,
+    tabs: Vec<SharedString>,
 }
 
 impl Gallery {
@@ -28,6 +41,18 @@ impl Gallery {
             focus_a: cx.focus_handle().tab_index(1).tab_stop(true),
             focus_b: cx.focus_handle().tab_index(2).tab_stop(true),
             focus_c: cx.focus_handle().tab_index(3).tab_stop(true),
+            checkbox_off: false,
+            checkbox_on: true,
+            checkbox_mixed: true,
+            radio: 0,
+            switch_a: true,
+            switch_b: false,
+            segmented: 1,
+            tab: 0,
+            tabs: ["History", "Changes", "Hover"]
+                .into_iter()
+                .map(SharedString::from)
+                .collect(),
         }
     }
 }
@@ -109,6 +134,12 @@ impl Render for Gallery {
                     .child(type_section(colors))
                     .child(fonts_section(colors))
                     .child(icons_section(colors))
+                    .child(buttons_section(colors))
+                    .child(badges_section(colors))
+                    .child(toggles_section(self, colors, cx))
+                    .child(segmented_tabs_section(self, colors, cx))
+                    .child(progress_section(colors))
+                    .child(banners_section(colors, cx))
                     .child(interaction_section(self, colors, window, cx))
                     .child(lanes_section(&theme)),
             );
@@ -490,6 +521,636 @@ fn kebab(name: IconName) -> &'static str {
     name.path()
         .trim_start_matches("icons/")
         .trim_end_matches(".svg")
+}
+
+fn card(colors: ThemeColors) -> Div {
+    div()
+        .p(px(16.))
+        .bg(colors.surface)
+        .border_1()
+        .border_color(colors.border)
+        .rounded(R_MD)
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+}
+
+fn component_row(label: &'static str, colors: ThemeColors) -> Div {
+    div().flex().items_center().gap(px(8.)).child(
+        div()
+            .w(px(90.))
+            .flex_none()
+            .text_size(FS_SM)
+            .text_color(colors.muted)
+            .child(label),
+    )
+}
+
+fn buttons_section(colors: ThemeColors) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading("Buttons"))
+        .child(
+            card(colors)
+                .child(
+                    component_row("Secondary", colors)
+                        .child(Button::new("btn-sec").label("Fetch"))
+                        .child(Button::new("btn-sec-dis").label("Fetch").disabled(true))
+                        .child(
+                            Button::new("btn-sec-icon")
+                                .icon(IconName::Branch)
+                                .label("Fetch"),
+                        )
+                        .child(
+                            Button::new("btn-sec-only")
+                                .icon_only(IconName::Gear)
+                                .tooltip("Settings"),
+                        )
+                        .child(
+                            Button::new("btn-sec-sm")
+                                .label("Fetch")
+                                .size(ButtonSize::Small),
+                        ),
+                )
+                .child(
+                    component_row("Primary", colors)
+                        .child(Button::primary("btn-pri").label("Commit"))
+                        .child(
+                            Button::primary("btn-pri-dis")
+                                .label("Commit")
+                                .disabled(true),
+                        )
+                        .child(
+                            Button::primary("btn-pri-icon")
+                                .icon(IconName::Check)
+                                .label("Commit"),
+                        )
+                        .child(
+                            Button::primary("btn-pri-only")
+                                .icon_only(IconName::Check)
+                                .tooltip("Commit"),
+                        )
+                        .child(
+                            Button::primary("btn-pri-sm")
+                                .label("Commit")
+                                .size(ButtonSize::Small),
+                        ),
+                )
+                .child(
+                    component_row("Danger", colors)
+                        .child(Button::danger("btn-danger").label("Delete…"))
+                        .child(
+                            Button::danger("btn-danger-dis")
+                                .label("Delete…")
+                                .disabled(true),
+                        )
+                        .child(
+                            Button::danger("btn-danger-icon")
+                                .icon(IconName::Trash)
+                                .label("Delete"),
+                        )
+                        .child(
+                            Button::danger("btn-danger-only")
+                                .icon_only(IconName::Trash)
+                                .tooltip("Delete"),
+                        )
+                        .child(
+                            Button::danger("btn-danger-sm")
+                                .label("Delete")
+                                .size(ButtonSize::Small),
+                        ),
+                )
+                .child(
+                    component_row("Ghost", colors)
+                        .child(Button::ghost("btn-ghost").label("Cancel"))
+                        .child(
+                            Button::ghost("btn-ghost-dis")
+                                .label("Cancel")
+                                .disabled(true),
+                        )
+                        .child(
+                            Button::ghost("btn-ghost-icon")
+                                .icon(IconName::X)
+                                .label("Cancel"),
+                        )
+                        .child(
+                            Button::ghost("btn-ghost-only")
+                                .icon_only(IconName::X)
+                                .tooltip("Close"),
+                        )
+                        .child(
+                            Button::ghost("btn-ghost-sm")
+                                .label("Cancel")
+                                .size(ButtonSize::Small),
+                        ),
+                )
+                .child(
+                    component_row("Tool", colors)
+                        .child(
+                            Button::tool("btn-tool")
+                                .icon(IconName::Fetch)
+                                .label("Fetch"),
+                        )
+                        .child(
+                            Button::tool("btn-tool-on")
+                                .icon(IconName::Up)
+                                .label("Push")
+                                .selected(true),
+                        )
+                        .child(
+                            Button::tool("btn-tool-dis")
+                                .icon(IconName::Fetch)
+                                .label("Fetch")
+                                .disabled(true),
+                        )
+                        .child(
+                            Button::tool("btn-tool-only")
+                                .icon_only(IconName::Gear)
+                                .tooltip("Settings"),
+                        )
+                        .child(
+                            Button::tool("btn-tool-sm")
+                                .label("Stash")
+                                .size(ButtonSize::Small),
+                        ),
+                )
+                .child(
+                    component_row("Toolbar", colors)
+                        .child(
+                            Button::tool("btn-bar-fetch")
+                                .icon(IconName::Fetch)
+                                .label("Fetch"),
+                        )
+                        .child(
+                            Button::tool("btn-bar-pull")
+                                .icon(IconName::Down)
+                                .label("Pull"),
+                        )
+                        .child(
+                            Button::tool("btn-bar-push")
+                                .icon(IconName::Up)
+                                .label("Push")
+                                .counter(Counter::new("3").accent()),
+                        )
+                        .child(
+                            Button::tool("btn-bar-stash")
+                                .icon(IconName::Stash)
+                                .label("Stash")
+                                .counter(Counter::new("1")),
+                        ),
+                ),
+        )
+}
+
+fn badges_section(colors: ThemeColors) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading("Badges & glyphs"))
+        .child(
+            card(colors)
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(RefBadge::new("ref-local", "feat/lanes"))
+                        .child(RefBadge::new("ref-remote", "origin/main").kind(RefKind::Remote))
+                        .child(RefBadge::new("ref-tag", "v0.3.0").kind(RefKind::Tag))
+                        .child(RefBadge::new("ref-stash", "stash@{0}").kind(RefKind::Stash))
+                        .child(RefBadge::new("ref-head", "HEAD").kind(RefKind::Head))
+                        .child(Counter::new("3"))
+                        .child(Counter::new("6").accent())
+                        .child(CountPill::new("12"))
+                        .child(Kbd::new("3"))
+                        .child(Kbd::new("Ctrl"))
+                        .child(StatusGlyph::new('A'))
+                        .child(StatusGlyph::new('M'))
+                        .child(StatusGlyph::new('D'))
+                        .child(StatusGlyph::new('R'))
+                        .child(StatusGlyph::new('?'))
+                        .child(StatusGlyph::new('U')),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(Chip::new("chip-none", "Local changes"))
+                        .child(
+                            Chip::new("chip-ok", "Using git 2.56.0")
+                                .kind(ChipKind::Ok)
+                                .icon(IconName::Check),
+                        )
+                        .child(
+                            Chip::new("chip-warn", "Skipped")
+                                .kind(ChipKind::Warn)
+                                .icon(IconName::Warn),
+                        )
+                        .child(
+                            Chip::new("chip-err", "Rejected")
+                                .kind(ChipKind::Err)
+                                .icon(IconName::Err),
+                        )
+                        .child(
+                            Chip::new("chip-acc", "Fetched")
+                                .kind(ChipKind::Acc)
+                                .icon(IconName::Down),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .child(Avatar::new("mira@example.com", px(24.)))
+                        .child(Avatar::new("feat/lane@example.com", px(32.)))
+                        .child(Avatar::new("pablo@example.com", px(44.)))
+                        .child(
+                            div()
+                                .text_size(FS_SM)
+                                .text_color(colors.muted)
+                                .child("Avatar fallback colours"),
+                        ),
+                ),
+        )
+}
+
+fn toggles_section(
+    gallery: &Gallery,
+    colors: ThemeColors,
+    cx: &mut Context<Gallery>,
+) -> impl IntoElement {
+    let view = cx.entity();
+
+    let off = gallery.checkbox_off;
+    let checkbox_off = {
+        let view = view.clone();
+        move |next: bool, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                this.checkbox_off = next;
+                cx.notify();
+            });
+        }
+    };
+    let on = gallery.checkbox_on;
+    let checkbox_on = {
+        let view = view.clone();
+        move |next: bool, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                this.checkbox_on = next;
+                cx.notify();
+            });
+        }
+    };
+    let mixed = gallery.checkbox_mixed;
+    let checkbox_mixed = {
+        let view = view.clone();
+        move |next: bool, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                this.checkbox_mixed = next;
+                cx.notify();
+            });
+        }
+    };
+
+    let radio_for = |index: usize, label: &'static str, id: &'static str, checked: bool| {
+        let view = view.clone();
+        Radio::new(id)
+            .label(label)
+            .checked(checked)
+            .on_click(move |_, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.radio = index;
+                    cx.notify();
+                });
+            })
+    };
+
+    let switch_a = gallery.switch_a;
+    let toggle_a = {
+        let view = view.clone();
+        move |next: bool, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                this.switch_a = next;
+                cx.notify();
+            });
+        }
+    };
+    let switch_b = gallery.switch_b;
+    let toggle_b = {
+        let view = view.clone();
+        move |next: bool, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                this.switch_b = next;
+                cx.notify();
+            });
+        }
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading("Toggles"))
+        .child(
+            card(colors)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .child(
+                            Checkbox::new("chk-off")
+                                .label("Off")
+                                .checked(off)
+                                .on_toggle(checkbox_off),
+                        )
+                        .child(
+                            Checkbox::new("chk-on")
+                                .label("On")
+                                .checked(on)
+                                .on_toggle(checkbox_on),
+                        )
+                        .child(
+                            Checkbox::new("chk-mixed")
+                                .label("Mixed")
+                                .checked(mixed)
+                                .mixed(mixed)
+                                .on_toggle(checkbox_mixed),
+                        )
+                        .child(
+                            Checkbox::new("chk-dis")
+                                .label("Disabled")
+                                .checked(true)
+                                .disabled(true),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(16.))
+                        .child(radio_for(0, "System", "radio-system", gallery.radio == 0))
+                        .child(radio_for(1, "Custom", "radio-custom", gallery.radio == 1))
+                        .child(
+                            Radio::new("radio-dis")
+                                .label("Disabled")
+                                .checked(false)
+                                .disabled(true),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(24.))
+                        .child(
+                            Switch::new("switch-a")
+                                .label("Amend")
+                                .checked(switch_a)
+                                .on_toggle(toggle_a),
+                        )
+                        .child(
+                            Switch::new("switch-b")
+                                .label("Sign commit")
+                                .checked(switch_b)
+                                .on_toggle(toggle_b),
+                        )
+                        .child(
+                            Switch::new("switch-dis")
+                                .label("Disabled")
+                                .checked(false)
+                                .disabled(true),
+                        ),
+                ),
+        )
+}
+
+fn segmented_tabs_section(
+    gallery: &Gallery,
+    colors: ThemeColors,
+    cx: &mut Context<Gallery>,
+) -> impl IntoElement {
+    let view = cx.entity();
+    let select = {
+        let view = view.clone();
+        move |index: usize, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                this.segmented = index;
+                cx.notify();
+            });
+        }
+    };
+    let select_tab = {
+        let view = view.clone();
+        move |index: usize, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                this.tab = index;
+                cx.notify();
+            });
+        }
+    };
+    let close_tab = {
+        let view = view.clone();
+        move |index: usize, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                if index < this.tabs.len() {
+                    this.tabs.remove(index);
+                }
+                if !this.tabs.is_empty() && this.tab >= this.tabs.len() {
+                    this.tab = this.tabs.len() - 1;
+                }
+                cx.notify();
+            });
+        }
+    };
+
+    let tabs = Tabs::new("tabs")
+        .selected(gallery.tab)
+        .tabs(gallery.tabs.iter().cloned().map(|label| {
+            if label == "Changes" {
+                Tab::new(label).closable()
+            } else {
+                Tab::new(label)
+            }
+        }))
+        .on_select(select_tab)
+        .on_close(close_tab);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading("Segmented & tabs"))
+        .child(
+            card(colors)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(16.))
+                        .child(
+                            Segmented::new("seg")
+                                .items([
+                                    SegmentItem::new("History"),
+                                    SegmentItem::new("Changes"),
+                                    SegmentItem::new("Hover"),
+                                ])
+                                .selected(gallery.segmented)
+                                .on_select(select.clone()),
+                        )
+                        .child(
+                            Segmented::new("seg-ico")
+                                .items([
+                                    SegmentItem::icon(IconName::Unified),
+                                    SegmentItem::icon(IconName::Split),
+                                    SegmentItem::icon(IconName::PanelR),
+                                ])
+                                .selected(0)
+                                .small()
+                                .on_select(select.clone()),
+                        )
+                        .child(
+                            Segmented::new("seg-dis")
+                                .items([SegmentItem::new("One"), SegmentItem::new("Two")])
+                                .selected(0)
+                                .disabled(true),
+                        ),
+                )
+                .child(tabs),
+        )
+}
+
+fn progress_section(colors: ThemeColors) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading("Progress"))
+        .child(
+            card(colors)
+                .child(
+                    component_row("Progress 62%", colors)
+                        .child(Progress::new("progress-main", 0.62))
+                        .child(div().text_size(FS_SM).text_color(colors.muted).child("62%")),
+                )
+                .child(
+                    component_row("Dialog", colors)
+                        .child(Progress::new("progress-dialog", 0.40).dialog()),
+                )
+                .child(
+                    component_row("Indeterminate", colors)
+                        .child(Progress::new("progress-indet", 0.).indeterminate()),
+                )
+                .child(
+                    component_row("Spinners", colors)
+                        .child(Spinner::new("spinner-12", px(12.)))
+                        .child(Spinner::new("spinner-14", px(14.)))
+                        .child(
+                            div()
+                                .text_size(FS_SM)
+                                .text_color(colors.muted)
+                                .child("12 · 14"),
+                        ),
+                )
+                .child(
+                    component_row("Skeleton", colors)
+                        .child(Skeleton::new("skel-1", px(160.)))
+                        .child(Skeleton::new("skel-2", px(220.))),
+                ),
+        )
+}
+
+fn banners_section(colors: ThemeColors, cx: &mut Context<Gallery>) -> impl IntoElement {
+    let retry = {
+        let view = cx.entity();
+        move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            view.update(cx, |_, cx| cx.notify());
+        }
+    };
+    let cancel = {
+        let view = cx.entity();
+        move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            view.update(cx, |_, cx| cx.notify());
+        }
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading("Banners & empty states"))
+        .child(
+            card(colors)
+                .child(
+                    Banner::new(BannerKind::Ok, "Using git 2.56.0 (bundled)")
+                        .body("The bundled binary is current."),
+                )
+                .child(
+                    Banner::new(BannerKind::Info, "Fetching in the background…")
+                        .body("2 new branches in origin."),
+                )
+                .child(Banner::new(BannerKind::Warn, "Bundled git failed to start").list([
+                    "Falling back to the system git",
+                    "Some features may be unavailable",
+                ]))
+                .child(Banner::new(
+                    BannerKind::Error,
+                    "git 2.28.1 is older than 2.31",
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .gap(px(16.))
+                .child(
+                    div()
+                        .flex_1()
+                        .border_1()
+                        .border_color(colors.border)
+                        .rounded(R_MD)
+                        .bg(colors.surface)
+                        .child(
+                            EmptyState::new("No repository open")
+                                .text("Open a repository or clone one to get started.")
+                                .icon(IconName::Folder)
+                                .actions(
+                                    div()
+                                        .flex()
+                                        .gap(px(8.))
+                                        .child(
+                                            Button::ghost("empty-cancel")
+                                                .label("Cancel")
+                                                .on_click(cancel),
+                                        )
+                                        .child(
+                                            Button::primary("empty-retry")
+                                                .label("Open…")
+                                                .on_click(retry),
+                                        ),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .border_1()
+                        .border_color(colors.border)
+                        .rounded(R_MD)
+                        .bg(colors.surface)
+                        .child(
+                            EmptyState::new("Repository could not be opened")
+                                .text("The path does not contain a git repository.")
+                                .error("fatal: not a git repository (or any parent)\nstopped at filesystem boundary"),
+                        ),
+                ),
+        )
 }
 
 fn interaction_section(

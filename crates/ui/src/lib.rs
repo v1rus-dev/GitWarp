@@ -7,6 +7,7 @@ use gpui::App;
 
 pub mod actions;
 pub mod assets;
+pub mod components;
 pub mod focus;
 pub mod fonts;
 pub mod icon;
@@ -15,6 +16,7 @@ pub mod overlay;
 pub mod theme;
 
 pub use assets::Assets;
+pub use components::*;
 pub use icon::{Icon, IconName};
 pub use theme::{ActiveTheme, Appearance, Shadow, Theme, ThemeColors, ThemeMode};
 
