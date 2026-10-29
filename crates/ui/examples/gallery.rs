@@ -10,6 +10,7 @@ use ui::metrics::{
     R_XS,
 };
 use ui::theme::{self, ActiveTheme, Theme, ThemeColors, ThemeMode};
+use ui::{Icon, IconName};
 
 struct Gallery {
     mode: ThemeMode,
@@ -90,6 +91,8 @@ impl Render for Gallery {
                     .gap(px(24.))
                     .child(colours_section(colors))
                     .child(type_section(colors))
+                    .child(fonts_section(colors))
+                    .child(icons_section(colors))
                     .child(lanes_section(theme)),
             )
     }
@@ -319,6 +322,156 @@ fn type_row(
         )
 }
 
+fn fonts_section(colors: ThemeColors) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .child(heading("Fonts"))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(font_row(
+                    "Inter 400",
+                    false,
+                    FontWeight::NORMAL,
+                    false,
+                    colors,
+                ))
+                .child(font_row(
+                    "Inter 500",
+                    false,
+                    FontWeight::MEDIUM,
+                    false,
+                    colors,
+                ))
+                .child(font_row(
+                    "Inter 600",
+                    false,
+                    FontWeight::SEMIBOLD,
+                    false,
+                    colors,
+                ))
+                .child(font_row(
+                    "Inter 700",
+                    false,
+                    FontWeight::BOLD,
+                    false,
+                    colors,
+                ))
+                .child(font_row(
+                    "JetBrains Mono Regular",
+                    true,
+                    FontWeight::NORMAL,
+                    false,
+                    colors,
+                ))
+                .child(font_row(
+                    "JetBrains Mono Bold",
+                    true,
+                    FontWeight::BOLD,
+                    false,
+                    colors,
+                ))
+                .child(font_row(
+                    "JetBrains Mono Italic",
+                    true,
+                    FontWeight::NORMAL,
+                    true,
+                    colors,
+                )),
+        )
+}
+
+fn font_row(
+    label: &'static str,
+    mono: bool,
+    weight: FontWeight,
+    italic: bool,
+    colors: ThemeColors,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .child(
+            div()
+                .w(px(170.))
+                .flex_none()
+                .text_size(FS_XS)
+                .text_color(colors.muted)
+                .child(label),
+        )
+        .child(
+            div()
+                .font_family(if mono { FONT_MONO } else { FONT_UI })
+                .text_size(if mono { MONO } else { FS_BASE })
+                .font_weight(weight)
+                .when(italic, |style| style.italic())
+                .text_color(colors.text)
+                .child("GitWarp 0123 — The quick brown fox"),
+        )
+}
+
+fn icons_section(colors: ThemeColors) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading("Icons"))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(12.))
+                .children(IconName::ALL.map(|name| {
+                    div()
+                        .w(px(78.))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(Icon::new(name).size(px(16.)).color(colors.text))
+                        .child(
+                            div()
+                                .text_size(FS_XS)
+                                .text_color(colors.muted)
+                                .child(kebab(name)),
+                        )
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .items_end()
+                .gap(px(12.))
+                .children([10_f32, 12., 14., 16., 22.].map(|size| {
+                    Icon::new(IconName::Branch)
+                        .size(px(size))
+                        .color(colors.text)
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(16.))
+                .child(Icon::new(IconName::Warn).color(colors.warning))
+                .child(Icon::new(IconName::Err).color(colors.error))
+                .child(Icon::new(IconName::Check).color(colors.success))
+                .child(Icon::new(IconName::Info).color(colors.info)),
+        )
+}
+
+/// The file stem of an icon's asset path, e.g. `chev-r`.
+fn kebab(name: IconName) -> &'static str {
+    name.path()
+        .trim_start_matches("icons/")
+        .trim_end_matches(".svg")
+}
+
 fn lanes_section(theme: &Theme) -> impl IntoElement {
     div()
         .flex()
@@ -341,27 +494,45 @@ fn lanes_section(theme: &Theme) -> impl IntoElement {
         )
 }
 
+/// `--theme dark|light|system`; anything else stays on the system theme.
+fn parse_mode(mut args: impl Iterator<Item = String>) -> ThemeMode {
+    while let Some(arg) = args.next() {
+        if arg == "--theme" {
+            return match args.next().as_deref() {
+                Some("dark") => ThemeMode::Dark,
+                Some("light") => ThemeMode::Light,
+                _ => ThemeMode::System,
+            };
+        }
+    }
+    ThemeMode::System
+}
+
 fn main() {
-    Application::new().run(|cx: &mut App| {
-        theme::init(cx);
-        let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("GitWarp UI gallery".into()),
+    let mode = parse_mode(std::env::args().skip(1));
+    Application::new()
+        .with_assets(ui::Assets)
+        .run(move |cx: &mut App| {
+            if let Err(e) = ui::init(cx) {
+                eprintln!("failed to load the bundled fonts: {e}");
+            }
+            theme::set_mode(mode, cx);
+            let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("GitWarp UI gallery".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |window, cx| {
-                theme::follow_system(window, cx);
-                cx.new(|_| Gallery {
-                    mode: ThemeMode::System,
-                })
-            },
-        )
-        .expect("failed to open the gallery window");
-        cx.activate(true);
-    });
+                },
+                |window, cx| {
+                    theme::follow_system(window, cx);
+                    cx.new(|_| Gallery { mode })
+                },
+            )
+            .expect("failed to open the gallery window");
+            cx.activate(true);
+        });
 }

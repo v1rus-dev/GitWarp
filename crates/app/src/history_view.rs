@@ -237,7 +237,7 @@ impl HistoryView {
                             .w(px(80.))
                             .flex_none()
                             .px_2()
-                            .font_family("monospace")
+                            .font_family(ui::metrics::FONT_MONO)
                             .text_color(colors.muted)
                             .child(c.id.short()),
                     )
@@ -263,6 +263,7 @@ impl Render for HistoryView {
             .flex_col()
             .bg(colors.bg)
             .text_color(colors.text)
+            .font_family(ui::metrics::FONT_UI)
             .child(
                 div()
                     .h(px(36.))
