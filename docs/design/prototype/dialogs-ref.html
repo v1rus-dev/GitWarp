@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — Dialogs: branch / tag</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="dialogs.css">
+<script src="app.js"></script>
+<script src="dialogs.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const D = GLD;
+  const old = () => G_.commits[3];
+  const G_ = GL;
+  D.page('Dialogs: branch / tag', [
+    ['Create branch · empty', (w) => D.branch(w, {})],
+    ['Create branch · name taken', (w) => D.branch(w, { name: 'feat/palette', touched: { name: true } })],
+    ['Create branch · invalid name', (w) => D.branch(w, { name: 'my branch', touched: { name: true } })],
+    ['Create branch · ready', (w) => D.branch(w, { name: 'feat/ssh-keys' })],
+    ['Create branch · older commit', (w) => D.branch(w, { name: 'fix/lane-gap', commit: old() })],
+    ['Create tag · empty', (w) => D.tag(w, {})],
+    ['Create tag · message missing', (w) => D.tag(w, { name: 'v0.3.1', touched: { msg: true } })],
+    ['Create tag · name taken', (w) => D.tag(w, { name: 'v0.3.0', msg: 'Release', touched: { name: true } })],
+    ['Create tag · ready, push', (w) => D.tag(w, { name: 'v0.3.1', msg: 'Fix line staging on CRLF files', push: true })],
+    ['Create tag · lightweight', (w) => D.tag(w, { name: 'checkpoint-1', type: 'light' })],
+    ['Add remote · empty', (w) => D.remoteAdd(w, {})],
+    ['Add remote · name taken', (w) => D.remoteAdd(w, { name: 'origin', url: 'git@github.com:acme/gitlane.git', touched: { name: true } })],
+    ['Add remote · invalid address', (w) => D.remoteAdd(w, { name: 'fork', url: 'github.com/mira', touched: { url: true } })],
+    ['Add remote · ready', (w) => D.remoteAdd(w, { name: 'fork', url: 'git@github.com:mira-k/gitlane.git' })]
+  ]);
+})();
+</script>
+</body>
+</html>

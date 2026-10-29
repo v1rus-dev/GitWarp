@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — Settings → Keybindings</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="settings.css">
+<style>
+  .ktool { display: flex; align-items: center; gap: 8px; max-width: 760px; margin-bottom: 12px; }
+  .ktool .input-wrap { flex: 1; min-width: 0; }
+  .krow { display: grid; grid-template-columns: minmax(0, 1fr) 190px 72px; gap: 8px; align-items: center; padding: 0 12px; min-height: 36px; border-bottom: 1px solid var(--border); }
+  .krow:last-child { border-bottom: 0; }
+  .krow .grp { color: var(--muted); font-size: var(--fs-sm); }
+  .krow .keys { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+  .krow.rec { background: var(--accent-soft); outline: 1px solid var(--accent); outline-offset: -1px; }
+  .krow.conf { background: var(--diff-del-bg); }
+  .krow .acts { display: flex; justify-content: flex-end; gap: 2px; }
+  .kmsg { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; padding: 0 0 8px; font-size: var(--fs-sm); }
+  .kmsg.err { color: var(--error); }
+  .khead { font-size: var(--fs-sm); color: var(--muted); }
+  .kempty { padding: 28px 12px; text-align: center; color: var(--muted); }
+</style>
+<script src="app.js"></script>
+<script src="settings.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const S = GLS, G = GL, ic = G.ic, esc = G.esc;
+  /* [id, group, action, default shortcut] — defaults match the overview page's shortcut list. */
+  const DEF = [
+    ['palette', 'General', 'Command palette', 'Ctrl+P'], ['search', 'General', 'Search commits', 'Ctrl+K'], ['settings', 'General', 'Open settings', 'Ctrl+,'],
+    ['sidebar', 'View', 'Toggle sidebar', 'Ctrl+B'], ['dock', 'View', 'Toggle details dock', 'Ctrl+J'],
+    ['branch', 'Repository', 'Switch branch', 'Ctrl+Shift+B'], ['fetch', 'Repository', 'Fetch', 'Ctrl+Shift+F'], ['pull', 'Repository', 'Pull', 'Ctrl+Shift+L'], ['push', 'Repository', 'Push', 'Ctrl+Shift+P'],
+    ['next', 'History', 'Next commit', 'J'], ['prev', 'History', 'Previous commit', 'K'],
+    ['stage', 'Changes', 'Stage / unstage file', 'Space'], ['commit', 'Changes', 'Commit', 'Ctrl+Enter'], ['discard', 'Changes', 'Discard changes', 'Ctrl+Shift+Z']
+  ];
+  const GROUPS = ['All', 'General', 'View', 'Repository', 'History', 'Changes'];
+  let q = '', grp = 'All', rec = null, conflict = null, st = S.get('kb', {}), flash = '';
+  const cur = (id) => (id in st ? st[id] : DEF.find((d) => d[0] === id)[3]);
+  const norm = (e) => {
+    if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return null;
+    const k = e.key === ' ' ? 'Space' : e.key.length === 1 ? e.key.toUpperCase() : e.key;
+    return [e.ctrlKey && 'Ctrl', e.altKey && 'Alt', e.shiftKey && 'Shift', k].filter(Boolean).join('+');
+  };
+  const kbd = (s) => (s ? s.split('+').map((p) => `<span class="kbd">${esc(p)}</span>`).join('<span class="muted">+</span>') : '<span class="muted">Unbound</span>');
+  const save = () => S.set('kb', st);
+  const ctx = S.mount('settings-keybindings.html', 'Keybindings', () => {
+    const rows = DEF.filter((d) => (grp === 'All' || d[1] === grp) && (!q || (d[2] + ' ' + cur(d[0])).toLowerCase().includes(q.toLowerCase())));
+    const changed = Object.keys(st).length;
+    const body = rows.map(([id, g, name]) => {
+      const isRec = rec === id, isConf = conflict && conflict.id === id, mod = id in st;
+      const keys = isRec ? '<span class="muted">Press the new shortcut…</span>' : kbd(cur(id));
+      const acts = isRec ? `<button class="btn btn-sm" data-kcancel>Cancel</button>` : `<button class="btn btn-icon btn-ghost" data-kedit="${id}" aria-label="Change shortcut for ${esc(name)}" data-tip="Change">${ic('edit', 14)}</button>${mod ? `<button class="btn btn-icon btn-ghost" data-kreset="${id}" aria-label="Reset ${esc(name)} to default" data-tip="Reset to ${esc(DEF.find((d) => d[0] === id)[3])}">${ic('undo', 14)}</button>` : ''}`;
+      const msg = isConf ? `<div class="kmsg err" role="alert">${ic('err', 12)}<span><span class="kbd">${esc(conflict.keys)}</span> is already used by “${esc(conflict.other)}”.</span><button class="btn btn-sm" data-kassign>Reassign here</button><button class="btn btn-sm btn-ghost" data-kcancel>Cancel</button></div>` : '';
+      return `<div class="krow${isRec ? ' rec' : ''}${isConf ? ' conf' : ''}"><div><span>${esc(name)}</span>${mod ? ' <span class="muted" style="font-size:11px">· modified</span>' : ''}</div><div class="keys">${keys}</div><div class="acts">${acts}</div>${msg}</div>`;
+    }).join('');
+    return `<h2>Keybindings</h2><p class="lead">Click the pencil, then press the shortcut you want. Esc cancels, Backspace unbinds.</p>
+      <div class="ktool"><label class="input-wrap">${ic('search', 14)}<input class="input" placeholder="Search actions or shortcuts" value="${esc(q)}" aria-label="Search keybindings" data-kq></label>
+        <select class="input" style="width:150px" aria-label="Group" data-kg>${GROUPS.map((x) => `<option${x === grp ? ' selected' : ''}>${x}</option>`).join('')}</select>
+        <button class="btn" data-kall${changed ? '' : ' disabled'}>Reset all</button><button class="btn" data-kexp>${ic('copy', 14)}Export</button></div>
+      ${flash ? S.banner('info', flash, 'Saved to ~/.config/gitwarp/keybindings.toml') : ''}
+      <div class="sgroup"><div class="khead" style="margin-bottom:6px">${rows.length} of ${DEF.length} actions${changed ? ` · ${changed} modified` : ''}</div><div class="slist">${body || `<div class="kempty">No actions match “${esc(q)}”.<br><button class="btn btn-sm" data-kclear style="margin-top:8px">Clear search</button></div>`}</div></div>`;
+  });
+  const pane = ctx.pane;
+  const act = (e) => {
+    const t = (s) => e.target.closest(s);
+    if (t('[data-kedit]')) { rec = t('[data-kedit]').dataset.kedit; conflict = null; flash = ''; ctx.draw(); }
+    else if (t('[data-kcancel]')) { rec = null; conflict = null; ctx.draw(); }
+    else if (t('[data-kreset]')) { delete st[t('[data-kreset]').dataset.kreset]; save(); ctx.draw(); }
+    else if (t('[data-kall]')) { st = {}; save(); flash = 'All shortcuts reset to defaults'; ctx.draw(); }
+    else if (t('[data-kexp]')) { ctx.toast('Keybindings copied as keybindings.toml', 'info'); }
+    else if (t('[data-kclear]')) { q = ''; ctx.draw(); }
+    else if (t('[data-kassign]')) { st[conflict.other_id] = ''; st[conflict.id] = conflict.keys; save(); rec = null; conflict = null; ctx.draw(); }
+  };
+  pane.addEventListener('click', act);
+  pane.addEventListener('input', (e) => { if (e.target.matches('[data-kq]')) { q = e.target.value; const p = e.target.selectionStart; ctx.draw(); const n = pane.querySelector('[data-kq]'); n.focus(); n.setSelectionRange(p, p); } });
+  pane.addEventListener('change', (e) => { if (e.target.matches('[data-kg]')) { grp = e.target.value; ctx.draw(); } });
+  /* capture phase so the recorded combo never triggers other handlers (Space/Enter on focused buttons) */
+  document.addEventListener('keydown', (e) => {
+    if (!rec || conflict) { if (conflict && e.key === 'Escape') { rec = null; conflict = null; ctx.draw(); } return; }
+    e.preventDefault(); e.stopPropagation();
+    if (e.key === 'Escape') { rec = null; ctx.draw(); return; }
+    if (e.key === 'Backspace') { st[rec] = ''; save(); rec = null; ctx.draw(); return; }
+    const k = norm(e); if (!k) return;
+    const other = DEF.find((d) => d[0] !== rec && cur(d[0]) === k);
+    if (other) { conflict = { id: rec, keys: k, other: other[2], other_id: other[0] }; ctx.draw(); return; }
+    st[rec] = k; if (k === DEF.find((d) => d[0] === rec)[3]) delete st[rec]; save(); rec = null; ctx.draw();
+  }, true);
+})();
+</script>
+</body>
+</html>

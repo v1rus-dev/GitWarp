@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — welcome</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<style>
+  .wl { display: grid; grid-template-columns: 300px minmax(0, 1fr); min-height: 0; }
+  .wl aside { padding: 28px 24px; border-right: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; gap: 8px; }
+  .logo { display: flex; align-items: center; gap: 10px; font-size: var(--fs-xl); font-weight: 700; margin-bottom: 4px; }
+  .act { display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--bg); cursor: default; width: 100%; text-align: left; }
+  .act:hover { background: var(--hover); } .act .kbd { margin-left: auto; }
+  .wl main { padding: 20px 24px; display: flex; flex-direction: column; min-height: 0; gap: 12px; }
+  .recent { overflow: auto; flex: 1; min-height: 0; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); outline: none; }
+  .rrow { display: grid; grid-template-columns: 24px minmax(0, 1fr) 150px 110px; gap: 12px; align-items: center; height: 44px; padding: 0 12px; cursor: default; border-bottom: 1px solid var(--border); }
+  .rrow:last-child { border-bottom: 0; }
+  .rrow:hover { background: var(--hover); } .rrow.sel { background: var(--selection); }
+  .rrow .n { font-weight: 600; } .rrow .p { color: var(--muted); font-size: var(--fs-sm); }
+  .dialog.clone { width: 520px; }
+</style>
+<link rel="stylesheet" href="dialogs.css">
+<script src="app.js"></script>
+<script src="dialogs.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL, ic = G.ic, esc = G.esc;
+  G.stagebar();
+  const stage = G.h('<div class="stage"><div class="winwrap"></div></div>'); document.body.appendChild(stage);
+  const R = [['gitwarp', '~/develop/gitwarp', 'main', '12 min ago'], ['open-design', '~/develop/open-design', 'feat/prompt-bundle', '2 h ago'], ['zed-themes', '~/projects/zed-themes', 'main', 'yesterday'], ['dotfiles', '~/.dotfiles', 'master', '3 d ago'], ['tree-sitter-rust', '~/src/tree-sitter-rust', 'master', '2 weeks ago'], ['notes', '/mnt/data/notes', '—', '3 weeks ago']];
+  const win = G.h(`<div class="win" style="width:960px;height:620px;grid-template-rows:var(--bar) minmax(0,1fr) var(--status)">
+    <header class="titlebar"><span style="display:inline-flex;gap:8px;align-items:center;font-weight:600;padding-left:4px">${ic('git', 16)}gitwarp</span><span class="od-fill"></span><div class="wc"><button class="btn btn-ghost" aria-label="Minimise">${ic('min', 14)}</button><button class="btn btn-ghost" aria-label="Maximise">${ic('max', 14)}</button><button class="btn btn-ghost close" aria-label="Close">${ic('x', 14)}</button></div></header>
+    <div class="wl"><aside><div class="logo">${ic('git', 26)}gitwarp</div><div class="muted" style="margin-bottom:16px">A fast, keyboard-first git client.</div>
+      <button class="act" id="open">${ic('folder', 16)}Open repository…<span class="kbd">Ctrl O</span></button>
+      <button class="act" id="clone">${ic('clone', 16)}Clone repository…<span class="kbd">Ctrl Shift O</span></button>
+      <button class="act" id="init">${ic('init', 16)}Init new repository…<span class="kbd">Ctrl N</span></button></aside>
+    <main><div class="od-row"><h2 style="margin:0;font-size:var(--fs-lg)" class="od-fill">Recent repositories</h2><label class="input-wrap" style="width:240px">${ic('search', 14)}<input class="input" placeholder="Filter recent…" aria-label="Filter recent repositories"></label></div>
+      <div class="recent" role="listbox" tabindex="0" aria-label="Recent repositories">${R.map((r, i) => `<div class="rrow${i === 0 ? ' sel' : ''}" role="option" aria-selected="${i === 0}" data-n="${esc(r[0])}"><span>${ic('folder', 16)}</span><div style="min-width:0"><div class="n">${esc(r[0])}</div><div class="p od-truncate mono">${esc(r[1])}</div></div><span class="od-truncate muted" style="font-size:12px">${r[2] === '—' ? '' : ic('branch', 12) + ' '}${esc(r[2])}</span><span class="muted" style="font-size:12px;text-align:right">${r[3]}</span></div>`).join('')}</div>
+      <div class="muted" style="font-size:12px"><span class="kbd">↑</span> <span class="kbd">↓</span> select · <span class="kbd">Enter</span> open · <span class="kbd">Del</span> remove from list</div></main></div>
+    <footer class="statusbar"><span class="od-fill"></span><span class="sb-btn">${ic('git', 12)}git 2.56.0 · bundled</span></footer></div>`);
+  stage.firstChild.appendChild(win);
+  G.initTips(win);
+  const list = win.querySelector('.recent'); let sel = 0;
+  const rows = () => G.$$('.rrow', list);
+  const pick = (i) => { sel = Math.max(0, Math.min(rows().length - 1, i)); rows().forEach((r, k) => { r.classList.toggle('sel', k === sel); r.setAttribute('aria-selected', k === sel); }); };
+  list.addEventListener('click', (e) => { const r = e.target.closest('.rrow'); if (r) pick(rows().indexOf(r)); });
+  list.addEventListener('dblclick', (e) => { if (e.target.closest('.rrow')) location.href = 'main-1200.html'; });
+  list.addEventListener('keydown', (e) => { if (e.key === 'ArrowDown') { pick(sel + 1); e.preventDefault(); } else if (e.key === 'ArrowUp') { pick(sel - 1); e.preventDefault(); } else if (e.key === 'Enter') location.href = 'main-1200.html'; });
+  const field = (l, id, v, ph, extra) => `<div><label class="field-label" for="${id}">${l}</label><div class="od-row"><input class="input" id="${id}" value="${v}" placeholder="${ph}">${extra || ''}</div></div>`;
+  function dlg(title, body, primary) {
+    const s = G.h(`<div class="scrim center"><div class="dialog clone" role="dialog" aria-modal="true" aria-label="${title}"><div class="dialog-head">${title}<span class="od-fill"></span><button class="btn btn-icon btn-ghost btn-xs" aria-label="Close" data-x>${ic('x', 12)}</button></div><div class="dialog-body">${body}</div><div class="dialog-foot"><button class="btn" data-x>Cancel</button><button class="btn btn-primary" data-x>${primary}</button></div></div></div>`);
+    G.layer(win).appendChild(s); s.querySelector('input').focus();
+    s.addEventListener('click', (e) => { if (e.target.closest('[data-x]') || e.target === s) s.remove(); });
+    s.addEventListener('keydown', (e) => { if (e.key === 'Escape') s.remove(); });
+  }
+  win.querySelector('#clone').onclick = () => GLD.repo(win, { tab: 'clone' });
+  win.querySelector('#init').onclick = () => dlg('Initialize repository', field('Folder', 'f', '~/develop/new-project', '', `<button class="btn">${ic('folder', 14)}Browse…</button>`) + field('Default branch', 'b', 'main', 'main') + '<div class="check on"><span class="box">' + ic('check', 10) + '</span><span>Create initial commit with .gitignore</span></div>', 'Initialize');
+  win.querySelector('#open').onclick = () => GLD.repo(win, { tab: 'open' });
+  addEventListener('keydown', (e) => { if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'o') { e.preventDefault(); GLD.repo(win, { tab: 'clone' }); } });
+  G.fit(win);
+})();
+</script>
+</body>
+</html>

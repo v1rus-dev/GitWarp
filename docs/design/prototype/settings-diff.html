@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — Settings → Diff &amp; merge</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="settings.css">
+<style>
+  .pvd { max-height: 220px; overflow: auto; font-family: var(--font-mono); font-size: 12px; line-height: 20px; }
+  .pvd.wrap .dl > span.c { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .pvd.nonum .dl > .ln { display: none; }
+  .pvd.nonum .dl.u { grid-template-columns: 16px minmax(0, 1fr); }
+  .pvd.nonum .dl.s { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .pvd.wrap .dl { min-width: 0; }
+  .cmd { grid-column: 1 / -1 !important; grid-row: auto !important; display: block !important; }
+</style>
+<script src="app.js"></script>
+<script src="settings.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const S = GLS, G = GL, ic = G.ic, esc = G.esc;
+  const TOOLS = [['builtin', 'gitwarp (built-in)'], ['vscode', 'VS Code'], ['vimdiff', 'vimdiff'], ['meld', 'Meld'], ['custom', 'Custom command…']];
+  const PRESET = { vscode: 'code --wait --merge $LOCAL $REMOTE $BASE $MERGED', vimdiff: 'vimdiff $LOCAL $BASE $REMOTE $MERGED', meld: 'meld $LOCAL $BASE $REMOTE --output $MERGED' };
+  const NEED = ['$LOCAL', '$REMOTE', '$MERGED'];
+  const num = (k, d, lo, hi) => Math.max(lo, Math.min(hi, parseInt(S.get(k, d), 10) || d));
+  const ctx = S.mount('settings-diff.html', 'Diff & merge', () => {
+    const mode = S.get('diff-mode', 'unified'), ws = S.get('diff-ws', 'none'), tool = S.get('merge-tool', 'builtin');
+    const ctxN = num('diff-ctx', 3, 0, 20), wrap = S.get('diff-wrap', false), ln = S.get('diff-ln', true), word = S.get('diff-word', true);
+    const cmd = tool === 'custom' ? S.get('merge-cmd', '') : (PRESET[tool] || '');
+    const missing = tool === 'custom' && cmd ? NEED.filter((v) => !cmd.includes(v)) : [];
+    const bad = tool === 'custom' && (!cmd.trim() || missing.length);
+    const hunks = G.DIFFS['src/history/graph.rs'].slice(0, 1);
+    return `<h2>Diff &amp; merge</h2><p class="lead">How changes are displayed, and which tool resolves conflicts.</p>
+      ${S.group('Display', [
+        S.row('Layout', 'Side-by-side needs a details pane at least 900 px wide; narrower panes fall back to unified.', S.seg('diff-mode', mode, [['unified', ic('unified', 13) + 'Unified'], ['split', ic('split', 13) + 'Side-by-side']])),
+        S.row('Highlight changed words', 'Marks the exact characters that differ inside a modified line.', S.sw('diff-word', word, 'Highlight changed words')),
+        S.row('Wrap long lines', 'Off scrolls horizontally.', S.sw('diff-wrap', wrap, 'Wrap long lines')),
+        S.row('Line numbers', '', S.sw('diff-ln', ln, 'Line numbers'))
+      ])}
+      ${S.group('Content', [
+        S.row('Whitespace', 'Hidden whitespace-only changes are still staged and committed.', S.sel('diff-ws', ws, [['none', 'Show all'], ['eol', 'Ignore at line end'], ['all', 'Ignore all']], 'Whitespace handling')),
+        S.row('Context lines', 'Unchanged lines shown around each change (0–20).', `<div class="stepper"><button class="btn btn-icon" data-dstep="-1" aria-label="Fewer context lines"${ctxN <= 0 ? ' disabled' : ''}>${ic('minus', 14)}</button><input class="input num" value="${ctxN}" inputmode="numeric" aria-label="Context lines" data-dctx><button class="btn btn-icon" data-dstep="1" aria-label="More context lines"${ctxN >= 20 ? ' disabled' : ''}>${ic('plus', 14)}</button></div>`)
+      ])}
+      <section class="sgroup"><h3>Preview</h3><div class="preview"><div class="ph mono">src/history/graph.rs · ${mode === 'split' ? 'side-by-side' : 'unified'}${ws !== 'none' ? ' · whitespace ignored' : ''}</div><div class="pvd${wrap ? ' wrap' : ''}${ln ? '' : ' nonum'}" tabindex="0" aria-label="Diff preview">${G.renderDiff(hunks, mode)}</div></div></section>
+      ${S.group('Merge tool', [
+        S.row('Resolve conflicts with', tool === 'builtin' ? 'Three-way editor inside gitwarp. No setup needed.' : 'Opened from the conflict banner; gitwarp waits until the tool exits.', S.sel('merge-tool', tool, TOOLS, 'Merge tool')),
+        tool === 'builtin' ? '' : `<div class="srow"><div class="cmd"><div class="field-label">Command</div><div class="od-row"><input class="input mono${bad ? ' error' : ''}" style="width:auto;flex:1;font-family:var(--font-mono);font-size:12px" value="${esc(cmd)}" placeholder="mytool $LOCAL $BASE $REMOTE $MERGED" aria-label="Merge tool command" aria-invalid="${bad}"${tool === 'custom' ? ' data-mcmd' : ' readonly'}><button class="btn" data-mtest${bad ? ' disabled' : ''}>${ic('play', 14)}Test</button></div>
+          ${tool !== 'custom' ? `<div class="field-help">Preset for ${esc(TOOLS.find((t) => t[0] === tool)[1])}. Choose “Custom command…” to edit.</div>` : !cmd.trim() ? `<div class="field-error">${ic('err', 12)}Enter a command.</div>` : missing.length ? `<div class="field-error">${ic('err', 12)}Missing ${missing.join(', ')}. The tool would not receive all required files.</div>` : `<div class="field-help" style="color:var(--success);display:flex;gap:4px;align-items:center">${ic('check', 12)}All required placeholders present.</div>`}
+          <div class="field-help">Placeholders: <span class="mono">$LOCAL</span> your side · <span class="mono">$REMOTE</span> their side · <span class="mono">$BASE</span> common ancestor · <span class="mono">$MERGED</span> result file.</div></div></div>`
+      ])}`;
+  });
+  const pane = ctx.pane, t = (e, s) => e.target.closest(s);
+  pane.addEventListener('click', (e) => {
+    const st = t(e, '[data-dstep]');
+    if (st) { S.set('diff-ctx', num('diff-ctx', 3, 0, 20) + (+st.dataset.dstep)); ctx.draw(); }
+    if (t(e, '[data-mtest]')) ctx.toast('Merge tool started with sample files', 'info');
+  });
+  pane.addEventListener('change', (e) => {
+    if (e.target.matches('[data-dctx]')) { S.set('diff-ctx', Math.max(0, Math.min(20, parseInt(e.target.value, 10) || 0))); ctx.draw(); }
+    if (e.target.matches('[data-mcmd]')) { S.set('merge-cmd', e.target.value); ctx.draw(); }
+  });
+})();
+</script>
+</body>
+</html>

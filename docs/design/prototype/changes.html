@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — Local changes</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<style>
+  .chg-wrap { display: grid; grid-template-columns: 310px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; flex: 1; min-height: 0; }
+  .lists { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); }
+  .grp { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+  .grp + .grp { border-top: 1px solid var(--border); }
+  .grp-h { display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px 0 12px; background: var(--surface); border-bottom: 1px solid var(--border); font-weight: 600; flex: none; }
+  .grp .flist { overflow: auto; flex: 1; min-height: 0; }
+  .frow .acts .btn { height: 20px; }
+  .dview { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .commitbox { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 16px; padding: 12px; background: var(--surface); border-top: 1px solid var(--border); }
+  .msgwrap { position: relative; }
+  .msgwrap textarea { font-family: var(--font-mono); font-size: 12.5px; line-height: 20px; padding: 6px 10px; height: 104px; background: var(--bg); width: 100%; }
+  /* character guides: decorative 1px rulers at 50 (subject) and 72 (body) columns; 1ch of the mono face + 10px padding */
+  .guide { position: absolute; top: 1px; bottom: 1px; width: 1px; background: var(--border-strong); pointer-events: none; }
+  .guide.g50 { left: calc(10px + 50ch); opacity: .7; } .guide.g72 { left: calc(10px + 72ch); }
+  .guide-lab { position: absolute; top: -17px; font-size: 10px; color: var(--muted); }
+  .cb-side { display: flex; flex-direction: column; gap: 8px; justify-content: space-between; }
+  .cnt { font-variant-numeric: tabular-nums; font-size: var(--fs-sm); color: var(--muted); }
+  .cnt.over { color: var(--warning); }
+  .hunkbtns { display: flex; gap: 6px; }
+</style>
+<script src="app.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL, ic = G.ic, esc = G.esc;
+  G.stagebar('<span class="muted" style="font-size:12px">stage/unstage per file, hunk and line · type in the editor to see the counters</span>');
+  const stage = G.h('<div class="stage"><div class="winwrap"></div></div>'); document.body.appendChild(stage);
+  const sh = G.shell({ host: stage.firstChild, w: 1200, h: 800, view: 'changes', statusInfo: '4 unstaged · 2 staged' });
+  const win = sh.win;
+
+  const unstaged = [['M', 'src/history/graph.rs', 9, 3], ['M', 'src/ui/toolbar.rs', 4, 1], ['q', 'docs/graph.md', 38, 0], ['D', 'scripts/old-release.sh', 0, 22]];
+  const staged = [['M', 'src/ui/sidebar.rs', 6, 4], ['A', 'src/settings/git_exec.rs', 11, 0]];
+  const LBL = { A: 'Added', M: 'Modified', D: 'Deleted', q: 'Untracked' };
+  const row = (x, i, st) => { const d = x[1].lastIndexOf('/'); return `<div class="frow${st === 'u' && i === 0 ? ' sel' : ''}" role="option" tabindex="-1" data-g="${st}" data-i="${i}"><span class="fs ${x[0]}" aria-label="${LBL[x[0]]}">${x[0] === 'q' ? '?' : x[0]}</span><span class="fname" title="${esc(x[1])}"><bdi><span class="fdir">${esc(x[1].slice(0, d + 1))}</span>${esc(x[1].slice(d + 1))}</bdi></span><span class="acts"><button class="btn btn-sm btn-ghost" data-tip="${st === 'u' ? 'Stage file' : 'Unstage file'}" data-kbd="Space" aria-label="${st === 'u' ? 'Stage file' : 'Unstage file'}">${ic(st === 'u' ? 'plus' : 'minus', 12)}</button><button class="btn btn-sm btn-ghost" data-tip="Discard changes" aria-label="Discard changes">${ic('undo', 12)}</button></span><span class="fnum"><span class="p">+${x[2]}</span><span class="m">−${x[3]}</span></span></div>`; };
+
+  sh.center.innerHTML = `<div class="chg-wrap">
+    <div class="lists">
+      <section class="grp" aria-label="Unstaged"><div class="grp-h"><span>Unstaged</span><span class="ncount">${unstaged.length}</span><span class="od-fill"></span><button class="btn btn-sm">Stage all</button></div><div class="flist" role="listbox" tabindex="0" aria-label="Unstaged files">${unstaged.map((x, i) => row(x, i, 'u')).join('')}</div></section>
+      <section class="grp" aria-label="Staged"><div class="grp-h"><span>Staged</span><span class="ncount">${staged.length}</span><span class="od-fill"></span><button class="btn btn-sm">Unstage all</button></div><div class="flist" role="listbox" tabindex="0" aria-label="Staged files">${staged.map((x, i) => row(x, i, 's')).join('')}</div></section>
+    </div>
+    <div class="dview">
+      <div class="ddiff" style="flex:1;min-height:0"><div class="dtool"><span class="fn">src/history/graph.rs</span><span>unstaged · 2 hunks</span>
+        <div class="seg sm" role="group" aria-label="Diff mode"><button class="on">${ic('unified', 13)}Unified</button><button>${ic('split', 13)}Side-by-side</button></div></div>
+        <div class="dscroll" id="diff" tabindex="0" aria-label="Diff with stage controls"></div></div>
+    </div>
+    <div class="commitbox">
+      <div><label class="field-label" for="msg">Commit message — subject on the first line, body after a blank line</label>
+        <div class="msgwrap"><textarea class="input" id="msg" spellcheck="true" placeholder="feat(graph): …">feat(graph): clip lanes past the column edge
+
+Skip paths that are fully outside the clipped column so wide graphs
+stay cheap to paint.</textarea><span class="guide g50"></span><span class="guide g72"></span></div>
+        <div class="od-row" style="margin-top:6px;gap:16px"><span class="cnt" id="subj">Subject 41 / 50</span><span class="cnt" id="wide">Longest body line 69 / 72</span><span class="od-fill"></span><span class="cnt">Ctrl+Enter to commit</span></div></div>
+      <div class="cb-side">
+        <div class="od-stack" style="--od-gap:4px"><div class="switch" id="amend" role="switch" aria-checked="false" tabindex="0"><span class="track"></span><span>Amend previous commit</span></div><div class="field-help" style="margin:0">Amend reuses the message of e4f2a91 and rewrites it.</div></div>
+        <div class="od-stack" style="--od-gap:8px"><button class="btn btn-primary" id="commit" style="height:30px">Commit 2 files to main</button><button class="btn" style="height:30px">Commit &amp; Push</button></div>
+      </div>
+    </div></div>`;
+
+  const hunks = G.DIFFS['src/history/graph.rs'];
+  document.getElementById('diff').innerHTML = G.renderDiff(hunks, 'unified', { hunkAction: 'Stage hunk', checks: false });
+  // per-line stage controls: a 14px checkbox appears in the gutter on hover, shift-click selects a range
+  document.getElementById('diff').querySelectorAll('.dl.add, .dl.del').forEach((r) => { const ln = r.querySelector('.ln'); ln.style.cursor = 'pointer'; ln.title = 'Click to select line for staging · Shift+click for a range'; });
+  document.getElementById('diff').addEventListener('click', (e) => { const l = e.target.closest('.dl.add, .dl.del'); if (l && e.target.closest('.ln')) l.classList.toggle('picked'); });
+  const st = G.h('<style>.dl.picked > span { box-shadow: inset 3px 0 0 var(--accent); } .dl.picked .ln { color: var(--text); }</style>'); document.head.appendChild(st);
+
+  const msg = document.getElementById('msg'), subj = document.getElementById('subj'), wide = document.getElementById('wide');
+  const upd = () => { const ls = msg.value.split('\n'), s = ls[0].length, w = Math.max(0, ...ls.slice(1).map((l) => l.length)); subj.textContent = `Subject ${s} / 50`; subj.classList.toggle('over', s > 50); wide.textContent = `Longest body line ${w} / 72`; wide.classList.toggle('over', w > 72); };
+  msg.addEventListener('input', upd);
+  const am = document.getElementById('amend');
+  am.addEventListener('click', () => { const on = am.classList.toggle('on'); am.setAttribute('aria-checked', on); document.getElementById('commit').textContent = on ? 'Amend commit' : 'Commit 2 files to main'; });
+  am.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); am.click(); } });
+  document.getElementById('commit').onclick = () => G.toast(win, 'Committed 2 files to main', 'ok');
+  G.fit(win);
+})();
+</script>
+</body>
+</html>

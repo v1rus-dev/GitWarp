@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — history states</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<style>
+  .boards { display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: 24px; }
+  .board h3 { margin: 0 0 8px; }
+  .frame { height: 380px; border: 1px solid var(--border-strong); border-radius: var(--r-lg); overflow: hidden; background: var(--bg); display: flex; flex-direction: column; }
+  .frame .lhead { grid-template-columns: 112px minmax(0, 1fr) 130px 104px 64px; }
+  .frame .body { flex: 1; min-height: 0; position: relative; }
+  .sk { display: grid; grid-template-columns: 112px minmax(0, 1fr) 130px 104px 64px; column-gap: 12px; align-items: center; height: 26px; padding: 0 12px 0 8px; }
+  .sk .lane { height: 100%; position: relative; }
+  .sk .lane::before { content: ""; position: absolute; left: 7px; top: 0; bottom: 0; width: 2px; background: var(--border-strong); }
+  .sk .lane::after { content: ""; position: absolute; left: 2.5px; top: 8.5px; width: 9px; height: 9px; border-radius: 50%; background: var(--border-strong); }
+  .loadbar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); }
+  .loadbar .progress { flex: 1; width: auto; }
+  .note { margin-top: 6px; color: var(--muted); font-size: var(--fs-sm); }
+</style>
+<script src="app.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL, ic = G.ic;
+  G.stagebar();
+  const head = '<div class="lhead"><div>Graph</div><div>Summary</div><div>Author</div><div>Date</div><div>Hash</div></div>';
+  const skel = (n) => Array.from({ length: n }, (_, i) => `<div class="sk"><div class="lane"></div><div class="skel" style="width:${40 + (i * 37) % 50}%"></div><div class="skel" style="width:${50 + (i * 17) % 35}%"></div><div class="skel" style="width:60%"></div><div class="skel" style="width:80%"></div></div>`).join('');
+  const board = (title, note, inner, hdr) => `<section class="board"><h3>${title}</h3><div class="frame" role="region" aria-label="${title}">${hdr === false ? '' : head}<div class="body">${inner}</div></div><div class="note">${note}</div></section>`;
+  const B = [
+    board('1 · Loading with progress', 'Skeleton rows keep the 26px rhythm; the count updates live while git log streams. First pages are shown as soon as they arrive.',
+      `<div class="loadbar">${ic('fetch', 14, 'spin')}<b>Loading… 12 400 commits</b><span class="progress"><i style="width:34%"></i></span><span class="muted">34%</span><button class="btn btn-sm">Cancel</button></div>${skel(10)}`),
+    board('2 · Empty repository', 'No commits yet: the call to action is the first commit, not an error.',
+      `<div class="empty"><div class="ei">${ic('git', 22)}</div><h4>No commits yet</h4><p>This repository is empty. Stage some files and make your first commit to see history here.</p><div class="od-row" style="margin-top:8px"><button class="btn btn-primary">Go to Local changes</button><button class="btn">Add .gitignore…</button></div></div>`),
+    board('3 · Not a git repository', 'Shown when the opened folder has no .git ancestor. The path is selectable.',
+      `<div class="empty"><div class="ei">${ic('folder', 22)}</div><h4>Not a git repository</h4><p><span class="mono">/home/mira/projects/notes</span> is not inside a git working tree.</p><div class="od-row" style="margin-top:8px"><button class="btn btn-primary">${ic('init', 14)}Initialize repository here</button><button class="btn">Open another…</button></div></div>`),
+    board('4a · Git not found', 'Blocking state. The settings button jumps straight to Settings → Git.',
+      `<div class="empty"><div class="ei" style="color:var(--error)">${ic('err', 22)}</div><h4>git was not found</h4><p>gitwarp could not find a usable git. The bundled copy is missing and there is no <span class="mono">git</span> in PATH.</p><div class="od-row" style="margin-top:8px"><button class="btn btn-primary" onclick="location.href='settings-git.html'">${ic('gear', 14)}Open Git settings</button><button class="btn">Retry</button></div></div>`),
+    board('4b · Unsupported git version', 'Distinct from “not found”: the executable works but is too old.',
+      `<div class="empty"><div class="ei" style="color:var(--warning)">${ic('warn', 22)}</div><h4>git 2.28.1 is too old</h4><p>gitwarp needs git 2.31 or newer. System git at <span class="mono">/usr/bin/git</span> reports 2.28.1.</p><div class="od-row" style="margin-top:8px"><button class="btn btn-primary" onclick="location.href='settings-git.html'">${ic('gear', 14)}Open Git settings</button><button class="btn">Retry</button></div></div>`),
+    board('5 · Generic git error', 'git’s own message is shown verbatim in a selectable monospace block, with the command that failed.',
+      `<div class="empty"><div class="ei" style="color:var(--error)">${ic('err', 22)}</div><h4>git could not read the history</h4><p>The command <span class="mono">git log --all --topo-order</span> failed with exit code 128.</p><div class="errbox" tabindex="0" aria-label="git error output">fatal: bad object refs/heads/feat/palette
+error: refs/heads/feat/palette does not point to a valid object!</div><div class="od-row" style="margin-top:8px"><button class="btn btn-primary">${ic('fetch', 14)}Retry</button><button class="btn">${ic('copy', 14)}Copy details</button></div></div>`)
+  ];
+  document.body.insertAdjacentHTML('beforeend', `<div class="page"><h1>History screen — states</h1><p class="lead">Every state keeps the toolbar, sidebar and back navigation of the main window; only the center pane changes. Use the theme button to check both themes.</p><div class="boards">${B.join('')}</div></div>`);
+})();
+</script>
+</body>
+</html>

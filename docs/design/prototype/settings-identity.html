@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — Settings → Identity</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="settings.css">
+<style>
+  .fld { display: grid; gap: 4px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .fld:last-child { border-bottom: 0; }
+  .fld .field-label { margin: 0; }
+  .acct { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .acct:last-child { border-bottom: 0; }
+  .acct .av { width: 32px; height: 32px; border-radius: 50%; background: var(--active); display: inline-flex; align-items: center; justify-content: center; color: var(--muted); }
+  .acct .nm { font-weight: 500; }
+  .acct .st { font-size: var(--fs-sm); display: flex; align-items: center; gap: 4px; }
+  .acct .st.ok { color: var(--success); } .acct .st.bad { color: var(--error); } .acct .st.no { color: var(--muted); }
+  .acct .btns { display: flex; gap: 8px; }
+</style>
+<script src="app.js"></script>
+<script src="settings.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const S = GLS, G = GL, ic = G.ic, esc = G.esc;
+  const KEYS = [['ssh-ed25519-mira', 'SSH · ed25519 · SHA256:q7Zc…1xA'], ['gpg-9F3A21C4', 'GPG · 9F3A21C4 · expires 2027-03-01'], ['gpg-old', 'GPG · 51B7E0D2 · expired 2026-01-12']];
+  const ACC0 = { github: { user: 'mira-k', state: 'ok' }, gitlab: { user: 'mira.kovalenko', state: 'err' } }; /* shows the expired-authorization state first */
+  const VERIFIED = ['mira@kovalenko.dev', 'mira.k@users.noreply.github.com'];
+  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  let acc = S.get('accounts', ACC0), showErr = false;
+  const saveAcc = () => S.set('accounts', acc);
+  const ctx = S.mount('settings-identity.html', 'Identity', () => {
+    const scope = S.get('id-scope', 'global'), sign = S.get('id-sign', false), key = S.get('id-key', KEYS[0][0]);
+    const name = S.get('id-name', 'Mira Kovalenko'), email = S.get('id-email', 'mira@kovalenko.dev');
+    const nameBad = !name.trim(), mailBad = !EMAIL_RE.test(email), unverified = !mailBad && !VERIFIED.includes(email);
+    const keyExpired = key === 'gpg-old';
+    const acct = (id, label, icon) => {
+      const a = acc[id], conn = a.state === 'ok', err = a.state === 'err';
+      return `<div class="acct"><span class="av">${ic(icon, 16)}</span><div><div class="nm">${label}</div><div class="st ${conn ? 'ok' : err ? 'bad' : 'no'}">${conn ? ic('check', 12) + 'Connected as ' + esc(a.user) : err ? ic('err', 12) + 'Authorization expired for ' + esc(a.user) : 'Not connected'}</div></div><div class="btns">${conn ? `<button class="btn" data-adis="${id}">Disconnect</button>` : `<button class="btn ${err ? 'btn-primary' : ''}" data-acon="${id}">${err ? 'Reconnect' : 'Connect'}</button>${err ? `<button class="btn btn-ghost" data-adis="${id}">Remove</button>` : ''}`}</div></div>`;
+    };
+    return `<h2>Identity</h2><p class="lead">Who your commits are attributed to, how they are signed, and which hosting accounts gitwarp can use.</p>
+      <section class="sgroup"><h3>Commit author</h3><div class="slist">
+        <div class="fld"><div class="field-label">Apply to</div><div>${S.seg('id-scope', scope, [['global', ic('user', 13) + 'All repositories'], ['repo', ic('folder', 13) + 'This repository only']])}</div><div class="field-help">${scope === 'global' ? 'Written to <span class="mono">~/.gitconfig</span>. A repository can still override it.' : 'Written to <span class="mono">.git/config</span> of the open repository (gitwarp).'}</div></div>
+        <div class="fld"><label class="field-label" for="idn">Name</label><input id="idn" class="input${nameBad && showErr ? ' error' : ''}" value="${esc(name)}" data-idf="id-name" aria-invalid="${nameBad && showErr}">${nameBad && showErr ? `<div class="field-error">${ic('err', 12)}Name is required — git refuses to commit without it.</div>` : ''}</div>
+        <div class="fld"><label class="field-label" for="ide">Email</label><input id="ide" class="input${mailBad && showErr ? ' error' : ''}" value="${esc(email)}" data-idf="id-email" inputmode="email" aria-invalid="${mailBad && showErr}">${mailBad && showErr ? `<div class="field-error">${ic('err', 12)}Enter a valid email address, like name@example.com.</div>` : unverified ? `<div class="field-help" style="color:var(--warning);display:flex;gap:4px;align-items:center">${ic('warn', 12)}Not a verified address on GitHub. Commits will not link to your profile. Verified: ${VERIFIED.map((v) => `<span class="mono">${esc(v)}</span>`).join(', ')}</div>` : `<div class="field-help">Visible in every commit you create.</div>`}</div>
+      </div></section>
+      ${S.group('Signing', [
+        S.row('Sign commits', 'Adds a verified badge on hosts that know your key.', S.sw('id-sign', sign, 'Sign commits')),
+        S.row('Signing key', keyExpired ? '' : 'Used for commits and tags.', S.sel('id-key', key, KEYS, 'Signing key', !sign), !sign)
+      ])}
+      ${sign && keyExpired ? S.banner('error', 'Signing key has expired', 'Commits will fail to sign. Choose another key or extend the expiry with gpg --edit-key.') : ''}
+      <section class="sgroup"><h3>Hosting accounts</h3><div class="slist">${acct('github', 'GitHub', 'cloud')}${acct('gitlab', 'GitLab', 'cloud')}</div><div class="field-help" style="margin-top:6px">Used for cloning private repositories and for push credentials. Tokens are stored in the system keychain, not in settings.toml.</div></section>`;
+  }, null);
+  const pane = ctx.pane;
+  /* text fields persist on change (blur) so validation does not fire per keystroke */
+  pane.addEventListener('change', (e) => { const f = e.target.closest('[data-idf]'); if (f) { S.set(f.dataset.idf, f.value); showErr = true; ctx.draw(); } });
+  pane.addEventListener('click', (e) => {
+    const c = e.target.closest('[data-acon]'), d = e.target.closest('[data-adis]');
+    if (c) { const id = c.dataset.acon; acc[id] = { user: id === 'github' ? 'mira-k' : 'mira.kovalenko', state: 'ok' }; saveAcc(); ctx.draw(); ctx.toast('Signed in to ' + (id === 'github' ? 'GitHub' : 'GitLab'), 'info'); }
+    if (d) { acc[d.dataset.adis] = { user: '', state: 'no' }; saveAcc(); ctx.draw(); }
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — Settings → Appearance</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="settings.css">
+<style>
+  .themes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 12px; }
+  .tcard { display: flex; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); cursor: default; }
+  .tcard:hover { border-color: var(--border-strong); }
+  .tcard.on { border-color: var(--accent); background: var(--accent-soft); }
+  .tcard:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .tcard .tl { display: flex; align-items: center; gap: 6px; font-weight: 500; }
+  .thumb { height: 64px; border-radius: var(--r-sm); border: 1px solid var(--border); display: grid; grid-template-columns: 28% 1fr; overflow: hidden; }
+  .thumb i { display: block; }
+  .thumb .a { padding: 6px; display: flex; flex-direction: column; gap: 4px; }
+  .thumb .a b, .thumb .b b { display: block; height: 4px; border-radius: 2px; }
+  .thumb .b { padding: 6px; display: flex; flex-direction: column; gap: 4px; }
+  .thumb.dk { background: #181b20; } .thumb.dk .a { background: #15171c; } .thumb.dk b { background: #4a515d; } .thumb.dk .b b:first-child { background: #6ea4f7; }
+  .thumb.lt { background: #ffffff; } .thumb.lt .a { background: #fbfcfe; } .thumb.lt b { background: #b9c0cb; } .thumb.lt .b b:first-child { background: #2a66d6; }
+  .swatches { display: flex; gap: 8px; }
+  .swatch { width: 28px; height: 28px; border-radius: 50%; border: 2px solid transparent; display: inline-flex; align-items: center; justify-content: center; cursor: default; color: var(--accent-fg); padding: 0; background-clip: padding-box; }
+  .swatch:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .swatch.on { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--text); }
+  .pv-list { padding: 4px 0; }
+  .pv-row { display: flex; align-items: center; gap: 10px; padding: 0 12px; }
+  .pv-row.sel { background: var(--selection); }
+  .pv-row .mono { color: var(--muted); }
+</style>
+<script src="app.js"></script>
+<script src="settings.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const S = GLS, G = GL, ic = G.ic;
+  const ACC = [['blue', 'Blue', '--accent', 'var(--accent)'], ['violet', 'Violet', '--st-untracked', 'var(--st-untracked)'], ['green', 'Green', '--st-added', 'var(--st-added)'], ['orange', 'Orange', '--st-conflict', 'var(--st-conflict)']];
+  const sys = () => (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  /* One place applies persisted appearance to the document root; the other pages only read the theme. */
+  function apply() {
+    const th = S.get('theme-pref', G.theme), real = th === 'system' ? sys() : th;
+    G.setTheme(real);
+    const a = ACC.find((x) => x[0] === S.get('accent', 'blue')) || ACC[0], r = document.documentElement.style;
+    if (a[0] === 'blue') { r.removeProperty('--accent'); r.removeProperty('--accent-hover'); r.removeProperty('--accent-soft'); r.removeProperty('--focus'); }
+    else { r.setProperty('--accent', a[3]); r.setProperty('--accent-hover', a[3]); r.setProperty('--accent-soft', `color-mix(in srgb, ${a[3]} 16%, transparent)`); r.setProperty('--focus', a[3]); }
+    r.setProperty('--gl-ui-size', S.get('ui-size', '13') + 'px');
+    r.setProperty('--gl-mono-size', S.get('mono-size', 12) + 'px');
+  }
+  apply();
+  const ROWH = { compact: 22, normal: 26, roomy: 30 };
+  const ctx = S.mount('settings-appearance.html', 'Appearance', () => {
+    const th = S.get('theme-pref', G.theme), acc = S.get('accent', 'blue'), den = S.get('density', 'normal');
+    const ms = S.get('mono-size', 12), lw = +S.get('line-w', '2'), colored = S.get('colored', true);
+    const tcard = (v, label, thumb) => `<div class="tcard${th === v ? ' on' : ''}" role="radio" aria-checked="${th === v}" tabindex="0" data-theme-pick="${v}"><div class="thumb ${thumb}"><div class="a"><b></b><b></b><b></b></div><div class="b"><b></b><b></b><b></b></div></div><div class="tl"><span class="dotbox">${th === v ? '<i style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></i>' : ''}</span>${label}</div></div>`;
+    const sysThumb = '<div class="thumb lt" style="background:linear-gradient(90deg,#ffffff 50%,#181b20 50%)"><div class="a"><b></b><b></b></div><div class="b"><b></b><b></b></div></div>';
+    const sysCard = `<div class="tcard${th === 'system' ? ' on' : ''}" role="radio" aria-checked="${th === 'system'}" tabindex="0" data-theme-pick="system">${sysThumb}<div class="tl"><span class="dotbox">${th === 'system' ? '<i style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></i>' : ''}</span>System</div></div>`;
+    const date = S.get('datefmt', 'rel');
+    const h = ROWH[den];
+    const pvRow = (sel, hash, msg, min) => `<div class="pv-row${sel ? ' sel' : ''}" style="height:${h}px"><span class="mono">${hash}</span><span class="od-fill od-truncate">${msg}</span><span class="muted od-nowrap">${date === 'rel' ? G.rel(min) : G.abs(min)}</span></div>`;
+    const lane = (c) => `<svg width="30" height="${h}" aria-hidden="true"><line x1="8" y1="0" x2="8" y2="${h}" stroke="${colored ? 'var(--info)' : 'var(--muted)'}" stroke-width="${lw}"/><line x1="22" y1="0" x2="22" y2="${h}" stroke="${colored ? 'var(--st-untracked)' : 'var(--muted)'}" stroke-width="${lw}"/><circle cx="${c}" cy="${h / 2}" r="4.5" fill="${c === 8 ? (colored ? 'var(--info)' : 'var(--muted)') : (colored ? 'var(--st-untracked)' : 'var(--muted)')}"/></svg>`;
+    return `<h2>Appearance</h2><p class="lead">Theme, accent colour, density and type. Changes apply immediately.</p>
+      <section class="sgroup"><h3>Theme</h3><div class="slist"><div class="themes" role="radiogroup" aria-label="Theme">${tcard('dark', 'Dark', 'dk')}${tcard('light', 'Light', 'lt')}${sysCard}</div>
+        ${S.row('Accent colour', 'Selection, focus ring and primary buttons.', `<div class="swatches" role="radiogroup" aria-label="Accent colour">${ACC.map(([k, l, , v]) => `<button class="swatch${acc === k ? ' on' : ''}" style="background:${v}" role="radio" aria-checked="${acc === k}" aria-label="${l}" data-acc="${k}">${acc === k ? ic('check', 12) : ''}</button>`).join('')}</div>`)}</div></section>
+      ${S.group('Lists and type', [
+        S.row('Row density', 'Height of rows in history, changes and the sidebar.', S.seg('density', den, [['compact', 'Compact'], ['normal', 'Normal'], ['roomy', 'Roomy']])),
+        S.row('Interface font size', 'Menus, toolbars and lists.', S.seg('ui-size', S.get('ui-size', '13'), [['12', '12'], ['13', '13'], ['14', '14']])),
+        S.row('Code font size', 'Diffs and the commit editor, in px (' + 9 + '–' + 20 + ').', `<div class="stepper"><button class="btn btn-icon" data-step="-1" aria-label="Decrease code font size"${ms <= 9 ? ' disabled' : ''}>${ic('minus', 14)}</button><input class="input num" value="${ms}" inputmode="numeric" aria-label="Code font size" data-mono><button class="btn btn-icon" data-step="1" aria-label="Increase code font size"${ms >= 20 ? ' disabled' : ''}>${ic('plus', 14)}</button></div>`)
+      ])}
+      ${S.group('Commit graph', [
+        S.row('Colour branches', 'Off draws every lane in a single neutral colour.', S.sw('colored', colored, 'Colour branches')),
+        S.row('Line width', '', S.seg('line-w', String(lw), [['1', '1 px'], ['2', '2 px'], ['3', '3 px']])),
+        S.row('Dates', 'Hover always shows the exact timestamp.', S.seg('datefmt', date, [['rel', 'Relative'], ['abs', 'Absolute']]))
+      ])}
+      <section class="sgroup"><h3>Preview</h3><div class="preview" aria-label="History preview"><div class="pv-list">
+        <div class="pv-row sel" style="height:${h}px">${lane(8)}<span class="mono">8d41f6e</span><span class="od-fill od-truncate">fix(settings): list both reasons when bundled and system git fail</span><span class="muted od-nowrap">${date === 'rel' ? G.rel(600) : G.abs(600)}</span></div>
+        <div class="pv-row" style="height:${h}px">${lane(22)}<span class="mono">b7a3d15</span><span class="od-fill od-truncate">feat(settings): validate custom git path, require git ≥ 2.31</span><span class="muted od-nowrap">${date === 'rel' ? G.rel(1100) : G.abs(1100)}</span></div>
+        <div class="pv-row" style="height:${h}px">${lane(8)}<span class="mono">c19e0a4</span><span class="od-fill od-truncate">refactor(history): extract lane collapse into its own module</span><span class="muted od-nowrap">${date === 'rel' ? G.rel(2900) : G.abs(2900)}</span></div>
+        <div class="pv-row mono" style="height:${h * 1.4}px;font-size:${ms}px;color:var(--text);border-top:1px solid var(--border);margin-top:4px;padding-left:12px"><span style="font-family:var(--font-mono);color:var(--code-kw)">pub fn</span><span style="font-family:var(--font-mono);color:var(--code-fn)">lane_x</span><span style="font-family:var(--font-mono);color:var(--text)">(&amp;self, col: usize) -&gt; f32</span></div>
+      </div></div></section>`;
+  }, (kind, k, v) => { if (k === 'ui-size' || k === 'density') apply(); });
+  /* controls specific to this page: theme cards, accent swatches, mono-size stepper */
+  const pane = document.querySelector('.spane');
+  pane.addEventListener('click', (e) => {
+    const t = e.target.closest('[data-theme-pick]'), a = e.target.closest('[data-acc]'), st = e.target.closest('[data-step]');
+    if (t) { S.set('theme-pref', t.dataset.themePick); apply(); document.dispatchEvent(new Event('gl-theme')); redraw(); }
+    if (a) { S.set('accent', a.dataset.acc); apply(); redraw(); }
+    if (st) { S.set('mono-size', Math.max(9, Math.min(20, S.get('mono-size', 12) + (+st.dataset.step)))); apply(); redraw(); }
+  });
+  pane.addEventListener('keydown', (e) => { if ((e.key === ' ' || e.key === 'Enter') && e.target.matches('[data-theme-pick]')) { e.preventDefault(); e.target.click(); } });
+  pane.addEventListener('change', (e) => {
+    if (e.target.matches('[data-mono]')) { const n = parseInt(e.target.value, 10); S.set('mono-size', isNaN(n) ? 12 : Math.max(9, Math.min(20, n))); apply(); redraw(); }
+  });
+  const redraw = () => ctx.draw();
+  document.addEventListener('gl-theme', () => { const lab = document.getElementById('gl-theme'); if (lab) S.set('theme-pref', G.theme); });
+})();
+</script>
+</body>
+</html>

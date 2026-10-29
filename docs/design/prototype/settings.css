@@ -1,0 +1,31 @@
+/* gitwarp settings: shared layout for every Settings section. Tokens only, no raw colours. */
+.set { display: grid; grid-template-columns: 200px minmax(0, 1fr); min-height: 0; }
+.snav { border-right: 1px solid var(--border); padding: 8px; background: var(--bg); display: flex; flex-direction: column; gap: 2px; }
+.snav .node { border-radius: var(--r-sm); padding-left: 10px; color: var(--text); text-decoration: none; }
+.snav .node:hover { text-decoration: none; background: var(--hover); }
+.snav .node:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.spane { overflow: auto; padding: 20px 28px 28px; }
+.spane h2 { margin: 0 0 4px; font-size: var(--fs-xl); }
+.spane .lead { margin: 0 0 16px; max-width: 70ch; color: var(--muted); }
+.sgroup { max-width: 760px; margin-bottom: 20px; }
+.sgroup > h3 { margin: 0 0 6px; font-size: var(--fs-sm); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.slist { border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); }
+.srow { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 16px; align-items: center; padding: 10px 12px; min-height: 44px; border-bottom: 1px solid var(--border); }
+.srow:last-child { border-bottom: 0; }
+.srow .st { font-weight: 500; }
+.srow .sd { grid-column: 1; color: var(--muted); font-size: var(--fs-sm); max-width: 60ch; }
+.srow .ctl { grid-column: 2; grid-row: 1 / span 2; display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.srow.off .st, .srow.off .sd { color: var(--disabled); }
+.srow .input, .srow select.input { width: 180px; }
+.srow .num { width: 64px; text-align: right; font-family: var(--font-mono); }
+.srow .switch { min-height: 32px; }
+.srow .check { min-height: 32px; }
+.sfoot { max-width: 760px; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: var(--fs-sm); }
+.stack-banner { max-width: 760px; margin-bottom: 12px; }
+select.input { appearance: none; padding-right: 22px; background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%); background-size: 4px 4px; background-position: calc(100% - 12px) 11px, calc(100% - 8px) 11px; background-repeat: no-repeat; }
+select.input[disabled], .seg.dis { opacity: .5; pointer-events: none; }
+.stepper { display: inline-flex; align-items: center; gap: 4px; }
+.scn { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; }
+.scn select { height: 24px; background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--r-sm); }
+.preview { border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); overflow: hidden; }
+.preview .ph { padding: 6px 12px; font-size: var(--fs-sm); color: var(--muted); border-bottom: 1px solid var(--border); background: var(--surface); }
