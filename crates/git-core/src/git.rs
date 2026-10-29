@@ -257,7 +257,7 @@ fn check_floor(found: GitVersion) -> Result<()> {
 /// The git shipped next to the app, if any. Layout per OS:
 /// - Windows: `<app dir>/git/cmd/git.exe` (MinGit)
 /// - macOS: `<app dir>/../Resources/git/bin/git` (inside the .app bundle)
-/// - Linux: `<app dir>/git/bin/git`, then `<app dir>/../lib/gitlane/git/bin/git`
+/// - Linux: `<app dir>/git/bin/git`, then `<app dir>/../lib/gitwarp/git/bin/git`
 fn bundled_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     // A symlinked launcher must still find files next to the real binary.
@@ -275,7 +275,7 @@ fn bundled_candidates(app_dir: &Path) -> Vec<PathBuf> {
     } else {
         vec![
             app_dir.join("git/bin/git"),
-            app_dir.join("../lib/gitlane/git/bin/git"),
+            app_dir.join("../lib/gitwarp/git/bin/git"),
         ]
     }
 }

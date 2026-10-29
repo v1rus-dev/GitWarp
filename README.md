@@ -1,9 +1,7 @@
-# gitlane
+# GitWarp
 
 A fast desktop Git client in the spirit of Fork, for Linux first, and
 Windows and macOS too. Rust + [GPUI](https://www.gpui.rs) (the UI framework of Zed).
-
-> `gitlane` is a working name.
 
 ## Layout
 
@@ -11,7 +9,7 @@ Windows and macOS too. Rust + [GPUI](https://www.gpui.rs) (the UI framework of Z
 crates/
   git-graph/   commit-graph lane layout: incremental, UI-agnostic, no dependencies
   git-core/    repository access: streaming `git log`, refs, HEAD, commit-graph upkeep
-  app/         the GPUI desktop app (binary: `gitlane`)
+  app/         the GPUI desktop app (binary: `gitwarp`)
 patches/       temporary fix for a GPUI transitive dependency (see Cargo.toml)
 ```
 
@@ -29,7 +27,7 @@ cargo run --release -p app -- /path/to/repo  # the app
 ### Which git
 
 The app runs a `git` executable (minimum version 2.31). Pick it with
-`--git <auto|system|bundled|PATH>` or the `GITLANE_GIT` environment variable
+`--git <auto|system|bundled|PATH>` or the `GITWARP_GIT` environment variable
 (the flag wins); the default `auto` uses the bundled git if present, else the
 one on `PATH`. The header shows what is in use, e.g. `git 2.56.0 (system)`.
 
@@ -39,7 +37,7 @@ The bundled git is looked up next to the app binary:
 |---|---|
 | Windows | `<app dir>/git/cmd/git.exe` (MinGit) |
 | macOS | `<app dir>/../Resources/git/bin/git` |
-| Linux | `<app dir>/git/bin/git`, then `<app dir>/../lib/gitlane/git/bin/git` |
+| Linux | `<app dir>/git/bin/git`, then `<app dir>/../lib/gitwarp/git/bin/git` |
 
 Packaging the bundle is not done yet; only the lookup exists, so dev builds
 fall back to the system git.

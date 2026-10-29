@@ -13,15 +13,15 @@ use std::sync::Arc;
 use git_core::{Git, GitChoice};
 use history_view::HistoryView;
 
-const USAGE: &str = "Usage: gitlane [--git <auto|system|bundled|PATH>] [REPO]
+const USAGE: &str = "Usage: gitwarp [--git <auto|system|bundled|PATH>] [REPO]
 
 Options:
-  --git <VALUE>  Which git to run (default: auto; env: GITLANE_GIT, the flag wins)
+  --git <VALUE>  Which git to run (default: auto; env: GITWARP_GIT, the flag wins)
   -h, --help     Print this help";
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-    let (path, git) = match parse_args(std::env::args_os().skip(1), std::env::var_os("GITLANE_GIT"))
+    let (path, git) = match parse_args(std::env::args_os().skip(1), std::env::var_os("GITWARP_GIT"))
     {
         Ok(Cli::Run { path, git }) => (path, git),
         Ok(Cli::Help) => {
@@ -29,7 +29,7 @@ fn main() {
             return;
         }
         Err(message) => {
-            eprintln!("gitlane: {message}\n\n{USAGE}");
+            eprintln!("gitwarp: {message}\n\n{USAGE}");
             std::process::exit(2);
         }
     };
@@ -50,10 +50,10 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("gitlane".into()),
+                    title: Some("GitWarp".into()),
                     ..Default::default()
                 }),
-                app_id: Some("dev.v1rus.gitlane".into()),
+                app_id: Some("dev.v1rus.gitwarp".into()),
                 ..Default::default()
             },
             |_, cx| cx.new(|cx| HistoryView::open(path.clone(), git.clone(), cx)),
@@ -70,7 +70,7 @@ enum Cli {
 }
 
 /// `[--git <auto|system|bundled|PATH>] [repo]`. The flag wins over
-/// `GITLANE_GIT`; the repo defaults to the current directory.
+/// `GITWARP_GIT`; the repo defaults to the current directory.
 fn parse_args(
     mut args: impl Iterator<Item = OsString>,
     env_git: Option<OsString>,
