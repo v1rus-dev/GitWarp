@@ -32,7 +32,10 @@ Fix rounds are sent to the same terminal with `orca terminal send --terminal <ha
   files to touch, the relevant design excerpt (tokens/spec values copied in, not "see the
   design"), API notes for GPUI 0.2.2 found during planning, acceptance criteria, and the
   check commands to run before finishing.
-- Fix rounds go to the same OpenCode terminal with the list of findings, so the model keeps its context.
+- One OpenCode session per step: fix rounds of that step go to the same terminal (the model keeps its
+  context); once the step is accepted, close that terminal (`orca terminal close --terminal <handle>`) and
+  launch a fresh agent for the next step, so its context does not grow across steps. Briefs are
+  self-contained, so nothing is lost.
 
 ### Verifying a step
 
