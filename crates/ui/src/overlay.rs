@@ -4,7 +4,7 @@
 //! responsible for focusing the view they pass in; closing restores the focus
 //! that was active before the layer opened.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gpui::{
     anchored, deferred, div, px, AnyView, App, AppContext, BorrowAppContext, Div, Entity,
@@ -105,6 +105,26 @@ struct OverlayRegistry {
 
 impl Global for OverlayRegistry {}
 
+/// Drops the overlay state of windows that no longer exist.
+///
+/// `on_window_closed` does not report which window closed, so prune the map
+/// against the windows that are still alive.
+pub(crate) fn init(cx: &mut App) {
+    cx.on_window_closed(|cx| {
+        let live: HashSet<WindowId> = cx
+            .windows()
+            .iter()
+            .map(|handle| handle.window_id())
+            .collect();
+        if cx.try_global::<OverlayRegistry>().is_some() {
+            cx.update_global::<OverlayRegistry, _>(|registry, _| {
+                registry.by_window.retain(|id, _| live.contains(id));
+            });
+        }
+    })
+    .detach();
+}
+
 /// Opens a centred modal with a full-window scrim.
 pub fn open_modal(view: AnyView, window: &mut Window, cx: &mut App) -> LayerId {
     let restore_focus = window.focused(cx);
@@ -172,8 +192,8 @@ fn restore(layer: Layer, window: &mut Window) {
 }
 
 /// Renders every layer for `window`, bottom-to-top. Add it as the root's last child.
-pub fn render_overlays(_window: &mut Window, cx: &mut App) -> impl IntoElement {
-    let overlays = entity(_window, cx);
+pub fn render_overlays(window: &mut Window, cx: &mut App) -> impl IntoElement {
+    let overlays = entity(window, cx);
     let colors = cx.theme().colors;
     let layers: Vec<(LayerId, LayerKind, AnyView, bool)> = overlays
         .read(cx)
@@ -302,6 +322,11 @@ fn try_entity(window: &Window, cx: &App) -> Option<Entity<Overlays>> {
         .by_window
         .get(&window_id)
         .cloned()
+}
+
+/// Number of open layers in `window`; zero if nothing has been opened.
+pub fn layer_count(window: &Window, cx: &App) -> usize {
+    try_entity(window, cx).map_or(0, |overlays| overlays.read(cx).layers.entries.len())
 }
 
 #[cfg(test)]
