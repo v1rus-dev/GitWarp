@@ -16,11 +16,13 @@ mod counter;
 mod empty_state;
 mod progress;
 mod ref_badge;
+mod search_field;
 mod segmented;
 mod skeleton;
 mod spinner;
 mod status_glyph;
 mod tabs;
+mod text_input;
 mod toggles;
 
 pub use avatar::Avatar;
@@ -31,9 +33,13 @@ pub use counter::{CountPill, Counter, Kbd};
 pub use empty_state::EmptyState;
 pub use progress::Progress;
 pub use ref_badge::{RefBadge, RefKind};
+pub use search_field::SearchField;
 pub use segmented::{SegmentItem, Segmented};
 pub use skeleton::Skeleton;
 pub use spinner::Spinner;
 pub use status_glyph::StatusGlyph;
 pub use tabs::{Tab, Tabs};
+pub use text_input::{TextInput, TextInputEvent};
 pub use toggles::{Checkbox, Radio, Switch};
+
+pub(crate) use text_input::bind_keys as bind_text_input_keys;

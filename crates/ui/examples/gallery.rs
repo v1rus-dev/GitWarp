@@ -1,9 +1,9 @@
 //! Visual catalogue of the design system tokens.
 
 use gpui::{
-    div, prelude::*, px, size, AnyView, App, Application, Bounds, ClickEvent, Div, FocusHandle,
-    FontWeight, Hsla, IntoElement, Pixels, Render, SharedString, TitlebarOptions, Window,
-    WindowBounds, WindowOptions,
+    div, prelude::*, px, size, AnyElement, AnyView, App, Application, Bounds, ClickEvent, Div,
+    FocusHandle, FontWeight, Hsla, IntoElement, Pixels, Render, SharedString, TitlebarOptions,
+    Window, WindowBounds, WindowOptions,
 };
 
 use ui::focus::RingOffset;
@@ -15,11 +15,49 @@ use ui::theme::{self, ActiveTheme, Theme, ThemeColors, ThemeMode};
 use ui::{
     actions, focus, overlay, Avatar, Banner, BannerKind, Button, ButtonSize, Checkbox, Chip,
     ChipKind, CountPill, Counter, EmptyState, Icon, IconName, Kbd, Progress, Radio, RefBadge,
-    RefKind, SegmentItem, Segmented, Skeleton, Spinner, StatusGlyph, Switch, Tab, Tabs,
+    RefKind, SearchField, SegmentItem, Segmented, Skeleton, Spinner, StatusGlyph, Switch, Tab,
+    Tabs, TextInput,
 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Colours,
+    Type,
+    Fonts,
+    Icons,
+    Interaction,
+    Buttons,
+    Badges,
+    Toggles,
+    Tabs,
+    Progress,
+    Banners,
+    Inputs,
+}
+
+impl Section {
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "colours" => Self::Colours,
+            "type" => Self::Type,
+            "fonts" => Self::Fonts,
+            "icons" => Self::Icons,
+            "interaction" => Self::Interaction,
+            "buttons" => Self::Buttons,
+            "badges" => Self::Badges,
+            "toggles" => Self::Toggles,
+            "tabs" => Self::Tabs,
+            "progress" => Self::Progress,
+            "banners" => Self::Banners,
+            "inputs" => Self::Inputs,
+            _ => return None,
+        })
+    }
+}
 
 struct Gallery {
     mode: ThemeMode,
+    section: Option<Section>,
     focus_a: FocusHandle,
     focus_b: FocusHandle,
     focus_c: FocusHandle,
@@ -35,9 +73,10 @@ struct Gallery {
 }
 
 impl Gallery {
-    fn new(mode: ThemeMode, cx: &mut Context<Self>) -> Self {
+    fn new(mode: ThemeMode, section: Option<Section>, cx: &mut Context<Self>) -> Self {
         Self {
             mode,
+            section,
             focus_a: cx.focus_handle().tab_index(1).tab_stop(true),
             focus_b: cx.focus_handle().tab_index(2).tab_stop(true),
             focus_c: cx.focus_handle().tab_index(3).tab_stop(true),
@@ -55,6 +94,10 @@ impl Gallery {
                 .collect(),
         }
     }
+
+    fn shows(&self, section: Section) -> bool {
+        self.section.is_none() || self.section == Some(section)
+    }
 }
 
 impl Render for Gallery {
@@ -62,6 +105,47 @@ impl Render for Gallery {
         let theme = cx.theme().clone();
         let colors = theme.colors;
         let mode = self.mode;
+
+        let mut sections: Vec<AnyElement> = Vec::new();
+        if self.shows(Section::Colours) {
+            sections.push(colours_section(colors).into_any_element());
+        }
+        if self.shows(Section::Type) {
+            sections.push(type_section(colors).into_any_element());
+        }
+        if self.shows(Section::Fonts) {
+            sections.push(fonts_section(colors).into_any_element());
+        }
+        if self.shows(Section::Icons) {
+            sections.push(icons_section(colors).into_any_element());
+        }
+        if self.shows(Section::Buttons) {
+            sections.push(buttons_section(colors).into_any_element());
+        }
+        if self.shows(Section::Badges) {
+            sections.push(badges_section(colors).into_any_element());
+        }
+        if self.shows(Section::Toggles) {
+            sections.push(toggles_section(self, colors, cx).into_any_element());
+        }
+        if self.shows(Section::Tabs) {
+            sections.push(segmented_tabs_section(self, colors, cx).into_any_element());
+        }
+        if self.shows(Section::Progress) {
+            sections.push(progress_section(colors).into_any_element());
+        }
+        if self.shows(Section::Banners) {
+            sections.push(banners_section(colors, cx).into_any_element());
+        }
+        if self.shows(Section::Inputs) {
+            sections.push(inputs_section(colors, window, cx).into_any_element());
+        }
+        if self.shows(Section::Interaction) {
+            sections.push(interaction_section(self, colors, window, cx).into_any_element());
+        }
+        if self.section.is_none() {
+            sections.push(lanes_section(&theme).into_any_element());
+        }
 
         let content = div()
             .size_full()
@@ -130,18 +214,7 @@ impl Render for Gallery {
                     .flex()
                     .flex_col()
                     .gap(px(24.))
-                    .child(colours_section(colors))
-                    .child(type_section(colors))
-                    .child(fonts_section(colors))
-                    .child(icons_section(colors))
-                    .child(buttons_section(colors))
-                    .child(badges_section(colors))
-                    .child(toggles_section(self, colors, cx))
-                    .child(segmented_tabs_section(self, colors, cx))
-                    .child(progress_section(colors))
-                    .child(banners_section(colors, cx))
-                    .child(interaction_section(self, colors, window, cx))
-                    .child(lanes_section(&theme)),
+                    .children(sections),
             );
 
         let content = focus::track_pointer(actions::tab_navigation(content));
@@ -1153,6 +1226,109 @@ fn banners_section(colors: ThemeColors, cx: &mut Context<Gallery>) -> impl IntoE
         )
 }
 
+fn input_field(
+    label: &'static str,
+    colors: ThemeColors,
+    input: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .w(px(340.))
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(div().text_size(FS_SM).text_color(colors.muted).child(label))
+        .child(input)
+}
+
+fn inputs_section(
+    colors: ThemeColors,
+    window: &mut Window,
+    cx: &mut Context<Gallery>,
+) -> impl IntoElement {
+    let empty = window.use_keyed_state("gallery-input-empty", cx, |window, cx| {
+        let mut input = TextInput::new(window, cx);
+        input.set_placeholder("e.g. feature/my-branch", cx);
+        input
+    });
+    let filled = window.use_keyed_state("gallery-input-filled", cx, |window, cx| {
+        let mut input = TextInput::new(window, cx);
+        input.set_text("feat (graph): clip lanes", cx);
+        input
+    });
+    let error = window.use_keyed_state("gallery-input-error", cx, |window, cx| {
+        let mut input = TextInput::new(window, cx);
+        input.set_text("not-a-ref", cx);
+        input.set_error(true, cx);
+        input
+    });
+    let disabled = window.use_keyed_state("gallery-input-disabled", cx, |window, cx| {
+        let mut input = TextInput::new(window, cx);
+        input.set_placeholder("Disabled", cx);
+        input.set_disabled(true, cx);
+        input
+    });
+    let limited = window.use_keyed_state("gallery-input-limited", cx, |window, cx| {
+        let mut input = TextInput::new(window, cx);
+        input.set_max_len(Some(24), cx);
+        input.set_placeholder("Up to 24 characters", cx);
+        input
+    });
+    let search = window.use_keyed_state("gallery-input-search", cx, |window, cx| {
+        let mut input = TextInput::new(window, cx);
+        input.set_placeholder("Filter branches, tags…", cx);
+        input
+    });
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading("Inputs"))
+        .child(
+            card(colors).child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(24.))
+                    .child(input_field("Default", colors, empty))
+                    .child(input_field("Filled", colors, filled))
+                    .child(
+                        div()
+                            .w(px(340.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_size(FS_SM)
+                                    .text_color(colors.muted)
+                                    .child("Error"),
+                            )
+                            .child(error)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .text_size(FS_SM)
+                                    .text_color(colors.error)
+                                    .child(
+                                        Icon::new(IconName::Err).size(px(12.)).color(colors.error),
+                                    )
+                                    .child("Branch names cannot contain '~'"),
+                            ),
+                    )
+                    .child(input_field("Disabled", colors, disabled))
+                    .child(input_field("Max length 24", colors, limited))
+                    .child(input_field(
+                        "Search",
+                        colors,
+                        SearchField::new("gallery-search", search).hint("Ctrl K"),
+                    )),
+            ),
+        )
+}
+
 fn interaction_section(
     gallery: &Gallery,
     colors: ThemeColors,
@@ -1367,22 +1543,29 @@ fn open_popover_button(colors: ThemeColors, cx: &mut Context<ModalPanel>) -> imp
         .child("Open nested popover")
 }
 
-/// `--theme dark|light|system`; anything else stays on the system theme.
-fn parse_mode(mut args: impl Iterator<Item = String>) -> ThemeMode {
+/// `--theme dark|light|system`, `--section <name>`; unknown values fall back.
+fn parse_args() -> (ThemeMode, Option<Section>) {
+    let mut mode = ThemeMode::System;
+    let mut section = None;
+    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--theme" {
-            return match args.next().as_deref() {
-                Some("dark") => ThemeMode::Dark,
-                Some("light") => ThemeMode::Light,
-                _ => ThemeMode::System,
-            };
+        match arg.as_str() {
+            "--theme" => {
+                mode = match args.next().as_deref() {
+                    Some("dark") => ThemeMode::Dark,
+                    Some("light") => ThemeMode::Light,
+                    _ => ThemeMode::System,
+                }
+            }
+            "--section" => section = args.next().as_deref().and_then(Section::parse),
+            _ => {}
         }
     }
-    ThemeMode::System
+    (mode, section)
 }
 
 fn main() {
-    let mode = parse_mode(std::env::args().skip(1));
+    let (mode, section) = parse_args();
     Application::new()
         .with_assets(ui::Assets)
         .run(move |cx: &mut App| {
@@ -1402,7 +1585,7 @@ fn main() {
                 },
                 |window, cx| {
                     theme::follow_system(window, cx);
-                    cx.new(|cx| Gallery::new(mode, cx))
+                    cx.new(|cx| Gallery::new(mode, section, cx))
                 },
             )
             .expect("failed to open the gallery window");

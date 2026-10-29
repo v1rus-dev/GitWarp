@@ -176,6 +176,11 @@ impl RenderOnce for Button {
         } else {
             height
         };
+        let icon_size = if self.icon_only.is_some() && self.size == ButtonSize::Default {
+            px(16.)
+        } else {
+            icon_size
+        };
 
         let (mut background, mut foreground, mut border, mut weight) = match self.variant {
             ButtonVariant::Secondary => (

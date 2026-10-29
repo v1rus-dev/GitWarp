@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, Animation, AnimationExt, App, ClickEvent, ElementId, InteractiveElement, IntoElement,
-    ParentElement, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px, Animation, AnimationExt, AnyElement, App, ClickEvent, ElementId, FocusHandle,
+    InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::focus::{self, RingOffset};
@@ -246,6 +247,12 @@ impl RenderOnce for Radio {
     }
 }
 
+struct SwitchState {
+    focus: FocusHandle,
+    checked: bool,
+    generation: u64,
+}
+
 /// A switch with a 150 ms knob animation.
 #[derive(IntoElement)]
 pub struct Switch {
@@ -291,43 +298,64 @@ impl Switch {
 impl RenderOnce for Switch {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors;
-        let focus = window
-            .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
-            .read(cx)
-            .clone()
-            .tab_stop(!self.disabled);
+        let state = window.use_keyed_state(self.id.clone(), cx, |_, cx| SwitchState {
+            focus: cx.focus_handle(),
+            checked: self.checked,
+            generation: 0,
+        });
+        let (focus, generation) = state.update(cx, |state, _| {
+            if state.checked != self.checked {
+                state.checked = self.checked;
+                state.generation += 1;
+            }
+            (state.focus.clone(), state.generation)
+        });
+        let focus = focus.tab_stop(!self.disabled);
         let ring = !self.disabled && focus::focus_visible(&focus, window, cx);
         let checked = self.checked;
 
-        let animation_id = ElementId::Name(format!("{}-knob-{checked}", self.id).into());
+        let knob_debug = format!("{}-knob", self.id);
         let knob = div()
             .absolute()
             .top(px(2.))
             .w(px(10.))
             .h(px(10.))
+            .debug_selector(move || knob_debug)
             .rounded(px(5.))
             .bg(if checked {
                 colors.accent_fg
             } else {
                 colors.muted
-            })
-            .with_animation(
-                animation_id,
-                Animation::new(Duration::from_millis(150)),
-                move |this, delta| {
-                    let left = if checked {
-                        2. + 12. * delta
-                    } else {
-                        14. - 12. * delta
-                    };
-                    this.left(px(left))
-                },
-            );
+            });
 
+        let knob: AnyElement = if generation == 0 {
+            // First paint: jump straight to the final position.
+            knob.left(px(if checked { 14. } else { 2. }))
+                .into_any_element()
+        } else {
+            let animation_id = ElementId::Name(format!("{}-knob-{generation}", self.id).into());
+            knob.left(px(if checked { 2. } else { 14. }))
+                .with_animation(
+                    animation_id,
+                    Animation::new(Duration::from_millis(150)),
+                    move |this, delta| {
+                        let left = if checked {
+                            2. + 12. * delta
+                        } else {
+                            14. - 12. * delta
+                        };
+                        this.left(px(left))
+                    },
+                )
+                .into_any_element()
+        };
+
+        let track_debug = format!("{}-track", self.id);
         let mut track = div()
             .relative()
             .w(px(28.))
             .h(px(16.))
+            .debug_selector(move || track_debug)
             .rounded(R_PILL)
             .border_1()
             .border_color(if checked {

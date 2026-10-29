@@ -28,6 +28,7 @@ pub fn init(cx: &mut App) -> gpui::Result<()> {
     theme::init(cx);
     focus::init(cx);
     actions::bind_keys(cx);
+    components::bind_text_input_keys(cx);
     overlay::init(cx);
     fonts::load(cx)
 }

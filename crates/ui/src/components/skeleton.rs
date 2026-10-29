@@ -1,7 +1,8 @@
 //! Loading skeletons.
 //!
-//! GPUI 0.2.2 has no animated gradient positions, so the shimmer pulses the
-//! `hover` overlay between transparent and opaque instead of moving it.
+//! GPUI 0.2.2 has no animated gradient positions, so the shimmer pulses a
+//! `hover` overlay over an `active` base; the base keeps it visible even on the
+//! first frame.
 
 use std::time::Duration;
 
@@ -29,6 +30,12 @@ impl Skeleton {
     }
 }
 
+/// Shimmer opacity, never below 0.4 so the skeleton is visible at any phase.
+fn shimmer_opacity(delta: f32) -> f32 {
+    let phase = (2. * delta - 1.).abs();
+    0.4 + 0.6 * (1. - phase)
+}
+
 impl RenderOnce for Skeleton {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors;
@@ -42,10 +49,7 @@ impl RenderOnce for Skeleton {
                 Animation::new(Duration::from_millis(1400))
                     .repeat()
                     .with_easing(ease_in_out),
-                |this, delta| {
-                    let phase = (2. * delta - 1.).abs();
-                    this.opacity(1. - phase)
-                },
+                |this, delta| this.opacity(shimmer_opacity(delta)),
             );
 
         div()
@@ -53,8 +57,22 @@ impl RenderOnce for Skeleton {
             .w(self.width)
             .h(px(10.))
             .rounded(R_XS)
-            .bg(colors.surface)
+            .bg(colors.active)
             .overflow_hidden()
             .child(pulse)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shimmer_is_visible_at_every_phase() {
+        for step in 0..=20 {
+            let delta = step as f32 / 20.;
+            let opacity = shimmer_opacity(delta);
+            assert!((0.4..=1.0).contains(&opacity), "{delta}: {opacity}");
+        }
     }
 }

@@ -226,3 +226,74 @@ fn clicking_a_segment_selects_it(cx: &mut TestAppContext) {
 
     assert_eq!(cx.read(|app| view.read(app).selected.get()), Some(2));
 }
+
+#[gpui::test]
+fn switch_first_paint_uses_the_final_knob_position(cx: &mut TestAppContext) {
+    use ui::Switch;
+
+    struct Root;
+    impl Render for Root {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .relative()
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(40.))
+                        .top(px(40.))
+                        .child(Switch::new("on").checked(true)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(40.))
+                        .top(px(80.))
+                        .child(Switch::new("off").checked(false)),
+                )
+        }
+    }
+
+    init(cx);
+    let (_, cx) = cx.add_window_view(|_, _| Root);
+    cx.run_until_parked();
+
+    let on = cx.debug_bounds("on-knob").expect("no checked knob");
+    let off = cx.debug_bounds("off-knob").expect("no unchecked knob");
+    let offset: f32 = (on.origin.x - off.origin.x).into();
+    assert_eq!(
+        offset, 12.,
+        "first paint must show the final knob positions"
+    );
+}
+
+#[gpui::test]
+fn indeterminate_progress_starts_inside_the_track(cx: &mut TestAppContext) {
+    use ui::Progress;
+
+    struct Root;
+    impl Render for Root {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().relative().child(
+                div()
+                    .absolute()
+                    .left(px(40.))
+                    .top(px(40.))
+                    .child(Progress::new("indet", 0.).indeterminate()),
+            )
+        }
+    }
+
+    init(cx);
+    let (_, cx) = cx.add_window_view(|_, _| Root);
+    cx.run_until_parked();
+
+    let track = cx.debug_bounds("indet-track").expect("no track");
+    let fill = cx.debug_bounds("indet-fill").expect("no fill");
+    let track_left: f32 = track.origin.x.into();
+    let track_right: f32 = (track.origin.x + track.size.width).into();
+    let fill_left: f32 = fill.origin.x.into();
+    let fill_right: f32 = (fill.origin.x + fill.size.width).into();
+    assert!(fill_left >= track_left, "segment starts off the track");
+    assert!(fill_right <= track_right, "segment starts past the track");
+}

@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use gpui::{
-    div, ease_in_out, px, Animation, AnimationExt, App, ElementId, IntoElement, ParentElement,
-    RenderOnce, Styled, Window,
+    div, ease_in_out, px, Animation, AnimationExt, App, ElementId, InteractiveElement, IntoElement,
+    ParentElement, RenderOnce, Styled, Window,
 };
 
 use crate::theme::ActiveTheme;
@@ -50,16 +50,19 @@ impl RenderOnce for Progress {
         let height = if self.dialog { px(6.) } else { px(4.) };
         let radius = if self.dialog { px(3.) } else { px(2.) };
 
+        let track_debug = format!("{}-track", self.id);
         let track = div()
             .relative()
             .w(px(TRACK_WIDTH))
             .h(height)
             .rounded(radius)
             .bg(colors.active)
+            .debug_selector(move || track_debug)
             .overflow_hidden();
 
         if self.indeterminate {
             let width = TRACK_WIDTH * 0.35;
+            let fill_debug = format!("{}-fill", self.id);
             let fill = div()
                 .absolute()
                 .top(px(0.))
@@ -67,14 +70,16 @@ impl RenderOnce for Progress {
                 .h_full()
                 .rounded(radius)
                 .bg(colors.accent)
+                .debug_selector(move || fill_debug)
                 .with_animation(
                     self.id,
                     Animation::new(Duration::from_millis(1200))
                         .repeat()
                         .with_easing(ease_in_out),
                     move |this, delta| {
-                        let left = -width + delta * (TRACK_WIDTH + width);
-                        this.left(px(left))
+                        // Stay inside the track so the segment is visible even
+                        // on the first frame and at the loop boundaries.
+                        this.left(px(delta * (TRACK_WIDTH - width)))
                     },
                 );
             track.child(fill)
