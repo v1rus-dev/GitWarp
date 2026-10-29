@@ -22,6 +22,7 @@ pub struct Checkbox {
     checked: bool,
     mixed: bool,
     disabled: bool,
+    focus_handle: Option<FocusHandle>,
     on_toggle: Option<crate::components::ToggleHandler>,
 }
 
@@ -33,6 +34,7 @@ impl Checkbox {
             checked: false,
             mixed: false,
             disabled: false,
+            focus_handle: None,
             on_toggle: None,
         }
     }
@@ -57,6 +59,12 @@ impl Checkbox {
         self
     }
 
+    /// Uses an existing focus handle instead of the checkbox's own keyed one.
+    pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
+        self.focus_handle = Some(handle);
+        self
+    }
+
     pub fn on_toggle(mut self, listener: impl Fn(bool, &mut Window, &mut App) + 'static) -> Self {
         self.on_toggle = Some(Box::new(listener));
         self
@@ -66,11 +74,14 @@ impl Checkbox {
 impl RenderOnce for Checkbox {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors;
-        let focus = window
-            .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
-            .read(cx)
-            .clone()
-            .tab_stop(!self.disabled);
+        let focus = match self.focus_handle.clone() {
+            Some(handle) => handle,
+            None => window
+                .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
+                .read(cx)
+                .clone(),
+        }
+        .tab_stop(!self.disabled);
         let ring = !self.disabled && focus::focus_visible(&focus, window, cx);
         let on = self.checked || self.mixed;
 

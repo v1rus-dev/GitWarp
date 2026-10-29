@@ -1,9 +1,13 @@
 //! Visual catalogue of the design system tokens.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::{
-    div, prelude::*, px, size, AnyElement, AnyView, App, Application, Bounds, ClickEvent, Div,
-    FocusHandle, FontWeight, Hsla, IntoElement, Pixels, Render, SharedString, TitlebarOptions,
-    Window, WindowBounds, WindowOptions,
+    canvas, div, point, prelude::*, px, size, AnyElement, AnyView, App, Application, Bounds,
+    ClickEvent, Div, Entity, FocusHandle, FontWeight, Hsla, IntoElement, MouseButton,
+    MouseDownEvent, Pixels, Render, SharedString, Subscription, TitlebarOptions, Window,
+    WindowBounds, WindowOptions,
 };
 
 use ui::focus::RingOffset;
@@ -13,10 +17,11 @@ use ui::metrics::{
 };
 use ui::theme::{self, ActiveTheme, Theme, ThemeColors, ThemeMode};
 use ui::{
-    actions, focus, overlay, Avatar, Banner, BannerKind, Button, ButtonSize, Checkbox, Chip,
-    ChipKind, CountPill, Counter, EmptyState, Icon, IconName, Kbd, Progress, Radio, RefBadge,
-    RefKind, SearchField, SegmentItem, Segmented, Skeleton, Spinner, StatusGlyph, Switch, Tab,
-    Tabs, TextInput,
+    actions, dialog, focus, menu, overlay, toast, Avatar, Banner, BannerKind, Button, ButtonSize,
+    Checkbox, Chip, ChipKind, CountPill, Counter, Dialog, DialogFocus, EmptyState, Icon, IconName,
+    Kbd, MenuEntry, MenuItem, Progress, Radio, RefBadge, RefKind, SearchField, SegmentItem,
+    Segmented, Select, Skeleton, Spinner, StatusGlyph, Switch, Tab, Tabs, TextInput,
+    TextInputEvent, ToastKind,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -33,6 +38,7 @@ enum Section {
     Progress,
     Banners,
     Inputs,
+    Floating,
 }
 
 impl Section {
@@ -50,10 +56,53 @@ impl Section {
             "progress" => Self::Progress,
             "banners" => Self::Banners,
             "inputs" => Self::Inputs,
+            "floating" => Self::Floating,
             _ => return None,
         })
     }
 }
+
+/// The floating component to open on the first frame, for visual review.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenOnStart {
+    Menu,
+    Select,
+    Dialog,
+    Toasts,
+}
+
+impl OpenOnStart {
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "menu" => Self::Menu,
+            "select" => Self::Select,
+            "dialog" => Self::Dialog,
+            "toasts" => Self::Toasts,
+            _ => return None,
+        })
+    }
+}
+
+/// The Select's options; shared with the menu it opens.
+const SELECT_OPTIONS: [&str; 4] = ["main", "develop", "feat/lanes", "release/0.3"];
+
+/// The four toast demos: id, label, kind and message.
+const TOAST_DEMOS: [(&str, &str, ToastKind, &str); 4] = [
+    ("toast-ok", "Ok toast", ToastKind::Ok, "Branch created"),
+    (
+        "toast-info",
+        "Info toast",
+        ToastKind::Info,
+        "Fetching origin…",
+    ),
+    ("toast-warn", "Warn toast", ToastKind::Warn, "Detached HEAD"),
+    (
+        "toast-error",
+        "Error toast",
+        ToastKind::Error,
+        "Push rejected: non-fast-forward",
+    ),
+];
 
 struct Gallery {
     mode: ThemeMode,
@@ -70,6 +119,10 @@ struct Gallery {
     segmented: usize,
     tab: usize,
     tabs: Vec<SharedString>,
+    select: usize,
+    branch_subscription: Option<Subscription>,
+    menu_area_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    select_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl Gallery {
@@ -92,6 +145,10 @@ impl Gallery {
                 .into_iter()
                 .map(SharedString::from)
                 .collect(),
+            select: 0,
+            branch_subscription: None,
+            menu_area_bounds: Rc::new(Cell::new(None)),
+            select_bounds: Rc::new(Cell::new(None)),
         }
     }
 
@@ -139,6 +196,9 @@ impl Render for Gallery {
         }
         if self.shows(Section::Inputs) {
             sections.push(inputs_section(colors, window, cx).into_any_element());
+        }
+        if self.shows(Section::Floating) {
+            sections.push(floating_section(self, colors, cx).into_any_element());
         }
         if self.shows(Section::Interaction) {
             sections.push(interaction_section(self, colors, window, cx).into_any_element());
@@ -1329,6 +1389,477 @@ fn inputs_section(
         )
 }
 
+fn floating_section(
+    gallery: &Gallery,
+    colors: ThemeColors,
+    cx: &mut Context<Gallery>,
+) -> impl IntoElement {
+    let view = cx.entity();
+    let select = {
+        let view = view.clone();
+        Select::new("gallery-select")
+            .options(SELECT_OPTIONS)
+            .selected(gallery.select)
+            .on_change(move |index, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.select = index;
+                    cx.notify();
+                });
+            })
+    };
+
+    let open_branch = {
+        let view = view.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                this.open_branch_dialog(window, cx);
+            });
+        }
+    };
+
+    let mut toasts = div().flex().items_center().gap(px(8.));
+    for (id, label, kind, message) in TOAST_DEMOS {
+        toasts = toasts.child(Button::new(id).label(label).on_click(move |_, window, cx| {
+            toast::show(kind, message, window, cx);
+        }));
+    }
+
+    let menu_area_bounds = gallery.menu_area_bounds.clone();
+    let select_bounds = gallery.select_bounds.clone();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading("Floating"))
+        .child(
+            card(colors)
+                .child(
+                    div()
+                        .id("gallery-menu-area")
+                        .relative()
+                        .h(px(120.))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(R_MD)
+                        .border_1()
+                        .border_color(colors.border_strong)
+                        .bg(colors.bg)
+                        .text_size(FS_SM)
+                        .text_color(colors.muted)
+                        .cursor_context_menu()
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|_, event: &MouseDownEvent, window, cx| {
+                                menu::open_context_menu(
+                                    event.position,
+                                    history_menu_entries(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child(
+                            canvas(
+                                |bounds, _, _| bounds,
+                                move |_, bounds, _, _| menu_area_bounds.set(Some(bounds)),
+                            )
+                            .absolute()
+                            .inset_0(),
+                        )
+                        .child("Right-click here for the history-row context menu"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .w(px(90.))
+                                .flex_none()
+                                .text_size(FS_SM)
+                                .text_color(colors.muted)
+                                .child("Select"),
+                        )
+                        .child(
+                            div().relative().w(px(220.)).child(select).child(
+                                canvas(
+                                    |bounds, _, _| bounds,
+                                    move |_, bounds, _, _| select_bounds.set(Some(bounds)),
+                                )
+                                .absolute()
+                                .inset_0(),
+                            ),
+                        )
+                        .child(
+                            Button::primary("open-branch-dialog")
+                                .label("Create branch…")
+                                .on_click(open_branch),
+                        ),
+                )
+                .child(toasts),
+        )
+}
+
+/// The history row's context menu, with a disabled extra item.
+fn history_menu_entries() -> Vec<MenuEntry> {
+    vec![
+        MenuEntry::Item(
+            MenuItem::new("Copy commit hash")
+                .icon(IconName::Copy)
+                .shortcut("Ctrl+C")
+                .action(|window, cx| {
+                    toast::show(ToastKind::Ok, "Copied commit hash", window, cx);
+                }),
+        ),
+        MenuEntry::Item(
+            MenuItem::new("Create branch here…")
+                .icon(IconName::Branch)
+                .shortcut("B")
+                .action(|window, cx| {
+                    toast::show(ToastKind::Ok, "Created branch at this commit", window, cx);
+                }),
+        ),
+        MenuEntry::Item(
+            MenuItem::new("Create tag here…")
+                .icon(IconName::Tag)
+                .action(|window, cx| {
+                    toast::show(ToastKind::Ok, "Created tag at this commit", window, cx);
+                }),
+        ),
+        MenuEntry::Separator,
+        MenuEntry::Item(MenuItem::new("Cherry-pick").action(|window, cx| {
+            toast::show(ToastKind::Info, "Cherry-picked onto main", window, cx);
+        })),
+        MenuEntry::Item(MenuItem::new("Revert commit").icon(IconName::Undo).action(
+            |window, cx| {
+                toast::show(ToastKind::Info, "Reverted commit", window, cx);
+            },
+        )),
+        MenuEntry::Item(
+            MenuItem::new("Reset main to here…")
+                .danger()
+                .action(|window, cx| {
+                    toast::show(ToastKind::Error, "Reset main to this commit", window, cx);
+                }),
+        ),
+        MenuEntry::Item(
+            MenuItem::new("Copy patch")
+                .shortcut("Ctrl+Shift+C")
+                .disabled(true),
+        ),
+    ]
+}
+
+/// The Select's options as menu entries, for the `--open select` review flag.
+fn select_menu_entries(view: Entity<Gallery>, selected: usize) -> Vec<MenuEntry> {
+    SELECT_OPTIONS
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let mut item = MenuItem::new(*label);
+            if index == selected {
+                item = item.icon(IconName::Check);
+            }
+            let view = view.clone();
+            MenuEntry::Item(item.action(move |_, cx| {
+                view.update(cx, |this, cx| {
+                    this.select = index;
+                    cx.notify();
+                });
+            }))
+        })
+        .collect()
+}
+
+impl Gallery {
+    fn open_branch_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextInput> {
+        let layer = Rc::new(Cell::new(None));
+        let body = cx.new(|cx| BranchBody::new(window, layer.clone(), cx));
+        let name = body.read(cx).name.clone();
+        let footer = cx.new(|cx| BranchFooter::new(name.clone(), layer.clone(), cx));
+
+        let name_focus = name.read(cx).focus_handle().clone();
+        let (switch_focus, busy_focus) = body.read(cx).focus_handles();
+        let (cancel_focus, create_focus, on_create) = footer.read(cx).dialog_parts();
+        let on_default = on_create.clone();
+
+        let build_body = body.clone();
+        let build_footer = footer.clone();
+        let focus_name = name.clone();
+        let autofocus = name_focus.clone();
+        let focus_switch = switch_focus.clone();
+        let focus_busy = busy_focus.clone();
+        let focus_cancel = cancel_focus.clone();
+        let default_button = create_focus.clone();
+
+        let (layer_id, host) = dialog::open_with_view(window, cx, move |_, cx| {
+            let empty = focus_name.read(cx).text().trim().is_empty();
+            let mut focus = vec![
+                DialogFocus::input(autofocus.clone()),
+                DialogFocus::control(focus_switch.clone()),
+                DialogFocus::control(focus_busy.clone()),
+                DialogFocus::control(focus_cancel.clone()),
+            ];
+            if !empty {
+                focus.push(DialogFocus::control(default_button.clone()));
+            }
+            Dialog::new("Create branch")
+                .icon(IconName::Branch)
+                .body(build_body.clone())
+                .footer(build_footer.clone())
+                .hint("The new branch starts at HEAD.")
+                .width(px(480.))
+                .focus_order(focus)
+                .autofocus(autofocus.clone())
+                .default_button(default_button.clone())
+                .on_default({
+                    let on_default = on_default.clone();
+                    move |window, cx| on_default.as_ref()(window, cx)
+                })
+        });
+        layer.set(Some(layer_id));
+        self.branch_subscription =
+            Some(cx.subscribe(&name, move |_, _, _: &TextInputEvent, cx| {
+                host.update(cx, |_, cx| cx.notify());
+            }));
+        name
+    }
+
+    /// Opens the floating component requested by `--open`, after the first frame.
+    fn open_on_start(&mut self, open: OpenOnStart, window: &mut Window, cx: &mut Context<Self>) {
+        match open {
+            OpenOnStart::Menu => {
+                let area = self.menu_area_bounds.get().unwrap_or_else(|| {
+                    Bounds::new(point(px(40.), px(40.)), size(px(220.), px(120.)))
+                });
+                menu::open_context_menu(area.center(), history_menu_entries(), window, cx);
+                // The menu opens unhighlighted; two steps down land on the
+                // second enabled item.
+                window.on_next_frame(|window, cx| {
+                    window.dispatch_action(Box::new(actions::SelectNext), cx);
+                    window.dispatch_action(Box::new(actions::SelectNext), cx);
+                });
+                window.refresh();
+            }
+            OpenOnStart::Select => {
+                if let Some(anchor) = self.select_bounds.get() {
+                    menu::open_dropdown(
+                        anchor,
+                        select_menu_entries(cx.entity(), self.select),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            OpenOnStart::Dialog => {
+                let name = self.open_branch_dialog(window, cx);
+                name.update(cx, |input, cx| input.set_text("feat/ssh-keys", cx));
+            }
+            OpenOnStart::Toasts => {
+                for (_, _, kind, message) in TOAST_DEMOS {
+                    toast::show(kind, message, window, cx);
+                }
+            }
+        }
+    }
+}
+
+struct BranchBody {
+    name: Entity<TextInput>,
+    layer: Rc<Cell<Option<overlay::LayerId>>>,
+    switch: bool,
+    busy: bool,
+    switch_focus: FocusHandle,
+    busy_focus: FocusHandle,
+}
+
+impl BranchBody {
+    fn new(
+        window: &mut Window,
+        layer: Rc<Cell<Option<overlay::LayerId>>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name = cx.new(|cx| {
+            let mut input = TextInput::new(window, cx);
+            input.set_placeholder("feature/my-branch", cx);
+            input
+        });
+        Self {
+            name,
+            layer,
+            switch: true,
+            busy: false,
+            switch_focus: cx.focus_handle().tab_stop(true),
+            busy_focus: cx.focus_handle().tab_stop(true),
+        }
+    }
+
+    fn focus_handles(&self) -> (FocusHandle, FocusHandle) {
+        (self.switch_focus.clone(), self.busy_focus.clone())
+    }
+}
+
+impl Render for BranchBody {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let view = cx.entity();
+        let switch = self.switch;
+        let switch_toggle = {
+            let view = view.clone();
+            move |next: bool, _: &mut Window, cx: &mut App| {
+                view.update(cx, |this, cx| {
+                    this.switch = next;
+                    cx.notify();
+                });
+            }
+        };
+        let busy = self.busy;
+        let layer = self.layer.clone();
+        let busy_toggle = {
+            let view = view.clone();
+            move |next: bool, window: &mut Window, cx: &mut App| {
+                if let Some(layer) = layer.get() {
+                    dialog::set_busy(layer, next, window, cx);
+                }
+                view.update(cx, |this, cx| {
+                    this.busy = next;
+                    cx.notify();
+                });
+            }
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .text_size(FS_SM)
+                    .text_color(colors.muted)
+                    .child("Branch name"),
+            )
+            .child(self.name.clone())
+            .child(
+                Checkbox::new("branch-switch")
+                    .label("Switch to the new branch after creating it")
+                    .checked(switch)
+                    .focus_handle(self.switch_focus.clone())
+                    .on_toggle(switch_toggle),
+            )
+            .child(
+                Checkbox::new("branch-busy")
+                    .label("Simulate busy")
+                    .checked(busy)
+                    .focus_handle(self.busy_focus.clone())
+                    .on_toggle(busy_toggle),
+            )
+            .when(busy, |this| {
+                this.child(
+                    div()
+                        .text_size(FS_SM)
+                        .text_color(colors.muted)
+                        .child("Busy: Esc, the scrim, Enter and Close are disabled."),
+                )
+            })
+    }
+}
+
+struct BranchFooter {
+    name: Entity<TextInput>,
+    layer: Rc<Cell<Option<overlay::LayerId>>>,
+    cancel_focus: FocusHandle,
+    create_focus: FocusHandle,
+    on_create: Action,
+    _subscription: Subscription,
+}
+
+/// A callback for the branch dialog's controls.
+type Action = Rc<dyn Fn(&mut Window, &mut App)>;
+
+impl BranchFooter {
+    fn new(
+        name: Entity<TextInput>,
+        layer: Rc<Cell<Option<overlay::LayerId>>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let on_create: Action = {
+            let name = name.clone();
+            let layer = layer.clone();
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                let branch = name.read(cx).text().trim().to_owned();
+                if branch.is_empty() {
+                    return;
+                }
+                toast::show(
+                    ToastKind::Ok,
+                    format!("Created and checked out {branch}"),
+                    window,
+                    cx,
+                );
+                if let Some(layer) = layer.get() {
+                    dialog::close(layer, window, cx);
+                }
+            })
+        };
+        let subscription = cx.subscribe(&name, |_, _, _: &TextInputEvent, cx| cx.notify());
+        Self {
+            name,
+            layer,
+            cancel_focus: cx.focus_handle().tab_stop(true),
+            create_focus: cx.focus_handle().tab_stop(true),
+            on_create,
+            _subscription: subscription,
+        }
+    }
+
+    fn dialog_parts(&self) -> (FocusHandle, FocusHandle, Action) {
+        (
+            self.cancel_focus.clone(),
+            self.create_focus.clone(),
+            self.on_create.clone(),
+        )
+    }
+}
+
+impl Render for BranchFooter {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let empty = self.name.read(cx).text().trim().is_empty();
+        let layer = self.layer.clone();
+        let on_create = self.on_create.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                Button::ghost("branch-cancel")
+                    .label("Cancel")
+                    .min_width(px(72.))
+                    .focus_handle(self.cancel_focus.clone())
+                    .on_click(move |_, window, cx| {
+                        if let Some(layer) = layer.get() {
+                            dialog::close(layer, window, cx);
+                        }
+                    }),
+            )
+            .child(
+                Button::primary("branch-create")
+                    .label("Create branch")
+                    .min_width(px(72.))
+                    .disabled(empty)
+                    .focus_handle(self.create_focus.clone())
+                    .on_click(move |_, window, cx| on_create.as_ref()(window, cx)),
+            )
+    }
+}
+
 fn interaction_section(
     gallery: &Gallery,
     colors: ThemeColors,
@@ -1543,10 +2074,12 @@ fn open_popover_button(colors: ThemeColors, cx: &mut Context<ModalPanel>) -> imp
         .child("Open nested popover")
 }
 
-/// `--theme dark|light|system`, `--section <name>`; unknown values fall back.
-fn parse_args() -> (ThemeMode, Option<Section>) {
+/// `--theme dark|light|system`, `--section <name>`, `--open menu|select|dialog|toasts`;
+/// unknown values fall back.
+fn parse_args() -> (ThemeMode, Option<Section>, Option<OpenOnStart>) {
     let mut mode = ThemeMode::System;
     let mut section = None;
+    let mut open = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1558,14 +2091,15 @@ fn parse_args() -> (ThemeMode, Option<Section>) {
                 }
             }
             "--section" => section = args.next().as_deref().and_then(Section::parse),
+            "--open" => open = args.next().as_deref().and_then(OpenOnStart::parse),
             _ => {}
         }
     }
-    (mode, section)
+    (mode, section, open)
 }
 
 fn main() {
-    let (mode, section) = parse_args();
+    let (mode, section, open) = parse_args();
     Application::new()
         .with_assets(ui::Assets)
         .run(move |cx: &mut App| {
@@ -1574,21 +2108,43 @@ fn main() {
             }
             theme::set_mode(mode, cx);
             let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("GitWarp UI gallery".into()),
+            let mut root = None;
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some("GitWarp UI gallery".into()),
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    theme::follow_system(window, cx);
-                    cx.new(|cx| Gallery::new(mode, section, cx))
-                },
-            )
-            .expect("failed to open the gallery window");
+                    },
+                    |window, cx| {
+                        theme::follow_system(window, cx);
+                        let view = cx.new(|cx| Gallery::new(mode, section, cx));
+                        root = Some(view.clone());
+                        view
+                    },
+                )
+                .expect("failed to open the gallery window");
+
+            if let (Some(open), Some(root)) = (open, root) {
+                // The first frame records the review targets' bounds; the second
+                // callback runs after that frame, so the menu, select and dialog
+                // can be placed from real layout.
+                window
+                    .update(cx, |_, window, _| {
+                        window.on_next_frame(move |window, _| {
+                            window.on_next_frame(move |window, cx| {
+                                root.update(cx, |gallery, cx| {
+                                    gallery.open_on_start(open, window, cx);
+                                });
+                            });
+                            window.refresh();
+                        });
+                    })
+                    .ok();
+            }
             cx.activate(true);
         });
 }

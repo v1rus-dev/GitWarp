@@ -2,13 +2,13 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, point, px, transparent_black, App, AppContext, BoxShadow, ClickEvent, Div, ElementId,
-    FontWeight, IntoElement, ParentElement, Pixels, Render, RenderOnce, SharedString, Styled,
-    Window,
+    div, point, px, transparent_black, App, BoxShadow, ClickEvent, Div, ElementId, FocusHandle,
+    FontWeight, IntoElement, ParentElement, Pixels, RenderOnce, SharedString, Styled, Window,
 };
 use gpui::{InteractiveElement, StatefulInteractiveElement};
 
 use crate::components::counter::Counter;
+use crate::components::Tooltip;
 use crate::focus::{self, RingOffset};
 use crate::icon::{Icon, IconName};
 use crate::metrics::{CTL, CTL_SM, FONT_UI, FS_BASE, FS_SM, R_SM};
@@ -48,7 +48,8 @@ pub struct Button {
     disabled: bool,
     min_width: Option<Pixels>,
     counter: Option<Counter>,
-    tooltip: Option<SharedString>,
+    tooltip: Option<(SharedString, Option<SharedString>)>,
+    focus_handle: Option<FocusHandle>,
     on_click: Option<crate::components::ClickHandler>,
 }
 
@@ -66,6 +67,7 @@ impl Button {
             min_width: None,
             counter: None,
             tooltip: None,
+            focus_handle: None,
             on_click: None,
         }
     }
@@ -137,7 +139,23 @@ impl Button {
 
     /// Built-in GPUI tooltip; required for icon-only buttons.
     pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
-        self.tooltip = Some(text.into());
+        self.tooltip = Some((text.into(), None));
+        self
+    }
+
+    /// A tooltip with a trailing key cap.
+    pub fn tooltip_kbd(
+        mut self,
+        text: impl Into<SharedString>,
+        kbd: impl Into<SharedString>,
+    ) -> Self {
+        self.tooltip = Some((text.into(), Some(kbd.into())));
+        self
+    }
+
+    /// Uses an existing focus handle instead of the button's own keyed one.
+    pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
+        self.focus_handle = Some(handle);
         self
     }
 
@@ -159,11 +177,14 @@ impl RenderOnce for Button {
             "icon-only buttons need a tooltip"
         );
 
-        let focus = window
-            .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
-            .read(cx)
-            .clone()
-            .tab_stop(!self.disabled);
+        let focus = match self.focus_handle.clone() {
+            Some(handle) => handle,
+            None => window
+                .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
+                .read(cx)
+                .clone(),
+        }
+        .tab_stop(!self.disabled);
         let ring = !self.disabled && focus::focus_visible(&focus, window, cx);
 
         let (height, padding, font_size, icon_size) = match self.size {
@@ -325,8 +346,11 @@ impl RenderOnce for Button {
             }
         }
 
-        if let Some(text) = self.tooltip {
-            root = root.tooltip(move |_, cx| cx.new(|_| TooltipView { text: text.clone() }).into());
+        if let Some((text, kbd)) = self.tooltip {
+            root = match kbd {
+                Some(kbd) => root.tooltip(Tooltip::with_kbd(text, kbd)),
+                None => root.tooltip(Tooltip::text(text)),
+            };
         }
 
         let content: Div = if let Some(icon) = self.icon_only {
@@ -346,25 +370,5 @@ impl RenderOnce for Button {
         root.child(content).when(ring, |this| {
             this.child(focus::focus_ring(RingOffset::Outset1, R_SM, cx))
         })
-    }
-}
-
-struct TooltipView {
-    text: SharedString,
-}
-
-impl Render for TooltipView {
-    fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors;
-        div()
-            .px(px(8.))
-            .py(px(4.))
-            .border_1()
-            .border_color(colors.border_strong)
-            .rounded(R_SM)
-            .bg(colors.surface)
-            .text_color(colors.text)
-            .text_size(FS_SM)
-            .child(self.text.clone())
     }
 }

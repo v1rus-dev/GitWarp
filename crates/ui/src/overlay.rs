@@ -215,6 +215,9 @@ pub fn render_overlays(window: &mut Window, cx: &mut App) -> impl IntoElement {
         let layer = layer_element(id, kind, view, dismiss, colors);
         root = root.child(deferred(layer).with_priority(index));
     }
+    if let Some(toasts) = crate::components::toast::render_stack(window, cx) {
+        root = root.child(deferred(toasts).with_priority(usize::MAX));
+    }
     root
 }
 
@@ -274,9 +277,13 @@ fn popover_layer(
 ) -> Div {
     let mut catcher = div().absolute().inset_0().occlude();
     if dismiss_on_outside_click {
-        catcher = catcher.on_mouse_down(MouseButton::Left, move |_, window, cx| {
-            close(id, window, cx);
-        });
+        catcher = catcher
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                close(id, window, cx);
+            })
+            .on_mouse_down(MouseButton::Right, move |_, window, cx| {
+                close(id, window, cx);
+            });
     }
 
     div()
@@ -327,6 +334,41 @@ fn try_entity(window: &Window, cx: &App) -> Option<Entity<Overlays>> {
 /// Number of open layers in `window`; zero if nothing has been opened.
 pub fn layer_count(window: &Window, cx: &App) -> usize {
     try_entity(window, cx).map_or(0, |overlays| overlays.read(cx).layers.entries.len())
+}
+
+/// The view of layer `id`, if it is open in `window`.
+pub fn layer_view(id: LayerId, window: &Window, cx: &App) -> Option<AnyView> {
+    let overlays = try_entity(window, cx)?;
+    overlays
+        .read(cx)
+        .layers
+        .entries
+        .iter()
+        .find(|(layer_id, _)| *layer_id == id)
+        .map(|(_, layer)| layer.view.clone())
+}
+
+/// Enables or disables closing a layer by clicking outside it.
+pub fn set_dismiss_on_outside_click(id: LayerId, dismiss: bool, window: &mut Window, cx: &mut App) {
+    let Some(overlays) = try_entity(window, cx) else {
+        return;
+    };
+    let changed = overlays.update(cx, |overlays, _| {
+        if let Some((_, layer)) = overlays
+            .layers
+            .entries
+            .iter_mut()
+            .find(|(layer_id, _)| *layer_id == id)
+        {
+            layer.dismiss_on_outside_click = dismiss;
+            true
+        } else {
+            false
+        }
+    });
+    if changed {
+        window.refresh();
+    }
 }
 
 #[cfg(test)]

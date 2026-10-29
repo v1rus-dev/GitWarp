@@ -5,7 +5,9 @@
 //! `cx.theme().colors.bg`.
 #![allow(clippy::unusual_byte_groupings)] // `0xRRGGBB_AA` mirrors the CSS colour.
 
-use gpui::{hsla, px, rgb, rgba, App, Global, Hsla, Pixels, Window, WindowAppearance};
+use gpui::{
+    hsla, point, px, rgb, rgba, App, BoxShadow, Global, Hsla, Pixels, Window, WindowAppearance,
+};
 
 /// The resolved colour theme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,6 +241,19 @@ impl Theme {
             }),
             graph_lightness: 0.45,
         }
+    }
+
+    /// The floating-layer shadow: both CSS layers of `shadow-pop`.
+    pub fn pop_shadow(&self) -> Vec<BoxShadow> {
+        self.shadow_pop
+            .iter()
+            .map(|shadow| BoxShadow {
+                color: shadow.color,
+                offset: point(px(0.), shadow.offset_y),
+                blur_radius: shadow.blur,
+                spread_radius: shadow.spread,
+            })
+            .collect()
     }
 
     /// Lane colour: hues spread by the golden angle, so neighbours never clash.
