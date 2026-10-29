@@ -349,9 +349,14 @@ impl Render for DialogHost {
                 px(16.)
             })
             .max_h(px(560.))
+            // The body is the dialog's scroll container: it keeps its capped
+            // height instead of being compressed by the head and footer.
+            .flex_none()
             .overflow_y_scroll();
         if let Some(content) = dialog.body {
-            body = body.child(content);
+            // The content is one flex item of the scrolling column: a fixed
+            // height here would otherwise shrink every field in it.
+            body = body.child(div().flex_none().child(content));
         }
 
         let mut footer = div()

@@ -310,7 +310,14 @@ impl Render for MenuView {
         for entry in &self.entries {
             match entry {
                 MenuEntry::Separator => {
-                    panel = panel.child(div().h(px(1.)).my(px(4.)).mx(px(2.)).bg(colors.border));
+                    panel = panel.child(
+                        div()
+                            .h(px(1.))
+                            .flex_none()
+                            .my(px(4.))
+                            .mx(px(2.))
+                            .bg(colors.border),
+                    );
                 }
                 MenuEntry::Item(item) => {
                     let index = item_index;
@@ -385,6 +392,8 @@ fn menu_item_row(
     let mut row = div()
         .id(ElementId::named_usize("menu-item", index))
         .h(px(28.))
+        // A fixed-height item in the menu's flex column keeps its height.
+        .flex_none()
         .px(px(10.))
         .flex()
         .items_center()

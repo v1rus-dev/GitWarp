@@ -133,7 +133,8 @@ impl RenderOnce for ListRow {
 
         // Padding (rather than margins on the row) works in both a plain flex
         // column and a uniform_list, where the item root is laid out with a
-        // definite width and does not flex-stretch its child.
-        div().w_full().px(px(6.)).child(row)
+        // definite width and does not flex-stretch its child. The wrapper is
+        // the flex item in a column list, so it must not shrink either.
+        div().w_full().px(px(6.)).flex_none().child(row)
     }
 }

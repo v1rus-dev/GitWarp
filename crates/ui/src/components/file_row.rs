@@ -252,6 +252,8 @@ impl RenderOnce for FileRow {
             .items_center()
             .gap(px(8.))
             .h(ROW)
+            // A row in a scrolling flex column keeps its fixed height.
+            .flex_none()
             .ml(px(6.))
             .mr(px(6.))
             .px(px(8.))
