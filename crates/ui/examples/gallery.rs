@@ -1396,6 +1396,17 @@ fn segmented_tabs_section(
                                 .items([SegmentItem::new("One"), SegmentItem::new("Two")])
                                 .selected(0)
                                 .disabled(true),
+                        )
+                        .child(
+                            // One disabled option inside a live control.
+                            Segmented::new("seg-item-dis")
+                                .items([
+                                    SegmentItem::new("History"),
+                                    SegmentItem::new("Changes")
+                                        .disabled(true)
+                                        .tooltip("Local changes arrive in a later stage"),
+                                ])
+                                .selected(0),
                         ),
                 )
                 .child(tabs),

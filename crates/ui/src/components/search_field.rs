@@ -54,8 +54,16 @@ impl RenderOnce for SearchField {
         };
 
         let mut root = div()
-            .id(self.id)
+            .id(self.id.clone())
+            // A field fills its container: with an auto width a flex row only
+            // takes its content width (icon + padding), which collapses the
+            // input and hides the placeholder.
+            .w_full()
             .relative()
+            .debug_selector({
+                let id = self.id.to_string();
+                move || id.clone()
+            })
             .h(CTL)
             .pl(px(8.))
             .pr(px(6.))

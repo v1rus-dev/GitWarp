@@ -1,12 +1,13 @@
 mod graph_paint;
 mod history_view;
+mod repo_view;
 mod settings;
 mod theme;
 mod welcome;
 mod workspace;
 
 use gpui::{
-    prelude::*, px, size, App, Application, Bounds, Global, TitlebarOptions,
+    prelude::*, px, size, App, Application, Bounds, Global, KeyBinding, TitlebarOptions,
     WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
 
@@ -27,7 +28,6 @@ struct AppSettings {
 impl Global for AppSettings {}
 
 /// Applies `f` to the loaded settings and saves them.
-#[allow(dead_code)] // used by the window shell (stage 2.2+)
 fn update_settings(cx: &mut App, f: impl FnOnce(&mut Settings)) {
     if cx.try_global::<AppSettings>().is_none() {
         return;
@@ -92,6 +92,16 @@ fn main() {
             if loaded.theme != ThemePref::System {
                 ui::theme::set_mode(loaded.theme.into(), cx);
             }
+            // Repository shortcuts. `secondary-` is Ctrl on Linux and Windows
+            // and Cmd on macOS. The views handle them, with a window-root
+            // fallback for when nothing holds the focus.
+            cx.bind_keys([
+                KeyBinding::new("secondary-b", repo_view::ToggleSidebar, None),
+                KeyBinding::new("secondary-j", repo_view::ToggleDetails, None),
+                KeyBinding::new("secondary-k", repo_view::FocusSearch, None),
+                KeyBinding::new("secondary-o", repo_view::OpenRepoSwitcher, None),
+                KeyBinding::new("secondary-shift-b", repo_view::OpenBranchSwitcher, None),
+            ]);
             cx.set_global(AppSettings {
                 path: config_path,
                 settings: loaded,

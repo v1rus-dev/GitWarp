@@ -1,43 +1,46 @@
-//! The window shell: client-side decorations, the titlebar, the status bar and
-//! the switch between the welcome and repository content.
+//! The window shell: client-side decorations, the frame and the switch between
+//! the welcome and repository content.
 //!
 //! A single window is opened at start; opening a repository or showing the
 //! welcome screen swaps the content of this root view instead of opening
 //! another window (on Linux the app quits with its last window).
+//!
+//! Each content view renders its own full column — titlebar, body, status bar —
+//! through the helpers in this module, so the frame only owns the decorations.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    canvas, div, point, px, AppContext, Bounds, Context, CursorStyle, Decorations, Div, Entity,
-    HitboxBehavior, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
-    Render, ResizeEdge, SharedString, Styled, Subscription, Tiling, Window,
+    canvas, div, point, px, App, AppContext, Bounds, Context, CursorStyle, Decorations, Div,
+    Entity, HitboxBehavior, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
+    Point, Render, ResizeEdge, SharedString, Styled, Subscription, Tiling, Window,
 };
 
 use git_core::Git;
-use ui::metrics::{BAR, FONT_UI, FS_BASE, FS_SM, R_WINDOW, STATUS};
+use ui::metrics::{BAR, FONT_UI, FS_BASE, R_WINDOW};
 use ui::theme::ActiveTheme;
-use ui::{Icon, IconName, WindowControls};
+use ui::WindowControls;
 
-use crate::history_view::HistoryView;
+use crate::repo_view::{
+    FocusSearch, OpenBranchSwitcher, OpenRepoSwitcher, RepositoryView, ToggleDetails, ToggleSidebar,
+};
 use crate::welcome::WelcomeView;
 
 /// The shadow and resize border drawn around the client-side frame.
 const INSET: Pixels = px(10.);
 
-/// What the frame shows below the titlebar.
+/// What the frame shows below the decorations.
 enum Content {
     Welcome(Entity<WelcomeView>),
-    Repository(Entity<HistoryView>),
+    Repository(Entity<RepositoryView>),
 }
 
-/// The window root: frame, titlebar, content and status bar.
+/// The window root: frame, decorations and the current content view.
 pub struct Workspace {
     content: Content,
     git: Result<Arc<Git>, String>,
-    /// The repository name in the titlebar; `None` on the welcome screen.
-    repo_name: Option<SharedString>,
     /// Repaints when the decorations change (windows forced to server-side
     /// decorations, tiling on maximise/snap).
     _decorations: Subscription,
@@ -53,9 +56,8 @@ impl Workspace {
     ) -> Self {
         let decorations = cx.observe_window_appearance(window, |_, _, cx| cx.notify());
         let mut this = Self {
-            content: Content::Welcome(cx.new(WelcomeView::new)),
+            content: Content::Welcome(cx.new(|cx| WelcomeView::new(git.clone(), cx))),
             git,
-            repo_name: None,
             _decorations: decorations,
         };
         match path {
@@ -65,13 +67,13 @@ impl Workspace {
         this
     }
 
-    /// Switches to the history of the repository at `path`.
+    /// Switches to the repository at `path`.
     pub fn open_repository(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let git = self.git.clone();
-        let view = cx.new(|cx| HistoryView::open(path.clone(), git, cx));
+        let workspace = cx.weak_entity();
+        let view = cx.new(|cx| RepositoryView::new(path.clone(), git, workspace, window, cx));
         let name = repo_name(&path);
         self.content = Content::Repository(view);
-        self.repo_name = Some(name.clone());
         window.set_window_title(&format!("{name} — GitWarp"));
         cx.notify();
     }
@@ -79,90 +81,78 @@ impl Workspace {
     /// Switches back to the welcome screen.
     pub fn show_welcome(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.content, Content::Welcome(_)) {
-            self.content = Content::Welcome(cx.new(WelcomeView::new));
+            self.content = Content::Welcome(cx.new(|cx| WelcomeView::new(self.git.clone(), cx)));
         }
-        self.repo_name = None;
         window.set_window_title("GitWarp");
         cx.notify();
     }
 
-    fn render_titlebar(&self, client: bool, cx: &mut Context<Self>) -> Div {
-        let colors = cx.theme().colors;
-        let leading = match &self.content {
-            Content::Welcome(_) => div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .pl(px(4.))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(Icon::new(IconName::Git).size(px(16.)))
-                .child("GitWarp")
-                .into_any_element(),
-            Content::Repository(_) => div()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .child(Icon::new(IconName::Folder).size(px(14.)))
-                .child(
-                    div()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .max_w(px(140.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(self.repo_name.clone().unwrap_or_default()),
-                )
-                .into_any_element(),
-        };
-
-        let mut bar = div()
-            .h(BAR)
-            .px(px(12.))
-            .flex()
-            .items_center()
-            .bg(colors.bg)
-            .border_b_1()
-            .border_color(colors.border)
-            // The empty area of the bar moves the window; a double-click
-            // toggles maximise. Right-click opens the system window menu.
-            .on_mouse_down(MouseButton::Left, |event, window, _| {
-                if event.click_count == 2 {
-                    window.zoom_window();
-                } else {
-                    window.start_window_move();
-                }
-            })
-            .on_mouse_down(MouseButton::Right, |event, window, _| {
-                window.show_window_menu(event.position);
-            })
-            .child(leading)
-            .child(div().flex_1().h_full());
-        if client {
-            bar = bar.child(WindowControls::new("window-controls"));
+    /// Runs `f` on the open repository, if there is one.
+    fn with_repository<R>(
+        &self,
+        cx: &mut App,
+        f: impl FnOnce(&mut RepositoryView, &mut Context<RepositoryView>) -> R,
+    ) -> Option<R> {
+        match &self.content {
+            Content::Repository(view) => Some(view.update(cx, f)),
+            Content::Welcome(_) => None,
         }
-        bar
     }
+}
 
-    fn render_status_bar(&self, cx: &mut Context<Self>) -> Div {
-        let colors = cx.theme().colors;
-        let git = match &self.git {
-            Ok(git) => format!("git {} · {}", git.version(), git.source()),
-            Err(_) => "git not found".to_owned(),
-        };
-        div()
-            .h(STATUS)
-            .px(px(8.))
-            .flex()
-            .items_center()
-            .justify_end()
-            .gap(px(6.))
-            .bg(colors.sidebar)
-            .border_t_1()
-            .border_color(colors.border)
-            .text_size(FS_SM)
-            .text_color(colors.muted)
-            .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
-            .child(git)
+/// The titlebar/toolbar container shared by the content views.
+///
+/// The caller appends its items, one of them [`titlebar_fill`], and finishes
+/// with [`titlebar_end`] so the window buttons stay at the right end.
+pub fn titlebar(cx: &App) -> Div {
+    let colors = cx.theme().colors;
+    div()
+        .h(BAR)
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .bg(colors.bg)
+        .border_b_1()
+        .border_color(colors.border)
+        .text_size(FS_BASE)
+        .font_family(FONT_UI)
+}
+
+/// The empty stretch of the titlebar: the window drag area.
+///
+/// The empty area of the bar moves the window; a double-click toggles
+/// maximise, a right-click opens the system window menu. Buttons and other
+/// controls sit beside it, so pressing them never starts a window move.
+pub fn titlebar_fill() -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .on_mouse_down(MouseButton::Left, |event, window, _| {
+            if event.click_count == 2 {
+                window.zoom_window();
+            } else {
+                window.start_window_move();
+            }
+        })
+        .on_mouse_down(MouseButton::Right, |event, window, _| {
+            window.show_window_menu(event.position);
+        })
+}
+
+/// Appends the window controls when the window uses client decorations.
+pub fn titlebar_end(bar: Div, client: bool) -> Div {
+    if client {
+        // Never shrink: the three buttons must stay fully visible at the
+        // minimum window width.
+        bar.child(
+            div()
+                .flex_none()
+                .child(WindowControls::new("window-controls")),
+        )
+    } else {
+        bar
     }
 }
 
@@ -179,7 +169,6 @@ impl Render for Workspace {
             Decorations::Client { tiling } => (true, tiling),
         };
 
-        let titlebar = self.render_titlebar(client, cx);
         let body = match &self.content {
             Content::Welcome(view) => view.clone().into_any_element(),
             Content::Repository(view) => view.clone().into_any_element(),
@@ -236,7 +225,6 @@ impl Render for Workspace {
         }
 
         let frame = frame
-            .child(titlebar)
             .child(
                 div()
                     .flex_1()
@@ -245,12 +233,35 @@ impl Render for Workspace {
                     .overflow_hidden()
                     .child(body),
             )
-            .child(self.render_status_bar(cx))
             // Menus, dialogs and toasts live inside the frame, above the
             // content, so they cannot spill over the window's shadow band.
             .child(ui::overlay::render_overlays(window, cx));
 
         let root = backdrop.child(frame);
+
+        // Fallback for the repository shortcuts: when nothing holds the focus,
+        // the dispatch path is the window root only and the content view's own
+        // handlers never run. When the focus is inside the repository view its
+        // handler runs first and stops propagation, so nothing toggles twice.
+        let root = root
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.with_repository(cx, |view, cx| view.toggle_sidebar(cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleDetails, _, cx| {
+                this.with_repository(cx, |view, cx| view.toggle_details(cx));
+            }))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                if let Some(handle) = this.with_repository(cx, |view, _| view.search_focus()) {
+                    window.focus(&handle);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenRepoSwitcher, window, cx| {
+                this.with_repository(cx, |view, cx| view.open_repo_menu(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenBranchSwitcher, window, cx| {
+                this.with_repository(cx, |view, cx| view.open_branch_menu(window, cx));
+            }));
+
         ui::focus::track_pointer(ui::actions::tab_navigation(root))
     }
 }
@@ -316,7 +327,7 @@ fn resize_edge(pos: Point<Pixels>, inset: Pixels, size: gpui::Size<Pixels>) -> O
 }
 
 /// The last path component, for the titlebar; "." and ".." resolve first.
-fn repo_name(path: &Path) -> SharedString {
+pub fn repo_name(path: &Path) -> SharedString {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -353,5 +364,11 @@ mod tests {
             Some(ResizeEdge::BottomRight)
         );
         assert_eq!(resize_edge(point(px(50.), px(25.)), INSET, size), None);
+    }
+
+    #[test]
+    fn repo_name_is_the_last_component() {
+        assert_eq!(repo_name(Path::new("/home/user/gitwarp")), "gitwarp");
+        assert_eq!(repo_name(Path::new("/")), "/");
     }
 }
