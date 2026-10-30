@@ -236,7 +236,7 @@ pub fn open_with_view(
     host.update(cx, |host, _| host.layer = Some(layer));
     overlay::set_dismiss_on_outside_click(layer, !busy, window, cx);
     let target = initial.unwrap_or_else(|| host.read(cx).focus.clone());
-    window.focus(&target);
+    window.focus(&target, cx);
     (layer, host)
 }
 
@@ -349,9 +349,14 @@ impl Render for DialogHost {
                 px(16.)
             })
             .max_h(px(560.))
+            // The body is the dialog's scroll container: it keeps its capped
+            // height instead of being compressed by the head and footer.
+            .flex_none()
             .overflow_y_scroll();
         if let Some(content) = dialog.body {
-            body = body.child(content);
+            // The content is one flex item of the scrolling column: a fixed
+            // height here would otherwise shrink every field in it.
+            body = body.child(div().flex_none().child(content));
         }
 
         let mut footer = div()
@@ -437,7 +442,7 @@ fn cycle_focus(handles: &[FocusHandle], forward: bool, window: &mut Window, cx: 
         .focused(cx)
         .and_then(|focused| handles.iter().position(|handle| handle == &focused));
     if let Some(index) = next_focus_index(handles.len(), current, forward) {
-        window.focus(&handles[index]);
+        window.focus(&handles[index], cx);
     }
 }
 

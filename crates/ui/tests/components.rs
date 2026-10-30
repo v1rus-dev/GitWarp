@@ -8,14 +8,16 @@ use gpui::{
     Render, TestAppContext, VisualTestContext, Window,
 };
 
-use ui::{actions, focus, Button, Checkbox, SegmentItem, Segmented, Tab, Tabs};
+use ui::{
+    actions, focus, Button, Checkbox, SearchField, SegmentItem, Segmented, Tab, Tabs, TextInput,
+};
 
 fn init(cx: &mut TestAppContext) {
     cx.update(ui::init).expect("ui::init");
 }
 
 /// `simulate_keystrokes` only sends key-down; GPUI's keyboard activation runs on key-up.
-fn press(cx: &mut VisualTestContext, keystroke: &str) {
+fn press(cx: &mut VisualTestContext, keystroke: &'static str) {
     cx.simulate_keystrokes(keystroke);
     cx.simulate_event(KeyUpEvent {
         keystroke: Keystroke::parse(keystroke).expect("valid keystroke"),
@@ -459,4 +461,48 @@ fn indeterminate_progress_starts_inside_the_track(cx: &mut TestAppContext) {
     let fill_right: f32 = (fill.origin.x + fill.size.width).into();
     assert!(fill_left >= track_left, "segment starts off the track");
     assert!(fill_right <= track_right, "segment starts past the track");
+}
+
+#[gpui::test]
+fn a_search_field_fills_the_sidebar(cx: &mut TestAppContext) {
+    struct Root;
+    impl Render for Root {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let input = window.use_keyed_state("sidebar-search-input", cx, |window, cx| {
+                TextInput::new(window, cx)
+            });
+            // The repository sidebar: a 240px flex column with the filter
+            // area inside 10px padding.
+            div().size_full().flex().flex_col().child(
+                div()
+                    .w(px(240.))
+                    .flex_none()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .border_r_1()
+                    .child(
+                        div()
+                            .w_full()
+                            .px(px(10.))
+                            .pt(px(12.))
+                            .pb(px(8.))
+                            .child(SearchField::new("sidebar-search", input)),
+                    )
+                    .child(div().w_full().flex_1().min_h_0()),
+            )
+        }
+    }
+
+    init(cx);
+    let (_, cx) = cx.add_window_view(|_, _| Root);
+    cx.run_until_parked();
+
+    let bounds = cx
+        .debug_bounds("sidebar-search")
+        .expect("the search field was not drawn");
+    // 240 - 1px border - 2 * 10px padding: the field spans the filter area
+    // instead of collapsing to its icon.
+    assert_eq!(bounds.size.width, px(219.));
+    assert_eq!(bounds.size.height, px(26.));
 }

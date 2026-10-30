@@ -269,7 +269,7 @@ impl Tree {
         self
     }
 
-    /// Double-click or double activation.
+    /// Double-click or double activation of a leaf node; parents toggle instead.
     pub fn on_open(mut self, listener: impl Fn(usize, &mut Window, &mut App) + 'static) -> Self {
         self.on_open = Some(Rc::new(listener));
         self
@@ -563,6 +563,10 @@ impl RenderOnce for Tree {
                 .items_center()
                 .gap(px(6.))
                 .h(ROW)
+                // The tree is a flex column inside a scroll container: without
+                // this every row shrinks below its fixed height when the
+                // content overflows, instead of the tree scrolling.
+                .flex_none()
                 .ml(px(6.))
                 .mr(px(6.))
                 .pl(pad_left)
@@ -621,17 +625,20 @@ impl RenderOnce for Tree {
                     move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
                         // Focus the tree ourselves: the listeners below may
                         // open a menu or dialog that must keep the focus.
-                        window.focus(&focus);
+                        window.focus(&focus, cx);
                         state.update(cx, |state, _| {
                             state.marker_key = Some(key.clone());
                             state.marker_index = index;
                         });
-                        if event.click_count >= 2 {
-                            if let Some(listener) = &on_open {
+                        if has_children {
+                            // A parent toggles on every click, however fast
+                            // the series: the second click of a double click
+                            // must collapse what the first one expanded.
+                            if let Some(listener) = &on_toggle {
                                 listener(index, window, cx);
                             }
-                        } else if has_children {
-                            if let Some(listener) = &on_toggle {
+                        } else if event.click_count >= 2 {
+                            if let Some(listener) = &on_open {
                                 listener(index, window, cx);
                             }
                         } else if let Some(listener) = &on_activate {
@@ -651,7 +658,7 @@ impl RenderOnce for Tree {
                 row = row.on_mouse_down(
                     MouseButton::Right,
                     move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
-                        window.focus(&focus);
+                        window.focus(&focus, cx);
                         state.update(cx, |state, _| {
                             state.marker_key = Some(key.clone());
                             state.marker_index = index;

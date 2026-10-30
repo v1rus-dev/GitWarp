@@ -30,7 +30,7 @@ Fix rounds are sent to the same terminal with `orca terminal send --terminal <ha
   commits, pushes, dependency additions not listed in the brief, and edits outside the repo.
 - The brief lives in `swarm-report/<stage>/<step>-brief.md` and is self-contained: goal,
   files to touch, the relevant design excerpt (tokens/spec values copied in, not "see the
-  design"), API notes for GPUI 0.2.2 found during planning, acceptance criteria, and the
+  design"), API notes for GPUI (gpui-pre, see Cargo.toml) found during planning, acceptance criteria, and the
   check commands to run before finishing.
 - One OpenCode session per step: fix rounds of that step go to the same terminal (the model keeps its
   context); once the step is accepted, close that terminal (`orca terminal close --terminal <handle>`) and
@@ -44,8 +44,8 @@ Claude never accepts a step on OpenCode's own report. Before acceptance:
 1. Read the full `git diff` of the step: scope matches the brief, no stray files,
    no new dependencies beyond the approved ones.
 2. `cargo build -p app`, `cargo build -p ui --examples`, `cargo clippy --workspace --all-targets -- -D warnings`,
-   `cargo fmt --all -- --check`, `cargo test` and `cargo test -p ui` (`ui` and `app` are not default members,
-   so plain `cargo test` skips them).
+   `cargo fmt --all -- --check`, `cargo test`, `cargo test -p ui` and `cargo test -p app` (`ui` and `app` are not
+   default members, so plain `cargo test` skips them).
 3. UI steps: run the app and compare against the design snapshot in `docs/design`.
 4. Findings go back to OpenCode as a fix round; after two failed rounds on the same issue
    Claude stops and reports to the user.

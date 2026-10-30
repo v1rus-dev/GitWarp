@@ -9,6 +9,7 @@ use gpui::{
 };
 use gpui::{InteractiveElement, StatefulInteractiveElement};
 
+use crate::components::Tooltip;
 use crate::focus::{self, RingOffset};
 use crate::icon::{Icon, IconName};
 use crate::metrics::{CTL_SM, FS_BASE, FS_SM, R_SM};
@@ -19,6 +20,8 @@ pub struct SegmentItem {
     id: Option<ElementId>,
     label: Option<SharedString>,
     icon: Option<IconName>,
+    disabled: bool,
+    tooltip: Option<SharedString>,
 }
 
 impl SegmentItem {
@@ -27,6 +30,8 @@ impl SegmentItem {
             id: None,
             label: Some(label.into()),
             icon: None,
+            disabled: false,
+            tooltip: None,
         }
     }
 
@@ -35,7 +40,21 @@ impl SegmentItem {
             id: None,
             label: None,
             icon: Some(icon),
+            disabled: false,
+            tooltip: None,
         }
+    }
+
+    /// A single disabled option; the rest of the control stays interactive.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    /// A tooltip on this option, e.g. for icon-only segments.
+    pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(text.into());
+        self
     }
 
     /// A stable identity for the segment; defaults to its label or icon, so
@@ -127,6 +146,7 @@ impl RenderOnce for Segmented {
         let mut label_occurrences: HashMap<String, usize> = HashMap::new();
         for (index, item) in self.items.into_iter().enumerate() {
             let selected = index == self.selected;
+            let item_disabled = self.disabled || item.disabled;
             // Key by identity, not position; duplicate labels/icons get
             // `label#n` so each item keeps its own focus handle.
             let key = match &item.id {
@@ -142,14 +162,17 @@ impl RenderOnce for Segmented {
                     format!("{base}#{occurrence}")
                 }
             };
-            let child_id = ElementId::NamedChild(Box::new(bar_id.clone()), SharedString::from(key));
+            let child_id =
+                ElementId::NamedChild(std::sync::Arc::new(bar_id.clone()), SharedString::from(key));
             let focus = window
                 .use_keyed_state(child_id.clone(), cx, |_, cx| cx.focus_handle())
                 .read(cx)
                 .clone()
-                .tab_stop(!self.disabled);
-            let ring = !self.disabled && focus::focus_visible(&focus, window, cx);
-            let foreground = if selected {
+                .tab_stop(!item_disabled);
+            let ring = !item_disabled && focus::focus_visible(&focus, window, cx);
+            let foreground = if item_disabled {
+                colors.disabled
+            } else if selected {
                 colors.selection_fg
             } else {
                 colors.muted
@@ -180,7 +203,7 @@ impl RenderOnce for Segmented {
                 })
                 .when_some(item.label, |this, label| this.child(label));
 
-            if self.disabled {
+            if item_disabled {
                 segment = segment.cursor_not_allowed();
             } else {
                 segment = segment.cursor_pointer().track_focus(&focus);
@@ -190,6 +213,10 @@ impl RenderOnce for Segmented {
                 if let Some(listener) = self.on_select.clone() {
                     segment = segment.on_click(move |_, window, cx| listener(index, window, cx));
                 }
+            }
+
+            if let Some(tooltip) = item.tooltip {
+                segment = segment.tooltip(Tooltip::text(tooltip));
             }
 
             if ring {

@@ -96,7 +96,7 @@ fn start(cx: &mut TestAppContext) -> (Entity<TestRoot>, &mut VisualTestContext) 
 }
 
 /// `simulate_keystrokes` only sends key-down; keyboard clicks run on key-up.
-fn press(cx: &mut VisualTestContext, keystroke: &str) {
+fn press(cx: &mut VisualTestContext, keystroke: &'static str) {
     cx.simulate_keystrokes(keystroke);
     cx.simulate_event(KeyUpEvent {
         keystroke: Keystroke::parse(keystroke).expect("valid keystroke"),
@@ -301,7 +301,7 @@ fn dialog_escape_closes_unless_busy_and_restores_focus(cx: &mut TestAppContext) 
     let outside = cx.read(|app| view.read(app).outside.clone());
     let hits = Rc::new(Cell::new(0));
 
-    cx.update(|window, _| window.focus(&outside));
+    cx.update(|window, cx| window.focus(&outside, cx));
     let _layer = open_test_dialog(cx, &view, false, false, &hits);
     cx.run_until_parked();
     assert_eq!(layer_count(cx), 1);
@@ -310,7 +310,7 @@ fn dialog_escape_closes_unless_busy_and_restores_focus(cx: &mut TestAppContext) 
     assert_eq!(layer_count(cx), 0, "escape did not close the dialog");
     assert_focused(cx, &outside);
 
-    cx.update(|window, _| window.focus(&outside));
+    cx.update(|window, cx| window.focus(&outside, cx));
     let layer = open_test_dialog(cx, &view, false, true, &hits);
     cx.run_until_parked();
 

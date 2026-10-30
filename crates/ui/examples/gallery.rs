@@ -4,10 +4,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, size, uniform_list, AnyElement, AnyView, App, Application,
-    Bounds, ClickEvent, Div, ElementId, Entity, FocusHandle, FontWeight, Hsla, IntoElement,
-    MouseButton, MouseDownEvent, Pixels, Render, ScrollStrategy, SharedString, Subscription,
-    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    canvas, div, point, prelude::*, px, size, uniform_list, AnyElement, AnyView, App, Bounds,
+    ClickEvent, Div, ElementId, Entity, FocusHandle, FontWeight, Hsla, IntoElement, MouseButton,
+    MouseDownEvent, Pixels, Render, ScrollStrategy, SharedString, Subscription, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 
 use ui::focus::RingOffset;
@@ -21,7 +21,7 @@ use ui::{
     Checkbox, Chip, ChipKind, CountPill, Counter, Dialog, DialogFocus, EmptyState, FileRow, Icon,
     IconName, Kbd, ListRow, MenuEntry, MenuItem, Progress, Radio, RefBadge, RefKind, SearchField,
     SegmentItem, Segmented, Select, Skeleton, Spinner, Splitter, StatusGlyph, Switch, Tab, Tabs,
-    TextInput, TextInputEvent, ToastKind, Tree, TreeNodeData,
+    TextInput, TextInputEvent, ToastKind, Tree, TreeNodeData, WindowControls,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1061,6 +1061,20 @@ fn buttons_section(colors: ThemeColors) -> impl IntoElement {
                                 .label("Stash")
                                 .counter(Counter::new("1")),
                         ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .w_full()
+                        .h(BAR)
+                        .pl(px(12.))
+                        .bg(colors.bg)
+                        .border_b_1()
+                        .border_color(colors.border)
+                        .child("Titlebar")
+                        .child(div().flex_1())
+                        .child(WindowControls::new("gallery-window-controls")),
                 ),
         )
 }
@@ -1382,6 +1396,17 @@ fn segmented_tabs_section(
                                 .items([SegmentItem::new("One"), SegmentItem::new("Two")])
                                 .selected(0)
                                 .disabled(true),
+                        )
+                        .child(
+                            // One disabled option inside a live control.
+                            Segmented::new("seg-item-dis")
+                                .items([
+                                    SegmentItem::new("History"),
+                                    SegmentItem::new("Changes")
+                                        .disabled(true)
+                                        .tooltip("Local changes arrive in a later stage"),
+                                ])
+                                .selected(0),
                         ),
                 )
                 .child(tabs),
@@ -1408,6 +1433,18 @@ fn progress_section(colors: ThemeColors) -> impl IntoElement {
                 .child(
                     component_row("Indeterminate", colors)
                         .child(Progress::new("progress-indet", 0.).indeterminate()),
+                )
+                .child(
+                    component_row("Filled (stretches)", colors)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .child(Progress::new("progress-fill", 0.62).fill()),
+                        )
+                        .child(div().text_size(FS_SM).text_color(colors.muted).child("62%")),
                 )
                 .child(
                     component_row("Spinners", colors)
@@ -2239,7 +2276,7 @@ fn lists_section(
                 let view = rows_view.clone();
                 let focus = rows_focus.clone();
                 row.on_click(move |_, window, cx| {
-                    window.focus(&focus);
+                    window.focus(&focus, cx);
                     view.update(cx, |this, cx| {
                         this.list_selected = index;
                         this.list_keyboard = false;
@@ -2249,7 +2286,7 @@ fn lists_section(
             })
             .collect::<Vec<_>>()
     })
-    .track_scroll(list_scroll.clone())
+    .track_scroll(&list_scroll)
     .flex_1()
     .h_full();
 
@@ -2474,7 +2511,7 @@ fn open_modal_button(colors: ThemeColors, cx: &mut Context<Gallery>) -> impl Int
             let panel = cx.new(ModalPanel::new);
             let focus = panel.read(cx).focus.clone();
             overlay::open_modal(AnyView::from(panel), window, cx);
-            window.focus(&focus);
+            window.focus(&focus, cx);
         }))
         .child("Open modal")
 }
@@ -2582,7 +2619,7 @@ fn open_popover_button(colors: ThemeColors, cx: &mut Context<ModalPanel>) -> imp
             let panel = cx.new(PopoverPanel::new);
             let focus = panel.read(cx).focus.clone();
             overlay::open_popover(event.position(), AnyView::from(panel), window, cx);
-            window.focus(&focus);
+            window.focus(&focus, cx);
         }))
         .child("Open nested popover")
 }
@@ -2613,7 +2650,7 @@ fn parse_args() -> (ThemeMode, Option<Section>, Option<OpenOnStart>) {
 
 fn main() {
     let (mode, section, open) = parse_args();
-    Application::new()
+    gpui_platform::application()
         .with_assets(ui::Assets)
         .run(move |cx: &mut App| {
             if let Err(e) = ui::init(cx) {

@@ -64,6 +64,8 @@ pub const CTL_SM: Pixels = px(22.);
 pub const BAR: Pixels = px(40.);
 /// Status bar.
 pub const STATUS: Pixels = px(24.);
+/// The details panel's header.
+pub const DOCK_HEADER: Pixels = px(34.);
 
 /// One graph lane.
 pub const LANE_W: Pixels = px(14.);

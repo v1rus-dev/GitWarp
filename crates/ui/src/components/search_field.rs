@@ -54,8 +54,16 @@ impl RenderOnce for SearchField {
         };
 
         let mut root = div()
-            .id(self.id)
+            .id(self.id.clone())
+            // A field fills its container: with an auto width a flex row only
+            // takes its content width (icon + padding), which collapses the
+            // input and hides the placeholder.
+            .w_full()
             .relative()
+            .debug_selector({
+                let id = self.id.to_string();
+                move || id.clone()
+            })
             .h(CTL)
             .pl(px(8.))
             .pr(px(6.))
@@ -75,14 +83,15 @@ impl RenderOnce for SearchField {
                 offset: point(px(0.), px(0.)),
                 blur_radius: px(0.),
                 spread_radius: px(1.),
+                inset: false,
             }]);
         } else {
             let hover_border = colors.muted;
             root = root.hover(move |style| style.border_color(hover_border));
         }
 
-        root = root.on_mouse_down(MouseButton::Left, move |_, window, _| {
-            window.focus(&focus_handle);
+        root = root.on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            window.focus(&focus_handle, cx);
         });
 
         root.child(

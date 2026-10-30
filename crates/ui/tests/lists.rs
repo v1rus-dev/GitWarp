@@ -5,17 +5,19 @@ use std::rc::Rc;
 
 use gpui::{
     div, prelude::*, px, uniform_list, Context, Entity, FocusHandle, IntoElement, KeyUpEvent,
-    Keystroke, Modifiers, MouseButton, Render, ScrollHandle, TestAppContext,
-    UniformListScrollHandle, VisualTestContext, Window,
+    Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render,
+    ScrollHandle, TestAppContext, UniformListScrollHandle, VisualTestContext, Window,
 };
 
-use ui::{actions, focus, ListRow, ScrollArea, Scrollbar, Splitter, Tree, TreeNodeData};
+use ui::{
+    actions, focus, metrics::ROW, ListRow, ScrollArea, Scrollbar, Splitter, Tree, TreeNodeData,
+};
 
 fn init(cx: &mut TestAppContext) {
     cx.update(ui::init).expect("ui::init");
 }
 
-fn press(cx: &mut VisualTestContext, keystroke: &str) {
+fn press(cx: &mut VisualTestContext, keystroke: &'static str) {
     cx.simulate_keystrokes(keystroke);
     cx.simulate_event(KeyUpEvent {
         keystroke: Keystroke::parse(keystroke).expect("valid keystroke"),
@@ -141,6 +143,119 @@ fn tree_right_click_reports_the_row_index(cx: &mut TestAppContext) {
     );
 }
 
+struct ClickTreeRoot {
+    focus: FocusHandle,
+    toggles: Rc<Cell<u32>>,
+    opens: Rc<Cell<u32>>,
+    activates: Rc<Cell<u32>>,
+}
+
+impl ClickTreeRoot {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            focus: cx.focus_handle().tab_stop(true),
+            toggles: Rc::new(Cell::new(0)),
+            opens: Rc::new(Cell::new(0)),
+            activates: Rc::new(Cell::new(0)),
+        }
+    }
+}
+
+impl Render for ClickTreeRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let toggles = self.toggles.clone();
+        let opens = self.opens.clone();
+        let activates = self.activates.clone();
+        let tree = Tree::new(
+            "click-tree",
+            vec![
+                TreeNodeData::new("parent").has_children(true),
+                TreeNodeData::new("leaf"),
+            ],
+        )
+        .focus_handle(self.focus.clone())
+        .on_toggle(move |_, _, _| toggles.set(toggles.get() + 1))
+        .on_open(move |_, _, _| opens.set(opens.get() + 1))
+        .on_activate(move |_, _, _| activates.set(activates.get() + 1));
+
+        let content = div().size_full().relative().child(
+            div()
+                .absolute()
+                .left(px(40.))
+                .top(px(40.))
+                .w(px(240.))
+                .h(px(320.))
+                .child(tree),
+        );
+
+        focus::track_pointer(actions::tab_navigation(content))
+    }
+}
+
+/// A press and release at the same position with an explicit click count, so
+/// the tree sees a fast series of clicks without advancing the test clock.
+fn click_at(cx: &mut VisualTestContext, position: Point<Pixels>, click_count: usize) {
+    cx.simulate_event(MouseDownEvent {
+        position,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Left,
+        click_count,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        position,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Left,
+        click_count,
+    });
+}
+
+#[gpui::test]
+fn fast_clicks_on_a_parent_row_toggle_it_every_time(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx, ClickTreeRoot::new);
+    let parent = cx
+        .debug_bounds("click-tree-node-0")
+        .expect("parent tree row was not drawn");
+
+    for click_count in 1..=3 {
+        click_at(cx, parent.center(), click_count);
+    }
+
+    let (toggles, opens) = cx.read(|app| {
+        let root = view.read(app);
+        (root.toggles.get(), root.opens.get())
+    });
+    assert_eq!(
+        toggles, 3,
+        "every left mouse-down on a parent row must toggle it"
+    );
+    assert_eq!(opens, 0, "a parent row must never open on a double click");
+}
+
+#[gpui::test]
+fn a_double_click_on_a_leaf_activates_and_opens_it(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx, ClickTreeRoot::new);
+    let leaf = cx
+        .debug_bounds("click-tree-node-1")
+        .expect("leaf tree row was not drawn");
+
+    click_at(cx, leaf.center(), 1);
+    click_at(cx, leaf.center(), 2);
+
+    let (activates, opens) = cx.read(|app| {
+        let root = view.read(app);
+        (root.activates.get(), root.opens.get())
+    });
+    assert_eq!(
+        activates, 1,
+        "the first click of a double click must activate the leaf"
+    );
+    assert_eq!(
+        opens, 1,
+        "the second click of a double click must open the leaf"
+    );
+}
+
 struct SplitterRoot {
     resized: Rc<Cell<Option<f32>>>,
 }
@@ -195,6 +310,96 @@ fn splitter_drag_reports_a_clamped_size(cx: &mut TestAppContext) {
         cx.read(|app| view.read(app).resized.get()),
         Some(420.),
         "the drag must report the size clamped to max"
+    );
+}
+
+struct SplitterDragRoot {
+    resizes: Rc<Cell<u32>>,
+    ends: Rc<Cell<u32>>,
+}
+
+impl Render for SplitterDragRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let resizes = self.resizes.clone();
+        let ends = self.ends.clone();
+        let splitter = Splitter::vertical("splitter")
+            .size(px(240.))
+            .bounds(px(160.), px(420.))
+            .on_resize(move |_, _, _| resizes.set(resizes.get() + 1))
+            .on_resize_end(move |_, _| ends.set(ends.get() + 1));
+
+        div().size_full().relative().child(
+            div()
+                .absolute()
+                .left(px(40.))
+                .top(px(40.))
+                .h(px(200.))
+                .child(splitter),
+        )
+    }
+}
+
+#[gpui::test]
+fn splitter_reports_the_end_of_a_drag_once_and_ignores_a_plain_click(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx, |_| SplitterDragRoot {
+        resizes: Rc::new(Cell::new(0)),
+        ends: Rc::new(Cell::new(0)),
+    });
+    let bounds = cx
+        .debug_bounds("splitter-handle")
+        .expect("splitter handle was not drawn");
+    let start = bounds.center();
+
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(
+        start + gpui::point(px(20.), px(0.)),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    let resizes_before = cx.read(|app| view.read(app).resizes.get());
+    cx.simulate_mouse_move(
+        start + gpui::point(px(40.), px(0.)),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    let resizes_after = cx.read(|app| view.read(app).resizes.get());
+
+    assert_eq!(
+        resizes_after,
+        resizes_before + 1,
+        "each mouse move during the drag must resize the panel"
+    );
+    assert_eq!(
+        cx.read(|app| view.read(app).ends.get()),
+        0,
+        "the drag ended before the mouse button was released"
+    );
+
+    cx.simulate_mouse_up(
+        start + gpui::point(px(40.), px(0.)),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+
+    assert_eq!(
+        cx.read(|app| view.read(app).ends.get()),
+        1,
+        "the end of the drag must be reported exactly once"
+    );
+
+    // A click without movement must not resize or end a drag.
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(start, MouseButton::Left, Modifiers::default());
+
+    assert_eq!(
+        cx.read(|app| view.read(app).resizes.get()),
+        resizes_after,
+        "a plain click resized the panel"
+    );
+    assert_eq!(
+        cx.read(|app| view.read(app).ends.get()),
+        1,
+        "a plain click reported the end of a drag"
     );
 }
 
@@ -350,6 +555,27 @@ fn moving_the_marker_past_the_bottom_scrolls_it_into_view(cx: &mut TestAppContex
     );
 }
 
+#[gpui::test]
+fn a_row_keeps_its_height_and_the_tree_scrolls_with_many_nodes(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx, |cx| ScrollTreeRoot::new(cx, 60));
+    let scroll = cx.read(|app| view.read(app).scroll.clone());
+    cx.run_until_parked();
+
+    let row = cx
+        .debug_bounds("scroll-tree-node-0")
+        .expect("the first tree row was not drawn");
+    assert_eq!(
+        row.size.height, ROW,
+        "a row must keep its fixed height inside the scrolling tree"
+    );
+
+    let max = scroll.max_offset().y;
+    assert!(
+        max > px(0.),
+        "the tree must scroll instead of squeezing its rows (max offset {max:?})"
+    );
+}
+
 struct SelectedTreeRoot {
     focus: FocusHandle,
     nodes: Vec<TreeNodeData>,
@@ -484,7 +710,7 @@ impl Render for ListRowRoot {
                 })
                 .collect::<Vec<_>>()
         })
-        .track_scroll(self.uniform_scroll.clone())
+        .track_scroll(&self.uniform_scroll)
         .flex_1()
         .h_full();
 

@@ -37,6 +37,7 @@ pub mod toast;
 mod toggles;
 mod tooltip;
 mod tree;
+mod window_controls;
 
 pub use avatar::Avatar;
 pub use banner::{Banner, BannerKind};
@@ -64,6 +65,7 @@ pub use toast::{Toast, ToastId, ToastKind, ToastQueue};
 pub use toggles::{Checkbox, Radio, Switch};
 pub use tooltip::Tooltip;
 pub use tree::{Tree, TreeNodeData, TreeNodeTrailing};
+pub use window_controls::WindowControls;
 
 pub(crate) use text_input::bind_keys as bind_text_input_keys;
 

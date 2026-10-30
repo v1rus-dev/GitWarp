@@ -4,7 +4,7 @@
 //! bottom-right and newest last. Errors stay until dismissed; every other kind
 //! hides itself after five seconds.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -142,17 +142,12 @@ struct ToastRegistry {
 
 impl Global for ToastRegistry {}
 
-/// Prunes the toasts of closed windows.
+/// Prunes the toasts of a window that closed.
 pub(crate) fn init(cx: &mut App) {
-    cx.on_window_closed(|cx| {
-        let live: HashSet<WindowId> = cx
-            .windows()
-            .iter()
-            .map(|handle| handle.window_id())
-            .collect();
+    cx.on_window_closed(|cx, window_id| {
         if cx.try_global::<ToastRegistry>().is_some() {
             cx.update_global::<ToastRegistry, _>(|registry, _| {
-                registry.by_window.retain(|id, _| live.contains(id));
+                registry.by_window.remove(&window_id);
             });
         }
     })

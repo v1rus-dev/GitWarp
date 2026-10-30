@@ -24,8 +24,16 @@ git-graph = { path = "crates/git-graph" }
 git-core = { path = "crates/git-core" }
 ui = { path = "crates/ui" }
 
-# UI: Zed's GPUI. Pinned on purpose, its API still moves between releases.
-gpui = "=0.2.2"
+# UI: Zed's GPUI. Pinned on purpose: this is a snapshot of Zed's GPUI
+# (zed@08cbb88) with the wgpu renderer, and its API still moves between
+# releases.
+gpui = { package = "gpui-pre", version = "=0.3.10" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", features = [
+    "font-kit",
+    "x11",
+    "wayland",
+    "runtime_shaders",
+] }
 
 [profile.release]
 lto = "thin"
@@ -34,9 +42,3 @@ codegen-units = 1
 # Keep dev builds of the heavy UI deps optimized: GPUI is very slow at opt-level 0.
 [profile.dev.package."*"]
 opt-level = 2
-
-# gpui 0.2.2 → zed-async-tar → xattr 0.2.3, which no longer builds with current
-# libc on Linux (ENOATTR was removed; on Linux it is ENODATA). Remove this once
-# GPUI is bumped to a release without the old xattr.
-[patch.crates-io]
-xattr = { path = "patches/xattr-0.2.3" }

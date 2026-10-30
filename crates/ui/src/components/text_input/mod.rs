@@ -10,7 +10,7 @@ use gpui::{
     EmptyView, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId,
     Hsla, InteractiveElement, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, ShapedLine,
-    SharedString, StatefulInteractiveElement, Style, Styled, TextRun, UTF16Selection,
+    SharedString, StatefulInteractiveElement, Style, Styled, TextAlign, TextRun, UTF16Selection,
     UnderlineStyle, Window,
 };
 
@@ -61,6 +61,7 @@ pub struct TextInput {
     focus_handle: FocusHandle,
     model: EditModel,
     placeholder: SharedString,
+    font_family: SharedString,
     disabled: bool,
     error: bool,
     borderless: bool,
@@ -76,6 +77,7 @@ impl TextInput {
             focus_handle: cx.focus_handle().tab_stop(true),
             model: EditModel::new(),
             placeholder: SharedString::default(),
+            font_family: FONT_UI.into(),
             disabled: false,
             error: false,
             borderless: false,
@@ -111,6 +113,13 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         self.placeholder = placeholder.into();
+        cx.notify();
+    }
+
+    /// The font of the field's text; the UI font by default. Paths and other
+    /// machine-readable values read better in the mono font.
+    pub fn set_font_family(&mut self, family: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.font_family = family.into();
         cx.notify();
     }
 
@@ -664,6 +673,8 @@ impl Element for TextElement {
         line.paint(
             point(bounds.left() - px(scroll), bounds.top()),
             window.line_height(),
+            TextAlign::Left,
+            None,
             window,
             cx,
         )
@@ -716,7 +727,7 @@ impl Render for TextInput {
             .border_1()
             .border_color(border)
             .text_size(FS_BASE)
-            .font_family(FONT_UI)
+            .font_family(self.font_family.clone())
             .text_color(if self.disabled {
                 colors.disabled
             } else {
@@ -734,6 +745,7 @@ impl Render for TextInput {
                     offset: point(px(0.), px(0.)),
                     blur_radius: px(0.),
                     spread_radius: px(1.),
+                    inset: false,
                 }]);
             }
             if !self.disabled && !focused && !self.error {
@@ -818,20 +830,30 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("right", Right, Some("TextInput")),
         KeyBinding::new("shift-left", SelectLeft, Some("TextInput")),
         KeyBinding::new("shift-right", SelectRight, Some("TextInput")),
-        KeyBinding::new("secondary-left", WordLeft, Some("TextInput")),
-        KeyBinding::new("secondary-right", WordRight, Some("TextInput")),
-        KeyBinding::new("secondary-shift-left", SelectWordLeft, Some("TextInput")),
-        KeyBinding::new("secondary-shift-right", SelectWordRight, Some("TextInput")),
-        KeyBinding::new("secondary-backspace", WordBackspace, Some("TextInput")),
-        KeyBinding::new("secondary-delete", WordDelete, Some("TextInput")),
+        crate::actions::key_binding(cx, "secondary-left", WordLeft, Some("TextInput")),
+        crate::actions::key_binding(cx, "secondary-right", WordRight, Some("TextInput")),
+        crate::actions::key_binding(
+            cx,
+            "secondary-shift-left",
+            SelectWordLeft,
+            Some("TextInput"),
+        ),
+        crate::actions::key_binding(
+            cx,
+            "secondary-shift-right",
+            SelectWordRight,
+            Some("TextInput"),
+        ),
+        crate::actions::key_binding(cx, "secondary-backspace", WordBackspace, Some("TextInput")),
+        crate::actions::key_binding(cx, "secondary-delete", WordDelete, Some("TextInput")),
         KeyBinding::new("home", Home, Some("TextInput")),
         KeyBinding::new("end", End, Some("TextInput")),
         KeyBinding::new("shift-home", SelectHome, Some("TextInput")),
         KeyBinding::new("shift-end", SelectEnd, Some("TextInput")),
-        KeyBinding::new("secondary-a", SelectAll, Some("TextInput")),
-        KeyBinding::new("secondary-c", Copy, Some("TextInput")),
-        KeyBinding::new("secondary-x", Cut, Some("TextInput")),
-        KeyBinding::new("secondary-v", Paste, Some("TextInput")),
+        crate::actions::key_binding(cx, "secondary-a", SelectAll, Some("TextInput")),
+        crate::actions::key_binding(cx, "secondary-c", Copy, Some("TextInput")),
+        crate::actions::key_binding(cx, "secondary-x", Cut, Some("TextInput")),
+        crate::actions::key_binding(cx, "secondary-v", Paste, Some("TextInput")),
         KeyBinding::new("enter", Submit, Some("TextInput")),
     ]);
 }
