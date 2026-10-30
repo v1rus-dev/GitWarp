@@ -239,7 +239,7 @@ textarea.input { height: auto; padding: 6px 8px; resize: none; line-height: 1.5;
 .frow:hover .acts, .frow:focus-within .acts { display: inline-flex; }
 
 /* ---------- history list + commit graph ---------- */
-.hist { display: flex; flex-direction: column; min-height: 0; min-width: 0; flex: 1; background: var(--bg); }
+.hist { display: flex; flex-direction: column; min-height: 0; min-width: 0; flex: 1; background: var(--bg); container-type: inline-size; }
 .lhead, .lrow { display: grid; grid-template-columns: var(--gw, 112px) minmax(0, 1fr) var(--aw, 130px) var(--dw, 104px) 64px; column-gap: 12px; align-items: center; padding: 0 12px 0 8px; }
 .lhead { height: 26px; background: var(--surface); border-bottom: 1px solid var(--border); color: var(--muted); font-size: var(--fs-sm); font-weight: 600; user-select: none; }
 .lhead .gh { display: flex; align-items: center; gap: 6px; position: relative; height: 100%; }
@@ -259,6 +259,15 @@ textarea.input { height: auto; padding: 6px 8px; resize: none; line-height: 1.5;
 .lrow .txt { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .lrow .au, .lrow .dt { color: var(--muted); font-size: var(--fs-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lrow .hash { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--muted); }
+/* narrow history pane (e.g. details docked right): drop Hash, then Author, so Summary keeps room instead of overlapping */
+@container (max-width: 560px) {
+  .lhead, .lrow { grid-template-columns: min(var(--gw, 112px), 40cqw) minmax(0, 1fr) 104px 76px; }
+  .lhead > :nth-child(5), .lbody .lrow > :nth-child(5) { display: none; }
+}
+@container (max-width: 460px) {
+  .lhead, .lrow { grid-template-columns: min(var(--gw, 112px), 36cqw) minmax(0, 1fr) 76px; }
+  .lhead > :nth-child(3), .lbody .lrow > :nth-child(3) { display: none; }
+}
 .gcol { position: relative; height: var(--row); overflow: hidden; }
 .gcol.clip { -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 20px), transparent); mask-image: linear-gradient(90deg, #000 calc(100% - 20px), transparent); }
 .gcol svg { display: block; }
@@ -274,7 +283,7 @@ textarea.input { height: auto; padding: 6px 8px; resize: none; line-height: 1.5;
 .work { display: flex; min-height: 0; flex: 1; min-width: 0; }
 .work.dock-bottom { flex-direction: column; } .work.dock-right { flex-direction: row; }
 .details { display: flex; flex-direction: column; background: var(--bg); min-width: 0; min-height: 0; border-top: 1px solid var(--border); }
-.dock-bottom .details { height: 340px; flex: none; } .dock-right .details { width: 640px; flex: none; border-top: 0; border-left: 1px solid var(--border); }
+.dock-bottom .details { height: 340px; flex: none; } .dock-right .details { width: 640px; max-width: 50%; flex: none; border-top: 0; border-left: 1px solid var(--border); }
 .dhead { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 8px 0 12px; background: var(--surface); border-bottom: 1px solid var(--border); font-weight: 600; flex: none; }
 .dbody { flex: 1; min-height: 0; display: grid; }
 .dock-bottom .dbody { grid-template-columns: 310px 250px minmax(0, 1fr); }
