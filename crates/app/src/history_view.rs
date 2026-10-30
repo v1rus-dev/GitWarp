@@ -813,8 +813,13 @@ impl HistoryView {
                     .child(
                         Button::new("empty-not-a-repo-open")
                             .label("Open another…")
-                            .disabled(true)
-                            .tooltip("Coming soon"),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(workspace) = this.workspace.upgrade() {
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.open_repository_dialog(window, cx);
+                                    });
+                                }
+                            })),
                     );
                 centred(
                     EmptyState::new("Not a git repository")

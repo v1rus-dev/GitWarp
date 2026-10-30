@@ -61,6 +61,7 @@ pub struct TextInput {
     focus_handle: FocusHandle,
     model: EditModel,
     placeholder: SharedString,
+    font_family: SharedString,
     disabled: bool,
     error: bool,
     borderless: bool,
@@ -76,6 +77,7 @@ impl TextInput {
             focus_handle: cx.focus_handle().tab_stop(true),
             model: EditModel::new(),
             placeholder: SharedString::default(),
+            font_family: FONT_UI.into(),
             disabled: false,
             error: false,
             borderless: false,
@@ -111,6 +113,13 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         self.placeholder = placeholder.into();
+        cx.notify();
+    }
+
+    /// The font of the field's text; the UI font by default. Paths and other
+    /// machine-readable values read better in the mono font.
+    pub fn set_font_family(&mut self, family: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.font_family = family.into();
         cx.notify();
     }
 
@@ -718,7 +727,7 @@ impl Render for TextInput {
             .border_1()
             .border_color(border)
             .text_size(FS_BASE)
-            .font_family(FONT_UI)
+            .font_family(self.font_family.clone())
             .text_color(if self.disabled {
                 colors.disabled
             } else {

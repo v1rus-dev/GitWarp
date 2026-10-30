@@ -5,7 +5,10 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use git_core::{ErrorClass, Git, GitChoice, GitSource, Head, LogOptions, RefKind, Repo};
+use git_core::{
+    probe_folder, ErrorClass, FolderProbe, Git, GitChoice, GitSource, Head, LogOptions, RefKind,
+    Repo,
+};
 use git_graph::GraphBuilder;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -428,5 +431,117 @@ fn open_failure_other_than_not_a_repository_keeps_gits_message() {
     match open(tmp.path()) {
         Err(git_core::Error::Git { stderr, .. }) => assert!(stderr.contains("frobnicate")),
         other => panic!("unexpected result {other:?}"),
+    }
+}
+
+fn probe(path: &Path) -> git_core::Result<FolderProbe> {
+    probe_folder(Arc::new(Git::resolve(GitChoice::System)?.git), path)
+}
+
+#[test]
+fn probe_reports_a_missing_folder_or_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(
+        probe(&tmp.path().join("does-not-exist")).unwrap(),
+        FolderProbe::Missing
+    );
+    // The dialog's field may point at a file; that is not an openable folder.
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, b"hello").unwrap();
+    assert_eq!(probe(&file).unwrap(), FolderProbe::Missing);
+}
+
+#[test]
+fn probe_reports_a_plain_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("plain");
+    std::fs::create_dir(&dir).unwrap();
+    assert_eq!(probe(&dir).unwrap(), FolderProbe::Plain);
+}
+
+#[test]
+fn probe_reports_a_repository_root_with_branch_and_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q"]);
+    commit(tmp.path(), "A");
+    commit(tmp.path(), "B");
+    match probe(tmp.path()).unwrap() {
+        FolderProbe::Repo {
+            root,
+            branch,
+            commits,
+        } => {
+            assert_eq!(root, tmp.path().canonicalize().unwrap());
+            assert_eq!(branch.as_deref(), Some("main"));
+            assert_eq!(commits, 2);
+        }
+        other => panic!("unexpected probe {other:?}"),
+    }
+}
+
+#[test]
+fn probe_reports_an_empty_repository_root_with_its_unborn_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q"]);
+    match probe(tmp.path()).unwrap() {
+        FolderProbe::Repo {
+            branch, commits, ..
+        } => {
+            assert_eq!(branch.as_deref(), Some("main"));
+            assert_eq!(commits, 0);
+        }
+        other => panic!("unexpected probe {other:?}"),
+    }
+}
+
+#[test]
+fn probe_reports_a_detached_head_without_a_branch() {
+    let tmp = sample_repo();
+    git(tmp.path(), &["checkout", "-q", "--detach"]);
+    match probe(tmp.path()).unwrap() {
+        FolderProbe::Repo { branch, .. } => assert_eq!(branch, None),
+        other => panic!("unexpected probe {other:?}"),
+    }
+}
+
+#[test]
+fn probe_reports_a_subdirectory_as_nested_under_the_root() {
+    let tmp = sample_repo();
+    let sub = tmp.path().join("crates").join("app");
+    std::fs::create_dir_all(&sub).unwrap();
+    match probe(&sub).unwrap() {
+        FolderProbe::Nested { root } => {
+            assert_eq!(root, tmp.path().canonicalize().unwrap());
+        }
+        other => panic!("unexpected probe {other:?}"),
+    }
+}
+
+#[test]
+fn probe_reports_a_bare_repository_as_a_root() {
+    let src = sample_repo();
+    let tmp = tempfile::tempdir().unwrap();
+    let bare = tmp.path().join("bare.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            src.path().to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    match probe(&bare).unwrap() {
+        FolderProbe::Repo {
+            root,
+            branch,
+            commits,
+        } => {
+            assert_eq!(root, bare.canonicalize().unwrap());
+            assert_eq!(branch.as_deref(), Some("main"));
+            assert_eq!(commits, 6);
+        }
+        other => panic!("unexpected probe {other:?}"),
     }
 }

@@ -229,6 +229,66 @@ impl Repo {
     }
 }
 
+/// What the "Open from folder" dialog found at a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderProbe {
+    /// The path does not exist, or is not a directory.
+    Missing,
+    /// The path exists but is inside no git working tree.
+    Plain,
+    /// The path is the root of a work tree (or a bare repository).
+    Repo {
+        root: PathBuf,
+        /// The checked-out branch; `None` for a detached HEAD.
+        branch: Option<String>,
+        commits: u64,
+    },
+    /// The path is inside a work tree whose root is `root`.
+    Nested { root: PathBuf },
+}
+
+/// Inspect `path` for the Open dialog without changing anything.
+///
+/// Paths that simply are not repositories (a folder outside a work tree, a
+/// missing folder) are answers, not errors; only git failures that leave the
+/// question open are returned as `Err`.
+pub fn probe_folder(git: Arc<Git>, path: &Path) -> Result<FolderProbe> {
+    if !path.is_dir() {
+        return Ok(FolderProbe::Missing);
+    }
+    let repo = match Repo::open(git, path) {
+        Ok(repo) => repo,
+        Err(Error::PathNotFound { .. }) => return Ok(FolderProbe::Missing),
+        Err(Error::NotARepository { .. }) => return Ok(FolderProbe::Plain),
+        Err(error) => return Err(error),
+    };
+    let root = repo.root().to_path_buf();
+    if !same_path(path, &root) {
+        return Ok(FolderProbe::Nested { root });
+    }
+    // HEAD of an empty repository is an unborn branch and still has a name.
+    let branch = match repo.head()? {
+        Head::Branch { name, .. } => Some(name),
+        Head::Detached(_) => None,
+    };
+    let commits = repo.commit_count()?;
+    Ok(FolderProbe::Repo {
+        root,
+        branch,
+        commits,
+    })
+}
+
+/// Whether two paths name the same directory, following symlinks where they
+/// exist. `git rev-parse --show-toplevel` may print a symlinked path, so the
+/// comparison cannot be textual.
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// `out` if git succeeded, otherwise git's own message as an error.
 pub(crate) fn check_output(out: Output, command: &'static str) -> Result<Output> {
     if out.status.success() {

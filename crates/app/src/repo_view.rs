@@ -660,11 +660,18 @@ impl RepositoryView {
         if !entries.is_empty() {
             entries.push(MenuEntry::Separator);
         }
+        let workspace = self.workspace.clone();
         entries.push(MenuEntry::Item(
             MenuItem::new("Open repository…")
                 .icon(IconName::Folder)
                 .shortcut("Ctrl O")
-                .disabled(true),
+                .action(move |window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.open_repository_dialog(window, cx);
+                        })
+                        .ok();
+                }),
         ));
         let workspace = self.workspace.clone();
         entries.push(MenuEntry::Item(
@@ -753,7 +760,7 @@ impl RepositoryView {
             Some(self.repo_name.clone()),
             layout.repo_name,
             layout.item_pad,
-            ("Switch repository", "Ctrl O"),
+            ("Switch repository", None),
             self.repo_bounds.clone(),
             repo_click,
             colors,
@@ -771,7 +778,7 @@ impl RepositoryView {
             Some(branch),
             layout.branch_name,
             layout.item_pad,
-            ("Switch branch", "Ctrl Shift B"),
+            ("Switch branch", Some("Ctrl Shift B")),
             self.branch_bounds.clone(),
             branch_click,
             colors,
@@ -1331,7 +1338,7 @@ fn switcher(
     name: Option<SharedString>,
     name_max: Option<f32>,
     padding: f32,
-    tooltip: (&'static str, &'static str),
+    tooltip: (&'static str, Option<&'static str>),
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     colors: ThemeColors,
@@ -1348,10 +1355,13 @@ fn switcher(
         .rounded(R_SM)
         .cursor_pointer()
         .hover(move |style| style.bg(colors.hover))
-        .tooltip(Tooltip::with_kbd(tooltip.0, tooltip.1))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(on_click)
         .child(Icon::new(icon).size(px(14.)).color(colors.muted));
+    row = match tooltip.1 {
+        Some(kbd) => row.tooltip(Tooltip::with_kbd(tooltip.0, kbd)),
+        None => row.tooltip(Tooltip::text(tooltip.0)),
+    };
     if let (Some(name), Some(max)) = (name, name_max) {
         row = row.child(
             div()

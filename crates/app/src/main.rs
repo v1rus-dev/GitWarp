@@ -2,6 +2,7 @@ mod format;
 mod graph_paint;
 mod history_state;
 mod history_view;
+mod open_dialog;
 mod repo_view;
 mod settings;
 mod theme;
@@ -113,11 +114,12 @@ fn main() {
                 binding(cx, "secondary-b", repo_view::ToggleSidebar, None),
                 binding(cx, "secondary-j", repo_view::ToggleDetails, None),
                 binding(cx, "secondary-k", repo_view::FocusSearch, None),
-                binding(cx, "secondary-o", repo_view::OpenRepoSwitcher, None),
+                // Ctrl O opens the "Open from folder" dialog everywhere: on
+                // the welcome screen and in a repository window alike.
+                binding(cx, "secondary-o", workspace::OpenRepositoryDialog, None),
                 binding(cx, "secondary-shift-b", repo_view::OpenBranchSwitcher, None),
-                // Welcome screen: Ctrl O keeps its repository meaning, Ctrl N
-                // opens the Initialize dialog and Del drops a recent entry.
-                binding(cx, "secondary-o", welcome::OpenRepository, Some("welcome")),
+                // Welcome screen: Ctrl N opens the Initialize dialog and Del
+                // drops a recent entry.
                 binding(cx, "secondary-n", welcome::NewRepository, Some("welcome")),
                 KeyBinding::new("delete", welcome::RemoveSelected, Some("welcome")),
             ];

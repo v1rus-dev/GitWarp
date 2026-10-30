@@ -31,7 +31,7 @@ use crate::history_view::unix_now;
 use crate::settings::RecentRepo;
 use crate::workspace::{git_label, titlebar, titlebar_end, titlebar_fill, Workspace};
 
-actions!(welcome, [OpenRepository, NewRepository, RemoveSelected]);
+actions!(welcome, [NewRepository, RemoveSelected]);
 
 /// The left column: the design's fixed width.
 const LEFT_W: f32 = 300.;
@@ -745,16 +745,6 @@ impl Render for WelcomeView {
             .font_family(FONT_UI)
             .text_size(FS_BASE)
             .key_context("welcome")
-            .on_action(cx.listener(|view, _: &OpenRepository, window, cx| {
-                view.open_repository_dialog(window, cx)
-            }))
-            // Ctrl O is also the repository switcher's global binding; on the
-            // welcome screen it means the same thing, so handle it here too.
-            .on_action(
-                cx.listener(|view, _: &crate::repo_view::OpenRepoSwitcher, window, cx| {
-                    view.open_repository_dialog(window, cx)
-                }),
-            )
             .on_action(
                 cx.listener(|view, _: &NewRepository, window, cx| {
                     view.open_init_dialog(window, cx)

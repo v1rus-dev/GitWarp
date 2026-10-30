@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    canvas, div, point, px, App, AppContext, Bounds, Context, CursorStyle, Decorations, Div,
-    Entity, HitboxBehavior, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent,
+    actions, canvas, div, point, px, App, AppContext, Bounds, Context, CursorStyle, Decorations,
+    Div, Entity, HitboxBehavior, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent,
     ParentElement, Pixels, Point, Render, ResizeEdge, SharedString, Styled, Subscription, Tiling,
     Window,
 };
@@ -22,12 +22,15 @@ use gpui::{
 use git_core::{Error, Git, GitChoice};
 use ui::metrics::{BAR, FONT_UI, FS_BASE, R_WINDOW};
 use ui::theme::ActiveTheme;
-use ui::WindowControls;
+use ui::{overlay, WindowControls};
 
+use crate::open_dialog::OpenRepoDialog;
 use crate::repo_view::{
     FocusSearch, OpenBranchSwitcher, OpenRepoSwitcher, RepositoryView, ToggleDetails, ToggleSidebar,
 };
 use crate::welcome::WelcomeView;
+
+actions!(workspace, [OpenRepositoryDialog]);
 
 /// The shadow and resize border drawn around the client-side frame.
 const INSET: Pixels = px(10.);
@@ -48,6 +51,8 @@ pub struct Workspace {
     /// The resize edge under the pointer in the frame's inset band, if any.
     /// The band only repaints when this changes, so the cursor follows it.
     last_resize_edge: Option<ResizeEdge>,
+    /// The Open-from-folder dialog, kept so its state survives the frames.
+    dialog: Option<Entity<OpenRepoDialog>>,
     /// Repaints when the decorations change (windows forced to server-side
     /// decorations, tiling on maximise/snap).
     _decorations: Subscription,
@@ -71,6 +76,7 @@ impl Workspace {
             git,
             git_choice,
             last_resize_edge: None,
+            dialog: None,
             _decorations: decorations,
         };
         match path {
@@ -107,9 +113,34 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Opens the repository picker (step 2.6 fills this in).
-    pub fn open_repository_dialog(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        log::info!("open repository dialog requested");
+    /// Opens the "Open from folder" dialog, or brings it back when the user
+    /// closed its layer with Esc or the scrim and asks for it again.
+    pub fn open_repository_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dialog) = &self.dialog {
+            if let Some(layer) = dialog.read(cx).layer_id() {
+                if overlay::layer_view(layer, window, cx).is_some() {
+                    return;
+                }
+            }
+        }
+        let git = self.git.clone();
+        let workspace = cx.weak_entity();
+        self.dialog = Some(crate::open_dialog::open(window, cx, git, workspace));
+        cx.notify();
+    }
+
+    /// Drops the dialog state once its layer is gone.
+    fn prune_dialog(&mut self, window: &Window, cx: &App) {
+        let Some(dialog) = &self.dialog else {
+            return;
+        };
+        let open = dialog
+            .read(cx)
+            .layer_id()
+            .is_some_and(|layer| overlay::layer_view(layer, window, cx).is_some());
+        if !open {
+            self.dialog = None;
+        }
     }
 
     /// Resolve git again (the user may have installed it since) and, when a
@@ -218,6 +249,7 @@ pub fn titlebar_end(bar: Div, client: bool) -> Div {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.prune_dialog(window, cx);
         let decorations = window.window_decorations();
         // Sent on every frame (the backend dedups): the frame's padding has to
         // match the inset before the layout runs.
@@ -335,6 +367,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenBranchSwitcher, window, cx| {
                 this.with_repository(cx, |view, cx| view.open_branch_menu(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenRepositoryDialog, window, cx| {
+                this.open_repository_dialog(window, cx);
             }));
 
         ui::focus::track_pointer(ui::actions::tab_navigation(root))
