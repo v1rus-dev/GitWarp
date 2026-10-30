@@ -576,6 +576,69 @@ fn a_row_keeps_its_height_and_the_tree_scrolls_with_many_nodes(cx: &mut TestAppC
     );
 }
 
+struct HorizontalTreeRoot {
+    focus: FocusHandle,
+    scroll: ScrollHandle,
+    nodes: Vec<TreeNodeData>,
+}
+
+impl HorizontalTreeRoot {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            focus: cx.focus_handle().tab_stop(true),
+            scroll: ScrollHandle::new(),
+            nodes: vec![
+                TreeNodeData::new("short"),
+                TreeNodeData::new(
+                    "feature/a-branch-name-that-is-far-too-long-for-a-narrow-sidebar",
+                ),
+            ],
+        }
+    }
+}
+
+impl Render for HorizontalTreeRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let tree = Tree::new("horizontal-tree", self.nodes.clone())
+            .focus_handle(self.focus.clone())
+            .scroll_handle(self.scroll.clone())
+            .horizontal_scroll();
+
+        let content = div().size_full().relative().child(
+            div()
+                .absolute()
+                .left(px(40.))
+                .top(px(40.))
+                .w(px(240.))
+                .h(px(200.))
+                .child(tree),
+        );
+
+        focus::track_pointer(actions::tab_navigation(content))
+    }
+}
+
+#[gpui::test]
+fn a_long_label_widens_the_tree_and_scrolls_it_horizontally(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx, HorizontalTreeRoot::new);
+    let scroll = cx.read(|app| view.read(app).scroll.clone());
+    cx.run_until_parked();
+
+    let max = scroll.max_offset().x;
+    assert!(
+        max > px(0.),
+        "the tree must scroll sideways instead of truncating a long label (max offset {max:?})"
+    );
+
+    scroll.set_offset(gpui::point(px(-f32::from(max)), px(0.)));
+    cx.run_until_parked();
+    let offset = scroll.offset().x;
+    assert!(
+        offset < px(0.),
+        "setting the horizontal offset must move the tree (offset {offset:?})"
+    );
+}
+
 struct SelectedTreeRoot {
     focus: FocusHandle,
     nodes: Vec<TreeNodeData>,
