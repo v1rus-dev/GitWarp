@@ -38,6 +38,10 @@ pub struct DiffRow {
     /// removed/added row of a pair.
     pub emphasis: Vec<Range<usize>>,
     pub no_newline: bool,
+    /// The hunk this row belongs to, for staging controls.
+    pub hunk: Option<usize>,
+    /// The line's index in its hunk's `lines`, for line-level staging.
+    pub line: Option<usize>,
 }
 
 impl DiffRow {
@@ -49,6 +53,8 @@ impl DiffRow {
             text: header.to_string(),
             emphasis: Vec::new(),
             no_newline: false,
+            hunk: None,
+            line: None,
         }
     }
 
@@ -64,6 +70,8 @@ impl DiffRow {
             text,
             emphasis,
             no_newline: line.no_newline,
+            hunk: None,
+            line: None,
         }
     }
 
@@ -75,6 +83,8 @@ impl DiffRow {
             text: "\\ No newline at end of file".to_string(),
             emphasis: Vec::new(),
             no_newline: false,
+            hunk: None,
+            line: None,
         }
     }
 }
@@ -87,15 +97,20 @@ impl DiffRow {
 /// in order.
 pub fn build_rows(hunks: &[Hunk]) -> Vec<DiffRow> {
     let mut rows = Vec::new();
-    for hunk in hunks {
-        rows.push(DiffRow::header(&hunk.header));
+    for (hunk_index, hunk) in hunks.iter().enumerate() {
+        let mut header = DiffRow::header(&hunk.header);
+        header.hunk = Some(hunk_index);
+        rows.push(header);
         let lines = &hunk.lines;
         let mut index = 0;
         while index < lines.len() {
             match lines[index].kind {
                 LineKind::Context => {
                     let text = expand_tabs(&lines[index].text);
-                    rows.push(DiffRow::line(&lines[index], text, Vec::new()));
+                    let mut row = DiffRow::line(&lines[index], text, Vec::new());
+                    row.hunk = Some(hunk_index);
+                    row.line = Some(index);
+                    rows.push(row);
                     push_note(&mut rows, &lines[index]);
                     index += 1;
                 }
@@ -116,19 +131,31 @@ pub fn build_rows(hunks: &[Hunk]) -> Vec<DiffRow> {
                                 let old_text = expand_tabs(&old.text);
                                 let new_text = expand_tabs(&new.text);
                                 let (old_emphasis, new_emphasis) = word_diff(&old_text, &new_text);
-                                rows.push(DiffRow::line(old, old_text, old_emphasis));
+                                let mut old_row = DiffRow::line(old, old_text, old_emphasis);
+                                old_row.hunk = Some(hunk_index);
+                                old_row.line = Some(removed_start + pair);
+                                rows.push(old_row);
                                 push_note(&mut rows, old);
-                                rows.push(DiffRow::line(new, new_text, new_emphasis));
+                                let mut new_row = DiffRow::line(new, new_text, new_emphasis);
+                                new_row.hunk = Some(hunk_index);
+                                new_row.line = Some(added_start + pair);
+                                rows.push(new_row);
                                 push_note(&mut rows, new);
                             }
                             (Some(old), None) => {
                                 let text = expand_tabs(&old.text);
-                                rows.push(DiffRow::line(old, text, Vec::new()));
+                                let mut row = DiffRow::line(old, text, Vec::new());
+                                row.hunk = Some(hunk_index);
+                                row.line = Some(removed_start + pair);
+                                rows.push(row);
                                 push_note(&mut rows, old);
                             }
                             (None, Some(new)) => {
                                 let text = expand_tabs(&new.text);
-                                rows.push(DiffRow::line(new, text, Vec::new()));
+                                let mut row = DiffRow::line(new, text, Vec::new());
+                                row.hunk = Some(hunk_index);
+                                row.line = Some(added_start + pair);
+                                rows.push(row);
                                 push_note(&mut rows, new);
                             }
                             (None, None) => {}
@@ -137,7 +164,10 @@ pub fn build_rows(hunks: &[Hunk]) -> Vec<DiffRow> {
                 }
                 LineKind::Added => {
                     let text = expand_tabs(&lines[index].text);
-                    rows.push(DiffRow::line(&lines[index], text, Vec::new()));
+                    let mut row = DiffRow::line(&lines[index], text, Vec::new());
+                    row.hunk = Some(hunk_index);
+                    row.line = Some(index);
+                    rows.push(row);
                     push_note(&mut rows, &lines[index]);
                     index += 1;
                 }

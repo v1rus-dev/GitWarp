@@ -1455,6 +1455,11 @@ impl HistoryView {
         cx.notify();
     }
 
+    /// Reloads the history from scratch, e.g. after a commit moved HEAD.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.retry(cx);
+    }
+
     /// Start over: drop the rows and the graph, then load again.
     fn retry(&mut self, cx: &mut Context<Self>) {
         self.items.clear();

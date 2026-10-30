@@ -1,3 +1,4 @@
+mod changes_view;
 mod details;
 mod diff_model;
 mod format;
@@ -213,6 +214,7 @@ fn main() {
             // The history list's extra keys (j/k, PgUp/PgDn, Ctrl+C) live in
             // the list's own context.
             history_view::bind_history_keys(cx);
+            changes_view::bind_keys(cx);
             cx.set_global(AppSettings {
                 path: config_path,
                 settings: loaded,

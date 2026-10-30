@@ -13,6 +13,7 @@ mod log;
 mod oid;
 mod refs;
 mod stash;
+mod status;
 mod submodule;
 mod worktree;
 
@@ -31,6 +32,7 @@ pub use log::{CommitCount, CommitInfo, LogKiller, LogOptions, LogStream};
 pub use oid::Oid;
 pub use refs::{Head, Ref, RefKind};
 pub use stash::Stash;
+pub use status::{HeadCommit, HunkPick, WorkingFile, WorkingStatus};
 pub use submodule::{Submodule, SubmoduleState};
 pub use worktree::Worktree;
 
@@ -327,6 +329,73 @@ impl Repo {
     /// The old and new text of one file, for syntax highlighting.
     pub fn file_texts(&self, oid: Oid, path: &str, old_path: Option<&str>) -> Result<FileTexts> {
         diff::file_texts(self, oid, path, old_path)
+    }
+
+    /// Everything the local-changes view shows: HEAD, the branch, staged and
+    /// unstaged files with their line counts.
+    pub fn working_status(&self) -> Result<WorkingStatus> {
+        status::status(self)
+    }
+
+    /// Adds `paths` to the index (new files, modifications and deletions).
+    pub fn stage(&self, paths: &[String]) -> Result<()> {
+        status::stage(self, paths)
+    }
+
+    /// Removes `paths` from the index, leaving the work tree alone.
+    pub fn unstage(&self, paths: &[String]) -> Result<()> {
+        status::unstage(self, paths)
+    }
+
+    /// Restores `tracked` files from the index and deletes `untracked` ones.
+    pub fn discard(&self, tracked: &[String], untracked: &[String]) -> Result<()> {
+        status::discard(self, tracked, untracked)
+    }
+
+    /// One file's work-tree diff (index to work tree).
+    pub fn unstaged_diff(&self, path: &str, old_path: Option<&str>) -> Result<FileDiff> {
+        status::unstaged_diff(self, path, old_path)
+    }
+
+    /// One file's index diff (HEAD to index).
+    pub fn staged_diff(&self, path: &str, old_path: Option<&str>) -> Result<FileDiff> {
+        status::staged_diff(self, path, old_path)
+    }
+
+    /// An untracked file as an all-additions diff.
+    pub fn untracked_diff(&self, path: &str) -> Result<FileDiff> {
+        status::untracked_diff(self, path)
+    }
+
+    /// Stages the picked hunks/lines of one unstaged file.
+    pub fn stage_selection(
+        &self,
+        file: &WorkingFile,
+        diff: &FileDiff,
+        picks: &[HunkPick],
+    ) -> Result<()> {
+        status::stage_selection(self, file, diff, picks)
+    }
+
+    /// Unstages the picked hunks/lines of one staged file.
+    pub fn unstage_selection(
+        &self,
+        file: &WorkingFile,
+        diff: &FileDiff,
+        picks: &[HunkPick],
+    ) -> Result<()> {
+        status::unstage_selection(self, file, diff, picks)
+    }
+
+    /// Commits the index, or rewrites HEAD with `amend`. Returns the new
+    /// commit.
+    pub fn commit(&self, message: &str, amend: bool) -> Result<Oid> {
+        status::commit(self, message, amend)
+    }
+
+    /// HEAD's commit, or `None` while the branch is unborn.
+    pub fn head_commit(&self) -> Result<Option<HeadCommit>> {
+        status::head_commit(self)
     }
 }
 

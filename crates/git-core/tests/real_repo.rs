@@ -1212,3 +1212,353 @@ fn keeps_the_no_newline_marker_and_marks_a_huge_diff_too_large() {
         .unwrap_err();
     assert!(matches!(err, git_core::Error::TooLarge { .. }), "{err}");
 }
+
+#[test]
+fn reads_the_working_status_and_moves_files_between_the_sides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "a.txt", "one\n");
+    write(d, "b.txt", "gone\n");
+    commit_all(d, "one");
+    write(d, "a.txt", "one\nchanged\n");
+    write(d, "c.txt", "new\nfile\n");
+    std::fs::remove_file(d.join("b.txt")).unwrap();
+
+    let repo = open(d).unwrap();
+    let status = repo.working_status().unwrap();
+    assert_eq!(status.branch.as_deref(), Some("main"));
+    assert_eq!(status.head.as_ref().unwrap().summary, "one");
+    assert_eq!(status.unstaged_count(), 3);
+    assert_eq!(status.staged_count(), 0);
+    let by_path = |path: &str| {
+        status
+            .unstaged
+            .iter()
+            .find(|file| file.path == path)
+            .unwrap_or_else(|| panic!("{path} in {status:?}"))
+            .clone()
+    };
+    let a = by_path("a.txt");
+    assert_eq!(
+        (a.kind, a.added, a.deleted),
+        (git_core::ChangeKind::Modified, 1, 0)
+    );
+    let b = by_path("b.txt");
+    assert_eq!((b.kind, b.deleted), (git_core::ChangeKind::Deleted, 1));
+    let c = by_path("c.txt");
+    assert_eq!(
+        (c.kind, c.added, c.untracked),
+        (git_core::ChangeKind::Added, 2, true)
+    );
+
+    repo.stage(&["a.txt".to_string()]).unwrap();
+    let status = repo.working_status().unwrap();
+    assert_eq!(status.staged.len(), 1);
+    assert_eq!(status.staged[0].path, "a.txt");
+    assert_eq!(status.unstaged_count(), 2);
+
+    repo.unstage(&["a.txt".to_string()]).unwrap();
+    let status = repo.working_status().unwrap();
+    assert!(status.staged.is_empty());
+    assert_eq!(status.unstaged_count(), 3);
+}
+
+#[test]
+fn discards_tracked_and_untracked_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "a.txt", "one\n");
+    commit_all(d, "one");
+    write(d, "a.txt", "changed\n");
+    write(d, "new.txt", "new\n");
+
+    let repo = open(d).unwrap();
+    repo.discard(&["a.txt".to_string()], &["new.txt".to_string()])
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "one\n");
+    assert!(!d.join("new.txt").exists());
+    assert_eq!(repo.working_status().unwrap().unstaged_count(), 0);
+}
+
+#[test]
+fn commits_and_amends_the_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    git(d, &["config", "user.name", "Test"]);
+    git(d, &["config", "user.email", "test@example.com"]);
+    write(d, "a.txt", "one\n");
+
+    let repo = open(d).unwrap();
+    repo.stage(&["a.txt".to_string()]).unwrap();
+    let first = repo.commit("first\n\nWhy.\n", false).unwrap();
+    assert_eq!(first, head_oid(&repo));
+    let details = repo.commit_details(first).unwrap();
+    assert_eq!(details.summary, "first");
+    assert_eq!(details.body, "Why.");
+
+    write(d, "a.txt", "two\n");
+    repo.stage(&["a.txt".to_string()]).unwrap();
+    let amended = repo.commit("second", true).unwrap();
+    assert_eq!(amended, head_oid(&repo));
+    assert_ne!(amended, first);
+    assert!(repo.commit_details(amended).unwrap().parents.is_empty());
+    let subjects: Vec<_> = repo
+        .log(&LogOptions::default())
+        .unwrap()
+        .collect::<git_core::Result<Vec<_>>>()
+        .unwrap()
+        .into_iter()
+        .map(|commit| commit.summary)
+        .collect();
+    assert_eq!(subjects, ["second"]);
+}
+
+#[test]
+fn stages_and_unstages_one_hunk_of_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    let mut original = String::new();
+    for line in 1..=20 {
+        original.push_str(&format!("line {line}\n"));
+    }
+    write(d, "a.txt", &original);
+    commit_all(d, "one");
+    let changed = original
+        .replace("line 2\n", "line two\n")
+        .replace("line 18\n", "line eighteen\n");
+    write(d, "a.txt", &changed);
+
+    let repo = open(d).unwrap();
+    let status = repo.working_status().unwrap();
+    let file = status.unstaged[0].clone();
+    let diff = repo.unstaged_diff("a.txt", None).unwrap();
+    assert_eq!(diff.hunks.len(), 2);
+
+    repo.stage_selection(&file, &diff, &[git_core::HunkPick::whole(1)])
+        .unwrap();
+    let cached = run_git(d, &["diff", "--cached", "-U0"]);
+    assert!(cached.contains("+line eighteen"), "{cached}");
+    assert!(!cached.contains("+line two"), "{cached}");
+    let status = repo.working_status().unwrap();
+    assert_eq!(status.staged[0].path, "a.txt");
+    assert_eq!(status.unstaged[0].path, "a.txt");
+
+    let staged = status.staged[0].clone();
+    let index_diff = repo.staged_diff("a.txt", None).unwrap();
+    assert_eq!(index_diff.hunks.len(), 1);
+    repo.unstage_selection(&staged, &index_diff, &[git_core::HunkPick::whole(0)])
+        .unwrap();
+    let status = repo.working_status().unwrap();
+    assert!(status.staged.is_empty());
+    let cached = run_git(d, &["diff", "--cached", "-U0"]);
+    assert!(cached.is_empty(), "{cached}");
+}
+
+#[test]
+fn stages_selected_lines_of_a_hunk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "a.txt", "one\ntwo\nthree\n");
+    commit_all(d, "one");
+    write(d, "a.txt", "one\nTWO\nthree\nfour\n");
+
+    let repo = open(d).unwrap();
+    let status = repo.working_status().unwrap();
+    let file = status.unstaged[0].clone();
+    let diff = repo.unstaged_diff("a.txt", None).unwrap();
+    let hunk = &diff.hunks[0];
+    // Pick the removed "two" and the added "TWO", but not "four".
+    let picks: Vec<usize> = hunk
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            matches!(line.kind, git_core::LineKind::Removed)
+                || (matches!(line.kind, git_core::LineKind::Added) && line.text == "TWO")
+        })
+        .map(|(index, _)| index)
+        .collect();
+    repo.stage_selection(&file, &diff, &[git_core::HunkPick::lines(0, picks)])
+        .unwrap();
+    let cached = run_git(d, &["diff", "--cached", "-U0"]);
+    assert!(cached.contains("-two"), "{cached}");
+    assert!(cached.contains("+TWO"), "{cached}");
+    assert!(!cached.contains("+four"), "{cached}");
+    let remaining = run_git(d, &["diff", "-U0"]);
+    assert!(remaining.contains("+four"), "{remaining}");
+}
+
+/// Runs git in `dir` and returns its stdout, failing on a non-zero exit.
+fn run_git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git is installed");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn works_in_an_unborn_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    git(d, &["config", "user.name", "Test"]);
+    git(d, &["config", "user.email", "test@example.com"]);
+    write(d, "a.txt", "one\n");
+
+    let repo = open(d).unwrap();
+    let status = repo.working_status().unwrap();
+    assert_eq!(status.branch.as_deref(), Some("main"));
+    assert!(status.head.is_none());
+    assert_eq!(status.unstaged[0].path, "a.txt");
+    assert!(status.unstaged[0].untracked);
+
+    repo.stage(&["a.txt".to_string()]).unwrap();
+    assert_eq!(repo.working_status().unwrap().staged.len(), 1);
+    repo.unstage(&["a.txt".to_string()]).unwrap();
+    let status = repo.working_status().unwrap();
+    assert!(status.staged.is_empty());
+    assert_eq!(status.unstaged.len(), 1);
+
+    repo.stage(&["a.txt".to_string()]).unwrap();
+    let oid = repo.commit("first", false).unwrap();
+    assert_eq!(oid, head_oid(&repo));
+    let status = repo.working_status().unwrap();
+    assert_eq!(status.head.as_ref().unwrap().summary, "first");
+    assert_eq!(status.unstaged_count(), 0);
+}
+
+#[test]
+fn an_untracked_file_reads_as_additions_and_can_be_partly_staged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "new.txt", "one\ntwo\nthree\n");
+
+    let repo = open(d).unwrap();
+    let file = repo.working_status().unwrap().unstaged[0].clone();
+    assert!(file.untracked);
+    let diff = repo.untracked_diff("new.txt").unwrap();
+    assert_eq!(diff.hunks.len(), 1);
+    assert_eq!(diff.hunks[0].lines.len(), 3);
+    assert!(diff.hunks[0]
+        .lines
+        .iter()
+        .all(|line| line.kind == git_core::LineKind::Added));
+
+    // Stage the first and last line only: the index gets a two-line file and
+    // the still-unstaged middle line shows up as a modification.
+    repo.stage_selection(&file, &diff, &[git_core::HunkPick::lines(0, vec![0, 2])])
+        .unwrap();
+    let cached = run_git(d, &["show", ":new.txt"]);
+    assert_eq!(cached, "one\nthree\n");
+    let status = repo.working_status().unwrap();
+    assert_eq!(status.staged.len(), 1);
+    assert_eq!(status.unstaged.len(), 1);
+}
+
+#[test]
+fn stages_a_hunk_of_a_file_whose_name_has_a_space() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    let mut original = String::new();
+    for line in 1..=20 {
+        original.push_str(&format!("line {line}\n"));
+    }
+    write(d, "my file.txt", &original);
+    commit_all(d, "one");
+    let changed = original
+        .replace("line 2\n", "line two\n")
+        .replace("line 18\n", "line eighteen\n");
+    write(d, "my file.txt", &changed);
+
+    let repo = open(d).unwrap();
+    let file = repo.working_status().unwrap().unstaged[0].clone();
+    let diff = repo.unstaged_diff("my file.txt", None).unwrap();
+    assert_eq!(diff.hunks.len(), 2);
+    repo.stage_selection(&file, &diff, &[git_core::HunkPick::whole(1)])
+        .unwrap();
+    let cached = run_git(d, &["diff", "--cached", "-U0"]);
+    assert!(cached.contains("+line eighteen"), "{cached}");
+    assert!(!cached.contains("+line two"), "{cached}");
+}
+
+#[test]
+fn unstages_selected_lines_of_a_staged_hunk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "a.txt", "one\ntwo\nthree\n");
+    commit_all(d, "one");
+    write(d, "a.txt", "one\nTWO\nthree\nfour\n");
+    git(d, &["add", "a.txt"]);
+
+    let repo = open(d).unwrap();
+    let staged = repo.working_status().unwrap().staged[0].clone();
+    let diff = repo.staged_diff("a.txt", None).unwrap();
+    let hunk = &diff.hunks[0];
+    let picks: Vec<usize> = hunk
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            matches!(line.kind, git_core::LineKind::Removed)
+                || (matches!(line.kind, git_core::LineKind::Added) && line.text == "TWO")
+        })
+        .map(|(index, _)| index)
+        .collect();
+    repo.unstage_selection(&staged, &diff, &[git_core::HunkPick::lines(0, picks)])
+        .unwrap();
+
+    let cached = run_git(d, &["diff", "--cached", "-U0"]);
+    assert!(cached.contains("+four"), "{cached}");
+    assert!(!cached.contains("+TWO"), "{cached}");
+    assert!(!cached.contains("-two"), "{cached}");
+    // The work tree keeps both changes.
+    let worktree = std::fs::read_to_string(d.join("a.txt")).unwrap();
+    assert_eq!(worktree, "one\nTWO\nthree\nfour\n");
+}
+
+#[test]
+fn reads_a_staged_rename_against_its_old_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "a.txt", "one\ntwo\n");
+    commit_all(d, "one");
+    git(d, &["mv", "a.txt", "b.txt"]);
+    write(d, "b.txt", "one\nTWO\n");
+    git(d, &["add", "b.txt"]);
+
+    let repo = open(d).unwrap();
+    let status = repo.working_status().unwrap();
+    let file = &status.staged[0];
+    assert_eq!(file.kind, git_core::ChangeKind::Renamed);
+    assert_eq!(file.old_path.as_deref(), Some("a.txt"));
+    let diff = repo
+        .staged_diff(&file.path, file.old_path.as_deref())
+        .unwrap();
+    assert_eq!(diff.old_path.as_deref(), Some("a.txt"));
+    let kinds: Vec<_> = diff.hunks[0]
+        .lines
+        .iter()
+        .map(|line| line.kind)
+        .collect();
+    assert!(kinds.contains(&git_core::LineKind::Removed), "{kinds:?}");
+    assert!(kinds.contains(&git_core::LineKind::Added), "{kinds:?}");
+}
