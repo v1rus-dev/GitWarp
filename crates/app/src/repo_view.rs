@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, canvas, div, point, px, size, App, AppContext, Bounds, ClickEvent, Context,
-    Decorations, Div, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, WeakEntity, Window,
+    actions, canvas, div, point, px, size, App, AppContext, Bounds, ClickEvent, ClipboardItem,
+    Context, Decorations, Div, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, WeakEntity, Window,
 };
 
 use git_core::{Error, Git, Head, RefKind};
@@ -29,7 +29,10 @@ use crate::format::format_count;
 use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
 use crate::settings::{Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
-use crate::sidebar::{read_sidebar_extras, sidebar_nodes, Expansion, SidebarExtras};
+use crate::sidebar::{
+    commit_for, read_sidebar_extras, sidebar_menu, sidebar_nodes, Expansion, SidebarAction,
+    SidebarExtras, SidebarMenuEntry,
+};
 use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
@@ -532,6 +535,84 @@ impl RepositoryView {
         cx.notify();
     }
 
+    /// Click / Enter / Space on a leaf: selects it and reveals its commit in
+    /// the history. Folders, remotes and sections only toggle, so they never
+    /// reach this.
+    fn activate_node(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.selected_node = Some(key.into());
+        self.reveal_node(key, cx);
+        cx.notify();
+    }
+
+    /// Jumps the history to the commit a leaf points at, when it has one.
+    fn reveal_node(&mut self, key: &str, cx: &mut Context<Self>) {
+        let oid = {
+            let history = self.history.read(cx);
+            commit_for(
+                key,
+                history.refs().unwrap_or(&[]),
+                self.sidebar_extras.as_ref(),
+            )
+        };
+        if let Some(oid) = oid {
+            self.history
+                .update(cx, |history, cx| history.reveal_commit(oid, cx));
+        }
+    }
+
+    /// Right-click on a sidebar row: selects it (without the jump) and opens
+    /// its kind's menu at the pointer. A kind without a menu does nothing.
+    fn open_sidebar_menu(
+        &mut self,
+        key: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let model = sidebar_menu(
+            key,
+            self.history.read(cx).head(),
+            self.sidebar_extras.as_ref(),
+        );
+        if model.is_empty() {
+            return;
+        }
+        self.selected_node = Some(key.into());
+        let view = cx.entity();
+        let entries: Vec<MenuEntry> = model
+            .into_iter()
+            .map(|entry| match entry {
+                SidebarMenuEntry::Separator => MenuEntry::Separator,
+                SidebarMenuEntry::Item(item) => {
+                    let mut menu_item = MenuItem::new(item.label)
+                        .icon(item.icon)
+                        .disabled(!item.enabled);
+                    if let Some(shortcut) = item.shortcut {
+                        menu_item = menu_item.shortcut(shortcut);
+                    }
+                    if item.danger {
+                        menu_item = menu_item.danger();
+                    }
+                    menu_item = match item.action {
+                        SidebarAction::CopyText(text) => menu_item.action(move |_, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        }),
+                        SidebarAction::Refresh => {
+                            let view = view.clone();
+                            menu_item.action(move |_, cx| {
+                                view.update(cx, |view, cx| view.refresh(cx));
+                            })
+                        }
+                        SidebarAction::None => menu_item,
+                    };
+                    MenuEntry::Item(menu_item)
+                }
+            })
+            .collect();
+        menu::open_context_menu(position, entries, window, cx);
+        cx.notify();
+    }
+
     /// Starts the sidebar's background load when the history first reports a
     /// root. Loading is once per root; `refresh` forces it again.
     fn ensure_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -550,8 +631,6 @@ impl RepositoryView {
     }
 
     /// Re-runs the sidebar's background load (the "Refresh list" action).
-    /// Wired to the UI by stage 4.3.
-    #[allow(dead_code)]
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         let root = self.sidebar_root.clone().or_else(|| {
             self.history
@@ -931,9 +1010,22 @@ impl RepositoryView {
                     if has_children {
                         view.toggle_node(&key, expanded, cx);
                     } else {
-                        view.selected_node = Some(key);
-                        cx.notify();
+                        view.activate_node(&key, cx);
                     }
+                });
+            }
+        };
+        // A right-click selects the row and opens its kind's menu at the
+        // pointer; the sidebar keeps the keyboard focus.
+        let context_menu = {
+            let rows = rows.clone();
+            let view = view.clone();
+            move |index: usize, position: Point<Pixels>, window: &mut Window, cx: &mut App| {
+                let Some((key, _, _)) = rows.get(index).cloned() else {
+                    return;
+                };
+                view.update(cx, |view, cx| {
+                    view.open_sidebar_menu(&key, position, window, cx);
                 });
             }
         };
@@ -987,7 +1079,8 @@ impl RepositoryView {
                                 .on_toggle(node_toggler(rows.clone(), view.clone()))
                                 .on_expand(node_toggler(rows.clone(), view.clone()))
                                 .on_collapse(node_toggler(rows, view))
-                                .on_activate(activate),
+                                .on_activate(activate)
+                                .on_context_menu(context_menu),
                         )
                     }),
             )
