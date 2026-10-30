@@ -452,26 +452,33 @@ fn parse_patch(raw: &[u8]) -> Result<FileDiff> {
     // whose `+++`/`---` lines are absent (a binary file).
     let mut old_path: Option<String> = None;
     let mut path: Option<String> = None;
+    // Inside a hunk an added line can itself start with `+++ ` (or a removed
+    // line with `--- `), which must not be mistaken for a file header.
+    let mut in_hunk = false;
 
     for line in text.split_inclusive('\n') {
         let line = line.strip_suffix('\n').unwrap_or(line);
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.starts_with("diff --git ") {
+            in_hunk = false;
             if let Some((a, b)) = parse_diff_git_header(line) {
                 old_path = Some(a);
                 path = Some(b);
             }
-        } else if let Some(rest) = line.strip_prefix("--- ") {
+        } else if !in_hunk && line.starts_with("--- ") {
+            let rest = &line[4..];
             if rest != "/dev/null" {
                 old_path = Some(strip_ab_prefix(rest));
             }
-        } else if let Some(rest) = line.strip_prefix("+++ ") {
+        } else if !in_hunk && line.starts_with("+++ ") {
+            let rest = &line[4..];
             if rest != "/dev/null" {
                 path = Some(strip_ab_prefix(rest));
             }
         } else if line.starts_with("Binary files ") || line == "GIT binary patch" {
             diff.binary = true;
         } else if let Some(header) = line.strip_prefix("@@ ") {
+            in_hunk = true;
             let header = format!("@@ {header}");
             let (old_start, old_count, new_start, new_count) =
                 parse_hunk_header(&header).ok_or(Error::Parse("hunk header"))?;
@@ -708,6 +715,27 @@ mod tests {
             ]
         );
         assert!(hunk.lines[4].no_newline);
+    }
+
+    #[test]
+    fn diff_markers_inside_a_hunk_are_line_text_not_headers() {
+        let patch = concat!(
+            "diff --git a/a.md b/a.md\n",
+            "--- a/a.md\n",
+            "+++ b/a.md\n",
+            "@@ -1,2 +1,2 @@\n",
+            "--- a removed line that starts with dashes\n",
+            "+++ an added line that starts with pluses\n",
+        );
+        let diff = parse_patch(patch.as_bytes()).unwrap();
+        assert_eq!(diff.path, "a.md");
+        assert_eq!(diff.hunks.len(), 1);
+        let kinds: Vec<_> = diff.hunks[0].lines.iter().map(|line| line.kind).collect();
+        assert_eq!(kinds, [LineKind::Removed, LineKind::Added]);
+        assert_eq!(
+            diff.hunks[0].lines[1].text,
+            "++ an added line that starts with pluses"
+        );
     }
 
     #[test]

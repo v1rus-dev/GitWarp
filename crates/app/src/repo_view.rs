@@ -1616,7 +1616,7 @@ impl RepositoryView {
         if !details.body.is_empty() {
             column = column.child(
                 div()
-                    .mb(px(12.))
+                    .mb(px(8.))
                     .text_size(FS_BASE)
                     .child(details.body.clone()),
             );
@@ -1680,12 +1680,17 @@ impl RepositoryView {
                 row = row.child(
                     div()
                         .id(SharedString::from(format!("details-parent-{index}")))
+                        .debug_selector(move || format!("details-parent-{index}"))
                         .font_family(FONT_MONO)
                         .text_size(FS_SM)
                         .text_color(colors.accent)
                         .cursor_pointer()
                         .hover(move |style| style.text_color(colors.accent_hover))
-                        .child(parent.short())
+                        .child({
+                            let mut hash = parent.to_string();
+                            hash.truncate(7);
+                            hash
+                        })
                         .on_click(move |_, _, cx| {
                             view.update(cx, |view, cx| {
                                 view.history.update(cx, |history, cx| {
@@ -1704,6 +1709,7 @@ impl RepositoryView {
                     .flex()
                     .flex_col()
                     .gap(px(6.))
+                    .text_size(FS_SM)
                     .child(meta_row("Author", author, colors))
                     .child(meta_row("Authored", authored, colors))
                     .child(meta_row("Committer", committer, colors))
@@ -1734,7 +1740,7 @@ impl RepositoryView {
             .text_color(colors.muted)
             .child(
                 div()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(FontWeight::BOLD)
                     .text_color(colors.text)
                     .child("Changed files"),
             );
@@ -1911,6 +1917,9 @@ impl RepositoryView {
                 .child(Skeleton::new("diff-skeleton-1", px(320.)))
                 .child(Skeleton::new("diff-skeleton-2", px(260.)))
                 .child(Skeleton::new("diff-skeleton-3", px(290.))),
+            DiffState::Failed(message) if message.contains("too large") => {
+                diff_note("Diff too large to display", colors)
+            }
             DiffState::Failed(message) => div()
                 .flex_1()
                 .min_h_0()
@@ -3089,6 +3098,49 @@ mod tests {
         view.read_with(&cx, |view, _| assert_eq!(view.selected_file, Some(0)));
         cx.simulate_keystrokes("down");
         view.read_with(&cx, |view, _| assert_eq!(view.selected_file, Some(1)));
+    }
+
+    /// Clicking a parent's short hash selects that commit in the history.
+    #[gpui::test]
+    fn clicking_a_parent_hash_selects_that_commit(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+
+        let repo = crate::test_support::TempRepo::new("details-parent");
+        commit(repo.path(), "a.txt", "one\n");
+        commit(repo.path(), "b.txt", "two\n");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.details
+                    .details()
+                    .map(|details| details.summary.as_str()),
+                Some("two")
+            );
+        });
+
+        let parent = cx
+            .debug_bounds("details-parent-0")
+            .expect("the parent link was not drawn");
+        cx.simulate_click(parent.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(
+                view.details
+                    .details()
+                    .map(|details| details.summary.as_str()),
+                Some("one"),
+                "the parent commit's details did not load"
+            );
+            assert_eq!(
+                view.history
+                    .read(cx)
+                    .selected_commit()
+                    .map(|c| c.summary.clone()),
+                Some("one".to_string()),
+                "the parent was not selected in the history"
+            );
+        });
     }
 
     /// The layout toggle switches the pane to side-by-side rows and stores the
