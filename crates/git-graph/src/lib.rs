@@ -17,10 +17,19 @@
 //!
 //! The crate is generic over the id type, so it does not depend on any git
 //! library: use a 20-byte hash, an interned `u32`, or a `String` in tests.
+//!
+//! There is at most one lane per expected commit. When a commit's first parent
+//! is already expected by another lane, the commit's line bends into that lane
+//! on its own row instead of running a second line down to the parent; a
+//! merged-in parent that is not expected yet gets a new lane in the leftmost
+//! free column, which may be left of the merge commit.
 
 use std::hash::Hash;
 
 pub mod ascii;
+pub mod collapse;
+
+pub use collapse::{ColumnGeometry, IdleLanes, FOLDED_WIDTH, LANE_WIDTH};
 
 /// Stable color slot of a lane. The renderer maps it onto a palette
 /// (`color % palette.len()`).
@@ -110,6 +119,14 @@ impl<Id: Clone + Eq + Hash> GraphBuilder<Id> {
 
     /// Lay out the next commit. `parents` must be in git order: the first
     /// parent is the one the branch continues on.
+    ///
+    /// At most one lane waits for any commit. A parent that is already waited
+    /// for is joined on this row — the first parent bends into its waiting
+    /// lane, so the commit's own column becomes free below it; the other
+    /// parents join that lane too. A parent nobody waits for yet gets a new
+    /// lane: the first parent's lane stays in the commit's column, the other
+    /// parents take the leftmost free column anywhere except that column
+    /// (left of the merge is allowed), appending when no column is free.
     pub fn push(&mut self, id: Id, parents: &[Id]) -> Row<Id> {
         // ---- upper half -------------------------------------------------
         // Every open lane either ends in this commit or passes by.
@@ -178,22 +195,33 @@ impl<Id: Clone + Eq + Hash> GraphBuilder<Id> {
                 continue;
             }
             if i == 0 {
-                // The branch continues straight down in its own lane, even if
-                // another lane already waits for the same parent: the lines
-                // meet at the parent's row, where the branch really forked.
-                self.lanes[column] = Some(Lane {
-                    expects: parent.clone(),
-                    color,
-                });
-                below.push(Segment {
-                    from: column,
-                    to: column,
-                    color,
-                });
+                if let Some(col) = self.find_lane(parent) {
+                    // A lane already waits for the first parent (the branch
+                    // forks off somewhere further down): bend into it here
+                    // and leave this commit's own column free.
+                    let lane_color = self.lane_color(col, color);
+                    below.push(Segment {
+                        from: column,
+                        to: col,
+                        color: lane_color,
+                    });
+                } else {
+                    // Nobody waits for the first parent yet: the branch
+                    // continues straight down in its own lane.
+                    self.lanes[column] = Some(Lane {
+                        expects: parent.clone(),
+                        color,
+                    });
+                    below.push(Segment {
+                        from: column,
+                        to: column,
+                        color,
+                    });
+                }
             } else if let Some(col) = self.find_lane(parent) {
                 // A merged-in parent that some lane already waits for: join it
                 // instead of opening yet another parallel line.
-                let lane_color = self.lanes[col].as_ref().map_or(color, |l| l.color);
+                let lane_color = self.lane_color(col, color);
                 below.push(Segment {
                     from: column,
                     to: col,
@@ -201,14 +229,15 @@ impl<Id: Clone + Eq + Hash> GraphBuilder<Id> {
                 });
             } else {
                 // Merged-in parent seen for the first time: open a lane for it
-                // to the right of the merge commit.
+                // in the leftmost free column, which may be left of the merge
+                // commit but never on the commit's own column.
                 let lane_color = self.new_color();
-                let col = self.alloc_lane(
+                let col = self.alloc_lane_beside(
                     Lane {
                         expects: parent.clone(),
                         color: lane_color,
                     },
-                    column + 1,
+                    column,
                 );
                 below.push(Segment {
                     from: column,
@@ -254,6 +283,11 @@ impl<Id: Clone + Eq + Hash> GraphBuilder<Id> {
             .position(|l| l.as_ref().is_some_and(|l| l.expects == *id))
     }
 
+    /// Color of the lane in `col`, falling back to `default` if it is free.
+    fn lane_color(&self, col: usize, default: ColorId) -> ColorId {
+        self.lanes[col].as_ref().map_or(default, |l| l.color)
+    }
+
     /// Put a lane into the leftmost free column at or right of `min`.
     fn alloc_lane(&mut self, lane: Lane<Id>, min: usize) -> usize {
         if let Some(col) = (min..self.lanes.len()).find(|&c| self.lanes[c].is_none()) {
@@ -262,6 +296,17 @@ impl<Id: Clone + Eq + Hash> GraphBuilder<Id> {
         }
         while self.lanes.len() < min {
             self.lanes.push(None);
+        }
+        self.lanes.push(Some(lane));
+        self.lanes.len() - 1
+    }
+
+    /// Put a lane into the leftmost free column other than `skip`, appending
+    /// when every other column is taken.
+    fn alloc_lane_beside(&mut self, lane: Lane<Id>, skip: usize) -> usize {
+        if let Some(col) = (0..self.lanes.len()).find(|&c| c != skip && self.lanes[c].is_none()) {
+            self.lanes[col] = Some(lane);
+            return col;
         }
         self.lanes.push(Some(lane));
         self.lanes.len() - 1

@@ -73,17 +73,24 @@ pub fn render<Id>(rows: &[Row<Id>], mut label: impl FnMut(&Row<Id>) -> String) -
                 }
             }
         }
-        // Lines from the dot sideways start at the dot itself.
-        if row
-            .below
-            .iter()
-            .any(|s| s.from == row.column && s.to != row.column)
-        {
-            let straight = row
-                .below
-                .iter()
-                .any(|s| s.from == row.column && s.to == row.column);
-            conn[row.column * 2] = if straight { '├' } else { '╰' };
+        // Lines from the dot sideways start at the dot itself. A lane bends
+        // left when it joins a waiting lane further left, so the corner
+        // depends on the direction, not just on whether a line also goes down.
+        let mut straight = false;
+        let mut left = false;
+        let mut right = false;
+        for s in &row.below {
+            if s.from != row.column {
+                continue;
+            }
+            match s.to.cmp(&row.column) {
+                std::cmp::Ordering::Equal => straight = true,
+                std::cmp::Ordering::Less => left = true,
+                std::cmp::Ordering::Greater => right = true,
+            }
+        }
+        if left || right {
+            conn[row.column * 2] = dot_connector(straight, left, right);
         }
         out.push_str(conn.iter().collect::<String>().trim_end());
         out.push('\n');
@@ -101,4 +108,19 @@ fn put(line: &mut [char], at: usize, c: char) {
         (cur, '─') => cur,
         (_, c) => c,
     };
+}
+
+/// Character at the commit dot on the connector line. `straight` is a lane
+/// going down, `left`/`right` are lanes going sideways from the dot.
+fn dot_connector(straight: bool, left: bool, right: bool) -> char {
+    match (straight, left, right) {
+        (true, true, true) => '┼',
+        (true, true, false) => '┤',
+        (true, false, true) => '├',
+        (false, true, true) => '┴',
+        (true, false, false) => '│',
+        (false, true, false) => '╯',
+        (false, false, true) => '╰',
+        (false, false, false) => '│',
+    }
 }

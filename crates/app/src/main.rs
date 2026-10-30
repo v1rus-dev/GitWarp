@@ -1,5 +1,6 @@
 mod format;
 mod graph_paint;
+mod history_search;
 mod history_state;
 mod history_view;
 mod init_flow;
@@ -202,6 +203,12 @@ fn main() {
                 KeyBinding::new("delete", welcome::RemoveSelected, Some("welcome")),
             ];
             cx.bind_keys(shortcuts);
+            // The search field's own keys (Shift+Enter, F3, Esc, ↓) live in
+            // its key context.
+            repo_view::bind_search_keys(cx);
+            // The history list's extra keys (j/k, PgUp/PgDn, Ctrl+C) live in
+            // the list's own context.
+            history_view::bind_history_keys(cx);
             cx.set_global(AppSettings {
                 path: config_path,
                 settings: loaded,

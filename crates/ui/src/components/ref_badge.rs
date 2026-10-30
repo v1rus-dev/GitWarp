@@ -1,18 +1,18 @@
 //! Ref badges: branch, remote, tag, stash and HEAD labels.
 
 use gpui::prelude::FluentBuilder;
-use gpui::InteractiveElement;
 use gpui::{
-    div, px, App, ElementId, FontWeight, Hsla, IntoElement, ParentElement, RenderOnce,
-    SharedString, Styled, Window,
+    div, px, App, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement,
+    Pixels, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::icon::{Icon, IconName};
 use crate::metrics::{FS_XS, R_SM};
 use crate::theme::{ActiveTheme, ThemeColors};
+use crate::Tooltip;
 
 /// What a badge points at.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum RefKind {
     #[default]
     Local,
@@ -20,6 +20,8 @@ pub enum RefKind {
     Tag,
     Stash,
     Head,
+    /// The "+N" badge that stands for collapsed refs.
+    Overflow,
 }
 
 /// A small tinted ref label.
@@ -28,6 +30,8 @@ pub struct RefBadge {
     id: ElementId,
     label: SharedString,
     kind: RefKind,
+    max_label_width: Option<Pixels>,
+    tooltip: Option<SharedString>,
 }
 
 impl RefBadge {
@@ -36,6 +40,8 @@ impl RefBadge {
             id: id.into(),
             label: label.into(),
             kind: RefKind::Local,
+            max_label_width: None,
+            tooltip: None,
         }
     }
 
@@ -43,15 +49,33 @@ impl RefBadge {
         self.kind = kind;
         self
     }
+
+    /// Cap the label at `width`; a longer label is ellipsized inside the badge.
+    pub fn max_label_width(mut self, width: Pixels) -> Self {
+        self.max_label_width = Some(width);
+        self
+    }
+
+    /// Show `text` when the badge is hovered.
+    pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(text.into());
+        self
+    }
 }
 
-fn kind_style(kind: RefKind, colors: ThemeColors) -> (Hsla, IconName, FontWeight) {
+fn kind_style(kind: RefKind, colors: ThemeColors) -> (Hsla, Option<IconName>, FontWeight) {
     match kind {
-        RefKind::Local => (colors.accent, IconName::Branch, FontWeight::SEMIBOLD),
-        RefKind::Remote => (colors.muted, IconName::Cloud, FontWeight::MEDIUM),
-        RefKind::Tag => (colors.warning, IconName::Tag, FontWeight::SEMIBOLD),
-        RefKind::Stash => (colors.st_untracked, IconName::Stash, FontWeight::SEMIBOLD),
-        RefKind::Head => (colors.accent, IconName::Branch, FontWeight::SEMIBOLD),
+        RefKind::Local => (colors.accent, Some(IconName::Branch), FontWeight::SEMIBOLD),
+        RefKind::Remote => (colors.muted, Some(IconName::Cloud), FontWeight::MEDIUM),
+        RefKind::Tag => (colors.warning, Some(IconName::Tag), FontWeight::SEMIBOLD),
+        RefKind::Stash => (
+            colors.st_untracked,
+            Some(IconName::Stash),
+            FontWeight::SEMIBOLD,
+        ),
+        RefKind::Head => (colors.accent, Some(IconName::Branch), FontWeight::SEMIBOLD),
+        // Like a remote badge, but heavier and without an icon.
+        RefKind::Overflow => (colors.muted, None, FontWeight::SEMIBOLD),
     }
 }
 
@@ -65,15 +89,11 @@ impl RenderOnce for RefBadge {
         } else {
             (color.opacity(0.10), color.opacity(0.28), color)
         };
-        let icon = if self.kind == RefKind::Head {
-            None
-        } else {
-            Some(icon)
-        };
 
         div()
             .id(self.id)
             .flex()
+            .flex_none()
             .items_center()
             .gap(px(3.))
             .h(px(18.))
@@ -89,6 +109,15 @@ impl RenderOnce for RefBadge {
             .when_some(icon, |this, icon| {
                 this.child(Icon::new(icon).size(px(11.)).color(foreground))
             })
-            .child(self.label)
+            .child(
+                div()
+                    .when_some(self.max_label_width, |this, width| {
+                        this.max_w(width).overflow_hidden().truncate()
+                    })
+                    .child(self.label),
+            )
+            .when_some(self.tooltip, |this, tooltip| {
+                this.tooltip(Tooltip::text(tooltip))
+            })
     }
 }

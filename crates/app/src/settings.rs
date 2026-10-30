@@ -20,6 +20,12 @@ pub const SIDEBAR_WIDTH_MIN: f32 = 160.0;
 pub const SIDEBAR_WIDTH_MAX: f32 = 420.0;
 /// The sidebar width used when the file has no usable value.
 pub const SIDEBAR_WIDTH_DEFAULT: f32 = 240.0;
+/// The narrowest graph column.
+pub const GRAPH_WIDTH_MIN: f32 = 40.0;
+/// The widest graph column; the pane's own share can still narrow it.
+pub const GRAPH_WIDTH_MAX: f32 = 480.0;
+/// The graph column width used when the file has no usable value.
+pub const GRAPH_WIDTH_DEFAULT: f32 = 112.0;
 
 /// The user's settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +41,10 @@ pub struct Settings {
     pub sidebar_width: f32,
     /// Height of the details pane; `None` uses the layout default.
     pub details_size: Option<f32>,
+    /// Width of the graph column in the history table.
+    pub graph_width: f32,
+    /// Whether idle lanes fold into gap lanes.
+    pub collapse_idle_lanes: bool,
 }
 
 impl Default for Settings {
@@ -45,6 +55,8 @@ impl Default for Settings {
             dock: None,
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             details_size: None,
+            graph_width: GRAPH_WIDTH_DEFAULT,
+            collapse_idle_lanes: false,
         }
     }
 }
@@ -86,6 +98,11 @@ impl Settings {
             if !size.is_finite() || size <= 0.0 {
                 self.details_size = None;
             }
+        }
+        if self.graph_width.is_finite() {
+            self.graph_width = self.graph_width.clamp(GRAPH_WIDTH_MIN, GRAPH_WIDTH_MAX);
+        } else {
+            self.graph_width = GRAPH_WIDTH_DEFAULT;
         }
     }
 }
@@ -243,6 +260,12 @@ fn settings_from_value(value: Value) -> Settings {
         dock: take(&mut object, "dock", defaults.dock),
         sidebar_width: take(&mut object, "sidebar_width", defaults.sidebar_width),
         details_size: take(&mut object, "details_size", defaults.details_size),
+        graph_width: take(&mut object, "graph_width", defaults.graph_width),
+        collapse_idle_lanes: take(
+            &mut object,
+            "collapse_idle_lanes",
+            defaults.collapse_idle_lanes,
+        ),
     }
 }
 
@@ -342,6 +365,8 @@ mod tests {
             dock: Some(Dock::Right),
             sidebar_width: 320.5,
             details_size: Some(180.0),
+            graph_width: 176.0,
+            collapse_idle_lanes: true,
         };
         store.save(&settings).unwrap();
         assert_eq!(store.load(), settings);
@@ -407,6 +432,33 @@ mod tests {
             load_json(dir.path(), r#"{"details_size":-1}"#).details_size,
             None
         );
+    }
+
+    #[test]
+    fn graph_settings_default_and_are_clamped_on_load() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.graph_width, GRAPH_WIDTH_DEFAULT);
+        assert!(!defaults.collapse_idle_lanes);
+
+        let dir = TempDir::new("graph-settings");
+        // A file written before the graph settings existed loads the defaults.
+        let old = load_json(dir.path(), r#"{"theme":"dark"}"#);
+        assert_eq!(old.graph_width, GRAPH_WIDTH_DEFAULT);
+        assert!(!old.collapse_idle_lanes);
+
+        assert_eq!(
+            load_json(dir.path(), r#"{"graph_width":9999}"#).graph_width,
+            GRAPH_WIDTH_MAX
+        );
+        assert_eq!(
+            load_json(dir.path(), r#"{"graph_width":1}"#).graph_width,
+            GRAPH_WIDTH_MIN
+        );
+        assert_eq!(
+            load_json(dir.path(), r#"{"graph_width":"wide"}"#).graph_width,
+            GRAPH_WIDTH_DEFAULT
+        );
+        assert!(load_json(dir.path(), r#"{"collapse_idle_lanes":true}"#).collapse_idle_lanes);
     }
 
     #[test]

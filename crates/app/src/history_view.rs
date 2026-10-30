@@ -5,36 +5,47 @@
 //! The view also owns the repository metadata the shell needs — HEAD and the
 //! refs — because it is the view that opens the [`Repo`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, container_query, div, px, uniform_list, AnyElement, AsyncApp, ClipboardItem,
-    ContentMask, Context, Div, FontWeight, IntoElement, Pixels, Render, SharedString, StyledText,
-    Task, TextRun, TextStyle, WeakEntity, Window,
+    actions, canvas, container_query, div, px, uniform_list, AnyElement, App, AsyncApp,
+    ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, FocusHandle, FontWeight,
+    IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, ScrollStrategy,
+    SharedString, StyledText, Task, TextRun, TextStyle, UniformListScrollHandle, WeakEntity,
+    Window,
 };
 
 use git_core::{CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo};
-use git_graph::{GraphBuilder, Row};
-use ui::metrics::{FONT_MONO, FONT_UI, FS_SM};
+use git_graph::{ColumnGeometry, GraphBuilder, IdleLanes, Row};
+use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
+use ui::focus::{self, RingOffset};
+use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD};
 use ui::theme::ThemeColors;
 use ui::{
-    ActiveTheme, Button, ButtonSize, EmptyState, Icon, IconName, Progress, Skeleton, Spinner,
+    menu, ActiveTheme, Avatar, Button, ButtonSize, EmptyState, Icon, IconName, ListRow, MenuEntry,
+    MenuItem, Progress, RefBadge, RefKind, Skeleton, Spinner, Tooltip,
 };
 
-use crate::format::format_count;
-use crate::graph_paint::{graph_width, paint_row};
+use crate::format::{format_count, relative_time};
+use crate::graph_paint::paint_row;
+use crate::history_search::{self, Query};
 use crate::history_state::{
     percent_text, progress_fraction, skeleton_percent, source_label, Failure, LoadState,
     SkeletonColumn,
 };
+use crate::settings::{GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MAX, GRAPH_WIDTH_MIN};
 use crate::theme;
 use crate::workspace::Workspace;
 
 /// Rows are delivered to the UI in pages of this size.
 const PAGE: usize = 2_000;
+
+/// How long the field waits after the last keystroke before the search runs.
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Column widths of the history table, shared by the header and the rows.
 const COL_GAP: f32 = 18.;
@@ -49,11 +60,10 @@ const COL_HASH: f32 = 64.;
 /// queries do: 560 px loses Hash, 460 px loses Author.
 const PANE_MEDIUM: f32 = 560.;
 const PANE_NARROW: f32 = 460.;
-/// The graph column's design range: at most 480 px on a wide pane and 112 px
-/// from 560 px down; on top of that it never takes more than a share of the
-/// pane, so the summary always keeps room.
-const GRAPH_MAX_WIDE: f32 = 480.;
-const GRAPH_MAX_NARROW: f32 = 112.;
+/// The graph column's design cap on a wide pane and on top of that its share
+/// of the pane, so the summary always keeps room. The user width `gw` (40–480)
+/// replaces the old lane auto-fit; the 480 cap stays a belt-and-braces bound.
+const GRAPH_MAX_WIDE: f32 = GRAPH_WIDTH_MAX;
 const GRAPH_SHARE_WIDE: f32 = 0.40;
 const GRAPH_SHARE_MEDIUM: f32 = 0.40;
 const GRAPH_SHARE_NARROW: f32 = 0.36;
@@ -62,13 +72,247 @@ const SIDE_MARGIN: f32 = 6.;
 const PAD_LEFT: f32 = 14.;
 const PAD_RIGHT: f32 = 18.;
 /// The graph column never gets narrower than this, even with one lane.
-const GRAPH_MIN: f32 = 40.;
+const GRAPH_MIN: f32 = GRAPH_WIDTH_MIN;
+/// Fitting the graph to its content never widens it past this, and leaves this
+/// much room beside the lanes.
+const GRAPH_FIT_MAX: f32 = 420.;
+const GRAPH_FIT_PAD: f32 = 8.;
 /// The summary column is flexible; its skeleton bars are percentages of this.
 const SKELETON_SUMMARY_REF: f32 = 360.;
 /// Skeleton rows shown until the first page of history arrives.
 const SKELETON_ROWS: usize = 10;
+/// The gap between a row's ref badges and the summary text (the summary cell's
+/// flex gap).
+const BADGE_GAP: f32 = 6.;
+/// The widest a badge label may get; a longer ref name is ellipsized.
+const BADGE_LABEL_MAX: f32 = 160.;
+/// A badge's label is wrapped in 6 px padding and a 1 px border on each side;
+/// a kind with an icon adds the 11 px icon and its 3 px gap.
+const BADGE_PADDING: f32 = 14.;
+const BADGE_ICON: f32 = 14.;
+/// The narrowest room the summary text keeps beside its badges, and at most
+/// 40 % of the cell when the cell is narrower than 200 px.
+const BADGE_TEXT_MIN: f32 = 80.;
+/// Relative dates are recomputed at this interval while the view is open.
+const CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+actions!(
+    gitwarp,
+    [
+        NextCommit,
+        PrevCommit,
+        PageDownCommits,
+        PageUpCommits,
+        CopyCommitHash
+    ]
+);
+
+/// How many rows Page Down / Page Up move: one viewport of rows minus the one
+/// the previous page already showed, at least a single row.
+pub fn page_rows(viewport_height: f32) -> usize {
+    let rows = (viewport_height / f32::from(theme::ROW_HEIGHT)).floor();
+    (rows as usize).saturating_sub(1).max(1)
+}
+
+/// Binds the list's extra keys in its own `history-list` context, so they
+/// fire only while the list has the keyboard: typing `j` in the search field
+/// still types `j`. Called once at startup.
+pub(crate) fn bind_history_keys(cx: &mut App) {
+    cx.bind_keys([
+        ui::actions::key_binding(cx, "j", NextCommit, Some("history-list")),
+        ui::actions::key_binding(cx, "k", PrevCommit, Some("history-list")),
+        ui::actions::key_binding(cx, "pagedown", PageDownCommits, Some("history-list")),
+        ui::actions::key_binding(cx, "pageup", PageUpCommits, Some("history-list")),
+        ui::actions::key_binding(cx, "secondary-c", CopyCommitHash, Some("history-list")),
+    ]);
+}
 
 type Page = Result<Vec<(CommitInfo, Row<Oid>)>, Failure>;
+
+/// One ref badge on a history row, derived from HEAD and the refs once they
+/// load — never per frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BadgeSpec {
+    pub kind: RefKind,
+    /// The label inside the badge: the short branch/tag name, or `HEAD`.
+    pub label: SharedString,
+    /// The full ref name, shown on hover.
+    pub tooltip: SharedString,
+}
+
+/// How many of a row's badges fit beside its summary text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BadgeFit {
+    /// Badges shown in order; the first (HEAD) is always among them.
+    pub shown: usize,
+    /// Whether the rest collapse into one "+N" badge.
+    pub collapsed: bool,
+}
+
+/// Pick the badges that fit in `available` px, leaving the summary text
+/// `min(80, 0.4·available)` px.
+///
+/// Badges are taken in order and the first one (HEAD) is always shown. Hidden
+/// badges become one "+N" badge of `plus_width`, which must also fit. A
+/// degenerate cell narrower than the first badge still shows that badge alone.
+pub fn badge_overflow(widths: &[f32], available: f32, gap: f32, plus_width: f32) -> BadgeFit {
+    let count = widths.len();
+    if count == 0 {
+        return BadgeFit {
+            shown: 0,
+            collapsed: false,
+        };
+    }
+    let available = available.max(0.);
+    let text_min = (available * 0.4).min(BADGE_TEXT_MIN);
+    let fits = |shown: usize, plus: bool| {
+        let used: f32 = widths[..shown].iter().sum();
+        let trailing = if plus { plus_width + gap } else { 0. };
+        used + trailing + shown as f32 * gap + text_min <= available
+    };
+    if fits(count, false) {
+        return BadgeFit {
+            shown: count,
+            collapsed: false,
+        };
+    }
+    for shown in (1..count).rev() {
+        if fits(shown, true) {
+            return BadgeFit {
+                shown,
+                collapsed: true,
+            };
+        }
+    }
+    // HEAD never hides, even when nothing else fits.
+    BadgeFit {
+        shown: 1,
+        collapsed: count > 1,
+    }
+}
+
+/// The badge specs for every commit, keyed by commit id.
+///
+/// Built once when HEAD and the refs load: the current branch is the HEAD
+/// badge (never also a local one), symbolic `origin/HEAD` remotes, stashes and
+/// other refs are hidden, and the order is HEAD, local, remote, tag with
+/// alphabetical names inside a kind.
+pub fn build_badges(head: Option<&Head>, refs: &[Ref]) -> HashMap<Oid, Vec<BadgeSpec>> {
+    let mut badges: HashMap<Oid, Vec<BadgeSpec>> = HashMap::new();
+    let mut current_branch = None;
+    match head {
+        Some(Head::Branch { name, target }) => {
+            current_branch = Some(name.as_str());
+            if let Some(target) = target {
+                badges.entry(*target).or_default().push(BadgeSpec {
+                    kind: RefKind::Head,
+                    label: name.as_str().into(),
+                    tooltip: format!("refs/heads/{name}").into(),
+                });
+            }
+        }
+        Some(Head::Detached(oid)) => badges.entry(*oid).or_default().push(BadgeSpec {
+            kind: RefKind::Head,
+            label: "HEAD".into(),
+            tooltip: "HEAD".into(),
+        }),
+        None => {}
+    }
+
+    for (source, kind) in [
+        (git_core::RefKind::LocalBranch, RefKind::Local),
+        (git_core::RefKind::RemoteBranch, RefKind::Remote),
+        (git_core::RefKind::Tag, RefKind::Tag),
+    ] {
+        let mut group: Vec<&Ref> = refs
+            .iter()
+            .filter(|reference| reference.kind == source)
+            // The current branch is drawn once, as the HEAD badge.
+            .filter(|reference| {
+                !(kind == RefKind::Local && Some(reference.name.as_str()) == current_branch)
+            })
+            // `origin/HEAD` is a symbolic duplicate of a real remote branch.
+            .filter(|reference| !(kind == RefKind::Remote && reference.name.ends_with("/HEAD")))
+            .collect();
+        group.sort_by(|a, b| a.name.cmp(&b.name));
+        for reference in group {
+            badges.entry(reference.target).or_default().push(BadgeSpec {
+                kind,
+                label: reference.name.clone().into(),
+                tooltip: reference.full_name.clone().into(),
+            });
+        }
+    }
+    badges
+}
+
+/// The width of the flexible summary column: the pane minus the side margins,
+/// the row padding, the fixed columns and the gaps between the present
+/// columns.
+pub fn summary_width(pane_width: f32, columns: Columns) -> f32 {
+    let mut fixed = columns.graph + columns.date;
+    let mut count = 3; // graph, summary, date
+    if let Some(author) = columns.author {
+        fixed += author;
+        count += 1;
+    }
+    if let Some(hash) = columns.hash {
+        fixed += hash;
+        count += 1;
+    }
+    (pane_width - 2. * SIDE_MARGIN - PAD_LEFT - PAD_RIGHT - fixed - (count - 1) as f32 * COL_GAP)
+        .max(0.)
+}
+
+/// A badge face, as far as text measurement is concerned: the weight and
+/// whether an icon and its gap precede the label.
+fn badge_face(kind: RefKind) -> (FontWeight, f32) {
+    let icon = if kind == RefKind::Overflow {
+        0.
+    } else {
+        BADGE_ICON
+    };
+    let weight = if kind == RefKind::Remote {
+        FontWeight::MEDIUM
+    } else {
+        FontWeight::SEMIBOLD
+    };
+    (weight, icon)
+}
+
+/// Measures one badge's full width with the window's text system, caching the
+/// result per label and kind. Only badges of the rows being painted are
+/// measured.
+fn measure_badge(
+    window: &Window,
+    label: &SharedString,
+    kind: RefKind,
+    cache: &mut HashMap<(SharedString, RefKind), Pixels>,
+) -> Pixels {
+    let key = (label.clone(), kind);
+    if let Some(width) = cache.get(&key) {
+        return *width;
+    }
+    let (weight, icon) = badge_face(kind);
+    let mut font = gpui::font(FONT_UI);
+    font.weight = weight;
+    let run = TextRun {
+        len: label.len(),
+        font,
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let text = window
+        .text_system()
+        .layout_line(label, FS_XS, &[run], None)
+        .width
+        .min(px(BADGE_LABEL_MAX));
+    let width = text + px(BADGE_PADDING + icon);
+    cache.insert(key, width);
+    width
+}
 
 /// The history table's columns for one pane width, shared by the header, the
 /// rows and the skeleton rows so the three stay aligned.
@@ -84,22 +328,25 @@ pub struct Columns {
     pub hash: Option<f32>,
 }
 
-/// The table layout for a history pane `pane_width` wide whose graph needs
-/// `lanes` lanes.
+/// The table layout for a history pane `pane_width` wide whose graph column
+/// has the user width `graph_width` (`gw`, 40–480).
 ///
-/// This is the design's container-query table: the graph column shrinks to a
-/// share of the pane (and to 112 px from 560 px down), the hash column goes at
-/// 560 px and the author column at 460 px.
-pub fn columns(pane_width: f32, lanes: usize) -> Columns {
-    let lanes_width = f32::from(graph_width(lanes)).max(GRAPH_MIN);
-    let (max, share) = if pane_width <= PANE_NARROW {
-        (GRAPH_MAX_NARROW, GRAPH_SHARE_NARROW)
+/// This is the design's container-query table: the user width shrinks to a
+/// share of the pane (40 % down to 560 px, 36 % below 460 px), the hash column
+/// goes at 560 px and the author column at 460 px.
+pub fn columns(pane_width: f32, graph_width: f32) -> Columns {
+    let gw = clamp_graph_width(graph_width);
+    let share = if pane_width <= PANE_NARROW {
+        GRAPH_SHARE_NARROW
     } else if pane_width <= PANE_MEDIUM {
-        (GRAPH_MAX_NARROW, GRAPH_SHARE_MEDIUM)
+        GRAPH_SHARE_MEDIUM
     } else {
-        (GRAPH_MAX_WIDE, GRAPH_SHARE_WIDE)
+        GRAPH_SHARE_WIDE
     };
-    let graph = lanes_width.min(max).min(share * pane_width).max(GRAPH_MIN);
+    let graph = gw
+        .min(GRAPH_MAX_WIDE)
+        .min(share * pane_width)
+        .max(GRAPH_MIN);
 
     if pane_width <= PANE_NARROW {
         Columns {
@@ -125,10 +372,45 @@ pub fn columns(pane_width: f32, lanes: usize) -> Columns {
     }
 }
 
+/// The graph width clamped to its persisted range; a value from a broken file
+/// falls back to the design default.
+fn clamp_graph_width(graph_width: f32) -> f32 {
+    if graph_width.is_finite() {
+        graph_width.clamp(GRAPH_MIN, GRAPH_MAX_WIDE)
+    } else {
+        GRAPH_WIDTH_DEFAULT
+    }
+}
+
+/// The "fit the graph to its content" width: the graph's current full width
+/// plus a little room, never past 420 px and never below the 40 px floor.
+pub fn fit_width(graph_width: f32) -> f32 {
+    (graph_width + GRAPH_FIT_PAD).clamp(GRAPH_MIN, GRAPH_FIT_MAX)
+}
+
+/// How many lanes have their centre past the graph column's right edge, i.e.
+/// the `N` of the header's "+N" pill. `column_width` is the effective column
+/// width, not the raw user setting (the pane's share may have narrowed it).
+pub fn clipped_lanes(geometry: &ColumnGeometry, column_width: f32) -> usize {
+    geometry.xs.iter().filter(|&&x| x > column_width).count()
+}
+
 struct Item {
-    commit: CommitInfo,
+    commit: Arc<CommitInfo>,
     row: Rc<Row<Oid>>,
 }
+
+/// The grip drag in flight: where the pointer started and the width it is
+/// resizing from. A click that never moved does not persist anything.
+struct GripDrag {
+    start_x: f32,
+    start_width: f32,
+    dragging: bool,
+}
+
+/// The drag payload of the graph grip; `on_drag_move` only reacts to this type.
+#[derive(Clone)]
+struct GripDragPayload;
 
 /// A kill handle for a git child that is started on a background thread:
 /// Cancel can arrive before the child exists, and then the child must die as
@@ -209,9 +491,73 @@ pub struct HistoryView {
     /// showing the placeholder.
     head: Option<Result<Head, String>>,
     refs: RefsState,
+    /// The ref badges of every commit, built when HEAD and the refs load.
+    badges: HashMap<Oid, Vec<BadgeSpec>>,
+    /// Measured badge widths, cached per label and kind so the per-frame work
+    /// stays proportional to the visible rows.
+    badge_widths: HashMap<(SharedString, RefKind), Pixels>,
     /// The table layout for the pane's last measured width, so the virtualized
     /// rows paint with the same columns the header was built for.
     columns: Columns,
+    /// The summary column's width for the current pane, used to fit badges.
+    summary_width: f32,
+    /// Notifies once a minute so relative dates stay fresh; dropped with the
+    /// view.
+    clock_task: Option<Task<()>>,
+    /// The user's graph column width (`gw`), kept live while the grip drags
+    /// and persisted on drag end.
+    graph_width: f32,
+    /// Per-column statistics for the idle-lane collapse, fed every emitted row
+    /// in order. Reset whenever the graph is rebuilt.
+    idle_lanes: IdleLanes,
+    /// The x positions the painter uses, recomputed when rows arrive or
+    /// `collapse` changes — never per row per frame.
+    geometry: Rc<ColumnGeometry>,
+    /// Whether idle lanes fold into gap lanes, persisted in the settings.
+    collapse: bool,
+    /// The grip drag in flight, if any: the pointer x and width it started at.
+    grip_drag: Option<GripDrag>,
+    /// The row under the mouse. The canvas cannot see the CSS-like hover, so
+    /// the painter takes the halo and merge-ring fill from this.
+    hovered: Option<usize>,
+    /// The list's focus handle: clicking a row focuses it, and only while it
+    /// is focused do the list's keys and the keyboard ring apply.
+    focus: FocusHandle,
+    /// The virtualized list's scroll state, so a selection moved by the
+    /// keyboard can be scrolled minimally into view.
+    scroll: UniformListScrollHandle,
+    /// Whether the user picked a row themselves. Until then the selection
+    /// follows the HEAD row as it arrives instead of staying on row 0.
+    user_selected: bool,
+    /// The one commit-graph writer of this view. Started only while nothing
+    /// writes one and the repository has none, and never dropped by Retry or
+    /// Cancel: it is useful work that finishes with the view.
+    commit_graph_task: Option<Task<()>>,
+    /// Whether that writer is still running, so a later load does not start a
+    /// second one. The finished task stays in its slot (inert) until it is
+    /// replaced.
+    commit_graph_running: bool,
+    /// The search field's current text. Applied after [`SEARCH_DEBOUNCE`].
+    search_text: String,
+    /// The query the matches belong to; `None` while the field is empty.
+    search: Option<Query>,
+    /// The matching rows of the applied query, sorted by row.
+    search_matches: Vec<history_search::HistoryMatch>,
+    /// How many rows the matches cover. Pages that arrive later are scanned
+    /// from here, never rescanned from the top.
+    search_scanned: usize,
+    /// Whether a background scan is in flight; new pages wait for it.
+    search_scanning: bool,
+    /// Bumped on every query or load change; results of an older scan are
+    /// dropped instead of appended to the wrong query.
+    search_generation: u64,
+    /// The pending debounce timer; dropping it cancels the wait.
+    search_debounce: Option<Task<()>>,
+    /// The running background scan.
+    search_task: Option<Task<()>>,
+    /// Whether the next finished scan should select the first match. Cleared
+    /// once the selection jumped, or with the query.
+    search_jump: bool,
 }
 
 impl HistoryView {
@@ -225,6 +571,18 @@ impl HistoryView {
         workspace: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (graph_width, collapse) = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| {
+                (
+                    state.settings.graph_width,
+                    state.settings.collapse_idle_lanes,
+                )
+            })
+            .unwrap_or((GRAPH_WIDTH_DEFAULT, false));
+        let graph_width = clamp_graph_width(graph_width);
+        // Replaced with the pane's real width in the first prepaint.
+        let columns = columns(1200., graph_width);
         let mut view = Self {
             path,
             git,
@@ -242,10 +600,41 @@ impl HistoryView {
             count_killer: LateKiller::default(),
             head: None,
             refs: RefsState::Loading,
-            // Replaced with the pane's real width in the first prepaint.
-            columns: columns(1200., 1),
+            badges: HashMap::new(),
+            badge_widths: HashMap::new(),
+            columns,
+            summary_width: summary_width(1200., columns),
+            clock_task: None,
+            graph_width,
+            idle_lanes: IdleLanes::new(),
+            geometry: Rc::new(IdleLanes::new().geometry(collapse)),
+            collapse,
+            grip_drag: None,
+            hovered: None,
+            focus: cx.focus_handle(),
+            scroll: UniformListScrollHandle::new(),
+            user_selected: false,
+            commit_graph_task: None,
+            commit_graph_running: false,
+            search_text: String::new(),
+            search: None,
+            search_matches: Vec::new(),
+            search_scanned: 0,
+            search_scanning: false,
+            search_generation: 0,
+            search_debounce: None,
+            search_task: None,
+            search_jump: false,
         };
         view.start(cx);
+        // Relative dates are derived at render time from the clock, so the
+        // rows only need a repaint; the task ends with the view.
+        view.clock_task = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(CLOCK_INTERVAL).await;
+            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                break;
+            }
+        }));
         view
     }
 
@@ -257,6 +646,9 @@ impl HistoryView {
         self.generation += 1;
         let generation = self.generation;
         self.state = LoadState::Loading { total: None };
+        // The graph starts over with the load, so its geometry does too.
+        self.idle_lanes = IdleLanes::new();
+        self.refresh_geometry();
 
         let git = match &self.git {
             Ok(git) => git.clone(),
@@ -380,16 +772,11 @@ impl HistoryView {
 
         // Without a commit-graph file the first screen waits for the whole
         // history walk. Write one for next time, in parallel with this load.
+        // The view owns the one writer, so Retry or Cancel cannot start a
+        // second copy of the same work.
         let writer = repo.clone();
-        executor
-            .spawn(async move {
-                if !writer.has_commit_graph() {
-                    if let Err(e) = writer.write_commit_graph() {
-                        log::warn!("could not write the commit-graph: {e}");
-                    }
-                }
-            })
-            .detach();
+        this.update(cx, |view, cx| view.start_commit_graph_writer(writer, cx))
+            .ok();
 
         // Both the git process and the layout run off the UI thread; the
         // UI thread only appends finished pages and repaints.
@@ -423,15 +810,299 @@ impl HistoryView {
         Ok(())
     }
 
+    /// Starts the view's one commit-graph writer when the repository has none
+    /// and no writer of this view is running. The task is kept in the view and
+    /// dropped with it; Retry and Cancel leave it alone.
+    fn start_commit_graph_writer(&mut self, repo: Repo, cx: &mut Context<Self>) {
+        if self.commit_graph_running || repo.has_commit_graph() {
+            return;
+        }
+        self.commit_graph_running = true;
+        self.commit_graph_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { repo.write_commit_graph() })
+                .await;
+            if let Err(e) = result {
+                log::warn!("could not write the commit-graph: {e}");
+            }
+            this.update(cx, |view, _cx| view.commit_graph_running = false)
+                .ok();
+        }));
+    }
+
     fn append(&mut self, page: Vec<(CommitInfo, Row<Oid>)>, cx: &mut Context<Self>) {
         for (commit, row) in page {
             self.max_lanes = self.max_lanes.max(row.width);
+            self.idle_lanes.push(&row);
             self.items.push(Item {
-                commit,
+                commit: Arc::new(commit),
                 row: Rc::new(row),
             });
         }
+        self.refresh_geometry();
+        // The HEAD row may only arrive now; the initial selection follows it
+        // until the user picks a row.
+        self.settle_initial_selection(cx);
+        // A page that arrives while a query is active is searched as it lands,
+        // never by rescanning the rows already covered.
+        self.scan_more(cx);
         cx.notify();
+    }
+
+    /// Rebuild the painter's x snapshot. Called when rows were added or the
+    /// collapse toggle changed, not while rendering.
+    fn refresh_geometry(&mut self) {
+        self.geometry = Rc::new(self.idle_lanes.geometry(self.collapse));
+    }
+
+    /// The row of the HEAD commit, once it is among the loaded rows.
+    fn head_index(&self) -> Option<usize> {
+        let head = self.head_oid()?;
+        self.items.iter().position(|item| item.commit.id == head)
+    }
+
+    /// The row a key press lands on when nothing is selected: the HEAD row
+    /// when it is loaded, else row 0.
+    fn initial_row(&self) -> Option<usize> {
+        if self.items.is_empty() {
+            None
+        } else {
+            Some(self.head_index().unwrap_or(0))
+        }
+    }
+
+    /// While the user has not picked a row, the selection follows the HEAD row
+    /// as it arrives, else row 0. Selecting is not focusing: this never moves
+    /// the keyboard focus or scrolls the list.
+    fn settle_initial_selection(&mut self, cx: &mut Context<Self>) {
+        if self.user_selected || self.items.is_empty() {
+            return;
+        }
+        let target = self.initial_row().unwrap_or(0);
+        if self.selected != Some(target) {
+            self.selected = Some(target);
+            cx.notify();
+        }
+    }
+
+    /// Selects `index` because the user picked it (a click, the row menu or a
+    /// navigation key): a pending search jump is cancelled, so a match from a
+    /// later page cannot yank the selection away.
+    fn select_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.search_jump = false;
+        self.select(index, cx);
+    }
+
+    /// Selects `index` because the search found it; the deferred jump stays
+    /// armed until it lands.
+    fn select_row_from_search(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.select(index, cx);
+    }
+
+    /// Selects `index`, scrolls it minimally into view and repaints. Any pick
+    /// stops the initial selection from following the load.
+    fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.items.len() || self.selected == Some(index) {
+            self.user_selected = true;
+            return;
+        }
+        self.user_selected = true;
+        self.selected = Some(index);
+        self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    /// ↓ / j and ↑ / k: one row, clamped at the ends. With nothing selected
+    /// the first press selects the initial row instead of moving off it.
+    fn step_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(current) = self.selected.or_else(|| self.initial_row()) else {
+            return;
+        };
+        let next = if self.selected.is_none() {
+            current
+        } else {
+            let last = self.items.len().saturating_sub(1) as isize;
+            (current as isize + delta).clamp(0, last) as usize
+        };
+        self.select_row(next, cx);
+    }
+
+    /// Home / End: the first or the last loaded row (`usize::MAX` for End).
+    fn jump_selection(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(last) = self.items.len().checked_sub(1) else {
+            return;
+        };
+        self.select_row(index.min(last), cx);
+    }
+
+    /// PgDn / PgUp: one viewport of rows minus one, clamped.
+    fn page_selection(&mut self, down: bool, cx: &mut Context<Self>) {
+        let Some(current) = self.selected.or_else(|| self.initial_row()) else {
+            return;
+        };
+        if self.selected.is_none() {
+            self.select_row(current, cx);
+            return;
+        }
+        let delta = page_rows(self.viewport_height()) as isize;
+        let delta = if down { delta } else { -delta };
+        let last = self.items.len().saturating_sub(1) as isize;
+        let next = (current as isize + delta).clamp(0, last) as usize;
+        self.select_row(next, cx);
+    }
+
+    /// The list's viewport height, from the last layout of the virtualized
+    /// list; 0 before its first layout.
+    fn viewport_height(&self) -> f32 {
+        self.scroll
+            .0
+            .borrow()
+            .last_item_size
+            .map(|size| f32::from(size.item.height))
+            .unwrap_or(0.)
+    }
+
+    /// `Ctrl+C` on the focused list: the selected commit's full 40-char hash
+    /// on the clipboard.
+    fn copy_selected_hash(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.selected.or_else(|| self.initial_row()) else {
+            return;
+        };
+        self.select_row(index, cx);
+        if let Some(item) = self.items.get(index) {
+            cx.write_to_clipboard(ClipboardItem::new_string(item.commit.id.to_string()));
+        }
+    }
+
+    /// Right-clicking a row selects it and opens the row menu at the pointer.
+    fn open_row_menu(
+        &mut self,
+        index: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hash = self.items.get(index).map(|item| item.commit.id.to_string());
+        let branch = match self.head() {
+            Some(Head::Branch { name, .. }) => name.clone(),
+            _ => "HEAD".to_owned(),
+        };
+        let entries = vec![
+            MenuEntry::Item(
+                MenuItem::new("Copy commit hash")
+                    .icon(IconName::Copy)
+                    .shortcut("Ctrl+C")
+                    .disabled(hash.is_none())
+                    .action(move |_, cx| {
+                        if let Some(hash) = hash.clone() {
+                            cx.write_to_clipboard(ClipboardItem::new_string(hash));
+                        }
+                    }),
+            ),
+            // The row actions arrive in a later version: they are shown, not
+            // clickable.
+            MenuEntry::Item(
+                MenuItem::new("Create branch here…")
+                    .icon(IconName::Branch)
+                    .disabled(true),
+            ),
+            MenuEntry::Item(
+                MenuItem::new("Create tag here…")
+                    .icon(IconName::Tag)
+                    .disabled(true),
+            ),
+            MenuEntry::Separator,
+            MenuEntry::Item(
+                MenuItem::new("Cherry-pick")
+                    .icon(IconName::Undo)
+                    .disabled(true),
+            ),
+            MenuEntry::Item(
+                MenuItem::new("Revert commit")
+                    .icon(IconName::Undo)
+                    .disabled(true),
+            ),
+            MenuEntry::Item(
+                MenuItem::new(format!("Reset {branch} to here…"))
+                    .danger()
+                    .disabled(true),
+            ),
+        ];
+        menu::open_context_menu(position, entries, window, cx);
+    }
+
+    /// Sets the idle-lane collapse, recomputes the geometry and persists it.
+    fn set_collapse(&mut self, collapse: bool, cx: &mut Context<Self>) {
+        if self.collapse == collapse {
+            return;
+        }
+        self.collapse = collapse;
+        self.refresh_geometry();
+        crate::update_settings(cx, move |settings| {
+            settings.collapse_idle_lanes = collapse;
+        });
+        cx.notify();
+    }
+
+    /// Fits the graph column to the current geometry and persists the width.
+    /// Used by the grip's double-click, the "+N" pill and the context menu.
+    fn fit_graph(&mut self, cx: &mut Context<Self>) {
+        let width = fit_width(self.geometry.width);
+        self.graph_width = width;
+        crate::update_settings(cx, move |settings| settings.graph_width = width);
+        cx.notify();
+    }
+
+    /// Ends a grip drag: only a drag that actually moved is persisted, so a
+    /// plain click on the grip does not write the settings.
+    fn finish_grip_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.grip_drag.take() else {
+            return;
+        };
+        if !drag.dragging {
+            return;
+        }
+        let width = self.graph_width;
+        crate::update_settings(cx, move |settings| settings.graph_width = width);
+        cx.notify();
+    }
+
+    /// Opens the graph header's context menu at the pointer.
+    fn open_graph_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity().downgrade();
+        let toggle = view.clone();
+        let fit = view;
+        let checked = self.collapse;
+        let entries = vec![
+            MenuEntry::Item(
+                MenuItem::new("Collapse idle lanes")
+                    // The kit menu has no checked state: the icon says it.
+                    .icon(if checked {
+                        IconName::Check
+                    } else {
+                        IconName::Lanes
+                    })
+                    .action(move |_, cx| {
+                        toggle
+                            .update(cx, |view, cx| view.set_collapse(!view.collapse, cx))
+                            .ok();
+                    }),
+            ),
+            MenuEntry::Item(
+                MenuItem::new("Fit graph to content")
+                    .icon(IconName::Split)
+                    .action(move |_, cx| {
+                        fit.update(cx, |view, cx| view.fit_graph(cx)).ok();
+                    }),
+            ),
+        ];
+        menu::open_context_menu(position, entries, window, cx);
     }
 
     /// The commit count arrived; only the current load may set it.
@@ -467,7 +1138,216 @@ impl HistoryView {
                 RefsState::Failed
             }
         };
+        // The per-commit badges are derived once here, never while painting.
+        let head = self.head.as_ref().and_then(|head| head.as_ref().ok());
+        let refs = match &self.refs {
+            RefsState::Loaded(refs) => refs.as_slice(),
+            RefsState::Loading | RefsState::Failed => &[],
+        };
+        self.badges = build_badges(head, refs);
+        // HEAD may have arrived after the first rows: the initial selection
+        // can now move to its row.
+        self.settle_initial_selection(cx);
         cx.notify();
+    }
+
+    /// The search field's text changed. The actual search waits for the
+    /// debounce; an empty query clears the matches at once.
+    pub fn set_search_query(&mut self, text: String, cx: &mut Context<Self>) {
+        if self.search_text == text {
+            return;
+        }
+        self.search_text = text;
+        // Dropping the old timer and the old scan cancels both.
+        self.search_debounce = None;
+        self.search_task = None;
+        self.search_scanning = false;
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        if Query::parse(&self.search_text).is_none() {
+            self.search = None;
+            self.search_matches.clear();
+            self.search_scanned = 0;
+            self.search_jump = false;
+            cx.notify();
+            return;
+        }
+        self.search_debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            this.update(cx, |view, cx| {
+                if view.search_generation == generation {
+                    view.apply_search(cx);
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Esc: no query, no matches, and the next query starts a fresh scan.
+    pub fn clear_search(&mut self, cx: &mut Context<Self>) {
+        self.search_text.clear();
+        self.search = None;
+        self.search_matches.clear();
+        self.search_scanned = 0;
+        self.search_scanning = false;
+        self.search_jump = false;
+        self.search_debounce = None;
+        self.search_task = None;
+        self.search_generation = self.search_generation.wrapping_add(1);
+        cx.notify();
+    }
+
+    /// What the search field's trailing text says: the position of the
+    /// selected match and the total, "No matches", or `None` for an empty
+    /// field (the hint comes back then).
+    pub fn search_status(&self) -> Option<SharedString> {
+        self.search.as_ref()?;
+        // While rows are still arriving or unscanned, the count is a lower
+        // bound: "No matches" would be a lie about a scan that is not done.
+        let pending =
+            self.is_loading() || self.search_scanning || self.search_scanned < self.items.len();
+        if self.search_matches.is_empty() {
+            return Some(if pending {
+                "– / 0+".into()
+            } else {
+                "No matches".into()
+            });
+        }
+        let total = self.search_matches.len();
+        let suffix = if pending { "+" } else { "" };
+        let position = self
+            .selected
+            .and_then(|row| history_search::position_of(&self.search_matches, row))
+            .map(|position| (position + 1).to_string())
+            .unwrap_or_else(|| "–".to_owned());
+        Some(format!("{position} / {total}{suffix}").into())
+    }
+
+    /// The history list's focus handle, so Esc and ↓ in the search field can
+    /// hand the keyboard back without moving the selection.
+    pub fn list_focus(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
+    /// The selected row, for the search's gpui test in the repository shell.
+    #[cfg(test)]
+    pub(crate) fn selected_row(&self) -> Option<usize> {
+        self.selected
+    }
+
+    /// Enter / F3 (next) and Shift+Enter / Shift+F3 (previous), both wrapping.
+    pub fn search_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        // The timer handle stays in its slot after it fires, so compare the
+        // field with the applied query instead: different text means the
+        // debounce has not searched it yet, and Enter must apply it now rather
+        // than step over the previous query's matches.
+        if Query::parse(&self.search_text) != self.search {
+            self.search_debounce = None;
+            self.apply_search(cx);
+        }
+        let Some(position) = history_search::step(&self.search_matches, self.selected, forward)
+        else {
+            return;
+        };
+        let row = self.search_matches[position].row;
+        self.select_row_from_search(row, cx);
+    }
+
+    /// The debounce elapsed: parse the field's text and start the scan.
+    fn apply_search(&mut self, cx: &mut Context<Self>) {
+        let Some(query) = Query::parse(&self.search_text) else {
+            return;
+        };
+        self.search = Some(query);
+        self.search_matches.clear();
+        self.search_scanned = 0;
+        self.search_scanning = false;
+        self.search_task = None;
+        // The first finished scan jumps to the first match at or after the
+        // selection, even when the match only arrives with a later page.
+        self.search_jump = true;
+        self.scan_more(cx);
+        cx.notify();
+    }
+
+    /// Scan the rows that were not searched yet. The snapshot shares the
+    /// commits with the view (`Arc`), and the match runs on the background
+    /// executor: even a 100k-row history never blocks a frame.
+    fn scan_more(&mut self, cx: &mut Context<Self>) {
+        let Some(query) = self.search.clone() else {
+            return;
+        };
+        if self.search_scanning || self.search_scanned >= self.items.len() {
+            return;
+        }
+        let start = self.search_scanned;
+        let end = self.items.len();
+        let rows: Vec<Arc<CommitInfo>> = self.items[start..end]
+            .iter()
+            .map(|item| item.commit.clone())
+            .collect();
+        let generation = self.search_generation;
+        let executor = cx.background_executor().clone();
+        self.search_scanning = true;
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            let found = executor
+                .spawn(async move {
+                    history_search::search(
+                        &query,
+                        rows.iter()
+                            .enumerate()
+                            .map(|(offset, commit)| (start + offset, &**commit)),
+                    )
+                })
+                .await;
+            this.update(cx, |view, cx| view.finish_scan(generation, end, found, cx))
+                .ok();
+        }));
+    }
+
+    /// A background scan finished: keep its matches when it still belongs to
+    /// the current query, then either jump or search the rows that arrived
+    /// while it ran.
+    fn finish_scan(
+        &mut self,
+        generation: u64,
+        end: usize,
+        found: Vec<history_search::HistoryMatch>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.search_generation {
+            return;
+        }
+        self.search_scanning = false;
+        self.search_matches.extend(found);
+        self.search_scanned = end;
+        if self.search_jump {
+            if let Some(position) = history_search::first_from(&self.search_matches, self.selected)
+            {
+                self.search_jump = false;
+                let row = self.search_matches[position].row;
+                self.select_row_from_search(row, cx);
+            }
+        }
+        self.scan_more(cx);
+        cx.notify();
+    }
+
+    /// A new load replaces the rows: keep the query and search the new rows
+    /// from the top.
+    fn restart_search(&mut self, cx: &mut Context<Self>) {
+        // The field may show text typed since the last debounce fired; apply it
+        // here, or cancelling the timer would silently drop the new query.
+        self.search_debounce = None;
+        self.search = Query::parse(&self.search_text);
+        self.search_matches.clear();
+        self.search_scanned = 0;
+        self.search_scanning = false;
+        self.search_task = None;
+        self.search_jump = self.search.is_some();
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.scan_more(cx);
     }
 
     fn finish(&mut self, generation: u64, result: Result<(), Failure>, cx: &mut Context<Self>) {
@@ -499,6 +1379,16 @@ impl HistoryView {
         self.items.clear();
         self.max_lanes = 1;
         self.selected = None;
+        self.user_selected = false;
+        self.hovered = None;
+        // The new load starts at the top, so the HEAD selection that settles
+        // later is visible instead of being left below the old scroll offset.
+        self.scroll.0.borrow().base_handle.set_offset(Point {
+            x: px(0.),
+            y: px(0.),
+        });
+        // The query stays in the field; its matches belong to the old rows.
+        self.restart_search(cx);
         self.start(cx);
         cx.notify();
     }
@@ -546,6 +1436,15 @@ impl HistoryView {
         self.head.as_ref().and_then(|head| head.as_ref().ok())
     }
 
+    /// The commit HEAD points at, for the graph's HEAD ring. Detached HEAD has
+    /// a ring too; a branch whose target could not be read does not.
+    fn head_oid(&self) -> Option<Oid> {
+        match self.head.as_ref()?.as_ref().ok()? {
+            Head::Branch { target, .. } => *target,
+            Head::Detached(oid) => Some(*oid),
+        }
+    }
+
     /// The refs, once loaded; `None` while loading or after a failure.
     pub fn refs(&self) -> Option<&[Ref]> {
         match &self.refs {
@@ -576,6 +1475,106 @@ impl HistoryView {
             .map(|item| item.commit.id.short().into())
     }
 
+    /// The graph header cell: the label, the "+N" clipped-lanes pill, the
+    /// resize grip and the right-click menu.
+    fn render_graph_header(&self, columns: Columns, cx: &Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let accent = colors.accent;
+        let clipped = clipped_lanes(&self.geometry, columns.graph);
+        let dragging = self.grip_drag.as_ref().is_some_and(|drag| drag.dragging);
+
+        let mut cell = div()
+            .id("history-graph-header")
+            .w(px(columns.graph))
+            .flex_none()
+            .h_full()
+            .relative()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .debug_selector(|| "history-graph-header".to_string())
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                    view.open_graph_menu(event.position, window, cx);
+                }),
+            )
+            .child("Graph");
+        if clipped > 0 {
+            cell = cell.child(
+                div()
+                    .id("history-graph-clipped")
+                    .flex_none()
+                    .px(px(6.))
+                    .rounded(px(8.))
+                    .bg(colors.accent_soft)
+                    .text_size(FS_XS)
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(accent)
+                    .cursor_pointer()
+                    .tooltip(Tooltip::text(format!(
+                        "{clipped} lanes are clipped. Click to widen the column."
+                    )))
+                    .on_click(cx.listener(|view, _, _, cx| view.fit_graph(cx)))
+                    .child(format!("+{clipped}")),
+            );
+        }
+
+        let grip = div()
+            .id("history-graph-grip")
+            .absolute()
+            .right(px(-8.))
+            .top(px(3.))
+            .bottom(px(3.))
+            .w(px(7.))
+            .rounded(px(2.))
+            .cursor_col_resize()
+            .hover(move |style| style.bg(accent.opacity(0.7)))
+            .when(dragging, |this| this.bg(accent.opacity(0.7)))
+            .tooltip(Tooltip::text(
+                "Drag to resize the graph column · double-click to fit",
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseDownEvent, _, cx| {
+                    if event.click_count >= 2 {
+                        view.fit_graph(cx);
+                    } else {
+                        view.grip_drag = Some(GripDrag {
+                            start_x: f32::from(event.position.x),
+                            start_width: view.graph_width,
+                            dragging: false,
+                        });
+                    }
+                }),
+            )
+            .on_drag(GripDragPayload, |_, _, _, cx| cx.new(|_| EmptyView))
+            .on_drag_move(
+                cx.listener(|view, event: &DragMoveEvent<GripDragPayload>, _, cx| {
+                    let Some(drag) = &mut view.grip_drag else {
+                        return;
+                    };
+                    let dx = f32::from(event.event.position.x) - drag.start_x;
+                    drag.dragging = true;
+                    let width = (drag.start_width + dx).clamp(GRAPH_MIN, GRAPH_MAX_WIDE);
+                    if view.graph_width != width {
+                        view.graph_width = width;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, _, cx| view.finish_grip_drag(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, _, cx| view.finish_grip_drag(cx)),
+            );
+
+        cell.child(grip)
+    }
+
     fn render_header(&self, columns: Columns, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         // A 6px gutter around the header, so it lines up with the rows.
@@ -593,7 +1592,7 @@ impl HistoryView {
             .text_size(FS_SM)
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(colors.muted)
-            .child(div().w(px(columns.graph)).flex_none().child("Graph"))
+            .child(self.render_graph_header(columns, cx))
             .child(div().flex_1().min_w_0().truncate().child("Summary"));
         if let Some(author) = columns.author {
             head = head.child(div().w(px(author)).flex_none().child("Author"));
@@ -611,6 +1610,13 @@ impl HistoryView {
         let progress = match progress_fraction(loaded, total) {
             Some(value) => Progress::new("history-progress", value).fill(),
             None => Progress::new("history-progress", 0.).indeterminate().fill(),
+        };
+        // The folded lanes are part of the history's own progress line: say
+        // how many the graph is hiding while the rows stream in.
+        let folded = if self.collapse && self.geometry.folded_count > 0 {
+            format!(" · {} idle lanes folded", self.geometry.folded_count)
+        } else {
+            String::new()
         };
         div()
             .w_full()
@@ -630,7 +1636,7 @@ impl HistoryView {
                     .font_weight(FontWeight::BOLD)
                     .text_color(colors.text)
                     .child(format!(
-                        "Loading… {} commits",
+                        "Loading… {} commits{folded}",
                         format_count(loaded as usize)
                     )),
             )
@@ -706,29 +1712,67 @@ impl HistoryView {
     fn render_rows(
         &mut self,
         range: std::ops::Range<usize>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<impl IntoElement> {
         let colors = cx.theme().colors;
         let ui_theme = cx.theme().clone();
         let columns = self.columns;
+        let geometry = self.geometry.clone();
+        let hovered = self.hovered;
+        let head = self.head_oid();
+        let selected_index = self.selected;
+        // The row states follow the table in the design: a selected row is
+        // `selection` only while the list itself has focus, and the keyboard
+        // ring appears only for a keyboard-modality focus.
+        let list_focused = self.focus.is_focused(window);
+        let ring_visible = focus::focus_visible(&self.focus, window, cx);
+        let now = unix_now();
+        let summary_width = self.summary_width;
+        let items = &self.items;
+        let badges = &self.badges;
+        let badge_widths = &mut self.badge_widths;
+        let search_matches = &self.search_matches;
         range
             .map(|ix| {
-                let item = &self.items[ix];
+                let item = &items[ix];
                 let row = item.row.clone();
-                let selected = self.selected == Some(ix);
+                let selected = selected_index == Some(ix);
+                let is_hovered = hovered == Some(ix) && !selected;
                 let c = &item.commit;
+                let fields = search_matches
+                    .binary_search_by_key(&ix, |found| found.row)
+                    .ok()
+                    .map(|position| &search_matches[position].fields);
                 let background = if selected {
-                    colors.selection
+                    if list_focused {
+                        colors.selection
+                    } else {
+                        colors.selection_inactive
+                    }
+                } else if is_hovered {
+                    colors.hover
                 } else {
                     colors.bg
                 };
+                let summary_color = if selected && list_focused {
+                    colors.selection_fg
+                } else {
+                    colors.text
+                };
+                let secondary = ListRow::secondary_color(colors, selected, list_focused);
+                let is_head = head == Some(c.id);
                 let row_theme = ui_theme.clone();
+                let row_geometry = geometry.clone();
+                let summary_ranges = fields.map(|f| f.summary.as_slice()).unwrap_or(&[]);
+                let author_ranges = fields.map(|f| f.author_name.as_slice()).unwrap_or(&[]);
 
                 // The 6px gutter lives on the wrapper: a uniform_list lays
                 // each item out with a definite width and does not stretch it,
                 // so margins on the row itself would overflow.
                 let mut row_div = div()
                     .id(ix)
+                    .relative()
                     .h(theme::ROW_HEIGHT)
                     .w_full()
                     .pl(px(PAD_LEFT))
@@ -737,12 +1781,42 @@ impl HistoryView {
                     .items_center()
                     .gap(px(COL_GAP))
                     .text_size(FS_SM)
-                    .when(selected, |d| d.bg(colors.selection))
-                    .when(!selected, |d| d.hover(|d| d.bg(colors.hover)))
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.selected = Some(ix);
-                        cx.notify();
+                    .rounded(R_MD)
+                    .debug_selector(move || format!("history-row-{ix}"))
+                    .bg(background)
+                    .on_hover(cx.listener(move |view, entered: &bool, _, cx| {
+                        // A leave only clears the row it belongs to: the next
+                        // row's enter may already have run.
+                        let next = if *entered {
+                            Some(ix)
+                        } else if view.hovered == Some(ix) {
+                            None
+                        } else {
+                            view.hovered
+                        };
+                        if view.hovered != next {
+                            view.hovered = next;
+                            cx.notify();
+                        }
                     }))
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        // Clicking focuses the list and selects the row; the
+                        // ring stays hidden because the modality is the mouse.
+                        let focus = view.focus.clone();
+                        window.focus(&focus, cx);
+                        view.select_row(ix, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                            let focus = view.focus.clone();
+                            window.focus(&focus, cx);
+                            view.select_row(ix, cx);
+                            view.open_row_menu(ix, event.position, window, cx);
+                            // Keep the menu that just took focus.
+                            window.prevent_default();
+                        }),
+                    )
                     .child(
                         canvas(
                             |_, _, _| {},
@@ -750,50 +1824,198 @@ impl HistoryView {
                                 // Clip to the graph column so lanes past its
                                 // edge are cut instead of drawn over Summary.
                                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                                    paint_row(&row, bounds, background, &row_theme, window)
+                                    paint_row(
+                                        &row,
+                                        ix,
+                                        bounds,
+                                        background,
+                                        &row_geometry,
+                                        is_head,
+                                        &row_theme,
+                                        window,
+                                    )
                                 })
                             },
                         )
                         .w(px(columns.graph))
                         .h_full()
                         .flex_none(),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(colors.text)
-                            .child(c.summary.clone()),
                     );
+
+                // The summary cell: ref badges (fixed size) first, then the
+                // summary text, which takes the room that is left.
+                let specs = badges.get(&c.id).map(Vec::as_slice).unwrap_or(&[]);
+                let fit = if specs.is_empty() {
+                    BadgeFit {
+                        shown: 0,
+                        collapsed: false,
+                    }
+                } else {
+                    let widths: Vec<f32> = specs
+                        .iter()
+                        .map(|spec| {
+                            f32::from(measure_badge(window, &spec.label, spec.kind, badge_widths))
+                        })
+                        .collect();
+                    // The most hidden badges the "+N" label can stand for.
+                    let plus = SharedString::from(format!("+{}", specs.len()));
+                    let plus_width = f32::from(measure_badge(
+                        window,
+                        &plus,
+                        RefKind::Overflow,
+                        badge_widths,
+                    ));
+                    badge_overflow(&widths, summary_width, BADGE_GAP, plus_width)
+                };
+
+                let mut summary = div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .gap(px(BADGE_GAP));
+                for (index, spec) in specs.iter().take(fit.shown).enumerate() {
+                    summary = summary.child(
+                        RefBadge::new(format!("history-badge-{ix}-{index}"), spec.label.clone())
+                            .kind(spec.kind)
+                            .max_label_width(px(BADGE_LABEL_MAX))
+                            .tooltip(spec.tooltip.clone()),
+                    );
+                }
+                if fit.collapsed {
+                    let hidden = specs[fit.shown..]
+                        .iter()
+                        .map(|spec| spec.tooltip.as_ref())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let count = specs.len() - fit.shown;
+                    summary = summary.child(
+                        RefBadge::new(format!("history-badge-{ix}-more"), format!("+{count}"))
+                            .kind(RefKind::Overflow)
+                            .tooltip(hidden),
+                    );
+                }
+                row_div = row_div.child(summary.child({
+                    let mut cell = div()
+                        .id(format!("history-summary-{ix}"))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(FS_BASE)
+                        .text_color(summary_color)
+                        .when(is_head, |text| text.font_weight(FontWeight::BOLD))
+                        .tooltip(Tooltip::text(c.summary.clone()));
+                    // Only a matching cell pays for styled runs; the plain
+                    // path keeps the cheap shared string.
+                    cell = if summary_ranges.is_empty() {
+                        cell.child(c.summary.clone())
+                    } else {
+                        let style = TextStyle {
+                            color: summary_color,
+                            font_family: FONT_UI.into(),
+                            font_size: FS_BASE.into(),
+                            font_weight: if is_head {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            },
+                            ..TextStyle::default()
+                        };
+                        cell.child(highlighted_text(
+                            &c.summary,
+                            summary_ranges,
+                            &style,
+                            colors.accent_soft,
+                        ))
+                    };
+                    cell
+                }));
                 if let Some(author) = columns.author {
                     row_div = row_div.child(
                         div()
+                            .id(format!("history-author-{ix}"))
                             .w(px(author))
                             .flex_none()
-                            .truncate()
-                            .text_color(colors.muted)
-                            .child(c.author_name.clone()),
+                            .flex()
+                            .items_center()
+                            .gap(px(BADGE_GAP))
+                            .text_color(secondary)
+                            .tooltip(Tooltip::text(c.author_name.clone()))
+                            .child(
+                                Avatar::new(c.author_email.clone(), px(16.))
+                                    .name(c.author_name.clone()),
+                            )
+                            .child({
+                                let mut cell = div().flex_1().min_w_0().truncate();
+                                cell = if author_ranges.is_empty() {
+                                    cell.child(c.author_name.clone())
+                                } else {
+                                    let style = TextStyle {
+                                        color: secondary,
+                                        font_family: FONT_UI.into(),
+                                        font_size: FS_SM.into(),
+                                        ..TextStyle::default()
+                                    };
+                                    cell.child(highlighted_text(
+                                        &c.author_name,
+                                        author_ranges,
+                                        &style,
+                                        colors.accent_soft,
+                                    ))
+                                };
+                                cell
+                            }),
                     );
                 }
                 row_div = row_div.child(
                     div()
+                        .id(format!("history-date-{ix}"))
                         .w(px(columns.date))
                         .flex_none()
                         .truncate()
-                        .text_color(colors.muted)
-                        .child(format_time(c.author_time)),
+                        .text_color(secondary)
+                        .tooltip(Tooltip::text(format_time_tooltip(c.author_time)))
+                        .child(relative_time(now, c.author_time.max(0) as u64)),
                 );
                 if let Some(hash) = columns.hash {
-                    row_div = row_div.child(
-                        div()
+                    let short = short_hash(&c.id);
+                    // The hash field only matches at the start of the full
+                    // hash, so the highlight covers the visible prefix.
+                    let hash_ranges = fields
+                        .and_then(|fields| fields.hash.as_ref())
+                        .map(|range| 0..range.end.min(short.len()))
+                        .filter(|range| !range.is_empty())
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    row_div = row_div.child({
+                        let mut cell = div()
                             .w(px(hash))
                             .flex_none()
                             .truncate()
                             .font_family(FONT_MONO)
-                            .text_color(colors.muted)
-                            .child(c.id.short()),
-                    );
+                            .text_color(secondary);
+                        cell = if hash_ranges.is_empty() {
+                            cell.child(short.clone())
+                        } else {
+                            let style = TextStyle {
+                                color: secondary,
+                                font_family: FONT_MONO.into(),
+                                font_size: FS_SM.into(),
+                                ..TextStyle::default()
+                            };
+                            cell.child(highlighted_text(
+                                &short,
+                                &hash_ranges,
+                                &style,
+                                colors.accent_soft,
+                            ))
+                        };
+                        cell
+                    });
+                }
+                if ring_visible && selected {
+                    row_div = row_div.child(focus::focus_ring(RingOffset::Inset2, R_MD, cx));
                 }
                 div().w_full().px(px(SIDE_MARGIN)).child(row_div)
             })
@@ -804,11 +2026,25 @@ impl HistoryView {
         uniform_list(
             "history",
             self.items.len(),
-            cx.processor(|view, range, _window, cx| view.render_rows(range, cx)),
+            cx.processor(|view, range, window, cx| view.render_rows(range, window, cx)),
         )
+        .track_scroll(&self.scroll)
+        .track_focus(&self.focus)
+        .key_context("history-list")
         .flex_1()
         .min_h_0()
         .w_full()
+        // The kit's arrow / Home / End actions are bound globally; the list
+        // handles them only while its own focus handle is the focused one.
+        .on_action(cx.listener(|view, _: &SelectNext, _, cx| view.step_selection(1, cx)))
+        .on_action(cx.listener(|view, _: &SelectPrev, _, cx| view.step_selection(-1, cx)))
+        .on_action(cx.listener(|view, _: &SelectFirst, _, cx| view.jump_selection(0, cx)))
+        .on_action(cx.listener(|view, _: &SelectLast, _, cx| view.jump_selection(usize::MAX, cx)))
+        .on_action(cx.listener(|view, _: &NextCommit, _, cx| view.step_selection(1, cx)))
+        .on_action(cx.listener(|view, _: &PrevCommit, _, cx| view.step_selection(-1, cx)))
+        .on_action(cx.listener(|view, _: &PageDownCommits, _, cx| view.page_selection(true, cx)))
+        .on_action(cx.listener(|view, _: &PageUpCommits, _, cx| view.page_selection(false, cx)))
+        .on_action(cx.listener(|view, _: &CopyCommitHash, _, cx| view.copy_selected_hash(cx)))
         .into_any_element()
     }
 
@@ -1215,10 +2451,11 @@ impl HistoryView {
     /// current state. Called with the width the pane was actually assigned.
     fn render_at(&mut self, pane_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
-        let columns = columns(pane_width, self.max_lanes.max(1));
+        let columns = columns(pane_width, self.graph_width);
         // The virtualized rows are painted after this and must agree with the
         // header.
         self.columns = columns;
+        self.summary_width = summary_width(pane_width, columns);
         let body = self.render_body(columns, cx);
         // The column header stays above every state.
         div()
@@ -1341,6 +2578,9 @@ fn centred(state: EmptyState) -> AnyElement {
 
 /// The graph column's placeholder: a lane line and one dot per row.
 fn graph_skeleton(width: Pixels, colors: ThemeColors) -> Div {
+    // The lane centre, plus the half-width of the 2 px line the placeholder
+    // draws there. (The skeleton's dot is centred on the same x.)
+    let centre = theme::LANE_WIDTH * 0.5 + px(1.);
     div()
         .w(width)
         .h_full()
@@ -1351,14 +2591,14 @@ fn graph_skeleton(width: Pixels, colors: ThemeColors) -> Div {
                 .absolute()
                 .top_0()
                 .bottom_0()
-                .left(px(7.))
+                .left(centre - px(1.))
                 .w(px(2.))
                 .bg(colors.border_strong),
         )
         .child(
             div()
                 .absolute()
-                .left(px(3.5))
+                .left(centre - px(4.5))
                 .top(px(8.5))
                 .w(px(9.))
                 .h(px(9.))
@@ -1406,7 +2646,63 @@ pub(crate) fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// `YYYY-MM-DD HH:MM` in UTC. Local time and relative dates come later.
+/// The 7-character abbreviated hash the history table shows.
+fn short_hash(id: &Oid) -> String {
+    let mut hash = id.to_string();
+    hash.truncate(7);
+    hash
+}
+
+/// One cell's text with every matched run painted `highlight`.
+///
+/// GPUI text runs carry a background colour but no corner radius, so the
+/// design's 3px radius is dropped: the highlight is a plain rectangle.
+fn highlighted_text(
+    text: &str,
+    ranges: &[std::ops::Range<usize>],
+    style: &TextStyle,
+    highlight: gpui::Hsla,
+) -> StyledText {
+    StyledText::new(text.to_owned()).with_runs(text_runs(text, ranges, style, highlight))
+}
+
+/// The runs behind [`highlighted_text`]: plain stretches in `style`, matched
+/// stretches in `style` plus the background. Ranges that are empty, outside
+/// the text or not on a character boundary are ignored.
+fn text_runs(
+    text: &str,
+    ranges: &[std::ops::Range<usize>],
+    style: &TextStyle,
+    highlight: gpui::Hsla,
+) -> Vec<TextRun> {
+    let mut runs = Vec::new();
+    let mut cursor = 0;
+    for range in ranges {
+        let start = range.start.max(cursor);
+        let end = range.end.min(text.len());
+        if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        if cursor < start {
+            runs.push(style.to_run(start - cursor));
+        }
+        let mut matched = style.clone();
+        matched.background_color = Some(highlight);
+        runs.push(matched.to_run(end - start));
+        cursor = end;
+    }
+    if cursor < text.len() {
+        runs.push(style.to_run(text.len() - cursor));
+    }
+    runs
+}
+
+/// The date cell's tooltip: `YYYY-MM-DD HH:MM UTC`.
+fn format_time_tooltip(unix: i64) -> String {
+    format!("{} UTC", format_time(unix))
+}
+
+/// `YYYY-MM-DD HH:MM` in UTC, for the date cell's tooltip.
 fn format_time(unix: i64) -> String {
     let days = unix.div_euclid(86_400);
     let secs = unix.rem_euclid(86_400);
@@ -1437,57 +2733,285 @@ mod tests {
         assert_eq!(format_time(0), "1970-01-01 00:00");
         assert_eq!(format_time(1_700_000_000), "2023-11-14 22:13");
         assert_eq!(format_time(951_782_400), "2000-02-29 00:00");
+        assert_eq!(format_time_tooltip(0), "1970-01-01 00:00 UTC");
+    }
+
+    #[test]
+    fn the_hash_is_abbreviated_to_seven_characters() {
+        let oid = Oid::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert_eq!(short_hash(&oid), "0123456");
+    }
+
+    fn oid(byte: u8) -> Oid {
+        Oid::from_hex(&format!("{byte:02x}").repeat(20)).unwrap()
+    }
+
+    fn reference(kind: git_core::RefKind, full_name: &str, name: &str, target: Oid) -> Ref {
+        Ref {
+            full_name: full_name.to_owned(),
+            name: name.to_owned(),
+            kind,
+            target,
+            upstream: None,
+        }
+    }
+
+    #[test]
+    fn badges_order_head_locals_remotes_and_tags_without_duplicating_head() {
+        let head_oid = oid(1);
+        let refs = vec![
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/main",
+                "main",
+                head_oid,
+            ),
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/zeta",
+                "zeta",
+                head_oid,
+            ),
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/alpha",
+                "alpha",
+                head_oid,
+            ),
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/origin/main",
+                "origin/main",
+                head_oid,
+            ),
+            // Symbolic remote refs are duplicates of a real branch.
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/origin/HEAD",
+                "origin/HEAD",
+                head_oid,
+            ),
+            reference(git_core::RefKind::Tag, "refs/tags/v1", "v1", head_oid),
+            reference(git_core::RefKind::Stash, "refs/stash", "stash", head_oid),
+            reference(
+                git_core::RefKind::Other,
+                "refs/notes/commits",
+                "refs/notes/commits",
+                head_oid,
+            ),
+        ];
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: Some(head_oid),
+        };
+        let badges = build_badges(Some(&head), &refs);
+        let row = &badges[&head_oid];
+        let labels: Vec<(&RefKind, &str)> = row
+            .iter()
+            .map(|spec| (&spec.kind, spec.label.as_ref()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                (&RefKind::Head, "main"),
+                (&RefKind::Local, "alpha"),
+                (&RefKind::Local, "zeta"),
+                (&RefKind::Remote, "origin/main"),
+                (&RefKind::Tag, "v1"),
+            ]
+        );
+        // The HEAD badge names its branch's full ref.
+        assert_eq!(row[0].tooltip.as_ref(), "refs/heads/main");
+        // Every other badge points at its own full ref name.
+        assert_eq!(row[2].tooltip.as_ref(), "refs/heads/zeta");
+        assert_eq!(row[3].tooltip.as_ref(), "refs/remotes/origin/main");
+    }
+
+    #[test]
+    fn detached_head_gets_a_head_badge_and_keeps_the_branches() {
+        let detached = oid(2);
+        let branch = oid(3);
+        let refs = vec![reference(
+            git_core::RefKind::LocalBranch,
+            "refs/heads/main",
+            "main",
+            branch,
+        )];
+        let badges = build_badges(Some(&Head::Detached(detached)), &refs);
+        assert_eq!(
+            badges[&detached],
+            vec![BadgeSpec {
+                kind: RefKind::Head,
+                label: "HEAD".into(),
+                tooltip: "HEAD".into(),
+            }]
+        );
+        assert_eq!(badges[&branch][0].kind, RefKind::Local);
+    }
+
+    #[test]
+    fn an_unborn_branch_has_no_head_badge() {
+        let refs = vec![reference(
+            git_core::RefKind::LocalBranch,
+            "refs/heads/main",
+            "main",
+            oid(4),
+        )];
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: None,
+        };
+        let badges = build_badges(Some(&head), &refs);
+        assert!(badges.is_empty(), "the current branch is not drawn twice");
+    }
+
+    #[test]
+    fn badge_overflow_keeps_room_for_text_and_head() {
+        let widths = [100., 100., 100.];
+        // All three fit and leave the 80 px text minimum.
+        assert_eq!(
+            badge_overflow(&widths, 500., 6., 30.),
+            BadgeFit {
+                shown: 3,
+                collapsed: false
+            }
+        );
+        // Two badges leave the text its room, but a third would not; the
+        // hidden one needs the +N badge, which does not fit beside two.
+        assert_eq!(
+            badge_overflow(&widths, 300., 6., 30.),
+            BadgeFit {
+                shown: 1,
+                collapsed: true
+            }
+        );
+        // A wide cell fits the two badges and the +N.
+        assert_eq!(
+            badge_overflow(&widths, 340., 6., 30.),
+            BadgeFit {
+                shown: 2,
+                collapsed: true
+            }
+        );
+    }
+
+    #[test]
+    fn badge_overflow_always_shows_head() {
+        assert_eq!(
+            badge_overflow(&[400., 100.], 100., 6., 30.),
+            BadgeFit {
+                shown: 1,
+                collapsed: true
+            }
+        );
+        assert_eq!(
+            badge_overflow(&[], 100., 6., 30.),
+            BadgeFit {
+                shown: 0,
+                collapsed: false
+            }
+        );
+        // One badge is never collapsed into a "+N".
+        assert_eq!(
+            badge_overflow(&[400.], 100., 6., 30.),
+            BadgeFit {
+                shown: 1,
+                collapsed: false
+            }
+        );
+    }
+
+    #[test]
+    fn summary_width_subtracts_the_fixed_columns_and_gaps() {
+        let wide = columns(1200., GRAPH_WIDTH_DEFAULT);
+        assert_eq!(summary_width(1200., wide), 674.);
+        let medium = columns(560., GRAPH_WIDTH_DEFAULT);
+        assert_eq!(
+            summary_width(560., medium),
+            560. - 2. * SIDE_MARGIN
+                - PAD_LEFT
+                - PAD_RIGHT
+                - medium.graph
+                - medium.author.unwrap()
+                - medium.date
+                - 3. * COL_GAP
+        );
+        // A pane narrower than its fixed columns leaves nothing, not a
+        // negative width.
+        assert_eq!(summary_width(10., wide), 0.);
     }
 
     #[test]
     fn columns_drop_the_wide_columns_at_the_container_queries() {
         // 560 px is the design's first breakpoint: Hash goes, Author and Date
-        // take their narrow widths.
-        let medium = columns(560., 30);
+        // take their narrow widths; the default graph width still fits.
+        let medium = columns(560., GRAPH_WIDTH_DEFAULT);
         assert_eq!(medium.hash, None);
         assert_eq!(medium.author, Some(COL_AUTHOR_NARROW));
         assert_eq!(medium.date, COL_DATE_NARROW);
-        assert!(medium.graph <= 112., "{}", medium.graph);
-        assert!(medium.graph <= 0.40 * 560. + f32::EPSILON);
+        assert_eq!(medium.graph, GRAPH_WIDTH_DEFAULT);
 
         // 460 px is the second: Author goes too.
-        let narrow = columns(460., 30);
+        let narrow = columns(460., GRAPH_WIDTH_DEFAULT);
         assert_eq!(narrow.hash, None);
         assert_eq!(narrow.author, None);
         assert_eq!(narrow.date, COL_DATE_NARROW);
-        assert!(
-            narrow.graph <= 112_f32.min(0.36 * 460.) + f32::EPSILON,
-            "{}",
-            narrow.graph
-        );
+        assert_eq!(narrow.graph, GRAPH_WIDTH_DEFAULT);
 
         // A wide pane keeps all five columns.
-        let wide = columns(1200., 2);
+        let wide = columns(1200., GRAPH_WIDTH_DEFAULT);
         assert_eq!(wide.author, Some(COL_AUTHOR));
         assert_eq!(wide.date, COL_DATE);
         assert_eq!(wide.hash, Some(COL_HASH));
     }
 
     #[test]
-    fn columns_cap_the_graph_so_the_summary_keeps_its_room() {
-        // 30 lanes need 356 px: `graph_width` stops drawing lanes past
-        // MAX_GRAPH_LANES, so the 480 px design cap never binds at 1200 px.
-        assert_eq!(f32::from(graph_width(30)), 356.);
-        assert_eq!(columns(1200., 30).graph, 356.);
-        // At 800 px the 40 % share binds before the lane width does.
-        assert_eq!(columns(800., 30).graph, 320.);
-        // A graph narrower than the share keeps the lanes' width.
-        assert_eq!(columns(800., 2).graph, f32::from(graph_width(2)));
-        // The 40 % share holds on any wide pane.
-        assert_eq!(columns(700., 30).graph, 280.);
-        // Never below the floor, however narrow the pane or the graph.
-        assert_eq!(columns(300., 1).graph, GRAPH_MIN);
-        assert_eq!(columns(100., 30).graph, GRAPH_MIN);
+    fn columns_use_the_user_graph_width_at_the_three_pane_widths() {
+        // The user width is the column width while it fits the pane's share.
+        assert_eq!(columns(1200., 400.).graph, 400.);
+        // A 300 px user width still fits the 40 % share at 560 px.
+        assert_eq!(columns(560., 200.).graph, 200.);
+        assert_eq!(columns(460., 150.).graph, 150.);
+
+        // Above 560 px the 40 % share and the 480 cap bound it.
+        assert_eq!(columns(800., 400.).graph, 320.);
+        assert_eq!(columns(1200., 9999.).graph, GRAPH_MAX_WIDE);
+        // At and below 560 / 460 the pane's share narrows it further.
+        assert_eq!(columns(560., 480.).graph, GRAPH_SHARE_MEDIUM * 560.);
+        assert_eq!(columns(460., 480.).graph, GRAPH_SHARE_NARROW * 460.);
+        // The 40 px floor holds whatever the file or the pane says.
+        assert_eq!(columns(1200., 1.).graph, GRAPH_MIN);
+        assert_eq!(columns(300., 480.).graph, GRAPH_SHARE_NARROW * 300.);
+        assert_eq!(columns(100., 480.).graph, GRAPH_MIN);
+    }
+
+    #[test]
+    fn fitting_the_graph_leaves_room_and_stays_in_range() {
+        assert_eq!(fit_width(0.), GRAPH_MIN);
+        assert_eq!(fit_width(GRAPH_WIDTH_DEFAULT), 120.);
+        assert_eq!(fit_width(412.), GRAPH_FIT_MAX);
+        // A wide graph (241 lanes, 3374 px) still fits at the 420 px cap.
+        assert_eq!(fit_width(3374.), GRAPH_FIT_MAX);
+    }
+
+    #[test]
+    fn clipped_lanes_count_the_centres_past_the_column_edge() {
+        let geometry = ColumnGeometry {
+            xs: vec![7., 21., 35., 49.],
+            folded: vec![false; 4],
+            width: 56.,
+            folded_count: 0,
+        };
+        // A centre exactly on the edge is not clipped.
+        assert_eq!(clipped_lanes(&geometry, 56.), 0);
+        assert_eq!(clipped_lanes(&geometry, 28.), 2);
+        assert_eq!(clipped_lanes(&geometry, 21.), 2);
+        assert_eq!(clipped_lanes(&geometry, 7.), 3);
     }
 
     #[test]
     fn skeleton_widths_are_cell_percentages() {
-        let wide = columns(1200., 1);
+        let wide = columns(1200., GRAPH_WIDTH_DEFAULT);
         assert_eq!(skeleton_width(SkeletonColumn::Summary, 0, wide), px(144.));
         assert_eq!(
             skeleton_width(SkeletonColumn::Summary, 1, wide),
@@ -1497,7 +3021,7 @@ mod tests {
         assert_eq!(skeleton_width(SkeletonColumn::Date, 4, wide), px(62.4));
         assert_eq!(skeleton_width(SkeletonColumn::Hash, 4, wide), px(51.2));
         // The narrow table uses the narrow date column.
-        let narrow = columns(460., 1);
+        let narrow = columns(460., GRAPH_WIDTH_DEFAULT);
         assert_eq!(
             skeleton_width(SkeletonColumn::Date, 4, narrow),
             px(COL_DATE_NARROW * (skeleton_percent(SkeletonColumn::Date, 4) / 100.))
@@ -1515,6 +3039,48 @@ mod tests {
         assert_eq!(body.code.len(), 1);
         let range = body.code[0].clone();
         assert_eq!(&body.text[range], "/usr/bin/git");
+    }
+
+    #[test]
+    fn highlight_runs_cover_the_text_and_paint_only_the_match() {
+        let style = TextStyle {
+            color: gpui::black(),
+            font_family: FONT_UI.into(),
+            font_size: FS_SM.into(),
+            ..TextStyle::default()
+        };
+        let highlight = gpui::blue();
+        let matched = [std::ops::Range { start: 4, end: 7 }];
+        let runs = text_runs("Fix the parser", &matched, &style, highlight);
+        assert_eq!(
+            runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![4, 3, 7]
+        );
+        assert_eq!(runs[0].background_color, None);
+        assert_eq!(runs[1].background_color, Some(highlight));
+        assert_eq!(runs[2].background_color, None);
+        // The unhighlighted runs keep the cell's colour and font.
+        assert!(runs.iter().all(|run| run.color == style.color));
+        assert!(runs
+            .iter()
+            .all(|run| run.font.family == style.font().family));
+
+        // Every occurrence is painted, with the plain gap in between.
+        let runs = text_runs("ab ab", &[0..2, 3..5], &style, highlight);
+        assert_eq!(
+            runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![2, 1, 2]
+        );
+        assert_eq!(runs[0].background_color, Some(highlight));
+        assert_eq!(runs[1].background_color, None);
+        assert_eq!(runs[2].background_color, Some(highlight));
+
+        // A range that does not sit on a character boundary is ignored, and
+        // the cell is still laid out whole.
+        let matched = [std::ops::Range { start: 1, end: 3 }];
+        let runs = text_runs("Ünï", &matched, &style, highlight);
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), 5);
+        assert!(runs.iter().all(|run| run.background_color.is_none()));
     }
 
     #[test]
@@ -1540,5 +3106,464 @@ mod tests {
         // Same colour across the sentence.
         assert!(runs.iter().all(|run| run.color == style.color));
         assert!(runs.iter().all(|run| run.font.weight == style.font_weight));
+    }
+
+    #[test]
+    fn page_steps_are_one_viewport_minus_a_row() {
+        // 26 px rows: a full page leaves one row of overlap, and a viewport
+        // shorter than a row still moves by one.
+        assert_eq!(page_rows(0.), 1);
+        assert_eq!(page_rows(26.), 1);
+        assert_eq!(page_rows(51.), 1);
+        assert_eq!(page_rows(52.), 1);
+        assert_eq!(page_rows(260.), 9);
+        assert_eq!(page_rows(259.), 8);
+        assert_eq!(page_rows(620.), 22);
+    }
+
+    /// The test root: the history view plus the overlay stack, like the
+    /// workspace renders them in the app.
+    struct GraphMenuTestRoot {
+        history: gpui::Entity<HistoryView>,
+    }
+
+    impl Render for GraphMenuTestRoot {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .relative()
+                .child(self.history.clone())
+                .child(ui::overlay::render_overlays(window, cx))
+        }
+    }
+
+    /// Right-clicking the graph header opens the two-item graph menu, and its
+    /// first item toggles the idle-lane collapse.
+    #[gpui::test]
+    fn right_clicking_the_graph_header_opens_the_graph_menu(cx: &mut gpui::TestAppContext) {
+        use git_core::GitChoice;
+        use gpui::{
+            point, size, AppContext, Bounds, Modifiers, VisualTestContext,
+            WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
+        };
+
+        let repo = crate::test_support::TempRepo::new("graph-header-menu");
+        let git = crate::test_support::git();
+        cx.update(ui::init).expect("ui::init");
+        let handle = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(960.), px(620.)),
+                    ))),
+                    window_decorations: Some(WindowDecorations::Client),
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    // The history view is the window root so the test can read
+                    // its state; the workspace only supplies the weak handle.
+                    let workspace = cx.new(|cx| {
+                        Workspace::new(None, Ok(git.clone()), GitChoice::Auto, window, cx)
+                    });
+                    let history = cx.new(|cx| {
+                        HistoryView::open(
+                            repo.path().to_path_buf(),
+                            Ok(git.clone()),
+                            workspace.downgrade(),
+                            cx,
+                        )
+                    });
+                    cx.new(|_| GraphMenuTestRoot { history })
+                },
+            )
+            .expect("open window")
+        });
+
+        let mut cx = VisualTestContext::from_window(handle.into(), cx);
+        cx.run_until_parked();
+        let root = cx
+            .update(|window, _| window.root::<GraphMenuTestRoot>().flatten())
+            .expect("the history test root is the window root");
+        let history = root.read_with(&cx, |root, _| root.history.clone());
+
+        let header = cx
+            .debug_bounds("history-graph-header")
+            .expect("the graph header was not drawn");
+        let position = header.center();
+        cx.simulate_mouse_down(position, MouseButton::Right, Modifiers::default());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(
+                ui::overlay::layer_count(window, cx),
+                1,
+                "right-clicking the graph header did not open a menu"
+            );
+        });
+
+        // Item 0 sits 20 px below the menu's top-left corner: the 6 px panel
+        // padding plus half of the 28 px first row.
+        cx.simulate_click(
+            point(position.x + px(40.), position.y + px(20.)),
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert!(
+                view.collapse,
+                "the first menu item did not toggle the idle-lane collapse"
+            );
+        });
+        cx.update(|window, cx| {
+            assert_eq!(
+                ui::overlay::layer_count(window, cx),
+                0,
+                "the menu stayed open after an item was clicked"
+            );
+        });
+    }
+
+    /// Makes one commit on the repository and returns its full hash.
+    fn commit(repo: &std::path::Path, file: &str, message: &str) -> String {
+        std::fs::write(repo.join(file), message).expect("write the committed file");
+        let run = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test User")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test User")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).expect("git prints UTF-8")
+        };
+        run(&["add", file]);
+        run(&["commit", "-q", "-m", message]);
+        run(&["rev-parse", "HEAD"]).trim().to_owned()
+    }
+
+    /// Opens the history view as the window root on `repo` and returns it with
+    /// its visual test context. The view loads on its own background tasks.
+    fn open_history(
+        repo: &crate::test_support::TempRepo,
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::VisualTestContext, gpui::Entity<HistoryView>) {
+        use git_core::GitChoice;
+        use gpui::{
+            point, size, AppContext, Bounds, VisualTestContext, WindowBackgroundAppearance,
+            WindowBounds, WindowDecorations, WindowOptions,
+        };
+
+        let git = crate::test_support::git();
+        cx.update(ui::init).expect("ui::init");
+        cx.update(bind_history_keys);
+        let handle = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(960.), px(620.)),
+                    ))),
+                    window_decorations: Some(WindowDecorations::Client),
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let workspace = cx.new(|cx| {
+                        Workspace::new(None, Ok(git.clone()), GitChoice::Auto, window, cx)
+                    });
+                    let history = cx.new(|cx| {
+                        HistoryView::open(
+                            repo.path().to_path_buf(),
+                            Ok(git.clone()),
+                            workspace.downgrade(),
+                            cx,
+                        )
+                    });
+                    cx.new(|_| GraphMenuTestRoot { history })
+                },
+            )
+            .expect("open window")
+        });
+        let mut cx = VisualTestContext::from_window(handle.into(), cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let root = cx
+            .update(|window, _| window.root::<GraphMenuTestRoot>().flatten())
+            .expect("the history test root is the window root");
+        let history = root.read_with(&cx, |root, _| root.history.clone());
+        (cx, history)
+    }
+
+    /// Clicking focuses the list and selects the row; the keyboard then moves
+    /// the selection, Home/End jump to the ends and Ctrl+C copies the full
+    /// hash of the selected commit.
+    #[gpui::test]
+    fn clicking_then_the_keyboard_selects_rows_and_copies_the_hash(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+
+        let repo = crate::test_support::TempRepo::new("history-keys");
+        commit(repo.path(), "a.txt", "A");
+        let b = commit(repo.path(), "b.txt", "B");
+        commit(repo.path(), "c.txt", "C");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.commit_count()),
+            3,
+            "the history did not finish loading"
+        );
+
+        // Clicking row 2 selects it and gives the list the keyboard.
+        let row = cx
+            .debug_bounds("history-row-2")
+            .expect("the third history row was not drawn");
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert_eq!(view.selected, Some(2), "the clicked row is not selected");
+        });
+        cx.update(|window, cx| {
+            assert!(
+                history.read(cx).focus.is_focused(window),
+                "clicking a row did not focus the history list"
+            );
+        });
+
+        // ↓ / j move down and clamp at the last row; ↑ / k move back up.
+        cx.simulate_keystrokes("up");
+        assert_eq!(history.read_with(&cx, |view, _| view.selected), Some(1));
+        cx.simulate_keystrokes("j");
+        assert_eq!(history.read_with(&cx, |view, _| view.selected), Some(2));
+        cx.simulate_keystrokes("j");
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected),
+            Some(2),
+            "the selection wrapped past the last row"
+        );
+        cx.simulate_keystrokes("k");
+        assert_eq!(history.read_with(&cx, |view, _| view.selected), Some(1));
+
+        // Home / End jump to the loaded ends.
+        cx.simulate_keystrokes("home");
+        assert_eq!(history.read_with(&cx, |view, _| view.selected), Some(0));
+        cx.simulate_keystrokes("end");
+        assert_eq!(history.read_with(&cx, |view, _| view.selected), Some(2));
+
+        // Ctrl+C copies the full 40-char hash of the selected commit.
+        cx.simulate_keystrokes("home");
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("ctrl-c");
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("Ctrl+C did not write the hash to the clipboard");
+        assert_eq!(copied, b, "the clipboard holds the wrong commit hash");
+    }
+
+    /// Right-clicking a row selects it and opens the row menu; its first item
+    /// copies the row's full hash.
+    #[gpui::test]
+    fn right_clicking_a_row_opens_the_row_menu_and_copies_the_hash(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, Modifiers, MouseButton};
+
+        let repo = crate::test_support::TempRepo::new("history-row-menu");
+        commit(repo.path(), "a.txt", "A");
+        let b = commit(repo.path(), "b.txt", "B");
+        commit(repo.path(), "c.txt", "C");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        let row = cx
+            .debug_bounds("history-row-1")
+            .expect("the second history row was not drawn");
+        let position = row.center();
+        cx.simulate_mouse_down(position, MouseButton::Right, Modifiers::default());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.selected,
+                Some(1),
+                "the right-clicked row is not selected"
+            );
+        });
+        cx.update(|window, cx| {
+            assert_eq!(
+                ui::overlay::layer_count(window, cx),
+                1,
+                "right-clicking a row did not open the row menu"
+            );
+        });
+
+        // Item 0 sits 20 px below the menu's top-left corner: the 6 px panel
+        // padding plus half of the 28 px first row.
+        cx.simulate_click(
+            point(position.x + px(40.), position.y + px(20.)),
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("the row menu's Copy item did not write the hash");
+        assert_eq!(copied, b, "the row menu copied the wrong commit hash");
+        cx.update(|window, cx| {
+            assert_eq!(
+                ui::overlay::layer_count(window, cx),
+                0,
+                "the row menu stayed open after its item was clicked"
+            );
+        });
+    }
+
+    /// The status only says "No matches" once the whole history was scanned; a
+    /// running or unfinished scan shows the partial count with a "+".
+    #[gpui::test]
+    fn the_search_status_is_partial_until_the_scan_finishes(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-search-status");
+        commit(repo.path(), "a.txt", "Alpha");
+        commit(repo.path(), "b.txt", "Beta");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, _| {
+            view.search = Query::parse("zzz");
+            view.selected = Some(0);
+            // A scan in flight over rows that are not covered yet.
+            view.search_matches.clear();
+            view.search_scanned = 0;
+            view.search_scanning = true;
+            assert_eq!(view.search_status().unwrap().as_ref(), "– / 0+");
+            // The scan ended, but rows are still unscanned: not "No matches".
+            view.search_scanning = false;
+            assert_eq!(
+                view.search_status().unwrap().as_ref(),
+                "– / 0+",
+                "unscanned rows are still pending"
+            );
+            // A match found by a scan that has not covered every row.
+            view.search_matches.push(history_search::HistoryMatch {
+                row: 0,
+                fields: Default::default(),
+            });
+            assert_eq!(view.search_status().unwrap().as_ref(), "1 / 1+");
+            // Every row scanned and no match: only now is "No matches" true.
+            view.search_scanned = view.items.len();
+            assert_eq!(view.search_status().unwrap().as_ref(), "1 / 1");
+            view.search_matches.clear();
+            assert_eq!(view.search_status().unwrap().as_ref(), "No matches");
+        });
+    }
+
+    /// A row the user picks cancels a pending search jump, so a match from a
+    /// later page cannot yank the selection; the jump stays armed when the
+    /// search itself picks the row.
+    #[gpui::test]
+    fn a_user_pick_cancels_the_deferred_search_jump(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-search-jump");
+        commit(repo.path(), "a.txt", "A");
+        commit(repo.path(), "b.txt", "B");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, cx| {
+            view.search_jump = true;
+            view.select_row(1, cx);
+            assert!(
+                !view.search_jump,
+                "a user pick must cancel the deferred search jump"
+            );
+            view.search_jump = true;
+            view.select_row_from_search(0, cx);
+            assert!(
+                view.search_jump,
+                "a search pick must keep the deferred jump armed"
+            );
+        });
+    }
+
+    /// Retry during the debounce applies the field's text instead of dropping
+    /// it with the cancelled timer.
+    #[gpui::test]
+    fn retry_during_the_debounce_keeps_the_typed_query(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-search-retry");
+        commit(repo.path(), "a.txt", "Alpha");
+        commit(repo.path(), "b.txt", "Beta");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, cx| {
+            view.set_search_query("Alpha".to_owned(), cx);
+            view.retry(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.search_status().map(|s| s.to_string())),
+            Some("1 / 1".to_owned()),
+            "retry dropped the query typed before the debounce fired"
+        );
+    }
+
+    /// The first selection is the HEAD row, even when HEAD is not row 0, and
+    /// the list does not steal the focus for it.
+    #[gpui::test]
+    fn the_initial_selection_is_the_head_row(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-head");
+        commit(repo.path(), "a.txt", "A");
+        let b = commit(repo.path(), "b.txt", "B");
+        // A newer commit on another branch puts HEAD at row 1 of `--all`.
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test User")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test User")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).expect("git prints UTF-8")
+        };
+        // The initial branch name comes from the user's git configuration.
+        let main_branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .trim()
+            .to_owned();
+        git(&["checkout", "-q", "-b", "other"]);
+        let c = commit(repo.path(), "c.txt", "C");
+        git(&["checkout", "-q", &main_branch]);
+
+        let (mut cx, history) = open_history(&repo, cx);
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected),
+            Some(1),
+            "the initial selection is not the HEAD row"
+        );
+        history.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.items[1].commit.id.to_string(),
+                b,
+                "HEAD is not the row the view selected"
+            );
+            assert_ne!(view.items[0].commit.id.to_string(), b);
+            assert_eq!(view.items[0].commit.id.to_string(), c);
+        });
+        cx.update(|window, cx| {
+            assert!(
+                !history.read(cx).focus.is_focused(window),
+                "the initial selection stole the focus"
+            );
+        });
     }
 }

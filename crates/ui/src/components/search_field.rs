@@ -9,7 +9,7 @@ use gpui::{
 use super::text_input::TextInput;
 use super::Kbd;
 use crate::icon::{Icon, IconName};
-use crate::metrics::{CTL, R_SM};
+use crate::metrics::{CTL, FS_SM, R_SM};
 use crate::theme::ActiveTheme;
 
 /// A bordered wrapper around a [`TextInput`].
@@ -18,6 +18,7 @@ pub struct SearchField {
     id: ElementId,
     input: Entity<TextInput>,
     hint: Option<SharedString>,
+    trailing: Option<SharedString>,
 }
 
 impl SearchField {
@@ -26,12 +27,20 @@ impl SearchField {
             id: id.into(),
             input,
             hint: None,
+            trailing: None,
         }
     }
 
     /// A trailing key hint, e.g. `Ctrl K`.
     pub fn hint(mut self, hint: impl Into<SharedString>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    /// Trailing plain text inside the field, e.g. the search's "3 / 17" count.
+    /// It takes the hint's place when both are set.
+    pub fn trailing_text(mut self, text: impl Into<SharedString>) -> Self {
+        self.trailing = Some(text.into());
         self
     }
 
@@ -94,12 +103,24 @@ impl RenderOnce for SearchField {
             window.focus(&focus_handle, cx);
         });
 
+        let has_trailing = self.trailing.is_some();
         root.child(
             Icon::new(IconName::Search)
                 .size(px(14.))
                 .color(colors.muted),
         )
         .child(div().flex_1().min_w_0().overflow_hidden().child(self.input))
-        .when_some(self.hint, |this, hint| this.child(Kbd::new(hint)))
+        .when_some(self.trailing, |this, text| {
+            this.child(
+                div()
+                    .flex_none()
+                    .text_size(FS_SM)
+                    .text_color(colors.muted)
+                    .child(text),
+            )
+        })
+        .when_some(self.hint.filter(|_| !has_trailing), |this, hint| {
+            this.child(Kbd::new(hint))
+        })
     }
 }
