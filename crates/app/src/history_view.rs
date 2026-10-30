@@ -5,6 +5,7 @@
 //! The view also owns the repository metadata the shell needs — HEAD and the
 //! refs — because it is the view that opens the [`Repo`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -19,14 +20,14 @@ use gpui::{
 
 use git_core::{CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo};
 use git_graph::{ColumnGeometry, GraphBuilder, IdleLanes, Row};
-use ui::metrics::{FONT_MONO, FONT_UI, FS_SM, FS_XS};
+use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD};
 use ui::theme::ThemeColors;
 use ui::{
-    menu, ActiveTheme, Button, ButtonSize, EmptyState, Icon, IconName, MenuEntry, MenuItem,
-    Progress, Skeleton, Spinner, Tooltip,
+    menu, ActiveTheme, Avatar, Button, ButtonSize, EmptyState, Icon, IconName, MenuEntry, MenuItem,
+    Progress, RefBadge, RefKind, Skeleton, Spinner, Tooltip,
 };
 
-use crate::format::format_count;
+use crate::format::{format_count, relative_time};
 use crate::graph_paint::paint_row;
 use crate::history_state::{
     percent_text, progress_fraction, skeleton_percent, source_label, Failure, LoadState,
@@ -73,8 +74,207 @@ const GRAPH_FIT_PAD: f32 = 8.;
 const SKELETON_SUMMARY_REF: f32 = 360.;
 /// Skeleton rows shown until the first page of history arrives.
 const SKELETON_ROWS: usize = 10;
+/// The gap between a row's ref badges and the summary text (the summary cell's
+/// flex gap).
+const BADGE_GAP: f32 = 6.;
+/// The widest a badge label may get; a longer ref name is ellipsized.
+const BADGE_LABEL_MAX: f32 = 160.;
+/// A badge's label is wrapped in 6 px padding and a 1 px border on each side;
+/// a kind with an icon adds the 11 px icon and its 3 px gap.
+const BADGE_PADDING: f32 = 14.;
+const BADGE_ICON: f32 = 14.;
+/// The narrowest room the summary text keeps beside its badges, and at most
+/// 40 % of the cell when the cell is narrower than 200 px.
+const BADGE_TEXT_MIN: f32 = 80.;
+/// Relative dates are recomputed at this interval while the view is open.
+const CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 type Page = Result<Vec<(CommitInfo, Row<Oid>)>, Failure>;
+
+/// One ref badge on a history row, derived from HEAD and the refs once they
+/// load — never per frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BadgeSpec {
+    pub kind: RefKind,
+    /// The label inside the badge: the short branch/tag name, or `HEAD`.
+    pub label: SharedString,
+    /// The full ref name, shown on hover.
+    pub tooltip: SharedString,
+}
+
+/// How many of a row's badges fit beside its summary text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BadgeFit {
+    /// Badges shown in order; the first (HEAD) is always among them.
+    pub shown: usize,
+    /// Whether the rest collapse into one "+N" badge.
+    pub collapsed: bool,
+}
+
+/// Pick the badges that fit in `available` px, leaving the summary text
+/// `min(80, 0.4·available)` px.
+///
+/// Badges are taken in order and the first one (HEAD) is always shown. Hidden
+/// badges become one "+N" badge of `plus_width`, which must also fit. A
+/// degenerate cell narrower than the first badge still shows that badge alone.
+pub fn badge_overflow(widths: &[f32], available: f32, gap: f32, plus_width: f32) -> BadgeFit {
+    let count = widths.len();
+    if count == 0 {
+        return BadgeFit {
+            shown: 0,
+            collapsed: false,
+        };
+    }
+    let available = available.max(0.);
+    let text_min = (available * 0.4).min(BADGE_TEXT_MIN);
+    let fits = |shown: usize, plus: bool| {
+        let used: f32 = widths[..shown].iter().sum();
+        let trailing = if plus { plus_width + gap } else { 0. };
+        used + trailing + shown as f32 * gap + text_min <= available
+    };
+    if fits(count, false) {
+        return BadgeFit {
+            shown: count,
+            collapsed: false,
+        };
+    }
+    for shown in (1..count).rev() {
+        if fits(shown, true) {
+            return BadgeFit {
+                shown,
+                collapsed: true,
+            };
+        }
+    }
+    // HEAD never hides, even when nothing else fits.
+    BadgeFit {
+        shown: 1,
+        collapsed: count > 1,
+    }
+}
+
+/// The badge specs for every commit, keyed by commit id.
+///
+/// Built once when HEAD and the refs load: the current branch is the HEAD
+/// badge (never also a local one), symbolic `origin/HEAD` remotes, stashes and
+/// other refs are hidden, and the order is HEAD, local, remote, tag with
+/// alphabetical names inside a kind.
+pub fn build_badges(head: Option<&Head>, refs: &[Ref]) -> HashMap<Oid, Vec<BadgeSpec>> {
+    let mut badges: HashMap<Oid, Vec<BadgeSpec>> = HashMap::new();
+    let mut current_branch = None;
+    match head {
+        Some(Head::Branch { name, target }) => {
+            current_branch = Some(name.as_str());
+            if let Some(target) = target {
+                badges.entry(*target).or_default().push(BadgeSpec {
+                    kind: RefKind::Head,
+                    label: name.as_str().into(),
+                    tooltip: format!("refs/heads/{name}").into(),
+                });
+            }
+        }
+        Some(Head::Detached(oid)) => badges.entry(*oid).or_default().push(BadgeSpec {
+            kind: RefKind::Head,
+            label: "HEAD".into(),
+            tooltip: "HEAD".into(),
+        }),
+        None => {}
+    }
+
+    for (source, kind) in [
+        (git_core::RefKind::LocalBranch, RefKind::Local),
+        (git_core::RefKind::RemoteBranch, RefKind::Remote),
+        (git_core::RefKind::Tag, RefKind::Tag),
+    ] {
+        let mut group: Vec<&Ref> = refs
+            .iter()
+            .filter(|reference| reference.kind == source)
+            // The current branch is drawn once, as the HEAD badge.
+            .filter(|reference| {
+                !(kind == RefKind::Local && Some(reference.name.as_str()) == current_branch)
+            })
+            // `origin/HEAD` is a symbolic duplicate of a real remote branch.
+            .filter(|reference| !(kind == RefKind::Remote && reference.name.ends_with("/HEAD")))
+            .collect();
+        group.sort_by(|a, b| a.name.cmp(&b.name));
+        for reference in group {
+            badges.entry(reference.target).or_default().push(BadgeSpec {
+                kind,
+                label: reference.name.clone().into(),
+                tooltip: reference.full_name.clone().into(),
+            });
+        }
+    }
+    badges
+}
+
+/// The width of the flexible summary column: the pane minus the side margins,
+/// the row padding, the fixed columns and the gaps between the present
+/// columns.
+pub fn summary_width(pane_width: f32, columns: Columns) -> f32 {
+    let mut fixed = columns.graph + columns.date;
+    let mut count = 3; // graph, summary, date
+    if let Some(author) = columns.author {
+        fixed += author;
+        count += 1;
+    }
+    if let Some(hash) = columns.hash {
+        fixed += hash;
+        count += 1;
+    }
+    (pane_width - 2. * SIDE_MARGIN - PAD_LEFT - PAD_RIGHT - fixed - (count - 1) as f32 * COL_GAP)
+        .max(0.)
+}
+
+/// A badge face, as far as text measurement is concerned: the weight and
+/// whether an icon and its gap precede the label.
+fn badge_face(kind: RefKind) -> (FontWeight, f32) {
+    let icon = if kind == RefKind::Overflow {
+        0.
+    } else {
+        BADGE_ICON
+    };
+    let weight = if kind == RefKind::Remote {
+        FontWeight::MEDIUM
+    } else {
+        FontWeight::SEMIBOLD
+    };
+    (weight, icon)
+}
+
+/// Measures one badge's full width with the window's text system, caching the
+/// result per label and kind. Only badges of the rows being painted are
+/// measured.
+fn measure_badge(
+    window: &Window,
+    label: &SharedString,
+    kind: RefKind,
+    cache: &mut HashMap<(SharedString, RefKind), Pixels>,
+) -> Pixels {
+    let key = (label.clone(), kind);
+    if let Some(width) = cache.get(&key) {
+        return *width;
+    }
+    let (weight, icon) = badge_face(kind);
+    let mut font = gpui::font(FONT_UI);
+    font.weight = weight;
+    let run = TextRun {
+        len: label.len(),
+        font,
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let text = window
+        .text_system()
+        .layout_line(label, FS_XS, &[run], None)
+        .width
+        .min(px(BADGE_LABEL_MAX));
+    let width = text + px(BADGE_PADDING + icon);
+    cache.insert(key, width);
+    width
+}
 
 /// The history table's columns for one pane width, shared by the header, the
 /// rows and the skeleton rows so the three stay aligned.
@@ -253,9 +453,19 @@ pub struct HistoryView {
     /// showing the placeholder.
     head: Option<Result<Head, String>>,
     refs: RefsState,
+    /// The ref badges of every commit, built when HEAD and the refs load.
+    badges: HashMap<Oid, Vec<BadgeSpec>>,
+    /// Measured badge widths, cached per label and kind so the per-frame work
+    /// stays proportional to the visible rows.
+    badge_widths: HashMap<(SharedString, RefKind), Pixels>,
     /// The table layout for the pane's last measured width, so the virtualized
     /// rows paint with the same columns the header was built for.
     columns: Columns,
+    /// The summary column's width for the current pane, used to fit badges.
+    summary_width: f32,
+    /// Notifies once a minute so relative dates stay fresh; dropped with the
+    /// view.
+    clock_task: Option<Task<()>>,
     /// The user's graph column width (`gw`), kept live while the grip drags
     /// and persisted on drag end.
     graph_width: f32,
@@ -295,6 +505,8 @@ impl HistoryView {
             })
             .unwrap_or((GRAPH_WIDTH_DEFAULT, false));
         let graph_width = clamp_graph_width(graph_width);
+        // Replaced with the pane's real width in the first prepaint.
+        let columns = columns(1200., graph_width);
         let mut view = Self {
             path,
             git,
@@ -312,8 +524,11 @@ impl HistoryView {
             count_killer: LateKiller::default(),
             head: None,
             refs: RefsState::Loading,
-            // Replaced with the pane's real width in the first prepaint.
-            columns: columns(1200., graph_width),
+            badges: HashMap::new(),
+            badge_widths: HashMap::new(),
+            columns,
+            summary_width: summary_width(1200., columns),
+            clock_task: None,
             graph_width,
             idle_lanes: IdleLanes::new(),
             geometry: Rc::new(IdleLanes::new().geometry(collapse)),
@@ -322,6 +537,14 @@ impl HistoryView {
             hovered: None,
         };
         view.start(cx);
+        // Relative dates are derived at render time from the clock, so the
+        // rows only need a repaint; the task ends with the view.
+        view.clock_task = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(CLOCK_INTERVAL).await;
+            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                break;
+            }
+        }));
         view
     }
 
@@ -627,6 +850,13 @@ impl HistoryView {
                 RefsState::Failed
             }
         };
+        // The per-commit badges are derived once here, never while painting.
+        let head = self.head.as_ref().and_then(|head| head.as_ref().ok());
+        let refs = match &self.refs {
+            RefsState::Loaded(refs) => refs.as_slice(),
+            RefsState::Loading | RefsState::Failed => &[],
+        };
+        self.badges = build_badges(head, refs);
         cx.notify();
     }
 
@@ -983,6 +1213,7 @@ impl HistoryView {
     fn render_rows(
         &mut self,
         range: std::ops::Range<usize>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<impl IntoElement> {
         let colors = cx.theme().colors;
@@ -991,11 +1222,17 @@ impl HistoryView {
         let geometry = self.geometry.clone();
         let hovered = self.hovered;
         let head = self.head_oid();
+        let selected_index = self.selected;
+        let now = unix_now();
+        let summary_width = self.summary_width;
+        let items = &self.items;
+        let badges = &self.badges;
+        let badge_widths = &mut self.badge_widths;
         range
             .map(|ix| {
-                let item = &self.items[ix];
+                let item = &items[ix];
                 let row = item.row.clone();
-                let selected = self.selected == Some(ix);
+                let selected = selected_index == Some(ix);
                 let is_hovered = hovered == Some(ix) && !selected;
                 let c = &item.commit;
                 let background = if selected {
@@ -1022,6 +1259,7 @@ impl HistoryView {
                     .items_center()
                     .gap(px(COL_GAP))
                     .text_size(FS_SM)
+                    .rounded(R_MD)
                     .when(selected, |d| d.bg(colors.selection))
                     .when(is_hovered, |d| d.bg(colors.hover))
                     .on_hover(cx.listener(move |view, entered: &bool, _, cx| {
@@ -1066,32 +1304,109 @@ impl HistoryView {
                         .w(px(columns.graph))
                         .h_full()
                         .flex_none(),
-                    )
-                    .child(
+                    );
+
+                // The summary cell: ref badges (fixed size) first, then the
+                // summary text, which takes the room that is left.
+                let specs = badges.get(&c.id).map(Vec::as_slice).unwrap_or(&[]);
+                let fit = if specs.is_empty() {
+                    BadgeFit {
+                        shown: 0,
+                        collapsed: false,
+                    }
+                } else {
+                    let widths: Vec<f32> = specs
+                        .iter()
+                        .map(|spec| {
+                            f32::from(measure_badge(window, &spec.label, spec.kind, badge_widths))
+                        })
+                        .collect();
+                    // The most hidden badges the "+N" label can stand for.
+                    let plus = SharedString::from(format!("+{}", specs.len()));
+                    let plus_width = f32::from(measure_badge(
+                        window,
+                        &plus,
+                        RefKind::Overflow,
+                        badge_widths,
+                    ));
+                    badge_overflow(&widths, summary_width, BADGE_GAP, plus_width)
+                };
+
+                let mut summary = div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .gap(px(BADGE_GAP));
+                for (index, spec) in specs.iter().take(fit.shown).enumerate() {
+                    summary = summary.child(
+                        RefBadge::new(format!("history-badge-{ix}-{index}"), spec.label.clone())
+                            .kind(spec.kind)
+                            .max_label_width(px(BADGE_LABEL_MAX))
+                            .tooltip(spec.tooltip.clone()),
+                    );
+                }
+                if fit.collapsed {
+                    let hidden = specs[fit.shown..]
+                        .iter()
+                        .map(|spec| spec.tooltip.as_ref())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let count = specs.len() - fit.shown;
+                    summary = summary.child(
+                        RefBadge::new(format!("history-badge-{ix}-more"), format!("+{count}"))
+                            .kind(RefKind::Overflow)
+                            .tooltip(hidden),
+                    );
+                }
+                row_div = row_div.child(
+                    summary.child(
                         div()
+                            .id(format!("history-summary-{ix}"))
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            .text_size(FS_BASE)
                             .text_color(colors.text)
+                            .when(is_head, |text| text.font_weight(FontWeight::BOLD))
+                            .tooltip(Tooltip::text(c.summary.clone()))
                             .child(c.summary.clone()),
-                    );
+                    ),
+                );
                 if let Some(author) = columns.author {
                     row_div = row_div.child(
                         div()
+                            .id(format!("history-author-{ix}"))
                             .w(px(author))
                             .flex_none()
-                            .truncate()
+                            .flex()
+                            .items_center()
+                            .gap(px(BADGE_GAP))
                             .text_color(colors.muted)
-                            .child(c.author_name.clone()),
+                            .tooltip(Tooltip::text(c.author_name.clone()))
+                            .child(
+                                Avatar::new(c.author_email.clone(), px(16.))
+                                    .name(c.author_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(c.author_name.clone()),
+                            ),
                     );
                 }
                 row_div = row_div.child(
                     div()
+                        .id(format!("history-date-{ix}"))
                         .w(px(columns.date))
                         .flex_none()
                         .truncate()
                         .text_color(colors.muted)
-                        .child(format_time(c.author_time)),
+                        .tooltip(Tooltip::text(format_time_tooltip(c.author_time)))
+                        .child(relative_time(now, c.author_time.max(0) as u64)),
                 );
                 if let Some(hash) = columns.hash {
                     row_div = row_div.child(
@@ -1101,7 +1416,7 @@ impl HistoryView {
                             .truncate()
                             .font_family(FONT_MONO)
                             .text_color(colors.muted)
-                            .child(c.id.short()),
+                            .child(short_hash(&c.id)),
                     );
                 }
                 div().w_full().px(px(SIDE_MARGIN)).child(row_div)
@@ -1113,7 +1428,7 @@ impl HistoryView {
         uniform_list(
             "history",
             self.items.len(),
-            cx.processor(|view, range, _window, cx| view.render_rows(range, cx)),
+            cx.processor(|view, range, window, cx| view.render_rows(range, window, cx)),
         )
         .flex_1()
         .min_h_0()
@@ -1528,6 +1843,7 @@ impl HistoryView {
         // The virtualized rows are painted after this and must agree with the
         // header.
         self.columns = columns;
+        self.summary_width = summary_width(pane_width, columns);
         let body = self.render_body(columns, cx);
         // The column header stays above every state.
         div()
@@ -1718,7 +2034,19 @@ pub(crate) fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// `YYYY-MM-DD HH:MM` in UTC. Local time and relative dates come later.
+/// The 7-character abbreviated hash the history table shows.
+fn short_hash(id: &Oid) -> String {
+    let mut hash = id.to_string();
+    hash.truncate(7);
+    hash
+}
+
+/// The date cell's tooltip: `YYYY-MM-DD HH:MM UTC`.
+fn format_time_tooltip(unix: i64) -> String {
+    format!("{} UTC", format_time(unix))
+}
+
+/// `YYYY-MM-DD HH:MM` in UTC, for the date cell's tooltip.
 fn format_time(unix: i64) -> String {
     let days = unix.div_euclid(86_400);
     let secs = unix.rem_euclid(86_400);
@@ -1749,6 +2077,212 @@ mod tests {
         assert_eq!(format_time(0), "1970-01-01 00:00");
         assert_eq!(format_time(1_700_000_000), "2023-11-14 22:13");
         assert_eq!(format_time(951_782_400), "2000-02-29 00:00");
+        assert_eq!(format_time_tooltip(0), "1970-01-01 00:00 UTC");
+    }
+
+    #[test]
+    fn the_hash_is_abbreviated_to_seven_characters() {
+        let oid = Oid::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert_eq!(short_hash(&oid), "0123456");
+    }
+
+    fn oid(byte: u8) -> Oid {
+        Oid::from_hex(&format!("{byte:02x}").repeat(20)).unwrap()
+    }
+
+    fn reference(kind: git_core::RefKind, full_name: &str, name: &str, target: Oid) -> Ref {
+        Ref {
+            full_name: full_name.to_owned(),
+            name: name.to_owned(),
+            kind,
+            target,
+            upstream: None,
+        }
+    }
+
+    #[test]
+    fn badges_order_head_locals_remotes_and_tags_without_duplicating_head() {
+        let head_oid = oid(1);
+        let refs = vec![
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/main",
+                "main",
+                head_oid,
+            ),
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/zeta",
+                "zeta",
+                head_oid,
+            ),
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/alpha",
+                "alpha",
+                head_oid,
+            ),
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/origin/main",
+                "origin/main",
+                head_oid,
+            ),
+            // Symbolic remote refs are duplicates of a real branch.
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/origin/HEAD",
+                "origin/HEAD",
+                head_oid,
+            ),
+            reference(git_core::RefKind::Tag, "refs/tags/v1", "v1", head_oid),
+            reference(git_core::RefKind::Stash, "refs/stash", "stash", head_oid),
+            reference(
+                git_core::RefKind::Other,
+                "refs/notes/commits",
+                "refs/notes/commits",
+                head_oid,
+            ),
+        ];
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: Some(head_oid),
+        };
+        let badges = build_badges(Some(&head), &refs);
+        let row = &badges[&head_oid];
+        let labels: Vec<(&RefKind, &str)> = row
+            .iter()
+            .map(|spec| (&spec.kind, spec.label.as_ref()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                (&RefKind::Head, "main"),
+                (&RefKind::Local, "alpha"),
+                (&RefKind::Local, "zeta"),
+                (&RefKind::Remote, "origin/main"),
+                (&RefKind::Tag, "v1"),
+            ]
+        );
+        // The HEAD badge names its branch's full ref.
+        assert_eq!(row[0].tooltip.as_ref(), "refs/heads/main");
+        // Every other badge points at its own full ref name.
+        assert_eq!(row[2].tooltip.as_ref(), "refs/heads/zeta");
+        assert_eq!(row[3].tooltip.as_ref(), "refs/remotes/origin/main");
+    }
+
+    #[test]
+    fn detached_head_gets_a_head_badge_and_keeps_the_branches() {
+        let detached = oid(2);
+        let branch = oid(3);
+        let refs = vec![reference(
+            git_core::RefKind::LocalBranch,
+            "refs/heads/main",
+            "main",
+            branch,
+        )];
+        let badges = build_badges(Some(&Head::Detached(detached)), &refs);
+        assert_eq!(
+            badges[&detached],
+            vec![BadgeSpec {
+                kind: RefKind::Head,
+                label: "HEAD".into(),
+                tooltip: "HEAD".into(),
+            }]
+        );
+        assert_eq!(badges[&branch][0].kind, RefKind::Local);
+    }
+
+    #[test]
+    fn an_unborn_branch_has_no_head_badge() {
+        let refs = vec![reference(
+            git_core::RefKind::LocalBranch,
+            "refs/heads/main",
+            "main",
+            oid(4),
+        )];
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: None,
+        };
+        let badges = build_badges(Some(&head), &refs);
+        assert!(badges.is_empty(), "the current branch is not drawn twice");
+    }
+
+    #[test]
+    fn badge_overflow_keeps_room_for_text_and_head() {
+        let widths = [100., 100., 100.];
+        // All three fit and leave the 80 px text minimum.
+        assert_eq!(
+            badge_overflow(&widths, 500., 6., 30.),
+            BadgeFit {
+                shown: 3,
+                collapsed: false
+            }
+        );
+        // Two badges leave the text its room, but a third would not; the
+        // hidden one needs the +N badge, which does not fit beside two.
+        assert_eq!(
+            badge_overflow(&widths, 300., 6., 30.),
+            BadgeFit {
+                shown: 1,
+                collapsed: true
+            }
+        );
+        // A wide cell fits the two badges and the +N.
+        assert_eq!(
+            badge_overflow(&widths, 340., 6., 30.),
+            BadgeFit {
+                shown: 2,
+                collapsed: true
+            }
+        );
+    }
+
+    #[test]
+    fn badge_overflow_always_shows_head() {
+        assert_eq!(
+            badge_overflow(&[400., 100.], 100., 6., 30.),
+            BadgeFit {
+                shown: 1,
+                collapsed: true
+            }
+        );
+        assert_eq!(
+            badge_overflow(&[], 100., 6., 30.),
+            BadgeFit {
+                shown: 0,
+                collapsed: false
+            }
+        );
+        // One badge is never collapsed into a "+N".
+        assert_eq!(
+            badge_overflow(&[400.], 100., 6., 30.),
+            BadgeFit {
+                shown: 1,
+                collapsed: false
+            }
+        );
+    }
+
+    #[test]
+    fn summary_width_subtracts_the_fixed_columns_and_gaps() {
+        let wide = columns(1200., GRAPH_WIDTH_DEFAULT);
+        assert_eq!(summary_width(1200., wide), 674.);
+        let medium = columns(560., GRAPH_WIDTH_DEFAULT);
+        assert_eq!(
+            summary_width(560., medium),
+            560. - 2. * SIDE_MARGIN
+                - PAD_LEFT
+                - PAD_RIGHT
+                - medium.graph
+                - medium.author.unwrap()
+                - medium.date
+                - 3. * COL_GAP
+        );
+        // A pane narrower than its fixed columns leaves nothing, not a
+        // negative width.
+        assert_eq!(summary_width(10., wide), 0.);
     }
 
     #[test]
