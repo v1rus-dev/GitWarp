@@ -5,7 +5,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use git_core::{ChangedFile, CommitDetails, Git, Oid, Repo};
+use git_core::{ChangedFile, CommitDetails, FileDiff, Git, Oid, Repo};
+
+use crate::diff_model::{build_rows, max_columns, DiffRow};
 
 /// What the details dock knows about the selected commit.
 #[derive(Clone, Debug, Default)]
@@ -41,6 +43,26 @@ pub struct CommitDetailsData {
     pub files: Vec<ChangedFile>,
 }
 
+/// One file's diff, already flattened into the unified view's rows.
+#[derive(Clone, Debug)]
+pub struct DiffData {
+    pub diff: FileDiff,
+    pub rows: Vec<DiffRow>,
+    /// Widest row in display columns, for the horizontal scroll width.
+    pub columns: usize,
+}
+
+/// What the diff pane knows about the selected file.
+#[derive(Clone, Debug, Default)]
+pub enum DiffState {
+    /// No file selected yet.
+    #[default]
+    Empty,
+    Loading,
+    Loaded(Arc<DiffData>),
+    Failed(String),
+}
+
 /// Reads the details and changed files of `oid`. Both come from one `git`
 /// process tree, so the pane shows them together.
 pub fn read_details(git: Arc<Git>, root: &Path, oid: Oid) -> Result<CommitDetailsData, String> {
@@ -52,4 +74,24 @@ pub fn read_details(git: Arc<Git>, root: &Path, oid: Oid) -> Result<CommitDetail
         .commit_changes(oid)
         .map_err(|error| error.to_string())?;
     Ok(CommitDetailsData { details, files })
+}
+
+/// Reads one file's diff and flattens it into rows off the UI thread.
+pub fn read_diff(
+    git: Arc<Git>,
+    root: &Path,
+    oid: Oid,
+    file: &ChangedFile,
+) -> Result<DiffData, String> {
+    let repo = Repo::open(git, root).map_err(|error| error.to_string())?;
+    let diff = repo
+        .file_diff(oid, &file.path, file.old_path.as_deref())
+        .map_err(|error| error.to_string())?;
+    let rows = build_rows(&diff.hunks);
+    let columns = max_columns(&rows);
+    Ok(DiffData {
+        diff,
+        rows,
+        columns,
+    })
 }

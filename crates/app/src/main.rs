@@ -1,4 +1,5 @@
 mod details;
+mod diff_model;
 mod format;
 mod graph_paint;
 mod history_search;
