@@ -982,3 +982,233 @@ fn probe_reports_a_bare_repository_as_a_root() {
         other => panic!("unexpected probe {other:?}"),
     }
 }
+
+/// Writes `content` to `file` under `dir`, creating parent directories.
+fn write(dir: &Path, file: &str, content: impl AsRef<[u8]>) {
+    let path = dir.join(file);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, content).unwrap();
+}
+
+/// `git add -A` then a commit with `message`.
+fn commit_all(dir: &Path, message: &str) {
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", message]);
+}
+
+fn head_oid(repo: &Repo) -> git_core::Oid {
+    match repo.head().unwrap() {
+        Head::Branch { target, .. } => target.unwrap(),
+        Head::Detached(target) => target,
+    }
+}
+
+#[test]
+fn reads_commit_details_with_body_and_committer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "a.txt", "one\n");
+    git(d, &["add", "a.txt"]);
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(d)
+        .args([
+            "-c",
+            "user.name=Committer",
+            "-c",
+            "user.email=committer@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "Add a file\n\nWhy it exists.\n\nCloses #1",
+        ])
+        .env("GIT_AUTHOR_NAME", "Author")
+        .env("GIT_AUTHOR_EMAIL", "author@example.com")
+        .env("GIT_AUTHOR_DATE", "2026-10-29T14:08:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-10-29T15:00:00Z")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .expect("git runs");
+    assert!(status.success());
+
+    let repo = open(d).unwrap();
+    let details = repo.commit_details(head_oid(&repo)).unwrap();
+    assert_eq!(details.author_name, "Author");
+    assert_eq!(details.author_email, "author@example.com");
+    assert_eq!(details.committer_name, "Committer");
+    assert_eq!(details.committer_email, "committer@example.com");
+    assert_eq!(details.summary, "Add a file");
+    assert_eq!(details.body, "Why it exists.\n\nCloses #1");
+    assert_eq!(details.committer_time - details.author_time, 52 * 60);
+    assert!(details.parents.is_empty(), "the root commit has no parents");
+}
+
+#[test]
+fn lists_add_modify_delete_rename_and_root_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "src/a.txt", "one\ntwo\nthree\n");
+    commit_all(d, "root");
+    let repo = open(d).unwrap();
+
+    let root = head_oid(&repo);
+    let files = repo.commit_changes(root).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].kind, git_core::ChangeKind::Added);
+    assert_eq!(files[0].path, "src/a.txt");
+    assert_eq!((files[0].added, files[0].deleted), (3, 0));
+
+    write(d, "src/a.txt", "one\nTWO\nthree\n");
+    write(d, "src/b.txt", "new\n");
+    commit_all(d, "modify and add");
+    let commit = head_oid(&repo);
+    let files = repo.commit_changes(commit).unwrap();
+    assert_eq!(files.len(), 2);
+    let a = files.iter().find(|f| f.path == "src/a.txt").unwrap();
+    assert_eq!(a.kind, git_core::ChangeKind::Modified);
+    assert_eq!((a.added, a.deleted), (1, 1));
+    let b = files.iter().find(|f| f.path == "src/b.txt").unwrap();
+    assert_eq!(b.kind, git_core::ChangeKind::Added);
+
+    git(d, &["mv", "src/a.txt", "src/c.txt"]);
+    write(d, "src/c.txt", "one\nTWO\nthree\nfour\n");
+    commit_all(d, "rename");
+    let commit = head_oid(&repo);
+    let files = repo.commit_changes(commit).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].kind, git_core::ChangeKind::Renamed);
+    assert_eq!(files[0].path, "src/c.txt");
+    assert_eq!(files[0].old_path.as_deref(), Some("src/a.txt"));
+    let diff = repo
+        .file_diff(commit, "src/c.txt", Some("src/a.txt"))
+        .unwrap();
+    assert_eq!(diff.old_path.as_deref(), Some("src/a.txt"));
+    assert_eq!(diff.hunks.len(), 1);
+
+    std::fs::remove_file(d.join("src/b.txt")).unwrap();
+    commit_all(d, "delete");
+    let commit = head_oid(&repo);
+    let files = repo.commit_changes(commit).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].kind, git_core::ChangeKind::Deleted);
+    let diff = repo.file_diff(commit, "src/b.txt", None).unwrap();
+    assert!(diff.hunks[0]
+        .lines
+        .iter()
+        .all(|l| l.kind == git_core::LineKind::Removed));
+    assert!(diff.hunks[0].lines.iter().all(|l| l.new_line.is_none()));
+}
+
+#[test]
+fn reads_a_merge_against_its_first_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "base.txt", "base\n");
+    commit_all(d, "base");
+    git(d, &["checkout", "-q", "-b", "feature"]);
+    write(d, "feature.txt", "from the feature branch\n");
+    commit_all(d, "feature work");
+    git(d, &["checkout", "-q", "main"]);
+    write(d, "main.txt", "on main\n");
+    commit_all(d, "main work");
+    git(
+        d,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--no-edit",
+            "-m",
+            "merge",
+            "feature",
+        ],
+    );
+
+    let repo = open(d).unwrap();
+    let merge = head_oid(&repo);
+    let details = repo.commit_details(merge).unwrap();
+    assert_eq!(details.parents.len(), 2);
+    let files = repo.commit_changes(merge).unwrap();
+    let paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["feature.txt"]);
+    let diff = repo.file_diff(merge, "feature.txt", None).unwrap();
+    assert_eq!(diff.hunks.len(), 1);
+    assert_eq!(diff.hunks[0].lines[0].kind, git_core::LineKind::Added);
+}
+
+#[test]
+fn reports_binary_files_without_hunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "img.bin", [0u8, 1, 2, 0, 255]);
+    commit_all(d, "binary");
+    let repo = open(d).unwrap();
+    let oid = head_oid(&repo);
+
+    let files = repo.commit_changes(oid).unwrap();
+    assert!(files[0].binary);
+    let diff = repo.file_diff(oid, "img.bin", None).unwrap();
+    assert!(diff.binary);
+    assert!(diff.hunks.is_empty());
+    let texts = repo.file_texts(oid, "img.bin", None).unwrap();
+    assert!(texts.binary);
+    assert!(texts.old.is_none() && texts.new.is_none());
+}
+
+#[test]
+fn reads_old_and_new_text_for_highlighting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "a.rs", "fn main() {}\n");
+    commit_all(d, "one");
+    write(d, "a.rs", "fn main() {\n    run();\n}\n");
+    commit_all(d, "two");
+    let repo = open(d).unwrap();
+
+    let texts = repo.file_texts(head_oid(&repo), "a.rs", None).unwrap();
+    assert_eq!(texts.old.as_deref(), Some("fn main() {}\n"));
+    assert_eq!(texts.new.as_deref(), Some("fn main() {\n    run();\n}\n"));
+    assert!(!texts.binary);
+
+    // An added file has no old side; a deleted file has no new side.
+    write(d, "b.rs", "x\n");
+    commit_all(d, "add b");
+    let texts = repo.file_texts(head_oid(&repo), "b.rs", None).unwrap();
+    assert_eq!(texts.old, None);
+    assert_eq!(texts.new.as_deref(), Some("x\n"));
+}
+
+#[test]
+fn keeps_the_no_newline_marker_and_marks_a_huge_diff_too_large() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "a.txt", "one");
+    commit_all(d, "no newline");
+    write(d, "a.txt", "one\ntwo");
+    commit_all(d, "still no newline");
+    let repo = open(d).unwrap();
+    let diff = repo.file_diff(head_oid(&repo), "a.txt", None).unwrap();
+    assert!(diff.hunks[0].lines.last().unwrap().no_newline);
+
+    let mut huge = String::new();
+    for i in 0..21_000 {
+        huge.push_str(&format!("line {i}\n"));
+    }
+    write(d, "huge.txt", huge);
+    commit_all(d, "huge");
+    let err = repo
+        .file_diff(head_oid(&repo), "huge.txt", None)
+        .unwrap_err();
+    assert!(matches!(err, git_core::Error::TooLarge { .. }), "{err}");
+}
