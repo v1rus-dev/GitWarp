@@ -11,21 +11,24 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, canvas, div, point, px, size, App, AppContext, Bounds, ClickEvent, ClipboardItem,
-    Context, Decorations, Div, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, WeakEntity, Window,
+    actions, canvas, div, point, px, size, AnyElement, App, AppContext, Bounds, ClickEvent,
+    ClipboardItem, Context, Decorations, Div, Entity, FocusHandle, FontWeight, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Pixels, Point, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window,
 };
 
-use git_core::{Error, Git, Head, RefKind};
-use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_SM, R_SM, STATUS};
+use git_core::{ChangedFile, CommitDetails, CommitInfo, Error, Git, Head, Oid, RefKind};
+use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
+use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    menu, Button, Icon, IconName, MenuEntry, MenuItem, SearchField, SegmentItem, Segmented,
-    Spinner, Splitter, TextInput, TextInputEvent, Tooltip, Tree, TreeNodeData,
+    menu, Avatar, Button, CountPill, FileRow, Icon, IconName, MenuEntry, MenuItem, Scrollbar,
+    SearchField, SegmentItem, Segmented, Skeleton, Spinner, Splitter, TextInput, TextInputEvent,
+    Tooltip, Tree, TreeNodeData,
 };
 
-use crate::format::format_count;
+use crate::details::{read_details, DetailsState};
+use crate::format::{absolute_time, format_count, relative_time};
 use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
 use crate::settings::{Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
@@ -310,6 +313,19 @@ pub struct RepositoryView {
     dock: Dock,
     details_open: bool,
     details_size: f32,
+    /// What the selected commit's details dock shows.
+    details: DetailsState,
+    /// The commit `details` belongs to; `None` while nothing is selected.
+    details_oid: Option<Oid>,
+    /// Bumped per details load; an older result that finishes later is dropped.
+    details_generation: u64,
+    /// The row of `details.files()` the diff pane shows.
+    selected_file: Option<usize>,
+    info_scroll: ScrollHandle,
+    files_scroll: ScrollHandle,
+    /// The file list's keyboard focus; arrow keys move the file selection only
+    /// while it is focused.
+    files_focus: FocusHandle,
     /// Window bounds of the two dropdown anchors, captured while painting.
     repo_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     branch_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -335,15 +351,23 @@ impl RepositoryView {
         let observer = cx.observe(&history, |this, history, cx| {
             // A repository opened from a subdirectory is remembered by its
             // root, so the switcher's "current" marker must follow it.
-            if let Some(root) = history.read(cx).root() {
+            let (root, selected) = {
+                let history = history.read(cx);
+                (
+                    history.root().map(std::path::Path::to_path_buf),
+                    history.selected_commit(),
+                )
+            };
+            if let Some(root) = root {
                 if this.root != root {
-                    this.root = root.to_path_buf();
-                    this.repo_name = repo_name(root);
+                    this.root = root.clone();
+                    this.repo_name = repo_name(&root);
                 }
                 // The sidebar's own lists need the root: load them once, when
                 // the history first reports it.
                 this.ensure_sidebar(cx);
             }
+            this.sync_details(selected, cx);
             cx.notify();
         });
         let search = cx.new(|cx| {
@@ -418,6 +442,13 @@ impl RepositoryView {
             dock,
             details_open: true,
             details_size,
+            details: DetailsState::Empty,
+            details_oid: None,
+            details_generation: 0,
+            selected_file: None,
+            info_scroll: ScrollHandle::new(),
+            files_scroll: ScrollHandle::new(),
+            files_focus: cx.focus_handle().tab_stop(true),
             repo_bounds: Rc::new(Cell::new(None)),
             branch_bounds: Rc::new(Cell::new(None)),
         }
@@ -685,6 +716,102 @@ impl RepositoryView {
         }
         self.sidebar_extras = Some(extras);
         cx.notify();
+    }
+
+    /// Loads the details when the history selection moved to another commit,
+    /// and clears them when nothing is selected.
+    fn sync_details(&mut self, selected: Option<Arc<CommitInfo>>, cx: &mut Context<Self>) {
+        let Some(commit) = selected else {
+            if self.details_oid.take().is_some() {
+                self.details_generation = self.details_generation.wrapping_add(1);
+                self.details = DetailsState::Empty;
+                self.selected_file = None;
+                cx.notify();
+            }
+            return;
+        };
+        if self.details_oid == Some(commit.id) {
+            return;
+        }
+        self.start_details(commit.id, cx);
+    }
+
+    /// Reads one commit's details and changed files in the background.
+    fn start_details(&mut self, oid: Oid, cx: &mut Context<Self>) {
+        self.details_oid = Some(oid);
+        self.selected_file = None;
+        self.details_generation = self.details_generation.wrapping_add(1);
+        let generation = self.details_generation;
+        self.details = DetailsState::Loading;
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                self.details = DetailsState::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { read_details(git, &root, oid) })
+                .await;
+            this.update(cx, |view, cx| view.set_details(generation, result, cx))
+                .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn set_details(
+        &mut self,
+        generation: u64,
+        result: Result<crate::details::CommitDetailsData, String>,
+        cx: &mut Context<Self>,
+    ) {
+        // A newer selection owns the pane now; this older answer is stale.
+        if generation != self.details_generation {
+            return;
+        }
+        match result {
+            Ok(data) => {
+                self.selected_file = (!data.files.is_empty()).then_some(0);
+                self.details = DetailsState::Loaded(Box::new(data));
+            }
+            Err(error) => {
+                log::warn!("could not read the commit details: {error}");
+                self.details = DetailsState::Failed(error);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Selects one changed file and scrolls it into view.
+    fn select_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        let count = self.details.files().map(<[ChangedFile]>::len).unwrap_or(0);
+        if index >= count || self.selected_file == Some(index) {
+            return;
+        }
+        self.selected_file = Some(index);
+        self.files_scroll.scroll_to_item(index);
+        cx.notify();
+    }
+
+    /// Moves the file selection by `step`, clamped at the ends.
+    fn step_file(&mut self, step: isize, cx: &mut Context<Self>) {
+        let count = self.details.files().map(<[ChangedFile]>::len).unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        let current = self.selected_file.unwrap_or(0) as isize;
+        let next = current.saturating_add(step).clamp(0, count as isize - 1) as usize;
+        self.select_file(next, cx);
+    }
+
+    /// Focuses the file list, so its arrow keys work.
+    fn focus_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.files_focus, cx);
     }
 
     /// Opens the recent-repositories dropdown under the repository switcher.
@@ -1166,7 +1293,7 @@ impl RepositoryView {
         panel
             .border_color(colors.border)
             .child(self.render_details_header(cx))
-            .child(self.render_details_body(colors))
+            .child(self.render_details_body(colors, cx))
     }
 
     fn render_details_header(&mut self, cx: &mut Context<Self>) -> Div {
@@ -1223,7 +1350,7 @@ impl RepositoryView {
             .child(no_shrink(switch))
     }
 
-    fn render_details_body(&self, colors: ThemeColors) -> Div {
+    fn render_details_body(&mut self, colors: ThemeColors, cx: &mut Context<Self>) -> Div {
         match self.dock {
             Dock::Bottom => div()
                 .flex_1()
@@ -1231,14 +1358,14 @@ impl RepositoryView {
                 .w_full()
                 .flex()
                 .child(
-                    details_pane("Commit details", colors)
+                    self.render_info_pane(colors, cx)
                         .w(px(310.))
                         .flex_none()
                         .h_full()
                         .border_r_1(),
                 )
                 .child(
-                    details_pane("Changed files", colors)
+                    self.render_files_pane(colors, cx)
                         .w(px(250.))
                         .flex_none()
                         .h_full()
@@ -1252,16 +1379,14 @@ impl RepositoryView {
                 .flex()
                 .flex_col()
                 .child(
-                    // Stage 5 fills this pane; until then it keeps the
-                    // design's maximum height so the three panes are visible.
-                    details_pane("Commit details", colors)
+                    self.render_info_pane(colors, cx)
                         .h(px(230.))
                         .flex_none()
                         .w_full()
                         .border_b_1(),
                 )
                 .child(
-                    details_pane("Changed files", colors)
+                    self.render_files_pane(colors, cx)
                         .h(px(160.))
                         .flex_none()
                         .w_full()
@@ -1269,6 +1394,303 @@ impl RepositoryView {
                 )
                 .child(details_pane("Diff", colors).flex_1().w_full()),
         }
+    }
+
+    /// The commit's message and metadata, scrolling when it is long.
+    fn render_info_pane(&mut self, colors: ThemeColors, cx: &mut Context<Self>) -> Div {
+        let content = self.render_info_content(colors, cx);
+        let viewport = div()
+            .id("details-info-scroll")
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.info_scroll)
+            .child(content);
+        div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .min_h_0()
+            .border_color(colors.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(viewport)
+                    .child(Scrollbar::vertical(
+                        "details-info-bar",
+                        self.info_scroll.clone(),
+                    )),
+            )
+    }
+
+    fn render_info_content(&self, colors: ThemeColors, cx: &mut Context<Self>) -> AnyElement {
+        match &self.details {
+            DetailsState::Empty => muted_note("Select a commit", colors).into_any_element(),
+            DetailsState::Loading => div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .px(px(18.))
+                .py(px(16.))
+                .child(Skeleton::new("details-skeleton-title", px(190.)))
+                .child(Skeleton::new("details-skeleton-body", px(240.)))
+                .child(Skeleton::new("details-skeleton-meta", px(150.)))
+                .into_any_element(),
+            DetailsState::Failed(message) => div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .px(px(18.))
+                .py(px(16.))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Could not load the commit"),
+                )
+                .child(div().text_color(colors.error).child(message.clone()))
+                .into_any_element(),
+            DetailsState::Loaded(data) => self.render_loaded_info(&data.details, cx),
+        }
+    }
+
+    fn render_loaded_info(&self, details: &CommitDetails, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors;
+        let now = crate::history_view::unix_now();
+        let mut column = div().flex().flex_col().px(px(18.)).py(px(16.)).child(
+            div()
+                .mb(px(8.))
+                .text_size(FS_MD)
+                .line_height(px(19.))
+                .font_weight(FontWeight::BOLD)
+                .child(details.summary.clone()),
+        );
+        if !details.body.is_empty() {
+            column = column.child(
+                div()
+                    .mb(px(12.))
+                    .text_size(FS_BASE)
+                    .child(details.body.clone()),
+            );
+        }
+
+        let author = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                Avatar::new(details.author_email.clone(), px(20.))
+                    .name(details.author_name.clone()),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(format!(
+                "{} <{}>",
+                details.author_name, details.author_email
+            )));
+        let committer = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                Avatar::new(details.committer_email.clone(), px(20.))
+                    .name(details.committer_name.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(details.committer_name.clone()),
+            );
+        let authored = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(absolute_time(details.author_time))
+            .child(div().text_color(colors.muted).child(format!(
+                "({})",
+                relative_time(now, details.author_time.max(0) as u64)
+            )));
+        let full_hash = details.id.to_string();
+        let mut hash = full_hash.clone();
+        hash.truncate(20);
+        hash.push('…');
+        let hash = div()
+            .id("details-hash")
+            .font_family(FONT_MONO)
+            .text_size(FS_SM)
+            .truncate()
+            .tooltip(Tooltip::text(full_hash))
+            .child(hash);
+
+        let parents = if details.parents.is_empty() {
+            div().text_color(colors.muted).child("none (root commit)")
+        } else {
+            let view = cx.entity();
+            let mut row = div().flex().items_center().gap(px(6.));
+            for (index, parent) in details.parents.iter().copied().enumerate() {
+                let view = view.clone();
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("details-parent-{index}")))
+                        .font_family(FONT_MONO)
+                        .text_size(FS_SM)
+                        .text_color(colors.accent)
+                        .cursor_pointer()
+                        .hover(move |style| style.text_color(colors.accent_hover))
+                        .child(parent.short())
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |view, cx| {
+                                view.history.update(cx, |history, cx| {
+                                    history.reveal_commit(parent, cx);
+                                });
+                            });
+                        }),
+                );
+            }
+            row
+        };
+
+        column
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(meta_row("Author", author, colors))
+                    .child(meta_row("Authored", authored, colors))
+                    .child(meta_row("Committer", committer, colors))
+                    .child(meta_row("Hash", hash, colors))
+                    .child(meta_row("Parents", parents, colors)),
+            )
+            .into_any_element()
+    }
+
+    /// The changed-file header and rows.
+    fn render_files_pane(&mut self, colors: ThemeColors, cx: &mut Context<Self>) -> Div {
+        let count = self.details.files().map(<[ChangedFile]>::len);
+        let is_merge = self
+            .details
+            .details()
+            .is_some_and(|details| details.parents.len() > 1);
+        let mut header = div()
+            .h(px(34.))
+            .flex_none()
+            .pl(px(16.))
+            .pr(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(colors.border)
+            .text_size(FS_SM)
+            .text_color(colors.muted)
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.text)
+                    .child("Changed files"),
+            );
+        if let Some(count) = count {
+            header = header.child(CountPill::new(count.to_string()));
+        }
+        header = header.child(div().flex_1());
+        if is_merge {
+            header = header.child(
+                div()
+                    .id("details-vs-parent")
+                    .tooltip(Tooltip::text("Combined diff against first parent"))
+                    .child("vs parent 1"),
+            );
+        }
+
+        let body = self.render_files_body(colors, cx);
+        div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .min_h_0()
+            .border_color(colors.border)
+            .child(header)
+            .child(body)
+    }
+
+    fn render_files_body(&mut self, colors: ThemeColors, cx: &mut Context<Self>) -> Div {
+        let Some(files) = self.details.files() else {
+            return match &self.details {
+                DetailsState::Loading => {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .p(px(8.))
+                        .children((0..4).map(|index| {
+                            Skeleton::new(
+                                SharedString::from(format!("details-files-skeleton-{index}")),
+                                px(180.),
+                            )
+                        }))
+                }
+                DetailsState::Failed(message) => div()
+                    .p(px(12.))
+                    .text_color(colors.error)
+                    .child(message.clone()),
+                _ => muted_note("No files changed", colors),
+            };
+        };
+        if files.is_empty() {
+            return muted_note("No files changed", colors);
+        }
+
+        let view = cx.entity();
+        let selected = self.selected_file;
+        let mut list = div()
+            .id("details-files-list")
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.files_scroll)
+            .track_focus(&self.files_focus)
+            .key_context("details-files")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _, window, cx| view.focus_files(window, cx)),
+            )
+            .on_action(cx.listener(|view, _: &SelectNext, _, cx| view.step_file(1, cx)))
+            .on_action(cx.listener(|view, _: &SelectPrev, _, cx| view.step_file(-1, cx)))
+            .on_action(cx.listener(|view, _: &SelectFirst, _, cx| view.step_file(isize::MIN, cx)))
+            .on_action(cx.listener(|view, _: &SelectLast, _, cx| view.step_file(isize::MAX, cx)));
+        for (index, file) in files.iter().enumerate() {
+            let view = view.clone();
+            list = list.child(
+                div()
+                    .debug_selector(move || format!("details-file-{index}"))
+                    .child(
+                        FileRow::new(
+                            SharedString::from(format!("details-file-{index}")),
+                            file.kind.letter(),
+                            file.path.clone(),
+                        )
+                        .added(file.added)
+                        .deleted(file.deleted)
+                        .selected(selected == Some(index))
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |view, cx| view.select_file(index, cx));
+                        }),
+                    ),
+            );
+        }
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .child(list)
+            .child(Scrollbar::vertical(
+                "details-files-bar",
+                self.files_scroll.clone(),
+            ))
     }
 
     fn render_status_bar(&self, cx: &Context<Self>) -> Div {
@@ -1567,6 +1989,34 @@ fn details_pane(label: &'static str, colors: ThemeColors) -> Div {
         .child(label)
 }
 
+/// A muted one-line note, for an empty pane or a cleared selection.
+fn muted_note(label: &'static str, colors: ThemeColors) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p(px(16.))
+        .text_size(FS_SM)
+        .text_color(colors.muted)
+        .child(label)
+}
+
+/// One label/value row of the details metadata grid.
+fn meta_row(label: &'static str, value: impl IntoElement, colors: ThemeColors) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .child(
+            div()
+                .w(px(74.))
+                .flex_none()
+                .text_color(colors.muted)
+                .child(label),
+        )
+        .child(div().flex_1().min_w_0().child(value))
+}
+
 /// A click, Enter/Space or ←/→ on an expandable row flips its expansion.
 fn node_toggler(
     rows: Vec<(SharedString, bool, bool)>,
@@ -1856,6 +2306,63 @@ mod tests {
             .update(|window, _| window.root::<RepositoryView>().flatten())
             .expect("the repository view is the window root");
         (cx, view)
+    }
+
+    /// Selecting a commit loads its details and changed files into the dock,
+    /// and clicking another row replaces them.
+    #[gpui::test]
+    fn selecting_a_commit_fills_the_details_dock(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+
+        let repo = crate::test_support::TempRepo::new("details-panel");
+        commit(repo.path(), "a.txt", "one\ntwo\n");
+        commit(repo.path(), "b.txt", "three\n");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, _| {
+            let details = view
+                .details
+                .details()
+                .expect("the selected commit's details did not load");
+            assert_eq!(details.summary, "three");
+            let files = view
+                .details
+                .files()
+                .expect("the changed files did not load");
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].path, "b.txt");
+            assert_eq!(
+                view.selected_file,
+                Some(0),
+                "the first file is not selected"
+            );
+        });
+        assert!(
+            cx.debug_bounds("details-file-0").is_some(),
+            "the changed file row was not drawn"
+        );
+
+        // Clicking the older row loads that commit instead.
+        let row = cx
+            .debug_bounds("history-row-1")
+            .expect("the second history row was not drawn");
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            let details = view
+                .details
+                .details()
+                .expect("the clicked commit's details did not load");
+            assert_eq!(details.summary, "one two");
+            let files = view
+                .details
+                .files()
+                .expect("the changed files did not load");
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].path, "a.txt");
+            assert_eq!(view.selected_file, Some(0));
+        });
     }
 
     /// Lets the 150 ms search debounce and the background scan finish. The

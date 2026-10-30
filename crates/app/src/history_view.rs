@@ -1556,6 +1556,13 @@ impl HistoryView {
             .map(|item| item.commit.id.short().into())
     }
 
+    /// The selected commit, for the details dock.
+    pub fn selected_commit(&self) -> Option<Arc<CommitInfo>> {
+        self.selected
+            .and_then(|ix| self.items.get(ix))
+            .map(|item| item.commit.clone())
+    }
+
     /// The graph header cell: the label, the "+N" clipped-lanes pill, the
     /// resize grip and the right-click menu.
     fn render_graph_header(&self, columns: Columns, cx: &Context<Self>) -> impl IntoElement {

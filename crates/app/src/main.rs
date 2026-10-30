@@ -1,3 +1,4 @@
+mod details;
 mod format;
 mod graph_paint;
 mod history_search;
