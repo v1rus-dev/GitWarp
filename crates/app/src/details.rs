@@ -8,6 +8,7 @@ use std::sync::Arc;
 use git_core::{ChangedFile, CommitDetails, FileDiff, Git, Oid, Repo};
 
 use crate::diff_model::{build_rows, build_split_rows, max_columns, DiffRow, SplitRow};
+use crate::syntax::Highlighted;
 
 /// What the details dock knows about the selected commit.
 #[derive(Clone, Debug, Default)]
@@ -51,6 +52,8 @@ pub struct DiffData {
     pub split_rows: Vec<SplitRow>,
     /// Widest row in display columns, for the horizontal scroll width.
     pub columns: usize,
+    /// Syntax spans for the old and new text.
+    pub highlight: Arc<Highlighted>,
 }
 
 /// What the diff pane knows about the selected file.
@@ -83,6 +86,7 @@ pub fn read_diff(
     root: &Path,
     oid: Oid,
     file: &ChangedFile,
+    cached: Option<Arc<Highlighted>>,
 ) -> Result<DiffData, String> {
     let repo = Repo::open(git, root).map_err(|error| error.to_string())?;
     let diff = repo
@@ -91,10 +95,21 @@ pub fn read_diff(
     let rows = build_rows(&diff.hunks);
     let split_rows = build_split_rows(&rows);
     let columns = max_columns(&rows);
+    let highlight = match cached {
+        Some(highlight) => highlight,
+        None => match repo.file_texts(oid, &file.path, file.old_path.as_deref()) {
+            Ok(texts) => Arc::new(crate::syntax::highlight(&file.path, &texts)),
+            Err(error) => {
+                log::warn!("could not read the file text for highlighting: {error}");
+                Arc::new(Highlighted::default())
+            }
+        },
+    };
     Ok(DiffData {
         diff,
         rows,
         split_rows,
         columns,
+        highlight,
     })
 }

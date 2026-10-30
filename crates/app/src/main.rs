@@ -10,6 +10,7 @@ mod open_dialog;
 mod repo_view;
 mod settings;
 mod sidebar;
+mod syntax;
 #[cfg(test)]
 mod test_support;
 mod theme;

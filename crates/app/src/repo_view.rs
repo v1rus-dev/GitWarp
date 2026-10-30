@@ -5,6 +5,7 @@
 //! stage is a placeholder or a disabled control, never a dead click.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -40,6 +41,7 @@ use crate::sidebar::{
     commit_for, read_sidebar_extras, sidebar_menu, sidebar_nodes, Expansion, SidebarAction,
     SidebarExtras, SidebarMenuEntry,
 };
+use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
@@ -334,6 +336,8 @@ pub struct RepositoryView {
     mono_cell: Pixels,
     /// Unified or side-by-side, persisted in the settings.
     diff_layout: DiffLayout,
+    /// Syntax spans per (commit, path), so revisiting a file is free.
+    highlight_cache: HashMap<(Oid, String), Arc<Highlighted>>,
     info_scroll: ScrollHandle,
     files_scroll: ScrollHandle,
     /// The file list's keyboard focus; arrow keys move the file selection only
@@ -470,6 +474,7 @@ impl RepositoryView {
                 )
                 .unwrap_or(px(7.2)),
             diff_layout: settings.diff_layout,
+            highlight_cache: HashMap::new(),
             info_scroll: ScrollHandle::new(),
             files_scroll: ScrollHandle::new(),
             files_focus: cx.focus_handle().tab_stop(true),
@@ -867,17 +872,31 @@ impl RepositoryView {
                 return;
             }
         };
+        let key = (oid, file.path.clone());
+        let cached = self.highlight_cache.get(&key).cloned();
         let root = self.root.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { read_diff(git, &root, oid, &file) })
+                .spawn(async move { read_diff(git, &root, oid, &file, cached) })
                 .await;
             this.update(cx, |view, cx| view.set_diff(generation, result, cx))
                 .ok();
         })
         .detach();
         cx.notify();
+    }
+
+    /// Keeps the syntax spans of a file, dropping the oldest entry past the
+    /// cache's small cap.
+    fn cache_highlight(&mut self, key: (Oid, String), spans: Arc<Highlighted>) {
+        const LIMIT: usize = 64;
+        if self.highlight_cache.len() >= LIMIT && !self.highlight_cache.contains_key(&key) {
+            if let Some(oldest) = self.highlight_cache.keys().next().cloned() {
+                self.highlight_cache.remove(&oldest);
+            }
+        }
+        self.highlight_cache.insert(key, spans);
     }
 
     /// Switches the diff pane between unified and side-by-side and remembers
@@ -903,7 +922,17 @@ impl RepositoryView {
             return;
         }
         match result {
-            Ok(data) => self.diff = DiffState::Loaded(Arc::new(data)),
+            Ok(data) => {
+                if let (Some(oid), Some(file)) = (
+                    self.details_oid,
+                    self.selected_file
+                        .and_then(|index| self.details.files().and_then(|files| files.get(index)))
+                        .cloned(),
+                ) {
+                    self.cache_highlight((oid, file.path.clone()), data.highlight.clone());
+                }
+                self.diff = DiffState::Loaded(Arc::new(data));
+            }
             Err(error) => {
                 log::warn!("could not read the file diff: {error}");
                 self.diff = DiffState::Failed(error);
@@ -1903,6 +1932,7 @@ impl RepositoryView {
                             cx.processor(move |view, range, window, cx| {
                                 view.render_split_rows(
                                     &data.split_rows,
+                                    &data.highlight,
                                     range,
                                     row_width,
                                     window,
@@ -1924,7 +1954,14 @@ impl RepositoryView {
                             "details-diff",
                             data.rows.len(),
                             cx.processor(move |view, range, window, cx| {
-                                view.render_diff_rows(&data.rows, range, row_width, window, cx)
+                                view.render_diff_rows(
+                                    &data.rows,
+                                    &data.highlight,
+                                    range,
+                                    row_width,
+                                    window,
+                                    cx,
+                                )
                             }),
                         )
                         .with_horizontal_sizing_behavior(
@@ -1962,6 +1999,7 @@ impl RepositoryView {
     fn render_diff_rows(
         &mut self,
         rows: &[DiffRow],
+        highlight: &Highlighted,
         range: std::ops::Range<usize>,
         width: Pixels,
         _window: &mut Window,
@@ -1970,8 +2008,21 @@ impl RepositoryView {
         let colors = cx.theme().colors;
         range
             .filter_map(|index| {
-                rows.get(index)
-                    .map(|row| diff_row(row, index, width, colors))
+                rows.get(index).map(|row| {
+                    let (old_spans, new_spans) = match row.kind {
+                        RowKind::Removed => (highlight.spans(true, row.old_line), &[][..]),
+                        RowKind::Added => (&[][..], highlight.spans(false, row.new_line)),
+                        _ => {
+                            let spans = if row.old_line.is_some() {
+                                highlight.spans(true, row.old_line)
+                            } else {
+                                highlight.spans(false, row.new_line)
+                            };
+                            (spans, &[][..])
+                        }
+                    };
+                    diff_row(row, index, width, colors, old_spans, new_spans)
+                })
             })
             .collect()
     }
@@ -1979,6 +2030,7 @@ impl RepositoryView {
     fn render_split_rows(
         &mut self,
         rows: &[SplitRow],
+        highlight: &Highlighted,
         range: std::ops::Range<usize>,
         width: Pixels,
         _window: &mut Window,
@@ -1989,7 +2041,7 @@ impl RepositoryView {
         range
             .filter_map(|index| {
                 rows.get(index)
-                    .map(|row| split_row(row, index, width, half, colors))
+                    .map(|row| split_row(row, index, width, half, colors, highlight))
             })
             .collect()
     }
@@ -2305,7 +2357,14 @@ fn diff_width(cell: Pixels, columns: usize, pane: f32) -> Pixels {
 }
 
 /// One unified-view row: a hunk header, a numbered line or a no-newline note.
-fn diff_row(row: &DiffRow, index: usize, width: Pixels, colors: ThemeColors) -> AnyElement {
+fn diff_row(
+    row: &DiffRow,
+    index: usize,
+    width: Pixels,
+    colors: ThemeColors,
+    old_spans: &[HighlightSpan],
+    new_spans: &[HighlightSpan],
+) -> AnyElement {
     let base = div()
         .id(SharedString::from(format!("diff-row-{index}")))
         .debug_selector(move || format!("diff-row-{index}"))
@@ -2345,6 +2404,11 @@ fn diff_row(row: &DiffRow, index: usize, width: Pixels, colors: ThemeColors) -> 
                 ),
                 _ => (None, None, None, colors.diff_add_strong),
             };
+            let spans = match row.kind {
+                RowKind::Removed => old_spans,
+                RowKind::Added => new_spans,
+                _ => old_spans,
+            };
             base.child(diff_gutter(row.old_line, old_background, colors))
                 .child(diff_gutter(row.new_line, new_background, colors))
                 .child(diff_marker(row.kind, line_background, colors))
@@ -2362,7 +2426,8 @@ fn diff_row(row: &DiffRow, index: usize, width: Pixels, colors: ThemeColors) -> 
                         .child(styled_diff_text(
                             &row.text,
                             &row.emphasis,
-                            colors.text,
+                            spans,
+                            colors,
                             strong,
                         )),
                 )
@@ -2420,6 +2485,7 @@ fn split_row(
     width: Pixels,
     half: Pixels,
     colors: ThemeColors,
+    highlight: &Highlighted,
 ) -> AnyElement {
     let base = div()
         .id(SharedString::from(format!("split-row-{index}")))
@@ -2446,13 +2512,23 @@ fn split_row(
             .into_any_element(),
         SplitRow::Pair { old, new } => base
             .child(split_gutter(old.as_ref(), colors))
-            .child(split_content(old.as_ref(), half, colors))
+            .child(split_content(
+                old.as_ref(),
+                half,
+                colors,
+                highlight.spans(true, old.as_ref().map(|cell| cell.line)),
+            ))
             .child(
                 split_gutter(new.as_ref(), colors)
                     .border_l_1()
                     .border_color(colors.border),
             )
-            .child(split_content(new.as_ref(), half, colors))
+            .child(split_content(
+                new.as_ref(),
+                half,
+                colors,
+                highlight.spans(false, new.as_ref().map(|cell| cell.line)),
+            ))
             .into_any_element(),
     }
 }
@@ -2479,7 +2555,12 @@ fn split_gutter(cell: Option<&SplitCell>, colors: ThemeColors) -> Div {
 }
 
 /// One half of a split row. A missing side is a hatched filler.
-fn split_content(cell: Option<&SplitCell>, width: Pixels, colors: ThemeColors) -> Div {
+fn split_content(
+    cell: Option<&SplitCell>,
+    width: Pixels,
+    colors: ThemeColors,
+    spans: &[HighlightSpan],
+) -> Div {
     let content = div()
         .w(width)
         .flex_none()
@@ -2490,7 +2571,7 @@ fn split_content(cell: Option<&SplitCell>, width: Pixels, colors: ThemeColors) -
         .pr(px(6.))
         .overflow_hidden();
     let Some(cell) = cell else {
-        return content.bg(gpui::pattern_slash(colors.hover, 1., 5.));
+        return content.bg(gpui::pattern_slash(colors.active, 1., 5.));
     };
     let (background, strong) = match cell.kind {
         SplitCellKind::Added => (Some(colors.diff_add_bg), colors.diff_add_strong),
@@ -2503,7 +2584,8 @@ fn split_content(cell: Option<&SplitCell>, width: Pixels, colors: ThemeColors) -
         .child(styled_diff_text(
             &cell.text,
             &cell.emphasis,
-            colors.text,
+            spans,
+            colors,
             strong,
         ))
 }
@@ -2515,31 +2597,45 @@ fn split_content(cell: Option<&SplitCell>, width: Pixels, colors: ThemeColors) -
 fn styled_diff_text(
     text: &str,
     emphasis: &[std::ops::Range<usize>],
-    color: Hsla,
+    spans: &[HighlightSpan],
+    colors: ThemeColors,
     background: Hsla,
 ) -> StyledText {
-    if emphasis.is_empty() {
+    if emphasis.is_empty() && spans.is_empty() {
         return StyledText::new(SharedString::from(text.to_owned()));
     }
     let font = gpui::font(FONT_MONO);
-    let mut runs = Vec::new();
-    let mut cursor = 0;
-    for range in emphasis {
-        let start = range.start.clamp(cursor, text.len());
-        let end = range.end.clamp(start, text.len());
-        if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
-            continue;
-        }
-        if cursor < start {
-            runs.push(diff_text_run(start - cursor, &font, color, None));
-        }
-        runs.push(diff_text_run(end - start, &font, color, Some(background)));
-        cursor = end;
-    }
-    if cursor < text.len() {
-        runs.push(diff_text_run(text.len() - cursor, &font, color, None));
+    let runs = syntax::line_segments(text, spans, emphasis)
+        .into_iter()
+        .map(|segment| {
+            let color = segment
+                .token
+                .map(|token| token_color(token, colors))
+                .unwrap_or(colors.text);
+            diff_text_run(
+                segment.range.len(),
+                &font,
+                color,
+                segment.changed.then_some(background),
+            )
+        })
+        .collect::<Vec<_>>();
+    if runs.is_empty() {
+        return StyledText::new(SharedString::from(text.to_owned()));
     }
     StyledText::new(SharedString::from(text.to_owned())).with_runs(runs)
+}
+
+/// The theme colour of a syntax token.
+fn token_color(token: Token, colors: ThemeColors) -> Hsla {
+    match token {
+        Token::Keyword => colors.code_kw,
+        Token::String => colors.code_str,
+        Token::Number => colors.code_num,
+        Token::Comment => colors.code_com,
+        Token::Type => colors.code_ty,
+        Token::Function => colors.code_fn,
+    }
 }
 
 fn diff_text_run(len: usize, font: &gpui::Font, color: Hsla, background: Option<Hsla>) -> TextRun {
@@ -3000,7 +3096,7 @@ mod tests {
     #[gpui::test]
     fn the_diff_toggle_switches_to_side_by_side_and_persists(cx: &mut gpui::TestAppContext) {
         let repo = crate::test_support::TempRepo::new("details-split");
-        commit(repo.path(), "a.txt", "one\ntwo\n");
+        commit(repo.path(), "main.rs", "fn main() {}\n");
         cx.update(|cx| {
             cx.set_global(crate::AppSettings {
                 path: None,
@@ -3025,6 +3121,11 @@ mod tests {
                 panic!("the diff did not load");
             };
             assert!(!diff.split_rows.is_empty());
+            assert_eq!(diff.highlight.language, Some("rust"));
+            assert!(
+                !diff.highlight.new.is_empty(),
+                "the new side was not highlighted"
+            );
         });
         assert!(
             cx.debug_bounds("split-row-0").is_some(),
