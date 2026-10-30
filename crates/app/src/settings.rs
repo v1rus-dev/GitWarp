@@ -52,10 +52,12 @@ impl Default for Settings {
 #[allow(dead_code)] // used by the welcome screen (stage 2.3+)
 impl Settings {
     /// Moves `path` to the front of the recent list with `now` as its time.
+    ///
+    /// The path is stored as given (callers canonicalize once, off the UI
+    /// thread, when they insert a repository root) and compared as stored:
+    /// touching the list must not call into the file system.
     pub fn touch_recent(&mut self, path: PathBuf, now: u64) {
-        let path = canonical_or_self(&path);
-        self.recent
-            .retain(|repo| canonical_or_self(&repo.path) != path);
+        self.recent.retain(|repo| repo.path != path);
         self.recent.insert(
             0,
             RecentRepo {
@@ -68,9 +70,7 @@ impl Settings {
 
     /// Removes `path` from the recent list, if present.
     pub fn remove_recent(&mut self, path: &Path) {
-        let path = canonical_or_self(path);
-        self.recent
-            .retain(|repo| canonical_or_self(&repo.path) != path);
+        self.recent.retain(|repo| repo.path != path);
     }
 
     /// Clamps layout sizes and drops values that cannot be used.
@@ -202,7 +202,11 @@ impl SettingsStore {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
-        let tmp = self.path.with_file_name("settings.json.tmp");
+        // Unique per process, so two instances saving at once cannot rename
+        // each other's half-written file over the settings.
+        let tmp = self
+            .path
+            .with_file_name(format!("settings.json.{}.tmp", std::process::id()));
         let mut file = fs::File::create(&tmp)?;
         file.write_all(&json)?;
         file.sync_all()?;
@@ -268,11 +272,6 @@ fn take_recent(object: &mut Map<String, Value>) -> Vec<RecentRepo> {
             }
         })
         .collect()
-}
-
-/// The canonical form of `path` when it exists, else the path itself.
-fn canonical_or_self(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -434,7 +433,34 @@ mod tests {
         let store = SettingsStore::new(settings_path(dir.path()));
         store.save(&Settings::default()).unwrap();
         assert!(settings_path(dir.path()).exists());
-        assert!(!dir.path().join("settings.json.tmp").exists());
+        let temp = dir
+            .path()
+            .join(format!("settings.json.{}.tmp", std::process::id()));
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn touching_dedupes_as_stored_without_canonicalizing() {
+        // Two spellings of the same directory stay two entries: the list is
+        // compared as stored, and only an identical stored path is replaced.
+        let dir = TempDir::new("dedupe");
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let alias = repo.join("..").join("repo");
+        assert_ne!(repo, alias);
+
+        let mut settings = Settings::default();
+        settings.touch_recent(repo.clone(), 1);
+        settings.touch_recent(alias.clone(), 2);
+        assert_eq!(paths(&settings), vec![alias.as_path(), repo.as_path()]);
+        assert_eq!(
+            settings.recent[0].path, alias,
+            "the path is stored as given"
+        );
+
+        settings.touch_recent(repo.clone(), 3);
+        assert_eq!(paths(&settings), vec![repo.as_path(), alias.as_path()]);
+        assert_eq!(settings.recent[0].last_opened, 3);
     }
 
     #[cfg(target_os = "linux")]

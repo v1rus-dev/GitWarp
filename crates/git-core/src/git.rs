@@ -242,6 +242,11 @@ impl Git {
     pub fn source(&self) -> GitSource {
         self.source
     }
+
+    /// The executable this handle runs.
+    pub fn path(&self) -> &Path {
+        &self.exe
+    }
 }
 
 fn check_floor(found: GitVersion, source: GitSource, path: &Path) -> Result<()> {

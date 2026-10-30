@@ -242,12 +242,12 @@ fn init_creates_a_missing_directory_too() {
     assert_eq!(repo.commit_count().unwrap(), 0);
 }
 
-/// Gives the in-process git commands a user identity for the duration of a
-/// test. `Repo::init_with` deliberately uses the user's own configuration, so
-/// the test has to provide one instead of passing `-c`.
+/// A throw-away global git configuration for `Repo::init_with_env`, so the
+/// test never mutates the process environment (which every test thread
+/// shares). `init_with` deliberately uses the user's own configuration, so the
+/// test has to provide one instead of passing `-c`.
 struct TestIdentity {
-    global: Option<std::ffi::OsString>,
-    nosystem: Option<std::ffi::OsString>,
+    config: std::path::PathBuf,
 }
 
 impl TestIdentity {
@@ -258,24 +258,15 @@ impl TestIdentity {
             "[user]\n\tname = Test\n\temail = test@example.com\n[commit]\n\tgpgsign = false\n",
         )
         .unwrap();
-        let global = std::env::var_os("GIT_CONFIG_GLOBAL");
-        let nosystem = std::env::var_os("GIT_CONFIG_NOSYSTEM");
-        std::env::set_var("GIT_CONFIG_GLOBAL", &config);
-        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
-        Self { global, nosystem }
+        Self { config }
     }
-}
 
-impl Drop for TestIdentity {
-    fn drop(&mut self) {
-        match &self.global {
-            Some(value) => std::env::set_var("GIT_CONFIG_GLOBAL", value),
-            None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
-        }
-        match &self.nosystem {
-            Some(value) => std::env::set_var("GIT_CONFIG_NOSYSTEM", value),
-            None => std::env::remove_var("GIT_CONFIG_NOSYSTEM"),
-        }
+    /// The environment that points git at the throw-away configuration.
+    fn env(&self) -> [(&str, &str); 2] {
+        [
+            ("GIT_CONFIG_GLOBAL", self.config.to_str().unwrap()),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ]
     }
 }
 
@@ -302,9 +293,9 @@ fn init_with_sets_the_initial_branch() {
 fn init_with_makes_the_optional_initial_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("with-initial-commit");
-    let _identity = TestIdentity::install(tmp.path());
+    let identity = TestIdentity::install(tmp.path());
     let git = Arc::new(Git::resolve(GitChoice::System).unwrap().git);
-    let repo = Repo::init_with(git, &dir, Some("main"), true).unwrap();
+    let repo = Repo::init_with_env(git, &dir, Some("main"), true, &identity.env()).unwrap();
 
     assert!(dir.join(".gitignore").is_file());
     assert_eq!(repo.commit_count().unwrap(), 1);
@@ -322,6 +313,102 @@ fn init_with_makes_the_optional_initial_commit() {
         }
         other => panic!("unexpected head {other:?}"),
     }
+}
+
+/// The user's `.gitignore` is theirs: it keeps its content and is what the
+/// initial commit adds.
+#[test]
+fn init_with_keeps_an_existing_gitignore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("own-gitignore");
+    std::fs::create_dir(&dir).unwrap();
+    let content = b"target/\n*.log\n# keep this\n";
+    std::fs::write(dir.join(".gitignore"), content).unwrap();
+    let identity = TestIdentity::install(tmp.path());
+    let git = Arc::new(Git::resolve(GitChoice::System).unwrap().git);
+    let repo = Repo::init_with_env(git, &dir, Some("main"), true, &identity.env()).unwrap();
+
+    assert_eq!(std::fs::read(dir.join(".gitignore")).unwrap(), content);
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["show", "--stat", "--format=", "HEAD"])
+        .output()
+        .unwrap();
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(shown.contains(".gitignore"), "{shown}");
+    assert_eq!(repo.commit_count().unwrap(), 1);
+}
+
+/// Only `.gitignore` may enter the initial commit; files in the folder stay
+/// untracked.
+#[test]
+fn init_with_commits_only_the_gitignore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("extra-files");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("notes.txt"), b"draft\n").unwrap();
+    let identity = TestIdentity::install(tmp.path());
+    let git = Arc::new(Git::resolve(GitChoice::System).unwrap().git);
+    Repo::init_with_env(git, &dir, Some("main"), true, &identity.env()).unwrap();
+
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["ls-tree", "--name-only", "HEAD"])
+        .output()
+        .unwrap();
+    let names = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(names.trim(), ".gitignore");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&status.stdout).contains("notes.txt"));
+}
+
+#[test]
+fn init_with_refuses_an_existing_repository() {
+    let tmp = sample_repo();
+    let before = open(tmp.path()).unwrap().head().unwrap();
+    let git = Arc::new(Git::resolve(GitChoice::System).unwrap().git);
+    match Repo::init(git, tmp.path()) {
+        Err(git_core::Error::AlreadyARepository { root }) => {
+            assert_eq!(root, tmp.path().canonicalize().unwrap());
+        }
+        other => panic!("unexpected result {other:?}"),
+    }
+    assert_eq!(open(tmp.path()).unwrap().head().unwrap(), before);
+}
+
+#[test]
+fn init_with_refuses_a_subfolder_of_a_repository() {
+    let tmp = sample_repo();
+    let sub = tmp.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let git = Arc::new(Git::resolve(GitChoice::System).unwrap().git);
+    match Repo::init(git, &sub) {
+        Err(git_core::Error::AlreadyARepository { root }) => {
+            assert_eq!(root, tmp.path().canonicalize().unwrap());
+        }
+        other => panic!("unexpected result {other:?}"),
+    }
+    assert!(!sub.join(".git").exists());
+}
+
+#[test]
+fn killing_a_log_stops_git() {
+    let tmp = sample_repo();
+    let repo = open(tmp.path()).unwrap();
+    let mut stream = repo.log(&LogOptions::default()).unwrap();
+    let killer = stream.killer();
+    killer.kill();
+    assert!(!killer.is_running(), "git log is still running");
+    // The stream ends after the kill: either with no commits or an error.
+    let rest: Vec<_> = stream.by_ref().collect();
+    assert!(rest.iter().all(|item| item.is_err()) || rest.is_empty());
 }
 
 #[test]

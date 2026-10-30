@@ -32,6 +32,10 @@ pub enum Error {
     NotARepository {
         path: PathBuf,
     },
+    /// `git init` was asked for a path that is already inside a working tree.
+    AlreadyARepository {
+        root: PathBuf,
+    },
     /// The opened path does not exist (or is not a directory).
     PathNotFound {
         path: PathBuf,
@@ -142,6 +146,13 @@ impl fmt::Display for Error {
             ),
             Error::NotARepository { path } => {
                 write!(f, "{} is not a git repository", path.display())
+            }
+            Error::AlreadyARepository { root } => {
+                write!(
+                    f,
+                    "the folder is already inside a git repository at {}",
+                    root.display()
+                )
             }
             Error::PathNotFound { path } => write!(f, "{} does not exist", path.display()),
             Error::Git {
@@ -271,6 +282,15 @@ mod tests {
             err.class(),
             ErrorClass::PathNotFound(Path::new("/tmp/gone"))
         );
+    }
+
+    #[test]
+    fn an_already_initialized_folder_names_the_root() {
+        let err = Error::AlreadyARepository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        assert_eq!(err.class(), ErrorClass::Other);
+        assert!(err.to_string().contains("/tmp/repo"), "{err}");
     }
 
     #[test]

@@ -42,6 +42,11 @@ pub enum Failure {
         code: Option<i32>,
         stderr: SharedString,
     },
+    /// A failure with no git command behind it (I/O, a parse error): only the
+    /// message is known.
+    Other {
+        message: SharedString,
+    },
 }
 
 impl Failure {
@@ -72,12 +77,10 @@ impl Failure {
                     code: *code,
                     stderr: stderr.trim().into(),
                 },
-                // I/O and parse failures have no command output; show their
-                // message in the same box instead of dropping it.
-                other => Failure::Git {
-                    command: "log --all --topo-order".into(),
-                    code: None,
-                    stderr: other.to_string().into(),
+                // I/O and parse failures have no command output: show their
+                // message in the same box instead of inventing the command.
+                other => Failure::Other {
+                    message: other.to_string().into(),
                 },
             },
         }
@@ -91,10 +94,11 @@ impl Failure {
             Failure::GitNotFound => "git was not found".into(),
             Failure::GitTooOld { found, .. } => format!("git {found} is too old").into(),
             Failure::Git { .. } => "git could not read the history".into(),
+            Failure::Other { .. } => "GitWarp could not read the history".into(),
         }
     }
 
-    /// The "Copy details" clipboard text, for the generic git failure.
+    /// The "Copy details" clipboard text, for the failures that have one.
     pub fn copy_details(&self) -> Option<String> {
         match self {
             Failure::Git {
@@ -105,8 +109,33 @@ impl Failure {
                 Some(code) => format!("git {command}\nexit code {code}\n\n{stderr}"),
                 None => format!("git {command}\nstopped\n\n{stderr}"),
             }),
+            Failure::Other { message } => Some(message.to_string()),
             _ => None,
         }
+    }
+}
+
+/// The body sentence for a git that cannot be used at all, or `None` when the
+/// error is about the folder instead. The history states and the Open dialog
+/// share this copy.
+pub fn git_unavailable_message(error: &Error) -> Option<String> {
+    match error.class() {
+        ErrorClass::GitNotFound => Some(
+            "GitWarp could not find a usable git. The bundled copy is missing and there is no \
+             `git` in PATH."
+                .to_owned(),
+        ),
+        ErrorClass::GitTooOld {
+            found,
+            required,
+            source,
+            path,
+        } => Some(format!(
+            "GitWarp needs git {required} or newer. {} git at {} reports {found}.",
+            source_label(source),
+            path.display()
+        )),
+        _ => None,
     }
 }
 
@@ -242,17 +271,23 @@ mod tests {
 
         let io = Error::Io(std::io::Error::other("pipe closed"));
         match Failure::from_error(&io) {
-            Failure::Git {
-                command,
-                code,
-                stderr,
-            } => {
-                assert_eq!(command.as_ref(), "log --all --topo-order");
-                assert_eq!(code, None);
-                assert!(stderr.contains("pipe closed"), "{stderr}");
+            Failure::Other { message } => {
+                assert!(message.contains("pipe closed"), "{message}");
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_io_failure_does_not_invent_a_git_command() {
+        let io = Error::Io(std::io::Error::other("pipe closed"));
+        let failure = Failure::from_error(&io);
+        assert_eq!(failure.title(), "GitWarp could not read the history");
+        assert_eq!(
+            failure.copy_details().as_deref(),
+            Some("I/O error: pipe closed")
+        );
+        assert!(!failure.copy_details().unwrap().contains("git log"));
     }
 
     #[test]
@@ -322,6 +357,13 @@ mod tests {
             }
             .title(),
             "git could not read the history"
+        );
+        assert_eq!(
+            Failure::Other {
+                message: "pipe closed".into()
+            }
+            .title(),
+            "GitWarp could not read the history"
         );
     }
 

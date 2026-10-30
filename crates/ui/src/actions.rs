@@ -30,7 +30,7 @@ actions!(
 ///
 /// `KeyBinding::new` parses without an OS, so `secondary-` there is an error;
 /// bindings that name it must go through `KeyBinding::load`.
-pub(crate) fn key_binding(
+pub fn key_binding(
     cx: &App,
     keystrokes: &str,
     action: impl Action,

@@ -1,21 +1,21 @@
 //! The "Open from folder" dialog: the folder field, the live probe banner, the
 //! recent folders and the optional initialization of a plain folder.
 //!
-//! The probe runs in the background and is debounced; every keystroke bumps a
-//! generation counter and a result for an older generation is dropped, so the
-//! banner never describes a previous value of the field.
+//! The probe and `git init` live in [`crate::init_flow`], shared with the
+//! welcome screen's Initialize dialog; this module owns the fields and the
+//! recent list.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use gpui::{
-    div, px, AnyElement, App, AppContext, ClickEvent, Context, ElementId, Entity, FocusHandle,
-    InteractiveElement, IntoElement, ParentElement, PathPromptOptions, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window,
+    div, px, App, AppContext, ClickEvent, Context, ElementId, Entity, FocusHandle,
+    InteractiveElement, IntoElement, ParentElement, PathPromptOptions, StatefulInteractiveElement,
+    Styled, Subscription, WeakEntity, Window,
 };
 
-use git_core::{probe_folder, Error, FolderProbe, Git, Repo};
+use git_core::{Error, FolderProbe, Git};
 use ui::metrics::{FONT_MONO, FS_BASE, FS_SM, MONO, R_MD};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
@@ -23,152 +23,29 @@ use ui::{
     Icon, IconName, TextInput, TextInputEvent, ToastKind,
 };
 
-use crate::format::{display_path, expand_home, format_count, home_dir};
+use crate::format::{display_path, expand_home, home_dir};
+use crate::init_flow::{banner_body, details, DialogKind, InitFlow, StatusKind};
 use crate::settings::RecentRepo;
 use crate::workspace::{repo_name, Workspace};
 
-/// The field's debounce: a probe starts this long after the last keystroke.
-const PROBE_DEBOUNCE: Duration = Duration::from_millis(250);
 /// How many recent folders the list shows.
 const RECENT_SHOWN: usize = 6;
-
-/// The outcome of a probe, with git's message flattened for the banner.
-type ProbeResult = Result<FolderProbe, String>;
-
-/// The dialog's border state, before the labels and texts are looked up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StatusKind {
-    Empty,
-    Probing,
-    Repo,
-    Nested,
-    Plain,
-    Missing,
-    Failed,
-}
-
-/// Everything the footer and the banner need for one status. `banner` is the
-/// kind and title; the body text is built separately because it contains mono
-/// spans and, for a plain folder, the initialize controls.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct StatusSpec {
-    kind: StatusKind,
-    banner: Option<(BannerKind, &'static str)>,
-    primary: &'static str,
-    enabled: bool,
-    hint: Option<&'static str>,
-}
-
-const OPEN: &str = "Open";
-const INITIALIZE: &str = "Initialize and open";
-
-/// The status of a folder field with `text`, `probing` and `result`.
-///
-/// While a probe runs the previous banner stays (`result`), so typing does not
-/// flash an empty dialog; only the primary button is disabled.
-fn status_spec(
-    field_empty: bool,
-    probing: bool,
-    result: Option<&ProbeResult>,
-    branch_blank: bool,
-) -> StatusSpec {
-    if field_empty {
-        return StatusSpec {
-            kind: StatusKind::Empty,
-            banner: None,
-            primary: OPEN,
-            enabled: false,
-            hint: Some("Choose a folder to continue"),
-        };
-    }
-    let previous = |result: Option<&ProbeResult>| match result {
-        Some(result) => result_spec(result, branch_blank),
-        None => StatusSpec {
-            kind: StatusKind::Empty,
-            banner: None,
-            primary: OPEN,
-            enabled: false,
-            hint: None,
-        },
-    };
-    if probing {
-        let mut spec = previous(result);
-        spec.kind = StatusKind::Probing;
-        spec.enabled = false;
-        spec.hint = None;
-        return spec;
-    }
-    previous(result)
-}
-
-fn result_spec(result: &ProbeResult, branch_blank: bool) -> StatusSpec {
-    match result {
-        Ok(FolderProbe::Repo { .. }) => StatusSpec {
-            kind: StatusKind::Repo,
-            banner: Some((BannerKind::Ok, "Git repository found")),
-            primary: OPEN,
-            enabled: true,
-            hint: None,
-        },
-        Ok(FolderProbe::Nested { .. }) => StatusSpec {
-            kind: StatusKind::Nested,
-            banner: Some((BannerKind::Warn, "This folder is inside a repository")),
-            primary: OPEN,
-            enabled: true,
-            hint: None,
-        },
-        Ok(FolderProbe::Plain) => StatusSpec {
-            kind: StatusKind::Plain,
-            banner: Some((BannerKind::Info, "Not a Git repository yet")),
-            primary: INITIALIZE,
-            enabled: !branch_blank,
-            hint: None,
-        },
-        Ok(FolderProbe::Missing) => StatusSpec {
-            kind: StatusKind::Missing,
-            banner: Some((BannerKind::Error, "Folder does not exist")),
-            primary: OPEN,
-            enabled: false,
-            hint: Some("Choose an existing folder"),
-        },
-        Err(_) => StatusSpec {
-            kind: StatusKind::Failed,
-            banner: Some((BannerKind::Error, "Could not read this folder")),
-            primary: OPEN,
-            enabled: false,
-            hint: None,
-        },
-    }
-}
-
-/// Whether a probe result belongs to an older state of the field.
-fn is_stale(result_generation: u64, current_generation: u64) -> bool {
-    result_generation != current_generation
-}
 
 pub(crate) struct OpenRepoDialog {
     layer: Option<overlay::LayerId>,
     host: Option<Entity<DialogHost>>,
     workspace: WeakEntity<Workspace>,
-    git: Result<Arc<Git>, Arc<Error>>,
+    /// The probe and the initialize state, shared with the welcome dialog.
+    flow: Entity<InitFlow>,
     folder: Entity<TextInput>,
     branch: Entity<TextInput>,
     /// For `~` in the field and in the recent folders.
     home: Option<PathBuf>,
     /// Set once the user typed in the field or picked a folder there.
     touched: bool,
-    /// A probe is scheduled or running; the banner keeps `result`.
-    probing: bool,
-    /// The last finished probe.
-    result: Option<ProbeResult>,
-    /// Bumped on every change of the field; older probes are dropped.
-    generation: u64,
     /// Set while the dialog fills the field itself: the change event that
     /// queues behind it must not restart the probe with the debounce.
     ignore_change: bool,
-    initial_commit: bool,
-    busy: bool,
-    init_error: Option<SharedString>,
     folder_focus: FocusHandle,
     browse_focus: FocusHandle,
     branch_focus: FocusHandle,
@@ -176,6 +53,7 @@ pub(crate) struct OpenRepoDialog {
     cancel_focus: FocusHandle,
     primary_focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
+    _flow_observer: Subscription,
 }
 
 /// What a folder picker answer means for the dialog.
@@ -207,31 +85,64 @@ impl OpenRepoDialog {
         });
         let folder_focus = folder.read(cx).focus_handle().clone();
         let branch_focus = branch.read(cx).focus_handle().clone();
+        let flow = cx.new(|_| InitFlow::new(git));
+
+        // Opening a repository (or finishing an init) closes this dialog and
+        // hands the root to the workspace.
+        let state = cx.entity().downgrade();
+        flow.update(cx, |flow, _| {
+            flow.set_on_open(Rc::new(move |root: PathBuf, created: bool, window, cx| {
+                let Some(dialog) = state.upgrade() else {
+                    return;
+                };
+                dialog.update(cx, |dialog, cx| {
+                    let label = display_path(&root, dialog.home.as_deref());
+                    let name = repo_name(&root);
+                    dialog.close(window, cx);
+                    if let Some(workspace) = dialog.workspace.upgrade() {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.open_repository(root.clone(), window, cx);
+                        });
+                    }
+                    if created {
+                        toast::show(
+                            ToastKind::Ok,
+                            format!("Initialized repository in {label}"),
+                            window,
+                            cx,
+                        );
+                    } else {
+                        toast::show(ToastKind::Ok, format!("Opened {name}"), window, cx);
+                    }
+                });
+            }));
+        });
+
         let subscriptions = vec![
             cx.subscribe(&folder, |this, _, event: &TextInputEvent, cx| {
                 this.on_folder_changed(event, cx)
             }),
             cx.subscribe(&branch, |this, _, _: &TextInputEvent, cx| {
                 this.notify_host(cx);
+                cx.notify();
             }),
         ];
+        let flow_observer = cx.observe(&flow, |this, _, cx| {
+            this.notify_host(cx);
+            this.sync_error_border(cx);
+            cx.notify();
+        });
 
         Self {
             layer: None,
             host: None,
             workspace,
-            git,
+            flow,
             folder,
             branch,
             home: home_dir(),
             touched: false,
-            probing: false,
-            result: None,
-            generation: 0,
             ignore_change: false,
-            initial_commit: true,
-            busy: false,
-            init_error: None,
             folder_focus,
             browse_focus: cx.focus_handle().tab_stop(true),
             branch_focus,
@@ -239,6 +150,7 @@ impl OpenRepoDialog {
             cancel_focus: cx.focus_handle().tab_stop(true),
             primary_focus: cx.focus_handle().tab_stop(true),
             _subscriptions: subscriptions,
+            _flow_observer: flow_observer,
         }
     }
 
@@ -248,10 +160,16 @@ impl OpenRepoDialog {
     }
 
     /// The state of the dialog as the banner and the footer show it.
-    fn spec(&self, cx: &App) -> StatusSpec {
+    fn spec(&self, cx: &App) -> crate::init_flow::StatusSpec {
         let empty = self.folder.read(cx).text().trim().is_empty();
         let branch_blank = self.branch.read(cx).text().trim().is_empty();
-        status_spec(empty, self.probing, self.result.as_ref(), branch_blank)
+        self.flow
+            .read(cx)
+            .spec(DialogKind::Open, empty, branch_blank)
+    }
+
+    fn busy(&self, cx: &App) -> bool {
+        self.flow.read(cx).busy()
     }
 
     fn notify_host(&self, cx: &mut App) {
@@ -270,13 +188,12 @@ impl OpenRepoDialog {
             return;
         }
         self.touched = true;
-        self.init_error = None;
         let text = self.folder.read(cx).text().trim().to_owned();
         if text.is_empty() {
-            self.reset_probe();
+            self.flow.update(cx, |flow, cx| flow.reset(cx));
         } else {
             let path = expand_home(&text, self.home.as_deref());
-            self.start_probe(path, true, cx);
+            self.flow.update(cx, |flow, cx| flow.probe(path, true, cx));
         }
         self.sync_error_border(cx);
         self.notify_host(cx);
@@ -295,61 +212,20 @@ impl OpenRepoDialog {
             .update(cx, |input, cx| input.set_text(label, cx));
     }
 
-    /// An empty field has no status: drop any result and any probe in flight.
-    fn reset_probe(&mut self) {
-        self.generation += 1;
-        self.probing = false;
-        self.result = None;
-    }
-
-    /// Starts a probe for `path`, after the debounce or at once.
-    fn start_probe(&mut self, path: PathBuf, debounced: bool, cx: &mut Context<Self>) {
-        self.generation += 1;
-        let generation = self.generation;
-        self.probing = true;
-        let git = self.git.clone();
-        cx.spawn(async move |this, cx| {
-            if debounced {
-                cx.background_executor().timer(PROBE_DEBOUNCE).await;
-            }
-            // A keystroke after this probe was scheduled made it obsolete.
-            let current = this.update(cx, |dialog, _| dialog.generation).ok();
-            if current != Some(generation) {
-                return;
-            }
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    match git {
-                        Ok(git) => probe_folder(git, &path).map_err(|error| error.to_string()),
-                        Err(error) => Err(error.to_string()),
-                    }
-                })
-                .await;
-            this.update(cx, |dialog, cx| dialog.finish_probe(generation, result, cx))
-                .ok();
-        })
-        .detach();
-    }
-
-    fn finish_probe(&mut self, generation: u64, result: ProbeResult, cx: &mut Context<Self>) {
-        if is_stale(generation, self.generation) {
-            return;
-        }
-        self.probing = false;
-        self.result = Some(result);
-        self.sync_error_border(cx);
-        self.notify_host(cx);
-        cx.notify();
-    }
-
-    /// The field shows the error border only for a missing folder the user
-    /// actually typed or picked.
+    /// The folder and branch fields show the error border only for input the
+    /// dialog itself cannot act on.
     fn sync_error_border(&mut self, cx: &mut Context<Self>) {
-        let missing = matches!(self.result, Some(Ok(FolderProbe::Missing)));
-        let error = self.touched && missing;
+        let empty = self.folder.read(cx).text().trim().is_empty();
+        let branch_blank = self.branch.read(cx).text().trim().is_empty();
+        let flow = self.flow.read(cx);
+        let spec = flow.spec(DialogKind::Open, empty, branch_blank);
+        let missing = matches!(flow.result(), Some(Ok(FolderProbe::Missing)));
+        let folder_error = self.touched && missing;
+        let branch_error = spec.kind == StatusKind::Plain && branch_blank;
         self.folder
-            .update(cx, |input, cx| input.set_error(error, cx));
+            .update(cx, |input, cx| input.set_error(folder_error, cx));
+        self.branch
+            .update(cx, |input, cx| input.set_error(branch_error, cx));
     }
 
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -386,10 +262,9 @@ impl OpenRepoDialog {
             Browse::Picked(Some(path)) => {
                 let label = display_path(&path, home.as_deref());
                 self.touched = true;
-                self.init_error = None;
                 self.set_folder_text(label, cx);
                 // The picker is an explicit choice: probe at once.
-                self.start_probe(path, false, cx);
+                self.flow.update(cx, |flow, cx| flow.probe(path, false, cx));
                 self.sync_error_border(cx);
                 self.notify_host(cx);
                 cx.notify();
@@ -411,9 +286,8 @@ impl OpenRepoDialog {
     fn choose_recent(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let label = display_path(&path, self.home.as_deref());
         self.touched = true;
-        self.init_error = None;
         self.set_folder_text(label, cx);
-        self.start_probe(path, false, cx);
+        self.flow.update(cx, |flow, cx| flow.probe(path, false, cx));
         self.sync_error_border(cx);
         self.notify_host(cx);
         cx.notify();
@@ -421,7 +295,7 @@ impl OpenRepoDialog {
 
     /// The primary button and Enter: open the repository or initialize one.
     fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy(cx) {
             return;
         }
         let spec = self.spec(cx);
@@ -430,27 +304,17 @@ impl OpenRepoDialog {
         }
         match spec.kind {
             StatusKind::Repo | StatusKind::Nested => {
-                let root = match self.result.as_ref() {
+                let root = match self.flow.read(cx).result() {
                     Some(Ok(FolderProbe::Repo { root, .. }))
                     | Some(Ok(FolderProbe::Nested { root })) => root.clone(),
                     _ => return,
                 };
-                self.open_root(root, window, cx);
+                self.flow
+                    .update(cx, |flow, cx| flow.open_root(root, window, cx));
             }
             StatusKind::Plain => self.start_init(window, cx),
             _ => {}
         }
-    }
-
-    fn open_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let name = repo_name(&root);
-        self.close(window, cx);
-        if let Some(workspace) = self.workspace.upgrade() {
-            workspace.update(cx, |workspace, cx| {
-                workspace.open_repository(root, window, cx);
-            });
-        }
-        toast::show(ToastKind::Ok, format!("Opened {name}"), window, cx);
     }
 
     /// Runs `init_with` off the UI thread; the dialog stays busy until it
@@ -458,78 +322,13 @@ impl OpenRepoDialog {
     fn start_init(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let folder_text = self.folder.read(cx).text().trim().to_owned();
         let branch_text = self.branch.read(cx).text().trim().to_owned();
-        if self.busy || folder_text.is_empty() {
+        if folder_text.is_empty() {
             return;
         }
         let path = expand_home(&folder_text, self.home.as_deref());
         let branch = (!branch_text.is_empty()).then_some(branch_text);
-        let initial_commit = self.initial_commit;
-        let git = match &self.git {
-            Ok(git) => git.clone(),
-            Err(error) => {
-                self.set_init_error(error.to_string(), cx);
-                return;
-            }
-        };
-
-        self.busy = true;
-        self.init_error = None;
-        self.notify_host(cx);
-        cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    Repo::init_with(git, &path, branch.as_deref(), initial_commit)
-                        .map(|repo| repo.root().to_path_buf())
-                        .map_err(|error| error.to_string())
-                })
-                .await;
-            this.update_in(cx, |dialog, window, cx| {
-                dialog.finish_init(result, window, cx)
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn finish_init(
-        &mut self,
-        result: Result<PathBuf, String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match result {
-            Ok(path) => {
-                let label = display_path(&path, self.home.as_deref());
-                self.close(window, cx);
-                if let Some(workspace) = self.workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.open_repository(path, window, cx);
-                    });
-                }
-                toast::show(
-                    ToastKind::Ok,
-                    format!("Initialized repository in {label}"),
-                    window,
-                    cx,
-                );
-            }
-            Err(message) => self.set_init_error(message, cx),
-        }
-    }
-
-    fn set_init_error(&mut self, message: String, cx: &mut Context<Self>) {
-        let message = message.trim();
-        let message = if message.is_empty() {
-            "git failed without a message"
-        } else {
-            message
-        };
-        self.busy = false;
-        self.init_error = Some(message.to_owned().into());
-        self.notify_host(cx);
-        cx.notify();
+        self.flow
+            .update(cx, |flow, cx| flow.start_init(path, branch, window, cx));
     }
 
     fn close(&mut self, window: &mut Window, cx: &mut App) {
@@ -568,7 +367,10 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
     let dialog = state.read(cx);
     let colors = cx.theme().colors;
     let spec = dialog.spec(cx);
-    let busy = dialog.busy;
+    let flow = dialog.flow.read(cx);
+    let busy = flow.busy();
+    let initial_commit = flow.initial_commit();
+    let init_error = flow.error().cloned();
     let recent = read_recent(cx);
 
     let label = |text: &'static str| div().text_size(FS_SM).text_color(colors.muted).child(text);
@@ -630,17 +432,17 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
     let mut has_status = false;
     if let Some((kind, title)) = spec.banner {
         let mut banner = Banner::new(kind, title);
-        if let Some(body) = banner_body(dialog) {
+        if let Some(body) = banner_body(flow, DialogKind::Open) {
             banner = banner.body(body);
         }
         status = status.child(banner);
         has_status = true;
     }
-    if let Some(extra) = status_details(state, spec.kind, cx) {
+    if let Some(extra) = details(flow, dialog.home.as_deref(), colors) {
         status = status.child(extra);
         has_status = true;
     }
-    if let Some(error) = dialog.init_error.clone() {
+    if let Some(error) = init_error {
         status = status.child(
             Banner::new(BannerKind::Error, "Could not initialize the repository").body(error),
         );
@@ -656,6 +458,16 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
         .child(field);
     if has_status {
         body = body.child(status);
+    }
+    if spec.kind == StatusKind::Plain && matches!(flow.result(), Some(Ok(FolderProbe::Plain))) {
+        body = body.child(init_controls(
+            state,
+            dialog.checkbox_focus.clone(),
+            dialog.branch.clone(),
+            initial_commit,
+            busy,
+            colors,
+        ));
     }
 
     if !recent.is_empty() {
@@ -737,117 +549,53 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
     panel
 }
 
-/// The plain part of the banner body: the sentences without mono spans.
-fn banner_body(dialog: &OpenRepoDialog) -> Option<SharedString> {
-    match dialog.result.as_ref()? {
-        Ok(FolderProbe::Plain) => Some("You can initialize one here and open it.".into()),
-        Ok(FolderProbe::Missing) => Some("Check the path, or choose a folder with Browse.".into()),
-        Err(message) => Some(message.clone().into()),
-        _ => None,
-    }
-}
-
-/// The banner's rich body (mono spans) and, for a plain folder, the
-/// initialize controls. `Banner` takes plain text, so this element sits after
-/// it instead of re-implementing the banner.
-fn status_details(
+/// The initialize controls of a plain folder: the initial-commit checkbox and
+/// the default branch field.
+#[allow(clippy::too_many_arguments)]
+fn init_controls(
     state: &Entity<OpenRepoDialog>,
-    kind: StatusKind,
-    cx: &App,
-) -> Option<AnyElement> {
-    let dialog = state.read(cx);
-    let colors = cx.theme().colors;
-    match dialog.result.as_ref()? {
-        Ok(FolderProbe::Repo {
-            root,
-            branch,
-            commits,
-        }) => {
-            let branch = branch.clone().unwrap_or_else(|| "detached HEAD".to_owned());
-            let commits = usize::try_from(*commits).unwrap_or(usize::MAX);
-            Some(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(4.))
-                    .text_size(FS_BASE)
-                    .text_color(colors.muted)
-                    .child(
-                        div()
-                            .font_family(FONT_MONO)
-                            .child(repo_name(root.as_path())),
-                    )
-                    .child("· branch")
-                    .child(div().font_family(FONT_MONO).child(branch))
-                    .child(format!("· {} commits", format_count(commits)))
-                    .into_any_element(),
-            )
+    checkbox_focus: FocusHandle,
+    branch: Entity<TextInput>,
+    initial_commit: bool,
+    busy: bool,
+    colors: ThemeColors,
+) -> impl IntoElement {
+    let toggle = {
+        let state = state.clone();
+        move |next: bool, _: &mut Window, cx: &mut App| {
+            state.update(cx, |dialog, cx| {
+                dialog
+                    .flow
+                    .update(cx, |flow, cx| flow.set_initial_commit(next, cx));
+                dialog.notify_host(cx);
+            });
         }
-        Ok(FolderProbe::Nested { root }) => {
-            let root = display_path(root.as_path(), dialog.home.as_deref());
-            Some(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(2.))
-                    .text_size(FS_BASE)
-                    .text_color(colors.muted)
-                    .child("The repository root is ")
-                    .child(
-                        div()
-                            .font_family(FONT_MONO)
-                            .max_w(px(420.))
-                            .truncate()
-                            .child(root),
-                    )
-                    .child(". GitWarp will open the root, not this subfolder.")
-                    .into_any_element(),
-            )
-        }
-        Ok(FolderProbe::Plain) if matches!(kind, StatusKind::Plain | StatusKind::Probing) => {
-            let busy = dialog.busy;
-            let toggle = {
-                let state = state.clone();
-                move |next: bool, _: &mut Window, cx: &mut App| {
-                    state.update(cx, |dialog, cx| {
-                        dialog.initial_commit = next;
-                        dialog.notify_host(cx);
-                    });
-                }
-            };
-            Some(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .child(
-                        Checkbox::new("open-initial-commit")
-                            .label("Create an initial commit with a .gitignore")
-                            .checked(dialog.initial_commit)
-                            .disabled(busy)
-                            .focus_handle(dialog.checkbox_focus.clone())
-                            .on_toggle(toggle),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.))
-                            .child(
-                                div()
-                                    .text_size(FS_SM)
-                                    .text_color(colors.muted)
-                                    .child("Default branch"),
-                            )
-                            .child(div().w(px(220.)).child(dialog.branch.clone())),
-                    )
-                    .into_any_element(),
-            )
-        }
-        _ => None,
-    }
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .child(
+            Checkbox::new("open-initial-commit")
+                .label("Create an initial commit with a .gitignore")
+                .checked(initial_commit)
+                .disabled(busy)
+                .focus_handle(checkbox_focus)
+                .on_toggle(toggle),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_size(FS_SM)
+                        .text_color(colors.muted)
+                        .child("Default branch"),
+                )
+                .child(div().w(px(220.)).child(branch)),
+        )
 }
 
 /// One row of the recent folders list: `Folder` 14 · name · path (mono).
@@ -925,124 +673,6 @@ fn read_recent(cx: &App) -> Vec<RecentRepo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn result(probe: FolderProbe) -> ProbeResult {
-        Ok(probe)
-    }
-
-    fn repo() -> ProbeResult {
-        result(FolderProbe::Repo {
-            root: PathBuf::from("/home/user/gitwarp"),
-            branch: Some("main".to_owned()),
-            commits: 21,
-        })
-    }
-
-    #[test]
-    fn an_empty_field_asks_for_a_folder_and_disables_open() {
-        let spec = status_spec(true, false, None, false);
-        assert_eq!(spec.kind, StatusKind::Empty);
-        assert_eq!(spec.banner, None);
-        assert_eq!(spec.primary, "Open");
-        assert!(!spec.enabled);
-        assert_eq!(spec.hint, Some("Choose a folder to continue"));
-    }
-
-    #[test]
-    fn a_repository_root_keeps_the_previous_banner_while_probing() {
-        let repo = repo();
-        let ready = status_spec(false, false, Some(&repo), false);
-        assert_eq!(
-            (ready.kind, ready.banner),
-            (
-                StatusKind::Repo,
-                Some((BannerKind::Ok, "Git repository found"))
-            )
-        );
-        assert_eq!(
-            (ready.primary, ready.enabled, ready.hint),
-            ("Open", true, None)
-        );
-
-        // Typing again: the same banner stays, the button goes dead.
-        let probing = status_spec(false, true, Some(&repo), false);
-        assert_eq!(probing.kind, StatusKind::Probing);
-        assert_eq!(probing.banner, ready.banner);
-        assert_eq!(probing.primary, "Open");
-        assert!(!probing.enabled);
-        assert_eq!(probing.hint, None);
-    }
-
-    #[test]
-    fn a_nested_folder_opens_the_root() {
-        let nested = result(FolderProbe::Nested {
-            root: PathBuf::from("/home/user/gitwarp"),
-        });
-        let spec = status_spec(false, false, Some(&nested), false);
-        assert_eq!(spec.kind, StatusKind::Nested);
-        assert_eq!(
-            spec.banner,
-            Some((BannerKind::Warn, "This folder is inside a repository"))
-        );
-        assert_eq!(
-            (spec.primary, spec.enabled, spec.hint),
-            ("Open", true, None)
-        );
-    }
-
-    #[test]
-    fn a_plain_folder_initializes_and_needs_a_branch() {
-        let plain = result(FolderProbe::Plain);
-        let ready = status_spec(false, false, Some(&plain), false);
-        assert_eq!(ready.kind, StatusKind::Plain);
-        assert_eq!(
-            ready.banner,
-            Some((BannerKind::Info, "Not a Git repository yet"))
-        );
-        assert_eq!(
-            (ready.primary, ready.enabled, ready.hint),
-            ("Initialize and open", true, None)
-        );
-
-        let blank = status_spec(false, false, Some(&plain), true);
-        assert_eq!(blank.primary, "Initialize and open");
-        assert!(!blank.enabled);
-    }
-
-    #[test]
-    fn a_missing_folder_reports_the_error_and_hints_at_browse() {
-        let missing = result(FolderProbe::Missing);
-        let spec = status_spec(false, false, Some(&missing), false);
-        assert_eq!(spec.kind, StatusKind::Missing);
-        assert_eq!(
-            spec.banner,
-            Some((BannerKind::Error, "Folder does not exist"))
-        );
-        assert_eq!((spec.primary, spec.enabled), ("Open", false));
-        assert_eq!(spec.hint, Some("Choose an existing folder"));
-    }
-
-    #[test]
-    fn a_failed_probe_shows_gits_message_in_an_error_banner() {
-        let failed: ProbeResult = Err("git rev-parse failed (exit 128)".to_owned());
-        let spec = status_spec(false, false, Some(&failed), false);
-        assert_eq!(spec.kind, StatusKind::Failed);
-        assert_eq!(
-            spec.banner,
-            Some((BannerKind::Error, "Could not read this folder"))
-        );
-        assert_eq!(
-            (spec.primary, spec.enabled, spec.hint),
-            ("Open", false, None)
-        );
-    }
-
-    #[test]
-    fn only_the_latest_probe_generation_is_accepted() {
-        assert!(!is_stale(7, 7));
-        assert!(is_stale(7, 8));
-        assert!(is_stale(8, 7));
-    }
 
     /// Opens the real window and drives the dialog through the workspace
     /// action, so the builder, its focus trap and Esc are exercised.

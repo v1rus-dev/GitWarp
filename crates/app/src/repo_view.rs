@@ -21,7 +21,7 @@ use git_core::{Error, Git, Head, Ref, RefKind};
 use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_SM, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    menu, Button, Icon, IconName, Kbd, MenuEntry, MenuItem, SearchField, SegmentItem, Segmented,
+    menu, Button, Icon, IconName, MenuEntry, MenuItem, SearchField, SegmentItem, Segmented,
     Spinner, Splitter, TextInput, Tooltip, Tree, TreeNodeData,
 };
 
@@ -29,7 +29,9 @@ use crate::format::format_count;
 use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
 use crate::settings::{Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
-use crate::workspace::{git_label, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace};
+use crate::workspace::{
+    git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
+};
 
 actions!(
     gitwarp,
@@ -446,6 +448,8 @@ pub struct RepositoryView {
     repo_name: SharedString,
     /// `git 2.56.0 · bundled`, or `git not found`.
     git_label: SharedString,
+    /// The informational tooltip of the status-bar git label.
+    git_tooltip: SharedString,
     history: Entity<HistoryView>,
     _history_observer: Subscription,
     workspace: WeakEntity<Workspace>,
@@ -473,9 +477,13 @@ impl RepositoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let root = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // Canonicalising is filesystem work; the history view reports the
+        // real root as soon as `Repo::open` finished and the observer below
+        // adopts it. Until then the given path is the best answer.
+        let root = path.clone();
         let name = repo_name(&path);
         let git_label = git_label(&git);
+        let git_tooltip = git_tooltip(&git);
         let history =
             cx.new(|cx| HistoryView::open(path.clone(), git.clone(), workspace.clone(), cx));
         let observer = cx.observe(&history, |this, history, cx| {
@@ -517,6 +525,7 @@ impl RepositoryView {
             root,
             repo_name: name,
             git_label,
+            git_tooltip,
             history,
             _history_observer: observer,
             workspace,
@@ -536,6 +545,12 @@ impl RepositoryView {
             repo_bounds: Rc::new(Cell::new(None)),
             branch_bounds: Rc::new(Cell::new(None)),
         }
+    }
+
+    /// The focus handle of the repository root; the workspace focuses it after
+    /// opening, so the keyboard lands in the new content.
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
     }
 
     /// The focus handle of the toolbar search field.
@@ -561,14 +576,11 @@ impl RepositoryView {
     fn set_dock(&mut self, dock: Dock, cx: &mut Context<Self>) {
         if self.dock != dock {
             self.dock = dock;
-            self.details_size = dock_default(dock);
+            // The size the user dragged stays: it is clamped to the new
+            // dock's range when rendered, never overwritten.
         }
         self.details_open = true;
-        let size = self.details_size;
-        crate::update_settings(cx, |settings| {
-            settings.dock = Some(dock);
-            settings.details_size = Some(size);
-        });
+        crate::update_settings(cx, |settings| settings.dock = Some(dock));
         cx.notify();
     }
 
@@ -693,30 +705,49 @@ impl RepositoryView {
             _ => None,
         };
         let Some(refs) = history.refs() else {
-            return vec![MenuEntry::Item(
-                MenuItem::new("Loading branches…")
+            return vec![
+                MenuEntry::Item(
+                    MenuItem::new("Checkout arrives in a later version")
+                        .icon(IconName::Branch)
+                        .disabled(true),
+                ),
+                MenuEntry::Separator,
+                MenuEntry::Item(
+                    MenuItem::new("Loading branches…")
+                        .icon(IconName::Branch)
+                        .disabled(true),
+                ),
+            ];
+        };
+        // The rows are branch targets for a checkout that does not exist yet;
+        // say so before the (disabled) rows instead of leaving them looking
+        // broken.
+        let mut entries: Vec<MenuEntry> = vec![
+            MenuEntry::Item(
+                MenuItem::new("Checkout arrives in a later version")
                     .icon(IconName::Branch)
                     .disabled(true),
-            )];
-        };
-        let mut entries: Vec<MenuEntry> = refs
-            .iter()
-            .filter(|r| r.kind == RefKind::LocalBranch)
-            .map(|r| {
-                let current = head_branch == Some(r.name.as_str());
-                MenuEntry::Item(
-                    MenuItem::new(r.name.clone())
-                        .icon(if current {
-                            IconName::Check
-                        } else {
-                            IconName::Branch
-                        })
-                        // Checkout is stage 7.
-                        .disabled(true),
-                )
-            })
-            .collect();
-        if entries.is_empty() {
+            ),
+            MenuEntry::Separator,
+        ];
+        entries.extend(
+            refs.iter()
+                .filter(|r| r.kind == RefKind::LocalBranch)
+                .map(|r| {
+                    let current = head_branch == Some(r.name.as_str());
+                    MenuEntry::Item(
+                        MenuItem::new(r.name.clone())
+                            .icon(if current {
+                                IconName::Check
+                            } else {
+                                IconName::Branch
+                            })
+                            // Checkout is stage 7.
+                            .disabled(true),
+                    )
+                }),
+        );
+        if entries.len() == 2 {
             entries.push(MenuEntry::Item(
                 MenuItem::new("No local branches")
                     .icon(IconName::Branch)
@@ -797,32 +828,28 @@ impl RepositoryView {
                 "toolbar-fetch",
                 IconName::Fetch,
                 "Fetch",
-                "Fetch all remotes",
-                "Ctrl Shift F",
+                "Fetch — arrives in a later version",
                 layout.labels,
             )))
             .child(no_shrink(tool_button(
                 "toolbar-pull",
                 IconName::Down,
                 "Pull",
-                "Pull from the remote",
-                "Ctrl Shift L",
+                "Pull — arrives in a later version",
                 layout.labels,
             )))
             .child(no_shrink(tool_button(
                 "toolbar-push",
                 IconName::Up,
                 "Push",
-                "Push to the remote",
-                "Ctrl Shift P",
+                "Push — arrives in a later version",
                 layout.labels,
             )))
             .child(no_shrink(tool_button(
                 "toolbar-stash",
                 IconName::Stash,
                 "Stash",
-                "Stash local changes",
-                "Ctrl Shift S",
+                "Stash — arrives in a later version",
                 layout.labels,
             )))
             .child(titlebar_fill());
@@ -841,7 +868,11 @@ impl RepositoryView {
         bar = bar.child(no_shrink(
             Segmented::new("view-switch")
                 .item(history_item)
-                .item(changes_item.disabled(true))
+                .item(
+                    changes_item
+                        .disabled(true)
+                        .tooltip("Changes — arrives in a later version"),
+                )
                 .selected(0),
         ));
 
@@ -866,7 +897,7 @@ impl RepositoryView {
             Button::ghost("settings-button")
                 .icon_only(IconName::Gear)
                 .disabled(true)
-                .tooltip_kbd("Settings", "Ctrl ,"),
+                .tooltip("Settings — arrives in a later version"),
         ));
 
         titlebar_end(bar, client)
@@ -1173,23 +1204,10 @@ impl RepositoryView {
                     .items_center()
                     .gap(px(4.))
                     .rounded(R_SM)
-                    .cursor_not_allowed()
-                    .text_color(colors.disabled)
-                    .tooltip(Tooltip::text("Git executable — open settings"))
-                    .child(
-                        Icon::new(IconName::Git)
-                            .size(px(12.))
-                            .color(colors.disabled),
-                    )
+                    .text_color(colors.muted)
+                    .tooltip(Tooltip::text(self.git_tooltip.clone()))
+                    .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
                     .child(self.git_label.clone()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .child(Kbd::new("Ctrl P"))
-                    .child(" commands"),
             );
         bar
     }
@@ -1203,7 +1221,9 @@ impl Render for RepositoryView {
         let layout = toolbar_layout(width);
 
         // Until the user picks a side, the dock follows the window width, so
-        // a window resized past the breakpoint docks the details right.
+        // a window resized past the breakpoint docks the details right. The
+        // dragged size is kept across the flip and only clamped for the dock
+        // that renders it.
         let auto_dock = cx
             .try_global::<crate::AppSettings>()
             .map(|state| state.settings.dock.is_none())
@@ -1212,7 +1232,6 @@ impl Render for RepositoryView {
             let dock = resolve_dock(None, width);
             if dock != self.dock {
                 self.dock = dock;
-                self.details_size = dock_default(dock);
             }
         }
 
@@ -1388,19 +1407,15 @@ fn no_shrink(child: impl IntoElement) -> Div {
 }
 
 /// One disabled tool button; the label is dropped on narrow windows and the
-/// tooltip keeps the name.
+/// tooltip keeps the name and says the action is not available yet.
 fn tool_button(
     id: &'static str,
     icon: IconName,
     label: &'static str,
     tooltip: &'static str,
-    kbd: &'static str,
     labels: bool,
 ) -> Button {
-    let button = Button::tool(id)
-        .icon(icon)
-        .disabled(true)
-        .tooltip_kbd(tooltip, kbd);
+    let button = Button::tool(id).icon(icon).disabled(true).tooltip(tooltip);
     if labels {
         button.label(label)
     } else {

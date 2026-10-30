@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use gpui::prelude::*;
 use gpui::{
@@ -16,7 +16,7 @@ use gpui::{
     Task, TextRun, TextStyle, WeakEntity, Window,
 };
 
-use git_core::{CommitInfo, Error, Git, Head, LogOptions, LogStream, Oid, Ref, Repo};
+use git_core::{CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo};
 use git_graph::{GraphBuilder, Row};
 use ui::metrics::{FONT_MONO, FONT_UI, FS_SM};
 use ui::theme::ThemeColors;
@@ -130,6 +130,45 @@ struct Item {
     row: Rc<Row<Oid>>,
 }
 
+/// A kill handle for a git child that is started on a background thread:
+/// Cancel can arrive before the child exists, and then the child must die as
+/// soon as it is published instead of running to completion.
+#[derive(Clone, Default)]
+struct LateKiller(Arc<Mutex<LateKill>>);
+
+#[derive(Default)]
+struct LateKill {
+    killer: Option<LogKiller>,
+    cancelled: bool,
+}
+
+impl LateKiller {
+    /// Publishes the handle of a just-started child.
+    fn set(&self, killer: LogKiller) {
+        let mut state = lock(&self.0);
+        if state.cancelled {
+            killer.kill();
+        } else {
+            state.killer = Some(killer);
+        }
+    }
+
+    /// Kills the child now, or the next one published.
+    fn kill(&self) {
+        let mut state = lock(&self.0);
+        state.cancelled = true;
+        if let Some(killer) = state.killer.take() {
+            killer.kill();
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// What the sidebar knows about the repository's refs.
 #[derive(Debug, Default)]
 enum RefsState {
@@ -159,6 +198,13 @@ pub struct HistoryView {
     /// The `commit_count` probe that feeds the load bar; cancelled with the
     /// load.
     count_task: Option<Task<()>>,
+    /// The running `git init`, kept so a cancel or a new load drops it (and
+    /// the load generation guards its answer).
+    init_task: Option<Task<()>>,
+    /// Stops the running `git log` at once, without waiting for its next page.
+    log_killer: LateKiller,
+    /// The same for `rev-list --count`.
+    count_killer: LateKiller,
     /// `None` until the background read finishes; `Err` leaves the toolbar
     /// showing the placeholder.
     head: Option<Result<Head, String>>,
@@ -191,6 +237,9 @@ impl HistoryView {
             generation: 0,
             task: None,
             count_task: None,
+            init_task: None,
+            log_killer: LateKiller::default(),
+            count_killer: LateKiller::default(),
             head: None,
             refs: RefsState::Loading,
             // Replaced with the pane's real width in the first prepaint.
@@ -202,10 +251,9 @@ impl HistoryView {
 
     /// Start a fresh load: a new task, a new generation and the loading state.
     fn start(&mut self, cx: &mut Context<Self>) {
-        // Dropping the old tasks stops their git processes before new ones
+        // Stopping the old tasks kills their git processes before new ones
         // start.
-        self.task = None;
-        self.count_task = None;
+        self.stop_tasks();
         self.generation += 1;
         let generation = self.generation;
         self.state = LoadState::Loading { total: None };
@@ -225,6 +273,17 @@ impl HistoryView {
         }));
     }
 
+    /// Drops the running tasks and kills the git children they started.
+    fn stop_tasks(&mut self) {
+        self.task = None;
+        self.count_task = None;
+        self.init_task = None;
+        self.log_killer.kill();
+        self.count_killer.kill();
+        self.log_killer = LateKiller::default();
+        self.count_killer = LateKiller::default();
+    }
+
     /// Open the repository and stream its history into the view. A closed
     /// window just ends the task with `Ok`.
     async fn run(
@@ -241,13 +300,23 @@ impl HistoryView {
             .map_err(|e| Failure::from_error(&e))?;
 
         // The repository opened: remember it for the switcher, whatever the
-        // history walk does next.
+        // history walk does next. The root is canonicalized (and the settings
+        // saved) off the UI thread; the entry is stored as canonical, so later
+        // touches compare as stored.
         let root = repo.root().to_path_buf();
-        cx.update(|cx| {
-            crate::update_settings(cx, |settings| {
-                settings.touch_recent(root.clone(), unix_now());
+        let recent_root = root.clone();
+        cx.spawn(async move |cx| {
+            let canonical = cx
+                .background_executor()
+                .spawn(async move { recent_root.canonicalize().unwrap_or(recent_root) })
+                .await;
+            cx.update(|cx| {
+                crate::update_settings(cx, |settings| {
+                    settings.touch_recent(canonical, unix_now());
+                });
             });
-        });
+        })
+        .detach();
 
         // HEAD and the refs feed the toolbar and the sidebar; read them in the
         // background so the log is not held back.
@@ -267,13 +336,35 @@ impl HistoryView {
 
         // The count feeds the load bar's percentage; it runs beside the log so
         // the first page is not delayed. A failure only loses the percentage.
-        // The view keeps the handle so cancelling the load cancels the count.
+        // The view keeps the handle so cancelling the load kills the count.
         let counter = repo.clone();
         let count_this = this.clone();
         let count_task = cx.spawn(async move |cx| {
+            let count = cx
+                .background_executor()
+                .spawn(async move { counter.commit_count_cancellable() })
+                .await;
+            let count = match count {
+                Ok(count) => count,
+                Err(e) => {
+                    log::warn!("could not start counting the commits: {e}");
+                    return;
+                }
+            };
+            let killer = count.killer();
+            count_this
+                .update(cx, |view, _cx| {
+                    // A newer load owns the slot now; this count is stale.
+                    if view.generation == generation {
+                        view.count_killer.set(killer);
+                    } else {
+                        killer.kill();
+                    }
+                })
+                .ok();
             let result = cx
                 .background_executor()
-                .spawn(async move { counter.commit_count() })
+                .spawn(async move { count.wait() })
                 .await;
             match result {
                 Ok(total) => {
@@ -306,6 +397,15 @@ impl HistoryView {
             .spawn(async move { repo.log(&LogOptions::default()) })
             .await
             .map_err(|e| Failure::from_error(&e))?;
+        let killer = stream.killer();
+        this.update(cx, |view, _cx| {
+            if view.generation == generation {
+                view.log_killer.set(killer);
+            } else {
+                killer.kill();
+            }
+        })
+        .ok();
         let mut state = Some((stream, GraphBuilder::new()));
         while let Some((stream, graph)) = state.take() {
             let (stream, graph, page) = executor
@@ -386,8 +486,10 @@ impl HistoryView {
         if !self.is_loading() {
             return;
         }
-        self.task = None;
-        self.count_task = None;
+        self.stop_tasks();
+        // A late answer from the cancelled task (or a running `git init`)
+        // must not touch the view any more.
+        self.generation += 1;
         self.state = LoadState::Cancelled;
         cx.notify();
     }
@@ -407,25 +509,30 @@ impl HistoryView {
             return;
         };
         let path = self.path.clone();
-        self.task = None;
-        self.count_task = None;
+        self.stop_tasks();
         self.generation += 1;
+        let generation = self.generation;
         self.state = LoadState::Loading { total: None };
-        cx.spawn(async move |this, cx| {
+        self.init_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { Repo::init(git, &path) })
                 .await;
-            this.update(cx, |view, cx| match result {
-                Ok(_) => view.retry(cx),
-                Err(error) => {
-                    view.state = LoadState::Failed(Failure::from_error(&error));
-                    cx.notify();
+            this.update(cx, |view, cx| {
+                // A cancel or a newer load wins over this answer.
+                if view.generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(_) => view.retry(cx),
+                    Err(error) => {
+                        view.state = LoadState::Failed(Failure::from_error(&error));
+                        cx.notify();
+                    }
                 }
             })
             .ok();
-        })
-        .detach();
+        }));
         cx.notify();
     }
 
@@ -733,7 +840,19 @@ impl HistoryView {
                 if self.items.is_empty() {
                     self.render_cancelled(cx)
                 } else {
-                    self.render_list(cx)
+                    // Rows already arrived: keep them and say a retry is
+                    // possible instead of showing the full empty state.
+                    let colors = cx.theme().colors;
+                    let strip = self.status_strip(
+                        "History is incomplete — loading was cancelled".into(),
+                        IconName::Warn,
+                        colors.warning,
+                        false,
+                        cx,
+                    );
+                    let mut column = div().flex_1().min_h_0().w_full().flex().flex_col();
+                    column = column.child(strip);
+                    column.child(self.render_list(cx)).into_any_element()
                 }
             }
             LoadState::Failed(failure) => {
@@ -830,13 +949,40 @@ impl HistoryView {
                 )
             }
             Failure::PathNotFound(path) => {
-                let path = path.display().to_string();
-                let body = BodyText::new().code(&path).plain(" does not exist.");
-                let actions = div().flex().gap(px(8.)).child(
-                    Button::primary("empty-path-missing-retry")
-                        .label("Retry")
-                        .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
-                );
+                let shown = path.display().to_string();
+                let remove_path = path.clone();
+                let body = BodyText::new().code(&shown).plain(" does not exist.");
+                // Removing the dead entry is the way out: the welcome screen
+                // shows the rest of the recent list again. Retry only repeats
+                // the same answer.
+                let actions = div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(
+                        Button::primary("empty-path-missing-remove")
+                            .label("Remove from recent")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                crate::update_settings(cx, |settings| {
+                                    settings.remove_recent(&remove_path)
+                                });
+                                if let Some(workspace) = this.workspace.upgrade() {
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.show_welcome(window, cx);
+                                    });
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("empty-path-missing-open")
+                            .label("Open another…")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(workspace) = this.workspace.upgrade() {
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.open_repository_dialog(window, cx);
+                                    });
+                                }
+                            })),
+                    );
                 centred(
                     EmptyState::new("Folder not found")
                         .icon(IconName::Folder)
@@ -951,6 +1097,36 @@ impl HistoryView {
                 };
                 centred(state)
             }
+            Failure::Other { message } => {
+                let actions = div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(
+                        Button::primary("empty-other-retry")
+                            .icon(IconName::Fetch)
+                            .label("Retry")
+                            .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+                    )
+                    .child(
+                        Button::new("empty-other-copy")
+                            .icon(IconName::Copy)
+                            .label("Copy details")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let LoadState::Failed(failure) = &this.state {
+                                    if let Some(details) = failure.copy_details() {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(details));
+                                    }
+                                }
+                            })),
+                    );
+                centred(
+                    EmptyState::new(failure.title())
+                        .icon(IconName::Err)
+                        .icon_color(colors.error)
+                        .error(message.clone())
+                        .actions(actions),
+                )
+            }
         }
     }
 
@@ -970,46 +1146,67 @@ impl HistoryView {
     /// The log broke after rows had arrived: keep the rows and say what
     /// happened in a strip under the header.
     fn render_incomplete(&mut self, failure: &Failure, cx: &mut Context<Self>) -> AnyElement {
+        let text: SharedString = match failure {
+            Failure::Git { command, .. } => {
+                format!("History is incomplete: git {command} failed").into()
+            }
+            Failure::Other { message } => format!("History is incomplete: {message}").into(),
+            _ => "History is incomplete".into(),
+        };
+        let colors = cx.theme().colors;
+        let strip = self.status_strip(text, IconName::Err, colors.error, true, cx);
         let mut column = div().flex_1().min_h_0().w_full().flex().flex_col();
-        if let Failure::Git { command, .. } = failure {
-            let colors = cx.theme().colors;
-            column = column.child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .px(px(12.))
-                    .py(px(6.))
-                    .bg(colors.surface)
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .text_size(FS_SM)
-                    .text_color(colors.muted)
-                    .child(Icon::new(IconName::Err).size(px(14.)).color(colors.error))
-                    .child(format!("History is incomplete: git {command} failed"))
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("history-incomplete-retry")
-                            .label("Retry")
-                            .size(ButtonSize::Small)
-                            .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
-                    )
-                    .child(
-                        Button::new("history-incomplete-copy")
-                            .label("Copy details")
-                            .size(ButtonSize::Small)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let LoadState::Failed(failure) = &this.state {
-                                    if let Some(details) = failure.copy_details() {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(details));
-                                    }
-                                }
-                            })),
-                    ),
+        column = column.child(strip);
+        column.child(self.render_list(cx)).into_any_element()
+    }
+
+    /// One-line strip above the rows: what went wrong, Retry and (for a
+    /// failure that has details) Copy details.
+    fn status_strip(
+        &mut self,
+        text: SharedString,
+        icon: IconName,
+        color: gpui::Hsla,
+        copy_details: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let colors = cx.theme().colors;
+        let mut strip = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(12.))
+            .py(px(6.))
+            .bg(colors.surface)
+            .border_b_1()
+            .border_color(colors.border)
+            .text_size(FS_SM)
+            .text_color(colors.muted)
+            .child(Icon::new(icon).size(px(14.)).color(color))
+            .child(text)
+            .child(div().flex_1())
+            .child(
+                Button::new("history-strip-retry")
+                    .label("Retry")
+                    .size(ButtonSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+            );
+        if copy_details {
+            strip = strip.child(
+                Button::new("history-strip-copy")
+                    .label("Copy details")
+                    .size(ButtonSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let LoadState::Failed(failure) = &this.state {
+                            if let Some(details) = failure.copy_details() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(details));
+                            }
+                        }
+                    })),
             );
         }
-        column.child(self.render_list(cx)).into_any_element()
+        strip
     }
 }
 
@@ -1034,6 +1231,16 @@ impl HistoryView {
             .child(self.render_header(columns, cx))
             .child(body)
             .into_any_element()
+    }
+}
+
+/// Closing the view (or switching repositories) must not leave `git log`
+/// running: the task is dropped with the view, but its blocking read may be
+/// pages away, so the children are killed here too.
+impl Drop for HistoryView {
+    fn drop(&mut self) {
+        self.log_killer.kill();
+        self.count_killer.kill();
     }
 }
 

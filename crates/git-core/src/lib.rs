@@ -12,13 +12,15 @@ mod log;
 mod oid;
 mod refs;
 
+use std::fs::OpenOptions;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
 pub use error::{Error, ErrorClass, Result};
 pub use git::{Git, GitChoice, GitSource, GitVersion, Resolution};
-pub use log::{CommitInfo, LogOptions, LogStream};
+pub use log::{CommitCount, CommitInfo, LogKiller, LogOptions, LogStream};
 pub use oid::Oid;
 pub use refs::{Head, Ref, RefKind};
 
@@ -117,36 +119,76 @@ impl Repo {
     /// Create a repository at `path` and open it.
     ///
     /// `branch` names the initial branch (`git init -b`), and
-    /// `initial_commit_gitignore` writes an empty `.gitignore` and commits it
-    /// as "Initial commit". That commit needs a `user.name`/`user.email` from
-    /// the user's git configuration; when it fails the repository itself still
-    /// exists and the error is returned as git reported it.
+    /// `initial_commit_gitignore` creates an empty `.gitignore` (only when the
+    /// folder has none) and commits just that file as "Initial commit". That
+    /// commit needs a `user.name`/`user.email` from the user's git
+    /// configuration; when it fails the repository itself still exists and the
+    /// error is returned as git reported it.
+    ///
+    /// A folder that is already inside a working tree is not initialized
+    /// again: git would reuse that repository and the "initial commit" would
+    /// land in someone else's history. [`Error::AlreadyARepository`] names the
+    /// root instead.
     pub fn init_with(
         git: Arc<Git>,
         path: &Path,
         branch: Option<&str>,
         initial_commit_gitignore: bool,
     ) -> Result<Self> {
+        Self::init_with_env(git, path, branch, initial_commit_gitignore, &[])
+    }
+
+    /// [`Repo::init_with`] with extra environment for the git commands.
+    ///
+    /// The tests use it to point git at a throw-away global configuration
+    /// without touching the process environment (which is shared by every
+    /// test thread).
+    #[doc(hidden)]
+    pub fn init_with_env(
+        git: Arc<Git>,
+        path: &Path,
+        branch: Option<&str>,
+        initial_commit_gitignore: bool,
+        env: &[(&str, &str)],
+    ) -> Result<Self> {
+        if let FolderProbe::Repo { root, .. } | FolderProbe::Nested { root } =
+            probe_folder(git.clone(), path)?
+        {
+            return Err(Error::AlreadyARepository { root });
+        }
+
         let mut cmd = git.command();
         cmd.args(["init", "-q"]);
         if let Some(branch) = branch {
             cmd.args(["-b", branch]);
         }
-        let out = cmd.arg(path).output().map_err(Error::Spawn)?;
+        // The path may start with `-`; after `--` it is always the directory.
+        let out = cmd
+            .args(["--"])
+            .arg(path)
+            .envs(env.iter().copied())
+            .output()
+            .map_err(Error::Spawn)?;
         check_output(out, "init")?;
         let repo = Self::open(git, path)?;
 
         if initial_commit_gitignore {
-            std::fs::write(repo.root.join(".gitignore"), b"")?;
+            create_gitignore(&repo.root)?;
             let out = repo
                 .command()
                 .args(["add", "--", ".gitignore"])
+                .envs(env.iter().copied())
                 .output()
                 .map_err(Error::Spawn)?;
             check_output(out, "add")?;
+            // Only the `.gitignore`: whatever else the user staged in the
+            // folder (if it was no repository, nothing could have been staged,
+            // but the commit stays explicit about its content) must not end up
+            // in this first commit.
             let out = repo
                 .command()
-                .args(["commit", "-q", "-m", "Initial commit"])
+                .args(["commit", "-q", "-m", "Initial commit", "--", ".gitignore"])
+                .envs(env.iter().copied())
                 .output()
                 .map_err(Error::Spawn)?;
             check_output(out, "commit")?;
@@ -178,16 +220,13 @@ impl Repo {
     /// How many commits the history log will show: every branch, remote and
     /// tag, minus the stash. An empty repository counts 0.
     pub fn commit_count(&self) -> Result<u64> {
-        let out = self
-            .command()
-            .args(["rev-list", "--count", "--exclude=refs/stash", "--all"])
-            .output()
-            .map_err(Error::Spawn)?;
-        let out = check_output(out, "rev-list --count")?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        text.trim()
-            .parse()
-            .map_err(|_| Error::Parse("rev-list --count output"))
+        self.commit_count_cancellable()?.wait()
+    }
+
+    /// Start the count without waiting, so the caller can kill it (the log
+    /// beside it may be cancelled while this still walks a cold repository).
+    pub fn commit_count_cancellable(&self) -> Result<CommitCount> {
+        CommitCount::spawn(self)
     }
 
     /// Whether git keeps a commit-graph file for this repository.
@@ -277,6 +316,20 @@ pub fn probe_folder(git: Arc<Git>, path: &Path) -> Result<FolderProbe> {
         branch,
         commits,
     })
+}
+
+/// Writes an empty `.gitignore` unless the folder already has one, in which
+/// case the user's file is left exactly as it is (and committed as such).
+fn create_gitignore(root: &Path) -> Result<()> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join(".gitignore"))
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Whether two paths name the same directory, following symlinks where they

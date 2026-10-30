@@ -21,15 +21,16 @@ use git_core::{Error, Git, Head, Repo};
 use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_LG, FS_SM, FS_XL, MONO, R_MD, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    dialog, focus, overlay, Banner, BannerKind, Button, Checkbox, Dialog, DialogFocus, DialogHost,
-    EmptyState, Icon, IconName, Kbd, Scrollbar, SearchField, TextInput, TextInputEvent,
-    TextInputSubmit, Tooltip,
+    dialog, focus, overlay, toast, Banner, BannerKind, Button, Checkbox, Dialog, DialogFocus,
+    DialogHost, EmptyState, Icon, IconName, Kbd, Scrollbar, SearchField, TextInput, TextInputEvent,
+    TextInputSubmit, ToastKind, Tooltip,
 };
 
 use crate::format::{display_path, expand_home, home_dir, relative_time};
 use crate::history_view::unix_now;
+use crate::init_flow::{banner_body, details, DialogKind, InitFlow, StatusKind};
 use crate::settings::RecentRepo;
-use crate::workspace::{git_label, titlebar, titlebar_end, titlebar_fill, Workspace};
+use crate::workspace::{git_label, git_tooltip, titlebar, titlebar_end, titlebar_fill, Workspace};
 
 actions!(welcome, [NewRepository, RemoveSelected]);
 
@@ -129,6 +130,12 @@ impl WelcomeView {
     /// The focus handle of the recent list.
     pub fn list_focus(&self) -> FocusHandle {
         self.focus.clone()
+    }
+
+    /// Adopts a newly resolved git (after a Retry) and repaints the label.
+    pub fn set_git(&mut self, git: Result<Arc<Git>, Arc<Error>>, cx: &mut Context<Self>) {
+        self.git = git;
+        cx.notify();
     }
 
     fn open_repository_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -504,15 +511,11 @@ impl WelcomeView {
         }
     }
 
-    fn notify_dialog(&self, cx: &mut App) {
-        if let Some(dialog) = &self.dialog {
-            if let Some(host) = dialog.read(cx).host.clone() {
-                host.update(cx, |_, cx| cx.notify());
-            }
-        }
-    }
-
     /// Opens the Initialize dialog; reopens it when the old layer is gone.
+    ///
+    /// The folder flow is the Open dialog's ([`crate::init_flow`]): the field
+    /// is probed as it is typed, an existing repository is opened instead of
+    /// initialized, and a missing folder is fine because `git init` creates it.
     fn open_init_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(dialog) = &self.dialog {
             if let Some(layer) = dialog.read(cx).layer {
@@ -522,36 +525,37 @@ impl WelcomeView {
             }
         }
 
-        let folder = cx.new(|cx| {
-            let mut input = TextInput::new(window, cx);
-            input.set_placeholder("~/develop/new-project", cx);
-            input
+        let git = self.git.clone();
+        let flow = cx.new(|_| InitFlow::new(git));
+        let view = cx.entity().downgrade();
+        flow.update(cx, |flow, _| {
+            flow.set_on_open(Rc::new(move |root: PathBuf, created: bool, window, cx| {
+                let Some(view) = view.upgrade() else {
+                    return;
+                };
+                view.update(cx, |view, cx| {
+                    let label = display_path(&root, view.home.as_deref());
+                    if let Some(dialog) = view.dialog.take() {
+                        dialog.update(cx, |dialog, cx| dialog.close(window, cx));
+                    }
+                    if let Some(workspace) = view.workspace.upgrade() {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.open_repository(root, window, cx);
+                        });
+                    }
+                    if created {
+                        toast::show(
+                            ToastKind::Ok,
+                            format!("Initialized repository in {label}"),
+                            window,
+                            cx,
+                        );
+                    }
+                });
+            }));
         });
-        let branch = cx.new(|cx| {
-            let mut input = TextInput::new(window, cx);
-            input.set_placeholder("main", cx);
-            input.set_text("main", cx);
-            input
-        });
-        let folder_focus = folder.read(cx).focus_handle().clone();
-        let branch_focus = branch.read(cx).focus_handle().clone();
 
-        let dialog = cx.new(|cx| InitDialog {
-            layer: None,
-            host: None,
-            folder,
-            branch,
-            folder_focus,
-            branch_focus,
-            browse_focus: cx.focus_handle().tab_stop(true),
-            checkbox_focus: cx.focus_handle().tab_stop(true),
-            cancel_focus: cx.focus_handle().tab_stop(true),
-            init_focus: cx.focus_handle().tab_stop(true),
-            initial_commit: false,
-            busy: false,
-            error: None,
-            _subscriptions: Vec::new(),
-        });
+        let dialog = cx.new(|cx| InitDialog::new(flow, self.home.clone(), window, cx));
 
         let state = dialog.downgrade();
         let view = cx.entity().downgrade();
@@ -561,155 +565,12 @@ impl WelcomeView {
                 None => Dialog::new("Initialize repository"),
             });
 
-        let subscriptions = {
-            let folder = dialog.read(cx).folder.clone();
-            let branch = dialog.read(cx).branch.clone();
-            let folder_host = host.clone();
-            let branch_host = host.clone();
-            vec![
-                cx.subscribe(&folder, move |_, _, _: &TextInputEvent, cx| {
-                    folder_host.update(cx, |_, cx| cx.notify());
-                }),
-                cx.subscribe(&branch, move |_, _, _: &TextInputEvent, cx| {
-                    branch_host.update(cx, |_, cx| cx.notify());
-                }),
-            ]
-        };
         dialog.update(cx, |dialog, _| {
             dialog.layer = Some(layer);
             dialog.host = Some(host);
-            dialog._subscriptions = subscriptions;
         });
         self.dialog = Some(dialog);
         cx.notify();
-    }
-
-    fn update_init(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut InitDialog)) {
-        let Some(dialog) = self.dialog.clone() else {
-            return;
-        };
-        dialog.update(cx, |dialog, cx| {
-            f(dialog);
-            if let Some(host) = &dialog.host {
-                host.update(cx, |_, cx| cx.notify());
-            }
-            cx.notify();
-        });
-    }
-
-    /// Runs `git init` off the UI thread, then opens the new repository.
-    fn start_init(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dialog) = self.dialog.clone() else {
-            return;
-        };
-        let (folder_text, branch_text, initial_commit, busy) = {
-            let dialog = dialog.read(cx);
-            (
-                dialog.folder.read(cx).text().trim().to_owned(),
-                dialog.branch.read(cx).text().trim().to_owned(),
-                dialog.initial_commit,
-                dialog.busy,
-            )
-        };
-        if busy || folder_text.is_empty() {
-            return;
-        }
-        let path = expand_home(&folder_text, self.home.as_deref());
-        let branch = (!branch_text.is_empty()).then_some(branch_text);
-        let git = match &self.git {
-            Ok(git) => git.clone(),
-            Err(error) => {
-                self.set_init_error(error.to_string(), cx);
-                return;
-            }
-        };
-
-        self.update_init(cx, |dialog| {
-            dialog.busy = true;
-            dialog.error = None;
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    Repo::init_with(git, &path, branch.as_deref(), initial_commit)
-                        .map(|repo| repo.root().to_path_buf())
-                        .map_err(|error| error.to_string())
-                })
-                .await;
-            this.update_in(cx, |view, window, cx| view.finish_init(result, window, cx))
-                .ok();
-        })
-        .detach();
-    }
-
-    fn finish_init(
-        &mut self,
-        result: Result<PathBuf, String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match result {
-            Ok(path) => {
-                if let Some(dialog) = self.dialog.take() {
-                    if let Some(layer) = dialog.read(cx).layer {
-                        dialog::close(layer, window, cx);
-                    }
-                }
-                if let Some(workspace) = self.workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.open_repository(path, window, cx);
-                    });
-                }
-            }
-            Err(message) => self.set_init_error(message, cx),
-        }
-    }
-
-    fn set_init_error(&mut self, message: String, cx: &mut Context<Self>) {
-        let message = message.trim().to_owned();
-        let message = if message.is_empty() {
-            "git failed without a message".to_owned()
-        } else {
-            message
-        };
-        self.update_init(cx, |dialog| {
-            dialog.busy = false;
-            dialog.error = Some(message.into());
-        });
-    }
-
-    fn browse_folder(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.dialog.clone() else {
-            return;
-        };
-        let folder = dialog.read(cx).folder.clone();
-        let home = self.home.clone();
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Choose a folder to initialize".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let response = receiver.await;
-            this.update(cx, |view, cx| {
-                match response {
-                    Ok(Ok(Some(paths))) => {
-                        if let Some(path) = paths.into_iter().next() {
-                            let label = display_path(&path, home.as_deref());
-                            folder.update(cx, |input, cx| input.set_text(label, cx));
-                        }
-                    }
-                    Ok(Ok(None)) => {}
-                    Ok(Err(error)) => log::warn!("folder picker failed: {error}"),
-                    Err(error) => log::warn!("folder picker did not answer: {error}"),
-                }
-                view.notify_dialog(cx);
-            })
-            .ok();
-        })
-        .detach();
     }
 }
 
@@ -787,29 +648,249 @@ impl Render for WelcomeView {
                     .border_color(colors.border)
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
-                    .child(git),
+                    .child(
+                        div()
+                            .id("welcome-status-git")
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .tooltip(Tooltip::text(git_tooltip(&self.git)))
+                            .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
+                            .child(git),
+                    ),
             )
     }
 }
 
 /// The Initialize dialog's state. The dialog builder reads it on every frame,
-/// so `busy` and `error` take effect as soon as they change.
+/// so the flow's busy, error and probe state take effect at once.
 struct InitDialog {
     layer: Option<overlay::LayerId>,
     host: Option<Entity<DialogHost>>,
+    /// The shared probe and initialize flow (also used by the Open dialog).
+    flow: Entity<InitFlow>,
     folder: Entity<TextInput>,
     branch: Entity<TextInput>,
+    home: Option<PathBuf>,
+    /// Set while the dialog fills the field itself: the change event that
+    /// queues behind it must not restart the probe with the debounce.
+    ignore_change: bool,
     folder_focus: FocusHandle,
     branch_focus: FocusHandle,
     browse_focus: FocusHandle,
     checkbox_focus: FocusHandle,
     cancel_focus: FocusHandle,
     init_focus: FocusHandle,
-    initial_commit: bool,
-    busy: bool,
-    error: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
+    _flow_observer: Subscription,
+}
+
+/// What the folder picker answered; the portal may be missing entirely.
+enum PickerOutcome {
+    Picked(Option<PathBuf>),
+    Cancelled,
+    Failed(String),
+}
+
+impl InitDialog {
+    fn new(
+        flow: Entity<InitFlow>,
+        home: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let folder = cx.new(|cx| {
+            let mut input = TextInput::new(window, cx);
+            input.set_placeholder("~/develop/new-project", cx);
+            input.set_font_family(FONT_MONO, cx);
+            input
+        });
+        let branch = cx.new(|cx| {
+            let mut input = TextInput::new(window, cx);
+            input.set_placeholder("main", cx);
+            input.set_text("main", cx);
+            input.set_font_family(FONT_MONO, cx);
+            input
+        });
+        let folder_focus = folder.read(cx).focus_handle().clone();
+        let branch_focus = branch.read(cx).focus_handle().clone();
+        let subscriptions = vec![
+            cx.subscribe(&folder, |this, _, event: &TextInputEvent, cx| {
+                if matches!(event, TextInputEvent::Changed(_)) {
+                    this.probe_folder(cx);
+                }
+            }),
+            cx.subscribe(&branch, |this, _, _: &TextInputEvent, cx| {
+                this.sync_error_border(cx);
+                this.notify_host(cx);
+                cx.notify();
+            }),
+        ];
+        let flow_observer = cx.observe(&flow, |this, _, cx| {
+            this.sync_error_border(cx);
+            this.notify_host(cx);
+            cx.notify();
+        });
+
+        Self {
+            layer: None,
+            host: None,
+            flow,
+            folder,
+            branch,
+            home,
+            ignore_change: false,
+            folder_focus,
+            branch_focus,
+            browse_focus: cx.focus_handle().tab_stop(true),
+            checkbox_focus: cx.focus_handle().tab_stop(true),
+            cancel_focus: cx.focus_handle().tab_stop(true),
+            init_focus: cx.focus_handle().tab_stop(true),
+            _subscriptions: subscriptions,
+            _flow_observer: flow_observer,
+        }
+    }
+
+    fn spec(&self, cx: &App) -> crate::init_flow::StatusSpec {
+        let empty = self.folder.read(cx).text().trim().is_empty();
+        let branch_blank = self.branch.read(cx).text().trim().is_empty();
+        self.flow
+            .read(cx)
+            .spec(DialogKind::Initialize, empty, branch_blank)
+    }
+
+    fn notify_host(&self, cx: &mut App) {
+        if let Some(host) = &self.host {
+            host.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    /// Probes the typed folder, one debounce after the last keystroke.
+    fn probe_folder(&mut self, cx: &mut Context<Self>) {
+        if self.ignore_change {
+            // The dialog filled the field and probed at once already.
+            self.ignore_change = false;
+            return;
+        }
+        let text = self.folder.read(cx).text().trim().to_owned();
+        if text.is_empty() {
+            self.flow.update(cx, |flow, cx| flow.reset(cx));
+        } else {
+            let path = expand_home(&text, self.home.as_deref());
+            self.flow.update(cx, |flow, cx| flow.probe(path, true, cx));
+        }
+        self.sync_error_border(cx);
+        cx.notify();
+    }
+
+    /// A blank default branch keeps the primary disabled and marks the field.
+    fn sync_error_border(&mut self, cx: &mut Context<Self>) {
+        let empty = self.folder.read(cx).text().trim().is_empty();
+        let blank = self.branch.read(cx).text().trim().is_empty();
+        let error = self
+            .flow
+            .read(cx)
+            .spec(DialogKind::Initialize, empty, blank)
+            .kind
+            == StatusKind::Plain
+            && blank;
+        self.branch
+            .update(cx, |input, cx| input.set_error(error, cx));
+    }
+
+    /// The primary button and Enter: open the repository the folder already
+    /// belongs to, or initialize a plain folder.
+    fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.flow.read(cx).busy() {
+            return;
+        }
+        let spec = self.spec(cx);
+        if !spec.enabled {
+            return;
+        }
+        match spec.kind {
+            StatusKind::Repo | StatusKind::Nested => {
+                let root = match self.flow.read(cx).result() {
+                    Some(Ok(git_core::FolderProbe::Repo { root, .. }))
+                    | Some(Ok(git_core::FolderProbe::Nested { root })) => root.clone(),
+                    _ => return,
+                };
+                self.flow
+                    .update(cx, |flow, cx| flow.open_root(root, window, cx));
+            }
+            StatusKind::Plain => {
+                let text = self.folder.read(cx).text().trim().to_owned();
+                if text.is_empty() {
+                    return;
+                }
+                let path = expand_home(&text, self.home.as_deref());
+                let branch_text = self.branch.read(cx).text().trim().to_owned();
+                let branch = (!branch_text.is_empty()).then_some(branch_text);
+                self.flow
+                    .update(cx, |flow, cx| flow.start_init(path, branch, window, cx));
+            }
+            _ => {}
+        }
+    }
+
+    fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let home = self.home.clone();
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose a folder to initialize".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = match receiver.await {
+                Ok(Ok(Some(paths))) => PickerOutcome::Picked(paths.into_iter().next()),
+                Ok(Ok(None)) => PickerOutcome::Cancelled,
+                Ok(Err(error)) => PickerOutcome::Failed(error.to_string()),
+                Err(error) => PickerOutcome::Failed(error.to_string()),
+            };
+            this.update_in(cx, |dialog, window, cx| {
+                dialog.finish_browse(outcome, home, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_browse(
+        &mut self,
+        outcome: PickerOutcome,
+        home: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            PickerOutcome::Picked(Some(path)) => {
+                let label = display_path(&path, home.as_deref());
+                self.folder
+                    .update(cx, |input, cx| input.set_text(label, cx));
+                // The picker is an explicit choice: probe at once.
+                self.flow.update(cx, |flow, cx| flow.probe(path, false, cx));
+                self.notify_host(cx);
+                cx.notify();
+            }
+            PickerOutcome::Picked(None) | PickerOutcome::Cancelled => {}
+            PickerOutcome::Failed(message) => {
+                // No xdg portal, no picker: the same toast as the Open dialog.
+                toast::show(
+                    ToastKind::Error,
+                    format!("Could not open the folder picker: {message}"),
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut App) {
+        if let Some(layer) = self.layer.take() {
+            dialog::close(layer, window, cx);
+        }
+    }
 }
 
 /// Builds the Initialize dialog from its state. The builder runs on every
@@ -821,35 +902,40 @@ fn build_init_dialog(
 ) -> Dialog {
     let dialog = state.read(cx);
     let colors = cx.theme().colors;
-    let empty = dialog.folder.read(cx).text().trim().is_empty();
-    let busy = dialog.busy;
+    let flow = dialog.flow.read(cx);
+    let spec = dialog.spec(cx);
+    let busy = flow.busy();
+    let initial_commit = flow.initial_commit();
+    let error = flow.error().cloned();
 
     let browse: ClickAction = {
-        let view = view.clone();
-        Box::new(move |_, _, cx| {
-            if let Some(view) = view.upgrade() {
-                view.update(cx, |view, cx| view.browse_folder(cx));
-            }
+        let state = state.clone();
+        Box::new(move |_, window, cx| {
+            state.update(cx, |dialog, cx| dialog.browse(window, cx));
         })
     };
     let toggle: ToggleAction = {
         let state = state.clone();
         Box::new(move |next, _, cx| {
             state.update(cx, |dialog, cx| {
-                dialog.initial_commit = next;
-                if let Some(host) = &dialog.host {
-                    host.update(cx, |_, cx| cx.notify());
-                }
+                dialog
+                    .flow
+                    .update(cx, |flow, cx| flow.set_initial_commit(next, cx));
+                dialog.notify_host(cx);
             });
         })
+    };
+    let activate = {
+        let state = state.clone();
+        move |window: &mut Window, cx: &mut App| {
+            state.update(cx, |dialog, cx| dialog.activate(window, cx));
+        }
     };
     let cancel = {
         let state = state.clone();
         let view = view.clone();
         move |window: &mut Window, cx: &mut App| {
-            if let Some(layer) = state.read(cx).layer {
-                dialog::close(layer, window, cx);
-            }
+            state.update(cx, |dialog, cx| dialog.close(window, cx));
             view.update(cx, |view, cx| {
                 view.dialog = None;
                 cx.notify();
@@ -857,51 +943,60 @@ fn build_init_dialog(
             .ok();
         }
     };
-    let on_default = {
-        let view = view.clone();
-        move |window: &mut Window, cx: &mut App| {
-            if let Some(view) = view.upgrade() {
-                view.update(cx, |view, cx| view.start_init(window, cx));
-            }
-        }
-    };
     let on_initialize = {
-        let view = view.clone();
-        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-            if let Some(view) = view.upgrade() {
-                view.update(cx, |view, cx| view.start_init(window, cx));
-            }
-        }
+        let activate = activate.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| activate(window, cx)
     };
 
     let label = |text: &'static str| div().text_size(FS_SM).text_color(colors.muted).child(text);
 
-    let body = div()
-        .flex()
-        .flex_col()
-        .gap(px(16.))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(6.))
-                .child(label("Folder"))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(div().flex_1().min_w_0().child(dialog.folder.clone()))
-                        .child(
-                            Button::new("init-browse")
-                                .label("Browse…")
-                                .icon(IconName::Folder)
-                                .disabled(busy)
-                                .focus_handle(dialog.browse_focus.clone())
-                                .on_click(browse),
-                        ),
-                ),
-        )
+    let mut status = div().flex().flex_col().gap(px(8.));
+    let mut has_status = false;
+    if let Some((kind, title)) = spec.banner {
+        let mut banner = Banner::new(kind, title);
+        if let Some(body) = banner_body(flow, DialogKind::Initialize) {
+            banner = banner.body(body);
+        }
+        status = status.child(banner);
+        has_status = true;
+    }
+    if let Some(extra) = details(flow, dialog.home.as_deref(), colors) {
+        status = status.child(extra);
+        has_status = true;
+    }
+    if let Some(error) = error {
+        status = status.child(
+            Banner::new(BannerKind::Error, "Could not initialize the repository").body(error),
+        );
+        has_status = true;
+    }
+
+    let mut body = div().flex().flex_col().gap(px(16.)).child(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(label("Folder"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w_0().child(dialog.folder.clone()))
+                    .child(
+                        Button::new("init-browse")
+                            .label("Browse…")
+                            .icon(IconName::Folder)
+                            .disabled(busy)
+                            .focus_handle(dialog.browse_focus.clone())
+                            .on_click(browse),
+                    ),
+            ),
+    );
+    if has_status {
+        body = body.child(status);
+    }
+    body = body
         .child(
             div()
                 .flex()
@@ -913,17 +1008,13 @@ fn build_init_dialog(
         .child(
             Checkbox::new("init-initial-commit")
                 .label("Create an initial commit with a .gitignore")
-                .checked(dialog.initial_commit)
+                .checked(initial_commit)
                 .disabled(busy)
                 .focus_handle(dialog.checkbox_focus.clone())
                 .on_toggle(toggle),
-        )
-        .when_some(dialog.error.clone(), |this, error| {
-            this.child(
-                Banner::new(BannerKind::Error, "Could not initialize the repository").body(error),
-            )
-        });
+        );
 
+    let primary_enabled = spec.enabled && !busy;
     let footer = div()
         .flex()
         .items_center()
@@ -938,9 +1029,9 @@ fn build_init_dialog(
         )
         .child(
             Button::primary("init-initialize")
-                .label("Initialize")
+                .label(spec.primary)
                 .min_width(px(88.))
-                .disabled(empty || busy)
+                .disabled(!primary_enabled)
                 .focus_handle(dialog.init_focus.clone())
                 .on_click(on_initialize),
         );
@@ -954,7 +1045,7 @@ fn build_init_dialog(
         DialogFocus::control(dialog.init_focus.clone()),
     ];
 
-    Dialog::new("Initialize repository")
+    let mut panel = Dialog::new("Initialize repository")
         .body(body)
         .footer(footer)
         .width(px(520.))
@@ -962,7 +1053,11 @@ fn build_init_dialog(
         .focus_order(focus_order)
         .autofocus(dialog.folder_focus.clone())
         .default_button(dialog.init_focus.clone())
-        .on_default(on_default)
+        .on_default(activate);
+    if let Some(hint) = spec.hint {
+        panel = panel.hint(hint);
+    }
+    panel
 }
 
 /// What one left-column action row shows.

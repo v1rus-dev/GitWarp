@@ -37,6 +37,10 @@ const INSET: Pixels = px(10.);
 
 /// What the frame shows below the decorations.
 enum Content {
+    /// Before [`Workspace::new`] has built the first content view: never
+    /// rendered, but the welcome screen must not be built for a repository
+    /// start.
+    Empty,
     Welcome(Entity<WelcomeView>),
     Repository(Entity<RepositoryView>),
 }
@@ -68,11 +72,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let decorations = cx.observe_window_appearance(window, |_, _, cx| cx.notify());
-        let workspace = cx.weak_entity();
         let mut this = Self {
-            content: Content::Welcome(
-                cx.new(|cx| WelcomeView::new(git.clone(), workspace, window, cx)),
-            ),
+            // Only a welcome start builds the welcome screen (item: it is
+            // expensive and a repository start never shows it).
+            content: Content::Empty,
             git,
             git_choice,
             last_resize_edge: None,
@@ -92,8 +95,12 @@ impl Workspace {
         let workspace = cx.weak_entity();
         let view = cx.new(|cx| RepositoryView::new(path.clone(), git, workspace, window, cx));
         let name = repo_name(&path);
+        let focus = view.read(cx).focus_handle();
         self.content = Content::Repository(view);
         window.set_window_title(&format!("{name} — GitWarp"));
+        // The keyboard belongs to the new content at once, like the welcome
+        // list gets it in `show_welcome`.
+        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -143,14 +150,16 @@ impl Workspace {
         }
     }
 
-    /// Resolve git again (the user may have installed it since) and, when a
-    /// repository is open, reopen it so its history starts over with the new
-    /// handle.
+    /// Resolve git again (the user may have installed it since) and, when the
+    /// same repository is still open, reopen it so its history starts over
+    /// with the new handle. A repository the user opened in the meantime wins
+    /// over the retry.
     pub fn retry_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let choice = self.git_choice.clone();
         let path = match &self.content {
             Content::Repository(view) => Some(view.read(cx).path().to_path_buf()),
             Content::Welcome(_) => None,
+            Content::Empty => None,
         };
         cx.spawn_in(window, async move |this, cx| {
             let resolved = cx
@@ -167,10 +176,33 @@ impl Workspace {
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
-                this.git = resolved;
-                match path {
-                    Some(path) => this.open_repository(path, window, cx),
-                    None => this.show_welcome(window, cx),
+                this.git = resolved.clone();
+                enum Target {
+                    Repository(PathBuf),
+                    Welcome,
+                    None,
+                }
+                let target = match &this.content {
+                    Content::Repository(view) => {
+                        Target::Repository(view.read(cx).path().to_path_buf())
+                    }
+                    Content::Welcome(_) => Target::Welcome,
+                    Content::Empty => Target::None,
+                };
+                match target {
+                    // Still the repository the user retried for.
+                    Target::Repository(current) if path.as_ref() == Some(&current) => {
+                        this.open_repository(current, window, cx);
+                    }
+                    // Another repository was opened while the resolve ran.
+                    Target::Repository(_) | Target::None => {}
+                    Target::Welcome => {
+                        let view = match &this.content {
+                            Content::Welcome(view) => view.clone(),
+                            _ => return,
+                        };
+                        view.update(cx, |view, cx| view.set_git(resolved, cx));
+                    }
                 }
             })
             .ok();
@@ -186,7 +218,7 @@ impl Workspace {
     ) -> Option<R> {
         match &self.content {
             Content::Repository(view) => Some(view.update(cx, f)),
-            Content::Welcome(_) => None,
+            Content::Welcome(_) | Content::Empty => None,
         }
     }
 }
@@ -220,7 +252,7 @@ pub fn titlebar_fill() -> Div {
         .flex_1()
         .min_w_0()
         .h_full()
-        .on_mouse_down(MouseButton::Left, |event, window, _| {
+        .on_mouse_down(MouseButton::Left, move |event, window, _| {
             if event.click_count == 2 {
                 window.zoom_window();
             } else {
@@ -262,6 +294,7 @@ impl Render for Workspace {
         };
 
         let body = match &self.content {
+            Content::Empty => div().size_full().into_any_element(),
             Content::Welcome(view) => view.clone().into_any_element(),
             Content::Repository(view) => view.clone().into_any_element(),
         };
@@ -280,21 +313,23 @@ impl Render for Workspace {
                 .when(!tiling.bottom, |d| d.pb(INSET))
                 .when(!tiling.left, |d| d.pl(INSET))
                 .when(!tiling.right, |d| d.pr(INSET))
-                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                .on_mouse_move(
+                    cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                        let size = window.window_bounds().get_bounds().size;
+                        let edge = resize_edge(event.position, INSET, size, tiling);
+                        if edge != this.last_resize_edge {
+                            this.last_resize_edge = edge;
+                            cx.notify();
+                        }
+                    }),
+                )
+                .on_mouse_down(MouseButton::Left, move |event, window, _| {
                     let size = window.window_bounds().get_bounds().size;
-                    let edge = resize_edge(event.position, INSET, size);
-                    if edge != this.last_resize_edge {
-                        this.last_resize_edge = edge;
-                        cx.notify();
-                    }
-                }))
-                .on_mouse_down(MouseButton::Left, |event, window, _| {
-                    let size = window.window_bounds().get_bounds().size;
-                    if let Some(edge) = resize_edge(event.position, INSET, size) {
+                    if let Some(edge) = resize_edge(event.position, INSET, size, tiling) {
                         window.start_window_resize(edge);
                     }
                 })
-                .child(resize_cursor());
+                .child(resize_cursor(tiling));
         }
 
         let mut frame = div()
@@ -377,7 +412,7 @@ impl Render for Workspace {
 }
 
 /// The cursor for the resize band: one shape per edge or corner.
-fn resize_cursor() -> impl IntoElement {
+fn resize_cursor(tiling: Tiling) -> impl IntoElement {
     canvas(
         |_bounds, window, _| {
             window.insert_hitbox(
@@ -388,10 +423,10 @@ fn resize_cursor() -> impl IntoElement {
                 HitboxBehavior::Normal,
             )
         },
-        |_bounds, hitbox, window, _| {
+        move |_bounds, hitbox, window, _| {
             let mouse = window.mouse_position();
             let size = window.window_bounds().get_bounds().size;
-            let Some(edge) = resize_edge(mouse, INSET, size) else {
+            let Some(edge) = resize_edge(mouse, INSET, size, tiling) else {
                 return;
             };
             window.set_cursor_style(
@@ -413,23 +448,34 @@ fn resize_cursor() -> impl IntoElement {
     .absolute()
 }
 
-/// The edge or corner under `pos`, only within the inset band.
-fn resize_edge(pos: Point<Pixels>, inset: Pixels, size: gpui::Size<Pixels>) -> Option<ResizeEdge> {
-    if pos.y < inset && pos.x < inset {
+/// The edge or corner under `pos`, only within the inset band and only for
+/// edges the window manager has not tiled (Zed's CSD does the same): a
+/// maximised window must not start a resize from a click near its edge.
+fn resize_edge(
+    pos: Point<Pixels>,
+    inset: Pixels,
+    size: gpui::Size<Pixels>,
+    tiling: Tiling,
+) -> Option<ResizeEdge> {
+    let top = !tiling.top && pos.y < inset;
+    let bottom = !tiling.bottom && pos.y > size.height - inset;
+    let left = !tiling.left && pos.x < inset;
+    let right = !tiling.right && pos.x > size.width - inset;
+    if top && left {
         Some(ResizeEdge::TopLeft)
-    } else if pos.y < inset && pos.x > size.width - inset {
+    } else if top && right {
         Some(ResizeEdge::TopRight)
-    } else if pos.y < inset {
+    } else if top {
         Some(ResizeEdge::Top)
-    } else if pos.y > size.height - inset && pos.x < inset {
+    } else if bottom && left {
         Some(ResizeEdge::BottomLeft)
-    } else if pos.y > size.height - inset && pos.x > size.width - inset {
+    } else if bottom && right {
         Some(ResizeEdge::BottomRight)
-    } else if pos.y > size.height - inset {
+    } else if bottom {
         Some(ResizeEdge::Bottom)
-    } else if pos.x < inset {
+    } else if left {
         Some(ResizeEdge::Left)
-    } else if pos.x > size.width - inset {
+    } else if right {
         Some(ResizeEdge::Right)
     } else {
         None
@@ -444,6 +490,21 @@ pub fn git_label(git: &Result<Arc<Git>, Arc<Error>>) -> SharedString {
             git_core::ErrorClass::GitTooOld { found, .. } => format!("git {found} too old").into(),
             _ => "git not found".into(),
         },
+    }
+}
+
+/// The informational tooltip of the git label: version, source and
+/// executable path, or the failure title when git is unusable.
+pub fn git_tooltip(git: &Result<Arc<Git>, Arc<Error>>) -> SharedString {
+    match git {
+        Ok(git) => format!(
+            "git {} · {} · {}",
+            git.version(),
+            git.source(),
+            git.path().display()
+        )
+        .into(),
+        Err(error) => crate::history_state::Failure::from_error(error).title(),
     }
 }
 
@@ -464,27 +525,73 @@ mod tests {
     #[test]
     fn resize_edges_cover_the_band_and_corners() {
         let size = size(px(100.), px(50.));
+        let untiled = Tiling::default();
         assert_eq!(
-            resize_edge(point(px(1.), px(1.)), INSET, size),
+            resize_edge(point(px(1.), px(1.)), INSET, size, untiled),
             Some(ResizeEdge::TopLeft)
         );
         assert_eq!(
-            resize_edge(point(px(99.), px(1.)), INSET, size),
+            resize_edge(point(px(99.), px(1.)), INSET, size, untiled),
             Some(ResizeEdge::TopRight)
         );
         assert_eq!(
-            resize_edge(point(px(50.), px(1.)), INSET, size),
+            resize_edge(point(px(50.), px(1.)), INSET, size, untiled),
             Some(ResizeEdge::Top)
         );
         assert_eq!(
-            resize_edge(point(px(1.), px(25.)), INSET, size),
+            resize_edge(point(px(1.), px(25.)), INSET, size, untiled),
             Some(ResizeEdge::Left)
         );
         assert_eq!(
-            resize_edge(point(px(99.), px(49.)), INSET, size),
+            resize_edge(point(px(99.), px(49.)), INSET, size, untiled),
             Some(ResizeEdge::BottomRight)
         );
-        assert_eq!(resize_edge(point(px(50.), px(25.)), INSET, size), None);
+        assert_eq!(
+            resize_edge(point(px(50.), px(25.)), INSET, size, untiled),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tiled_window_has_no_resize_edges() {
+        let size = size(px(100.), px(50.));
+        // Maximised: every edge belongs to the window manager.
+        let tiled = Tiling {
+            top: true,
+            bottom: true,
+            left: true,
+            right: true,
+        };
+        for pos in [
+            point(px(1.), px(1.)),
+            point(px(99.), px(1.)),
+            point(px(50.), px(1.)),
+            point(px(1.), px(25.)),
+            point(px(99.), px(25.)),
+            point(px(99.), px(49.)),
+        ] {
+            assert_eq!(resize_edge(pos, INSET, size, tiled), None, "{pos:?}");
+        }
+        // Snapped to the left: the tiled side and its corners are dead, the
+        // others still resize.
+        let left = Tiling {
+            left: true,
+            ..Tiling::default()
+        };
+        assert_eq!(resize_edge(point(px(1.), px(25.)), INSET, size, left), None);
+        assert_eq!(
+            resize_edge(point(px(1.), px(1.)), INSET, size, left),
+            Some(ResizeEdge::Top),
+            "the tiled left edge is dead, the untiled top still resizes"
+        );
+        assert_eq!(
+            resize_edge(point(px(99.), px(25.)), INSET, size, left),
+            Some(ResizeEdge::Right)
+        );
+        assert_eq!(
+            resize_edge(point(px(99.), px(49.)), INSET, size, left),
+            Some(ResizeEdge::BottomRight)
+        );
     }
 
     #[test]

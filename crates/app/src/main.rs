@@ -2,6 +2,7 @@ mod format;
 mod graph_paint;
 mod history_state;
 mod history_view;
+mod init_flow;
 mod open_dialog;
 mod repo_view;
 mod settings;
@@ -10,7 +11,7 @@ mod welcome;
 mod workspace;
 
 use gpui::{
-    prelude::*, px, size, Action, App, Bounds, Global, KeyBinding, TitlebarOptions,
+    prelude::*, px, size, App, Bounds, Global, KeyBinding, TitlebarOptions,
     WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
 
@@ -26,33 +27,74 @@ use workspace::Workspace;
 struct AppSettings {
     path: Option<PathBuf>,
     settings: Settings,
+    /// A save is running on the background executor.
+    save_in_flight: bool,
+    /// The settings changed while that save ran: save once more after it.
+    dirty: bool,
 }
 
 impl Global for AppSettings {}
 
-/// A keybinding whose `secondary-` modifier is resolved for the host OS and
-/// which only applies in `context`, if given.
-fn binding(cx: &App, keystrokes: &str, action: impl Action, context: Option<&str>) -> KeyBinding {
-    let context = context.map(|context| {
-        std::rc::Rc::new(
-            gpui::KeyBindingContextPredicate::parse(context).expect("valid key binding context"),
-        )
-    });
-    KeyBinding::load(keystrokes, Box::new(action), context, false, None, cx)
-        .expect("valid keystroke")
+/// Applies `f` to the loaded settings and saves them on the background
+/// executor. The in-memory copy changes at once; a save that is already in
+/// flight makes this one just mark the state dirty, so a burst of changes
+/// costs one more write, not one write each.
+fn update_settings(cx: &mut App, f: impl FnOnce(&mut Settings)) {
+    let (path, snapshot) = {
+        if cx.try_global::<AppSettings>().is_none() {
+            return;
+        }
+        let state = cx.global_mut::<AppSettings>();
+        f(&mut state.settings);
+        let Some(path) = state.path.clone() else {
+            return;
+        };
+        if state.save_in_flight {
+            state.dirty = true;
+            return;
+        }
+        state.save_in_flight = true;
+        (path, state.settings.clone())
+    };
+    save_settings(cx, path, snapshot);
 }
 
-/// Applies `f` to the loaded settings and saves them.
-fn update_settings(cx: &mut App, f: impl FnOnce(&mut Settings)) {
-    if cx.try_global::<AppSettings>().is_none() {
-        return;
-    }
-    let state = cx.global_mut::<AppSettings>();
-    f(&mut state.settings);
-    if let Some(path) = &state.path {
-        if let Err(e) = SettingsStore::new(path.clone()).save(&state.settings) {
+/// Writes one snapshot off the UI thread, then saves again if the settings
+/// changed while it ran.
+fn save_settings(cx: &mut App, path: PathBuf, snapshot: Settings) {
+    cx.spawn(async move |cx| {
+        let save_path = path.clone();
+        let saved = cx
+            .background_executor()
+            .spawn(async move { SettingsStore::new(save_path).save(&snapshot) })
+            .await;
+        if let Err(e) = saved {
             log::warn!("failed to save settings to {}: {e}", path.display());
         }
+        cx.update(finish_save);
+    })
+    .detach();
+}
+
+fn finish_save(cx: &mut App) {
+    let next = {
+        if cx.try_global::<AppSettings>().is_none() {
+            return;
+        }
+        let state = cx.global_mut::<AppSettings>();
+        state.save_in_flight = false;
+        if !state.dirty {
+            return;
+        }
+        state.dirty = false;
+        let Some(path) = state.path.clone() else {
+            return;
+        };
+        state.save_in_flight = true;
+        Some((path, state.settings.clone()))
+    };
+    if let Some((path, snapshot)) = next {
+        save_settings(cx, path, snapshot);
     }
 }
 
@@ -111,22 +153,34 @@ fn main() {
             // and Cmd on macOS. The views handle them, with a window-root
             // fallback for when nothing holds the focus.
             let shortcuts = vec![
-                binding(cx, "secondary-b", repo_view::ToggleSidebar, None),
-                binding(cx, "secondary-j", repo_view::ToggleDetails, None),
-                binding(cx, "secondary-k", repo_view::FocusSearch, None),
+                ui::actions::key_binding(cx, "secondary-b", repo_view::ToggleSidebar, None),
+                ui::actions::key_binding(cx, "secondary-j", repo_view::ToggleDetails, None),
+                ui::actions::key_binding(cx, "secondary-k", repo_view::FocusSearch, None),
                 // Ctrl O opens the "Open from folder" dialog everywhere: on
                 // the welcome screen and in a repository window alike.
-                binding(cx, "secondary-o", workspace::OpenRepositoryDialog, None),
-                binding(cx, "secondary-shift-b", repo_view::OpenBranchSwitcher, None),
+                ui::actions::key_binding(cx, "secondary-o", workspace::OpenRepositoryDialog, None),
+                ui::actions::key_binding(
+                    cx,
+                    "secondary-shift-b",
+                    repo_view::OpenBranchSwitcher,
+                    None,
+                ),
                 // Welcome screen: Ctrl N opens the Initialize dialog and Del
                 // drops a recent entry.
-                binding(cx, "secondary-n", welcome::NewRepository, Some("welcome")),
+                ui::actions::key_binding(
+                    cx,
+                    "secondary-n",
+                    welcome::NewRepository,
+                    Some("welcome"),
+                ),
                 KeyBinding::new("delete", welcome::RemoveSelected, Some("welcome")),
             ];
             cx.bind_keys(shortcuts);
             cx.set_global(AppSettings {
                 path: config_path,
                 settings: loaded,
+                save_in_flight: false,
+                dirty: false,
             });
             let window_size = if path.is_some() {
                 size(px(1200.), px(800.))
