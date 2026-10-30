@@ -202,6 +202,9 @@ fn main() {
                 KeyBinding::new("delete", welcome::RemoveSelected, Some("welcome")),
             ];
             cx.bind_keys(shortcuts);
+            // The history list's extra keys (j/k, PgUp/PgDn, Ctrl+C) live in
+            // the list's own context.
+            history_view::bind_history_keys(cx);
             cx.set_global(AppSettings {
                 path: config_path,
                 settings: loaded,

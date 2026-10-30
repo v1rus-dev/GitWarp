@@ -12,19 +12,22 @@ use std::sync::{Arc, Mutex};
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, container_query, div, px, uniform_list, AnyElement, AsyncApp, ClipboardItem,
-    ContentMask, Context, Div, DragMoveEvent, EmptyView, FontWeight, IntoElement, MouseButton,
-    MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString, StyledText, Task, TextRun,
-    TextStyle, WeakEntity, Window,
+    actions, canvas, container_query, div, px, uniform_list, AnyElement, App, AsyncApp,
+    ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, FocusHandle, FontWeight,
+    IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, ScrollStrategy,
+    SharedString, StyledText, Task, TextRun, TextStyle, UniformListScrollHandle, WeakEntity,
+    Window,
 };
 
 use git_core::{CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo};
 use git_graph::{ColumnGeometry, GraphBuilder, IdleLanes, Row};
+use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
+use ui::focus::{self, RingOffset};
 use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD};
 use ui::theme::ThemeColors;
 use ui::{
-    menu, ActiveTheme, Avatar, Button, ButtonSize, EmptyState, Icon, IconName, MenuEntry, MenuItem,
-    Progress, RefBadge, RefKind, Skeleton, Spinner, Tooltip,
+    menu, ActiveTheme, Avatar, Button, ButtonSize, EmptyState, Icon, IconName, ListRow, MenuEntry,
+    MenuItem, Progress, RefBadge, RefKind, Skeleton, Spinner, Tooltip,
 };
 
 use crate::format::{format_count, relative_time};
@@ -88,6 +91,37 @@ const BADGE_ICON: f32 = 14.;
 const BADGE_TEXT_MIN: f32 = 80.;
 /// Relative dates are recomputed at this interval while the view is open.
 const CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+actions!(
+    gitwarp,
+    [
+        NextCommit,
+        PrevCommit,
+        PageDownCommits,
+        PageUpCommits,
+        CopyCommitHash
+    ]
+);
+
+/// How many rows Page Down / Page Up move: one viewport of rows minus the one
+/// the previous page already showed, at least a single row.
+pub fn page_rows(viewport_height: f32) -> usize {
+    let rows = (viewport_height / f32::from(theme::ROW_HEIGHT)).floor();
+    (rows as usize).saturating_sub(1).max(1)
+}
+
+/// Binds the list's extra keys in its own `history-list` context, so they
+/// fire only while the list has the keyboard: typing `j` in the search field
+/// still types `j`. Called once at startup.
+pub(crate) fn bind_history_keys(cx: &mut App) {
+    cx.bind_keys([
+        ui::actions::key_binding(cx, "j", NextCommit, Some("history-list")),
+        ui::actions::key_binding(cx, "k", PrevCommit, Some("history-list")),
+        ui::actions::key_binding(cx, "pagedown", PageDownCommits, Some("history-list")),
+        ui::actions::key_binding(cx, "pageup", PageUpCommits, Some("history-list")),
+        ui::actions::key_binding(cx, "secondary-c", CopyCommitHash, Some("history-list")),
+    ]);
+}
 
 type Page = Result<Vec<(CommitInfo, Row<Oid>)>, Failure>;
 
@@ -482,6 +516,23 @@ pub struct HistoryView {
     /// The row under the mouse. The canvas cannot see the CSS-like hover, so
     /// the painter takes the halo and merge-ring fill from this.
     hovered: Option<usize>,
+    /// The list's focus handle: clicking a row focuses it, and only while it
+    /// is focused do the list's keys and the keyboard ring apply.
+    focus: FocusHandle,
+    /// The virtualized list's scroll state, so a selection moved by the
+    /// keyboard can be scrolled minimally into view.
+    scroll: UniformListScrollHandle,
+    /// Whether the user picked a row themselves. Until then the selection
+    /// follows the HEAD row as it arrives instead of staying on row 0.
+    user_selected: bool,
+    /// The one commit-graph writer of this view. Started only while nothing
+    /// writes one and the repository has none, and never dropped by Retry or
+    /// Cancel: it is useful work that finishes with the view.
+    commit_graph_task: Option<Task<()>>,
+    /// Whether that writer is still running, so a later load does not start a
+    /// second one. The finished task stays in its slot (inert) until it is
+    /// replaced.
+    commit_graph_running: bool,
 }
 
 impl HistoryView {
@@ -535,6 +586,11 @@ impl HistoryView {
             collapse,
             grip_drag: None,
             hovered: None,
+            focus: cx.focus_handle(),
+            scroll: UniformListScrollHandle::new(),
+            user_selected: false,
+            commit_graph_task: None,
+            commit_graph_running: false,
         };
         view.start(cx);
         // Relative dates are derived at render time from the clock, so the
@@ -682,16 +738,11 @@ impl HistoryView {
 
         // Without a commit-graph file the first screen waits for the whole
         // history walk. Write one for next time, in parallel with this load.
+        // The view owns the one writer, so Retry or Cancel cannot start a
+        // second copy of the same work.
         let writer = repo.clone();
-        executor
-            .spawn(async move {
-                if !writer.has_commit_graph() {
-                    if let Err(e) = writer.write_commit_graph() {
-                        log::warn!("could not write the commit-graph: {e}");
-                    }
-                }
-            })
-            .detach();
+        this.update(cx, |view, cx| view.start_commit_graph_writer(writer, cx))
+            .ok();
 
         // Both the git process and the layout run off the UI thread; the
         // UI thread only appends finished pages and repaints.
@@ -725,6 +776,27 @@ impl HistoryView {
         Ok(())
     }
 
+    /// Starts the view's one commit-graph writer when the repository has none
+    /// and no writer of this view is running. The task is kept in the view and
+    /// dropped with it; Retry and Cancel leave it alone.
+    fn start_commit_graph_writer(&mut self, repo: Repo, cx: &mut Context<Self>) {
+        if self.commit_graph_running || repo.has_commit_graph() {
+            return;
+        }
+        self.commit_graph_running = true;
+        self.commit_graph_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { repo.write_commit_graph() })
+                .await;
+            if let Err(e) = result {
+                log::warn!("could not write the commit-graph: {e}");
+            }
+            this.update(cx, |view, _cx| view.commit_graph_running = false)
+                .ok();
+        }));
+    }
+
     fn append(&mut self, page: Vec<(CommitInfo, Row<Oid>)>, cx: &mut Context<Self>) {
         for (commit, row) in page {
             self.max_lanes = self.max_lanes.max(row.width);
@@ -735,6 +807,9 @@ impl HistoryView {
             });
         }
         self.refresh_geometry();
+        // The HEAD row may only arrive now; the initial selection follows it
+        // until the user picks a row.
+        self.settle_initial_selection(cx);
         cx.notify();
     }
 
@@ -742,6 +817,168 @@ impl HistoryView {
     /// collapse toggle changed, not while rendering.
     fn refresh_geometry(&mut self) {
         self.geometry = Rc::new(self.idle_lanes.geometry(self.collapse));
+    }
+
+    /// The row of the HEAD commit, once it is among the loaded rows.
+    fn head_index(&self) -> Option<usize> {
+        let head = self.head_oid()?;
+        self.items.iter().position(|item| item.commit.id == head)
+    }
+
+    /// The row a key press lands on when nothing is selected: the HEAD row
+    /// when it is loaded, else row 0.
+    fn initial_row(&self) -> Option<usize> {
+        if self.items.is_empty() {
+            None
+        } else {
+            Some(self.head_index().unwrap_or(0))
+        }
+    }
+
+    /// While the user has not picked a row, the selection follows the HEAD row
+    /// as it arrives, else row 0. Selecting is not focusing: this never moves
+    /// the keyboard focus or scrolls the list.
+    fn settle_initial_selection(&mut self, cx: &mut Context<Self>) {
+        if self.user_selected || self.items.is_empty() {
+            return;
+        }
+        let target = self.initial_row().unwrap_or(0);
+        if self.selected != Some(target) {
+            self.selected = Some(target);
+            cx.notify();
+        }
+    }
+
+    /// Selects `index`, scrolls it minimally into view and repaints. A pick by
+    /// the user stops the initial selection from following the load.
+    fn select_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.items.len() || self.selected == Some(index) {
+            self.user_selected = true;
+            return;
+        }
+        self.user_selected = true;
+        self.selected = Some(index);
+        self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    /// ↓ / j and ↑ / k: one row, clamped at the ends. With nothing selected
+    /// the first press selects the initial row instead of moving off it.
+    fn step_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(current) = self.selected.or_else(|| self.initial_row()) else {
+            return;
+        };
+        let next = if self.selected.is_none() {
+            current
+        } else {
+            let last = self.items.len().saturating_sub(1) as isize;
+            (current as isize + delta).clamp(0, last) as usize
+        };
+        self.select_row(next, cx);
+    }
+
+    /// Home / End: the first or the last loaded row (`usize::MAX` for End).
+    fn jump_selection(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(last) = self.items.len().checked_sub(1) else {
+            return;
+        };
+        self.select_row(index.min(last), cx);
+    }
+
+    /// PgDn / PgUp: one viewport of rows minus one, clamped.
+    fn page_selection(&mut self, down: bool, cx: &mut Context<Self>) {
+        let Some(current) = self.selected.or_else(|| self.initial_row()) else {
+            return;
+        };
+        if self.selected.is_none() {
+            self.select_row(current, cx);
+            return;
+        }
+        let delta = page_rows(self.viewport_height()) as isize;
+        let delta = if down { delta } else { -delta };
+        let last = self.items.len().saturating_sub(1) as isize;
+        let next = (current as isize + delta).clamp(0, last) as usize;
+        self.select_row(next, cx);
+    }
+
+    /// The list's viewport height, from the last layout of the virtualized
+    /// list; 0 before its first layout.
+    fn viewport_height(&self) -> f32 {
+        self.scroll
+            .0
+            .borrow()
+            .last_item_size
+            .map(|size| f32::from(size.item.height))
+            .unwrap_or(0.)
+    }
+
+    /// `Ctrl+C` on the focused list: the selected commit's full 40-char hash
+    /// on the clipboard.
+    fn copy_selected_hash(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.selected.or_else(|| self.initial_row()) else {
+            return;
+        };
+        self.select_row(index, cx);
+        if let Some(item) = self.items.get(index) {
+            cx.write_to_clipboard(ClipboardItem::new_string(item.commit.id.to_string()));
+        }
+    }
+
+    /// Right-clicking a row selects it and opens the row menu at the pointer.
+    fn open_row_menu(
+        &mut self,
+        index: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hash = self.items.get(index).map(|item| item.commit.id.to_string());
+        let branch = match self.head() {
+            Some(Head::Branch { name, .. }) => name.clone(),
+            _ => "HEAD".to_owned(),
+        };
+        let entries = vec![
+            MenuEntry::Item(
+                MenuItem::new("Copy commit hash")
+                    .icon(IconName::Copy)
+                    .shortcut("Ctrl+C")
+                    .disabled(hash.is_none())
+                    .action(move |_, cx| {
+                        if let Some(hash) = hash.clone() {
+                            cx.write_to_clipboard(ClipboardItem::new_string(hash));
+                        }
+                    }),
+            ),
+            // The row actions arrive in a later version: they are shown, not
+            // clickable.
+            MenuEntry::Item(
+                MenuItem::new("Create branch here…")
+                    .icon(IconName::Branch)
+                    .disabled(true),
+            ),
+            MenuEntry::Item(
+                MenuItem::new("Create tag here…")
+                    .icon(IconName::Tag)
+                    .disabled(true),
+            ),
+            MenuEntry::Separator,
+            MenuEntry::Item(
+                MenuItem::new("Cherry-pick")
+                    .icon(IconName::Undo)
+                    .disabled(true),
+            ),
+            MenuEntry::Item(
+                MenuItem::new("Revert commit")
+                    .icon(IconName::Undo)
+                    .disabled(true),
+            ),
+            MenuEntry::Item(
+                MenuItem::new(format!("Reset {branch} to here…"))
+                    .danger()
+                    .disabled(true),
+            ),
+        ];
+        menu::open_context_menu(position, entries, window, cx);
     }
 
     /// Sets the idle-lane collapse, recomputes the geometry and persists it.
@@ -857,6 +1094,9 @@ impl HistoryView {
             RefsState::Loading | RefsState::Failed => &[],
         };
         self.badges = build_badges(head, refs);
+        // HEAD may have arrived after the first rows: the initial selection
+        // can now move to its row.
+        self.settle_initial_selection(cx);
         cx.notify();
     }
 
@@ -889,6 +1129,7 @@ impl HistoryView {
         self.items.clear();
         self.max_lanes = 1;
         self.selected = None;
+        self.user_selected = false;
         self.hovered = None;
         self.start(cx);
         cx.notify();
@@ -1223,6 +1464,11 @@ impl HistoryView {
         let hovered = self.hovered;
         let head = self.head_oid();
         let selected_index = self.selected;
+        // The row states follow the table in the design: a selected row is
+        // `selection` only while the list itself has focus, and the keyboard
+        // ring appears only for a keyboard-modality focus.
+        let list_focused = self.focus.is_focused(window);
+        let ring_visible = focus::focus_visible(&self.focus, window, cx);
         let now = unix_now();
         let summary_width = self.summary_width;
         let items = &self.items;
@@ -1236,12 +1482,22 @@ impl HistoryView {
                 let is_hovered = hovered == Some(ix) && !selected;
                 let c = &item.commit;
                 let background = if selected {
-                    colors.selection
+                    if list_focused {
+                        colors.selection
+                    } else {
+                        colors.selection_inactive
+                    }
                 } else if is_hovered {
                     colors.hover
                 } else {
                     colors.bg
                 };
+                let summary_color = if selected && list_focused {
+                    colors.selection_fg
+                } else {
+                    colors.text
+                };
+                let secondary = ListRow::secondary_color(colors, selected, list_focused);
                 let is_head = head == Some(c.id);
                 let row_theme = ui_theme.clone();
                 let row_geometry = geometry.clone();
@@ -1251,6 +1507,7 @@ impl HistoryView {
                 // so margins on the row itself would overflow.
                 let mut row_div = div()
                     .id(ix)
+                    .relative()
                     .h(theme::ROW_HEIGHT)
                     .w_full()
                     .pl(px(PAD_LEFT))
@@ -1260,8 +1517,8 @@ impl HistoryView {
                     .gap(px(COL_GAP))
                     .text_size(FS_SM)
                     .rounded(R_MD)
-                    .when(selected, |d| d.bg(colors.selection))
-                    .when(is_hovered, |d| d.bg(colors.hover))
+                    .debug_selector(move || format!("history-row-{ix}"))
+                    .bg(background)
                     .on_hover(cx.listener(move |view, entered: &bool, _, cx| {
                         // A leave only clears the row it belongs to: the next
                         // row's enter may already have run.
@@ -1277,10 +1534,24 @@ impl HistoryView {
                             cx.notify();
                         }
                     }))
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.selected = Some(ix);
-                        cx.notify();
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        // Clicking focuses the list and selects the row; the
+                        // ring stays hidden because the modality is the mouse.
+                        let focus = view.focus.clone();
+                        window.focus(&focus, cx);
+                        view.select_row(ix, cx);
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                            let focus = view.focus.clone();
+                            window.focus(&focus, cx);
+                            view.select_row(ix, cx);
+                            view.open_row_menu(ix, event.position, window, cx);
+                            // Keep the menu that just took focus.
+                            window.prevent_default();
+                        }),
+                    )
                     .child(
                         canvas(
                             |_, _, _| {},
@@ -1368,7 +1639,7 @@ impl HistoryView {
                             .min_w_0()
                             .truncate()
                             .text_size(FS_BASE)
-                            .text_color(colors.text)
+                            .text_color(summary_color)
                             .when(is_head, |text| text.font_weight(FontWeight::BOLD))
                             .tooltip(Tooltip::text(c.summary.clone()))
                             .child(c.summary.clone()),
@@ -1383,7 +1654,7 @@ impl HistoryView {
                             .flex()
                             .items_center()
                             .gap(px(BADGE_GAP))
-                            .text_color(colors.muted)
+                            .text_color(secondary)
                             .tooltip(Tooltip::text(c.author_name.clone()))
                             .child(
                                 Avatar::new(c.author_email.clone(), px(16.))
@@ -1404,7 +1675,7 @@ impl HistoryView {
                         .w(px(columns.date))
                         .flex_none()
                         .truncate()
-                        .text_color(colors.muted)
+                        .text_color(secondary)
                         .tooltip(Tooltip::text(format_time_tooltip(c.author_time)))
                         .child(relative_time(now, c.author_time.max(0) as u64)),
                 );
@@ -1415,9 +1686,12 @@ impl HistoryView {
                             .flex_none()
                             .truncate()
                             .font_family(FONT_MONO)
-                            .text_color(colors.muted)
+                            .text_color(secondary)
                             .child(short_hash(&c.id)),
                     );
+                }
+                if ring_visible && selected {
+                    row_div = row_div.child(focus::focus_ring(RingOffset::Inset2, R_MD, cx));
                 }
                 div().w_full().px(px(SIDE_MARGIN)).child(row_div)
             })
@@ -1430,9 +1704,23 @@ impl HistoryView {
             self.items.len(),
             cx.processor(|view, range, window, cx| view.render_rows(range, window, cx)),
         )
+        .track_scroll(&self.scroll)
+        .track_focus(&self.focus)
+        .key_context("history-list")
         .flex_1()
         .min_h_0()
         .w_full()
+        // The kit's arrow / Home / End actions are bound globally; the list
+        // handles them only while its own focus handle is the focused one.
+        .on_action(cx.listener(|view, _: &SelectNext, _, cx| view.step_selection(1, cx)))
+        .on_action(cx.listener(|view, _: &SelectPrev, _, cx| view.step_selection(-1, cx)))
+        .on_action(cx.listener(|view, _: &SelectFirst, _, cx| view.jump_selection(0, cx)))
+        .on_action(cx.listener(|view, _: &SelectLast, _, cx| view.jump_selection(usize::MAX, cx)))
+        .on_action(cx.listener(|view, _: &NextCommit, _, cx| view.step_selection(1, cx)))
+        .on_action(cx.listener(|view, _: &PrevCommit, _, cx| view.step_selection(-1, cx)))
+        .on_action(cx.listener(|view, _: &PageDownCommits, _, cx| view.page_selection(true, cx)))
+        .on_action(cx.listener(|view, _: &PageUpCommits, _, cx| view.page_selection(false, cx)))
+        .on_action(cx.listener(|view, _: &CopyCommitHash, _, cx| view.copy_selected_hash(cx)))
         .into_any_element()
     }
 
@@ -2410,6 +2698,19 @@ mod tests {
         assert!(runs.iter().all(|run| run.font.weight == style.font_weight));
     }
 
+    #[test]
+    fn page_steps_are_one_viewport_minus_a_row() {
+        // 26 px rows: a full page leaves one row of overlap, and a viewport
+        // shorter than a row still moves by one.
+        assert_eq!(page_rows(0.), 1);
+        assert_eq!(page_rows(26.), 1);
+        assert_eq!(page_rows(51.), 1);
+        assert_eq!(page_rows(52.), 1);
+        assert_eq!(page_rows(260.), 9);
+        assert_eq!(page_rows(259.), 8);
+        assert_eq!(page_rows(620.), 22);
+    }
+
     /// The test root: the history view plus the overlay stack, like the
     /// workspace renders them in the app.
     struct GraphMenuTestRoot {
@@ -2510,6 +2811,263 @@ mod tests {
                 ui::overlay::layer_count(window, cx),
                 0,
                 "the menu stayed open after an item was clicked"
+            );
+        });
+    }
+
+    /// Makes one commit on the repository and returns its full hash.
+    fn commit(repo: &std::path::Path, file: &str, message: &str) -> String {
+        std::fs::write(repo.join(file), message).expect("write the committed file");
+        let run = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test User")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test User")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).expect("git prints UTF-8")
+        };
+        run(&["add", file]);
+        run(&["commit", "-q", "-m", message]);
+        run(&["rev-parse", "HEAD"]).trim().to_owned()
+    }
+
+    /// Opens the history view as the window root on `repo` and returns it with
+    /// its visual test context. The view loads on its own background tasks.
+    fn open_history(
+        repo: &crate::test_support::TempRepo,
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::VisualTestContext, gpui::Entity<HistoryView>) {
+        use git_core::GitChoice;
+        use gpui::{
+            point, size, AppContext, Bounds, VisualTestContext, WindowBackgroundAppearance,
+            WindowBounds, WindowDecorations, WindowOptions,
+        };
+
+        let git = crate::test_support::git();
+        cx.update(ui::init).expect("ui::init");
+        cx.update(bind_history_keys);
+        let handle = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(960.), px(620.)),
+                    ))),
+                    window_decorations: Some(WindowDecorations::Client),
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let workspace = cx.new(|cx| {
+                        Workspace::new(None, Ok(git.clone()), GitChoice::Auto, window, cx)
+                    });
+                    let history = cx.new(|cx| {
+                        HistoryView::open(
+                            repo.path().to_path_buf(),
+                            Ok(git.clone()),
+                            workspace.downgrade(),
+                            cx,
+                        )
+                    });
+                    cx.new(|_| GraphMenuTestRoot { history })
+                },
+            )
+            .expect("open window")
+        });
+        let mut cx = VisualTestContext::from_window(handle.into(), cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let root = cx
+            .update(|window, _| window.root::<GraphMenuTestRoot>().flatten())
+            .expect("the history test root is the window root");
+        let history = root.read_with(&cx, |root, _| root.history.clone());
+        (cx, history)
+    }
+
+    /// Clicking focuses the list and selects the row; the keyboard then moves
+    /// the selection, Home/End jump to the ends and Ctrl+C copies the full
+    /// hash of the selected commit.
+    #[gpui::test]
+    fn clicking_then_the_keyboard_selects_rows_and_copies_the_hash(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+
+        let repo = crate::test_support::TempRepo::new("history-keys");
+        commit(repo.path(), "a.txt", "A");
+        let b = commit(repo.path(), "b.txt", "B");
+        commit(repo.path(), "c.txt", "C");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.commit_count()),
+            3,
+            "the history did not finish loading"
+        );
+
+        // Clicking row 2 selects it and gives the list the keyboard.
+        let row = cx
+            .debug_bounds("history-row-2")
+            .expect("the third history row was not drawn");
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert_eq!(view.selected, Some(2), "the clicked row is not selected");
+        });
+        cx.update(|window, cx| {
+            assert!(
+                history.read(cx).focus.is_focused(window),
+                "clicking a row did not focus the history list"
+            );
+        });
+
+        // ↓ / j move down and clamp at the last row; ↑ / k move back up.
+        cx.simulate_keystrokes("up");
+        assert_eq!(history.read_with(&cx, |view, _| view.selected), Some(1));
+        cx.simulate_keystrokes("j");
+        assert_eq!(history.read_with(&cx, |view, _| view.selected), Some(2));
+        cx.simulate_keystrokes("j");
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected),
+            Some(2),
+            "the selection wrapped past the last row"
+        );
+        cx.simulate_keystrokes("k");
+        assert_eq!(history.read_with(&cx, |view, _| view.selected), Some(1));
+
+        // Home / End jump to the loaded ends.
+        cx.simulate_keystrokes("home");
+        assert_eq!(history.read_with(&cx, |view, _| view.selected), Some(0));
+        cx.simulate_keystrokes("end");
+        assert_eq!(history.read_with(&cx, |view, _| view.selected), Some(2));
+
+        // Ctrl+C copies the full 40-char hash of the selected commit.
+        cx.simulate_keystrokes("home");
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("ctrl-c");
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("Ctrl+C did not write the hash to the clipboard");
+        assert_eq!(copied, b, "the clipboard holds the wrong commit hash");
+    }
+
+    /// Right-clicking a row selects it and opens the row menu; its first item
+    /// copies the row's full hash.
+    #[gpui::test]
+    fn right_clicking_a_row_opens_the_row_menu_and_copies_the_hash(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, Modifiers, MouseButton};
+
+        let repo = crate::test_support::TempRepo::new("history-row-menu");
+        commit(repo.path(), "a.txt", "A");
+        let b = commit(repo.path(), "b.txt", "B");
+        commit(repo.path(), "c.txt", "C");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        let row = cx
+            .debug_bounds("history-row-1")
+            .expect("the second history row was not drawn");
+        let position = row.center();
+        cx.simulate_mouse_down(position, MouseButton::Right, Modifiers::default());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.selected,
+                Some(1),
+                "the right-clicked row is not selected"
+            );
+        });
+        cx.update(|window, cx| {
+            assert_eq!(
+                ui::overlay::layer_count(window, cx),
+                1,
+                "right-clicking a row did not open the row menu"
+            );
+        });
+
+        // Item 0 sits 20 px below the menu's top-left corner: the 6 px panel
+        // padding plus half of the 28 px first row.
+        cx.simulate_click(
+            point(position.x + px(40.), position.y + px(20.)),
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("the row menu's Copy item did not write the hash");
+        assert_eq!(copied, b, "the row menu copied the wrong commit hash");
+        cx.update(|window, cx| {
+            assert_eq!(
+                ui::overlay::layer_count(window, cx),
+                0,
+                "the row menu stayed open after its item was clicked"
+            );
+        });
+    }
+
+    /// The first selection is the HEAD row, even when HEAD is not row 0, and
+    /// the list does not steal the focus for it.
+    #[gpui::test]
+    fn the_initial_selection_is_the_head_row(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-head");
+        commit(repo.path(), "a.txt", "A");
+        let b = commit(repo.path(), "b.txt", "B");
+        // A newer commit on another branch puts HEAD at row 1 of `--all`.
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test User")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test User")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).expect("git prints UTF-8")
+        };
+        // The initial branch name comes from the user's git configuration.
+        let main_branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .trim()
+            .to_owned();
+        git(&["checkout", "-q", "-b", "other"]);
+        let c = commit(repo.path(), "c.txt", "C");
+        git(&["checkout", "-q", &main_branch]);
+
+        let (mut cx, history) = open_history(&repo, cx);
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected),
+            Some(1),
+            "the initial selection is not the HEAD row"
+        );
+        history.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.items[1].commit.id.to_string(),
+                b,
+                "HEAD is not the row the view selected"
+            );
+            assert_ne!(view.items[0].commit.id.to_string(), b);
+            assert_eq!(view.items[0].commit.id.to_string(), c);
+        });
+        cx.update(|window, cx| {
+            assert!(
+                !history.read(cx).focus.is_focused(window),
+                "the initial selection stole the focus"
             );
         });
     }
