@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, px, uniform_list, AnyElement, AsyncApp, ClipboardItem, Context, Div, FontWeight,
-    IntoElement, Pixels, Render, SharedString, StyledText, Task, TextRun, TextStyle, WeakEntity,
-    Window,
+    canvas, container_query, div, px, uniform_list, AnyElement, AsyncApp, ClipboardItem,
+    ContentMask, Context, Div, FontWeight, IntoElement, Pixels, Render, SharedString, StyledText,
+    Task, TextRun, TextStyle, WeakEntity, Window,
 };
 
 use git_core::{CommitInfo, Error, Git, Head, LogOptions, LogStream, Oid, Ref, Repo};
@@ -38,9 +38,25 @@ const PAGE: usize = 2_000;
 
 /// Column widths of the history table, shared by the header and the rows.
 const COL_GAP: f32 = 18.;
+/// Author and date columns on a wide pane.
 const COL_AUTHOR: f32 = 130.;
 const COL_DATE: f32 = 104.;
+/// The narrower author and date columns below [`PANE_MEDIUM`].
+const COL_AUTHOR_NARROW: f32 = 104.;
+const COL_DATE_NARROW: f32 = 76.;
 const COL_HASH: f32 = 64.;
+/// The pane widths where the table drops a column, as the design's container
+/// queries do: 560 px loses Hash, 460 px loses Author.
+const PANE_MEDIUM: f32 = 560.;
+const PANE_NARROW: f32 = 460.;
+/// The graph column's design range: at most 480 px on a wide pane and 112 px
+/// from 560 px down; on top of that it never takes more than a share of the
+/// pane, so the summary always keeps room.
+const GRAPH_MAX_WIDE: f32 = 480.;
+const GRAPH_MAX_NARROW: f32 = 112.;
+const GRAPH_SHARE_WIDE: f32 = 0.40;
+const GRAPH_SHARE_MEDIUM: f32 = 0.40;
+const GRAPH_SHARE_NARROW: f32 = 0.36;
 /// The header and the rows share this side margin and padding.
 const SIDE_MARGIN: f32 = 6.;
 const PAD_LEFT: f32 = 14.;
@@ -53,6 +69,61 @@ const SKELETON_SUMMARY_REF: f32 = 360.;
 const SKELETON_ROWS: usize = 10;
 
 type Page = Result<Vec<(CommitInfo, Row<Oid>)>, Failure>;
+
+/// The history table's columns for one pane width, shared by the header, the
+/// rows and the skeleton rows so the three stay aligned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Columns {
+    /// Width of the graph column.
+    pub graph: f32,
+    /// Width of the author column; `None` once the pane is too narrow.
+    pub author: Option<f32>,
+    /// Width of the date column.
+    pub date: f32,
+    /// Width of the hash column; `None` once the pane is too narrow.
+    pub hash: Option<f32>,
+}
+
+/// The table layout for a history pane `pane_width` wide whose graph needs
+/// `lanes` lanes.
+///
+/// This is the design's container-query table: the graph column shrinks to a
+/// share of the pane (and to 112 px from 560 px down), the hash column goes at
+/// 560 px and the author column at 460 px.
+pub fn columns(pane_width: f32, lanes: usize) -> Columns {
+    let lanes_width = f32::from(graph_width(lanes)).max(GRAPH_MIN);
+    let (max, share) = if pane_width <= PANE_NARROW {
+        (GRAPH_MAX_NARROW, GRAPH_SHARE_NARROW)
+    } else if pane_width <= PANE_MEDIUM {
+        (GRAPH_MAX_NARROW, GRAPH_SHARE_MEDIUM)
+    } else {
+        (GRAPH_MAX_WIDE, GRAPH_SHARE_WIDE)
+    };
+    let graph = lanes_width.min(max).min(share * pane_width).max(GRAPH_MIN);
+
+    if pane_width <= PANE_NARROW {
+        Columns {
+            graph,
+            author: None,
+            date: COL_DATE_NARROW,
+            hash: None,
+        }
+    } else if pane_width <= PANE_MEDIUM {
+        Columns {
+            graph,
+            author: Some(COL_AUTHOR_NARROW),
+            date: COL_DATE_NARROW,
+            hash: None,
+        }
+    } else {
+        Columns {
+            graph,
+            author: Some(COL_AUTHOR),
+            date: COL_DATE,
+            hash: Some(COL_HASH),
+        }
+    }
+}
 
 struct Item {
     commit: CommitInfo,
@@ -92,6 +163,9 @@ pub struct HistoryView {
     /// showing the placeholder.
     head: Option<Result<Head, String>>,
     refs: RefsState,
+    /// The table layout for the pane's last measured width, so the virtualized
+    /// rows paint with the same columns the header was built for.
+    columns: Columns,
 }
 
 impl HistoryView {
@@ -119,6 +193,8 @@ impl HistoryView {
             count_task: None,
             head: None,
             refs: RefsState::Loading,
+            // Replaced with the pane's real width in the first prepaint.
+            columns: columns(1200., 1),
         };
         view.start(cx);
         view
@@ -393,31 +469,33 @@ impl HistoryView {
             .map(|item| item.commit.id.short().into())
     }
 
-    fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_header(&self, columns: Columns, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
-        let graph = graph_column(self.max_lanes);
         // A 6px gutter around the header, so it lines up with the rows.
-        div().w_full().px(px(SIDE_MARGIN)).child(
-            div()
-                .w_full()
-                .h(theme::ROW_HEIGHT)
-                .pl(px(PAD_LEFT))
-                .pr(px(PAD_RIGHT))
-                .flex()
-                .items_center()
-                .gap(px(COL_GAP))
-                .bg(colors.bg)
-                .border_b_1()
-                .border_color(colors.border)
-                .text_size(FS_SM)
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors.muted)
-                .child(div().w(graph).flex_none().child("Graph"))
-                .child(div().flex_1().min_w_0().truncate().child("Summary"))
-                .child(div().w(px(COL_AUTHOR)).flex_none().child("Author"))
-                .child(div().w(px(COL_DATE)).flex_none().child("Date"))
-                .child(div().w(px(COL_HASH)).flex_none().child("Hash")),
-        )
+        let mut head = div()
+            .w_full()
+            .h(theme::ROW_HEIGHT)
+            .pl(px(PAD_LEFT))
+            .pr(px(PAD_RIGHT))
+            .flex()
+            .items_center()
+            .gap(px(COL_GAP))
+            .bg(colors.bg)
+            .border_b_1()
+            .border_color(colors.border)
+            .text_size(FS_SM)
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(colors.muted)
+            .child(div().w(px(columns.graph)).flex_none().child("Graph"))
+            .child(div().flex_1().min_w_0().truncate().child("Summary"));
+        if let Some(author) = columns.author {
+            head = head.child(div().w(px(author)).flex_none().child("Author"));
+        }
+        head = head.child(div().w(px(columns.date)).flex_none().child("Date"));
+        if let Some(hash) = columns.hash {
+            head = head.child(div().w(px(hash)).flex_none().child("Hash"));
+        }
+        div().w_full().px(px(SIDE_MARGIN)).child(head)
     }
 
     /// The one-line load bar under the header.
@@ -469,41 +547,52 @@ impl HistoryView {
     }
 
     /// Ten placeholder rows while the first page of history is on its way.
-    fn render_skeletons(&self, cx: &Context<Self>) -> Div {
+    fn render_skeletons(&self, columns: Columns, cx: &Context<Self>) -> Div {
         let colors = cx.theme().colors;
-        let graph = graph_column(1);
         div()
             .w_full()
             .flex()
             .flex_col()
             .children((0..SKELETON_ROWS).map(|index| {
-                div().w_full().px(px(SIDE_MARGIN)).child(
-                    div()
-                        .w_full()
-                        .h(theme::ROW_HEIGHT)
-                        .pl(px(PAD_LEFT))
-                        .pr(px(PAD_RIGHT))
-                        .flex()
-                        .items_center()
-                        .gap(px(COL_GAP))
-                        .child(graph_skeleton(graph, colors))
-                        .child(div().flex_1().min_w_0().child(Skeleton::new(
-                            format!("history-skeleton-summary-{index}"),
-                            skeleton_width(SkeletonColumn::Summary, index),
-                        )))
-                        .child(div().w(px(COL_AUTHOR)).flex_none().child(Skeleton::new(
-                            format!("history-skeleton-author-{index}"),
-                            skeleton_width(SkeletonColumn::Author, index),
-                        )))
-                        .child(div().w(px(COL_DATE)).flex_none().child(Skeleton::new(
-                            format!("history-skeleton-date-{index}"),
-                            skeleton_width(SkeletonColumn::Date, index),
-                        )))
-                        .child(div().w(px(COL_HASH)).flex_none().child(Skeleton::new(
-                            format!("history-skeleton-hash-{index}"),
-                            skeleton_width(SkeletonColumn::Hash, index),
-                        ))),
-                )
+                let mut row = div()
+                    .w_full()
+                    .h(theme::ROW_HEIGHT)
+                    .pl(px(PAD_LEFT))
+                    .pr(px(PAD_RIGHT))
+                    .flex()
+                    .items_center()
+                    .gap(px(COL_GAP))
+                    .child(graph_skeleton(px(columns.graph), colors))
+                    // The summary bar is a percentage of a fixed reference
+                    // width; clip it so a narrow pane's bar cannot run into
+                    // the author column.
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(Skeleton::new(
+                                format!("history-skeleton-summary-{index}"),
+                                skeleton_width(SkeletonColumn::Summary, index, columns),
+                            )),
+                    );
+                if let Some(author) = columns.author {
+                    row = row.child(div().w(px(author)).flex_none().child(Skeleton::new(
+                        format!("history-skeleton-author-{index}"),
+                        skeleton_width(SkeletonColumn::Author, index, columns),
+                    )));
+                }
+                row = row.child(div().w(px(columns.date)).flex_none().child(Skeleton::new(
+                    format!("history-skeleton-date-{index}"),
+                    skeleton_width(SkeletonColumn::Date, index, columns),
+                )));
+                if let Some(hash) = columns.hash {
+                    row = row.child(div().w(px(hash)).flex_none().child(Skeleton::new(
+                        format!("history-skeleton-hash-{index}"),
+                        skeleton_width(SkeletonColumn::Hash, index, columns),
+                    )));
+                }
+                div().w_full().px(px(SIDE_MARGIN)).child(row)
             }))
     }
 
@@ -514,7 +603,7 @@ impl HistoryView {
     ) -> Vec<impl IntoElement> {
         let colors = cx.theme().colors;
         let ui_theme = cx.theme().clone();
-        let graph_w = graph_column(self.max_lanes);
+        let columns = self.columns;
         range
             .map(|ix| {
                 let item = &self.items[ix];
@@ -531,68 +620,75 @@ impl HistoryView {
                 // The 6px gutter lives on the wrapper: a uniform_list lays
                 // each item out with a definite width and does not stretch it,
                 // so margins on the row itself would overflow.
-                div().w_full().px(px(SIDE_MARGIN)).child(
-                    div()
-                        .id(ix)
-                        .h(theme::ROW_HEIGHT)
-                        .w_full()
-                        .pl(px(PAD_LEFT))
-                        .pr(px(PAD_RIGHT))
-                        .flex()
-                        .items_center()
-                        .gap(px(COL_GAP))
-                        .text_size(FS_SM)
-                        .when(selected, |d| d.bg(colors.selection))
-                        .when(!selected, |d| d.hover(|d| d.bg(colors.hover)))
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.selected = Some(ix);
-                            cx.notify();
-                        }))
-                        .child(
-                            canvas(
-                                |_, _, _| {},
-                                move |bounds, _, window, _| {
+                let mut row_div = div()
+                    .id(ix)
+                    .h(theme::ROW_HEIGHT)
+                    .w_full()
+                    .pl(px(PAD_LEFT))
+                    .pr(px(PAD_RIGHT))
+                    .flex()
+                    .items_center()
+                    .gap(px(COL_GAP))
+                    .text_size(FS_SM)
+                    .when(selected, |d| d.bg(colors.selection))
+                    .when(!selected, |d| d.hover(|d| d.bg(colors.hover)))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.selected = Some(ix);
+                        cx.notify();
+                    }))
+                    .child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                // Clip to the graph column so lanes past its
+                                // edge are cut instead of drawn over Summary.
+                                window.with_content_mask(Some(ContentMask { bounds }), |window| {
                                     paint_row(&row, bounds, background, &row_theme, window)
-                                },
-                            )
-                            .w(graph_w)
-                            .h_full()
-                            .flex_none(),
+                                })
+                            },
                         )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_color(colors.text)
-                                .child(c.summary.clone()),
-                        )
-                        .child(
-                            div()
-                                .w(px(COL_AUTHOR))
-                                .flex_none()
-                                .truncate()
-                                .text_color(colors.muted)
-                                .child(c.author_name.clone()),
-                        )
-                        .child(
-                            div()
-                                .w(px(COL_DATE))
-                                .flex_none()
-                                .truncate()
-                                .text_color(colors.muted)
-                                .child(format_time(c.author_time)),
-                        )
-                        .child(
-                            div()
-                                .w(px(COL_HASH))
-                                .flex_none()
-                                .truncate()
-                                .font_family(FONT_MONO)
-                                .text_color(colors.muted)
-                                .child(c.id.short()),
-                        ),
-                )
+                        .w(px(columns.graph))
+                        .h_full()
+                        .flex_none(),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(colors.text)
+                            .child(c.summary.clone()),
+                    );
+                if let Some(author) = columns.author {
+                    row_div = row_div.child(
+                        div()
+                            .w(px(author))
+                            .flex_none()
+                            .truncate()
+                            .text_color(colors.muted)
+                            .child(c.author_name.clone()),
+                    );
+                }
+                row_div = row_div.child(
+                    div()
+                        .w(px(columns.date))
+                        .flex_none()
+                        .truncate()
+                        .text_color(colors.muted)
+                        .child(format_time(c.author_time)),
+                );
+                if let Some(hash) = columns.hash {
+                    row_div = row_div.child(
+                        div()
+                            .w(px(hash))
+                            .flex_none()
+                            .truncate()
+                            .font_family(FONT_MONO)
+                            .text_color(colors.muted)
+                            .child(c.id.short()),
+                    );
+                }
+                div().w_full().px(px(SIDE_MARGIN)).child(row_div)
             })
             .collect()
     }
@@ -609,7 +705,7 @@ impl HistoryView {
         .into_any_element()
     }
 
-    fn render_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_body(&mut self, columns: Columns, cx: &mut Context<Self>) -> AnyElement {
         // The state is small and cloned so the render helpers can take `&mut
         // self` for their click listeners.
         let state = self.state.clone();
@@ -619,7 +715,9 @@ impl HistoryView {
                 let mut column = div().flex_1().min_h_0().w_full().flex().flex_col();
                 column = column.child(self.render_load_bar(loaded, total, cx));
                 if self.items.is_empty() {
-                    column.child(self.render_skeletons(cx)).into_any_element()
+                    column
+                        .child(self.render_skeletons(columns, cx))
+                        .into_any_element()
                 } else {
                     column.child(self.render_list(cx)).into_any_element()
                 }
@@ -910,10 +1008,16 @@ impl HistoryView {
     }
 }
 
-impl Render for HistoryView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl HistoryView {
+    /// The whole table for a pane this wide: the header, then the body for the
+    /// current state. Called with the width the pane was actually assigned.
+    fn render_at(&mut self, pane_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
-        let body = self.render_body(cx);
+        let columns = columns(pane_width, self.max_lanes.max(1));
+        // The virtualized rows are painted after this and must agree with the
+        // header.
+        self.columns = columns;
+        let body = self.render_body(columns, cx);
         // The column header stays above every state.
         div()
             .size_full()
@@ -922,8 +1026,22 @@ impl Render for HistoryView {
             .bg(colors.bg)
             .text_color(colors.text)
             .font_family(FONT_UI)
-            .child(self.render_header(cx))
+            .child(self.render_header(columns, cx))
             .child(body)
+            .into_any_element()
+    }
+}
+
+impl Render for HistoryView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The pane's own width is only known after layout. A container query
+        // hands it back in prepaint, so the table is rebuilt for the width the
+        // pane really got — no measure-and-notify round trip, no stale frame.
+        let view = cx.entity().downgrade();
+        container_query(move |size, _window, cx| {
+            view.update(cx, |view, cx| view.render_at(f32::from(size.width), cx))
+                .unwrap_or_else(|_| div().into_any_element())
+        })
     }
 }
 
@@ -1038,20 +1156,15 @@ fn graph_skeleton(width: Pixels, colors: ThemeColors) -> Div {
 }
 
 /// A skeleton bar's width in pixels for its column.
-fn skeleton_width(column: SkeletonColumn, index: usize) -> Pixels {
+fn skeleton_width(column: SkeletonColumn, index: usize, columns: Columns) -> Pixels {
     let fraction = skeleton_percent(column, index) / 100.;
-    match column {
-        SkeletonColumn::Summary => px(SKELETON_SUMMARY_REF * fraction),
-        SkeletonColumn::Author => px(COL_AUTHOR * fraction),
-        SkeletonColumn::Date => px(COL_DATE * fraction),
-        SkeletonColumn::Hash => px(COL_HASH * fraction),
-    }
-}
-
-/// The width of the graph column: the lanes the history needs, but at least
-/// [`GRAPH_MIN`] so the header and the cells never collapse.
-fn graph_column(lanes: usize) -> Pixels {
-    graph_width(lanes).max(px(GRAPH_MIN))
+    let width = match column {
+        SkeletonColumn::Summary => SKELETON_SUMMARY_REF,
+        SkeletonColumn::Author => columns.author.unwrap_or(0.),
+        SkeletonColumn::Date => columns.date,
+        SkeletonColumn::Hash => columns.hash.unwrap_or(0.),
+    };
+    px(width * fraction)
 }
 
 fn next_page(
@@ -1115,22 +1228,68 @@ mod tests {
     }
 
     #[test]
-    fn graph_column_has_a_floor() {
-        assert_eq!(graph_column(1), px(GRAPH_MIN));
-        assert_eq!(graph_column(24), graph_width(24));
-        assert!(graph_column(24) > px(GRAPH_MIN));
+    fn columns_drop_the_wide_columns_at_the_container_queries() {
+        // 560 px is the design's first breakpoint: Hash goes, Author and Date
+        // take their narrow widths.
+        let medium = columns(560., 30);
+        assert_eq!(medium.hash, None);
+        assert_eq!(medium.author, Some(COL_AUTHOR_NARROW));
+        assert_eq!(medium.date, COL_DATE_NARROW);
+        assert!(medium.graph <= 112., "{}", medium.graph);
+        assert!(medium.graph <= 0.40 * 560. + f32::EPSILON);
+
+        // 460 px is the second: Author goes too.
+        let narrow = columns(460., 30);
+        assert_eq!(narrow.hash, None);
+        assert_eq!(narrow.author, None);
+        assert_eq!(narrow.date, COL_DATE_NARROW);
+        assert!(
+            narrow.graph <= 112_f32.min(0.36 * 460.) + f32::EPSILON,
+            "{}",
+            narrow.graph
+        );
+
+        // A wide pane keeps all five columns.
+        let wide = columns(1200., 2);
+        assert_eq!(wide.author, Some(COL_AUTHOR));
+        assert_eq!(wide.date, COL_DATE);
+        assert_eq!(wide.hash, Some(COL_HASH));
+    }
+
+    #[test]
+    fn columns_cap_the_graph_so_the_summary_keeps_its_room() {
+        // 30 lanes need 356 px: `graph_width` stops drawing lanes past
+        // MAX_GRAPH_LANES, so the 480 px design cap never binds at 1200 px.
+        assert_eq!(f32::from(graph_width(30)), 356.);
+        assert_eq!(columns(1200., 30).graph, 356.);
+        // At 800 px the 40 % share binds before the lane width does.
+        assert_eq!(columns(800., 30).graph, 320.);
+        // A graph narrower than the share keeps the lanes' width.
+        assert_eq!(columns(800., 2).graph, f32::from(graph_width(2)));
+        // The 40 % share holds on any wide pane.
+        assert_eq!(columns(700., 30).graph, 280.);
+        // Never below the floor, however narrow the pane or the graph.
+        assert_eq!(columns(300., 1).graph, GRAPH_MIN);
+        assert_eq!(columns(100., 30).graph, GRAPH_MIN);
     }
 
     #[test]
     fn skeleton_widths_are_cell_percentages() {
-        assert_eq!(skeleton_width(SkeletonColumn::Summary, 0), px(144.));
+        let wide = columns(1200., 1);
+        assert_eq!(skeleton_width(SkeletonColumn::Summary, 0, wide), px(144.));
         assert_eq!(
-            skeleton_width(SkeletonColumn::Summary, 1),
+            skeleton_width(SkeletonColumn::Summary, 1, wide),
             px(SKELETON_SUMMARY_REF * 0.77)
         );
-        assert_eq!(skeleton_width(SkeletonColumn::Author, 0), px(65.));
-        assert_eq!(skeleton_width(SkeletonColumn::Date, 4), px(62.4));
-        assert_eq!(skeleton_width(SkeletonColumn::Hash, 4), px(51.2));
+        assert_eq!(skeleton_width(SkeletonColumn::Author, 0, wide), px(65.));
+        assert_eq!(skeleton_width(SkeletonColumn::Date, 4, wide), px(62.4));
+        assert_eq!(skeleton_width(SkeletonColumn::Hash, 4, wide), px(51.2));
+        // The narrow table uses the narrow date column.
+        let narrow = columns(460., 1);
+        assert_eq!(
+            skeleton_width(SkeletonColumn::Date, 4, narrow),
+            px(COL_DATE_NARROW * (skeleton_percent(SkeletonColumn::Date, 4) / 100.))
+        );
     }
 
     #[test]

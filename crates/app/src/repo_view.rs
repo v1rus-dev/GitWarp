@@ -211,6 +211,42 @@ pub fn clamp_details(size: f32, dock: Dock) -> f32 {
     }
 }
 
+/// The room the history pane always keeps for itself.
+pub const HISTORY_MIN_WIDTH: f32 = 360.;
+/// A right-docked details panel never takes more than this share of the space
+/// right of the sidebar.
+const DETAILS_MAX_SHARE: f32 = 0.5;
+
+/// The widest a right-docked details panel may render: half of the space right
+/// of the sidebar, within the panel's own 220–900 range.
+///
+/// `sidebar_width` is the width the sidebar actually renders at (0 while it is
+/// collapsed).
+pub fn details_width_limit(window_width: f32, sidebar_width: f32) -> f32 {
+    let (min, max) = dock_bounds(Dock::Right);
+    (DETAILS_MAX_SHARE * (window_width - sidebar_width)).clamp(min, max)
+}
+
+/// The width a right-docked details panel renders at: its stored size, capped
+/// by [`details_width_limit`] and never below its 220 px minimum.
+///
+/// The stored size is not rewritten; only the rendered width shrinks.
+pub fn effective_details_width(stored: f32, window_width: f32, sidebar_width: f32) -> f32 {
+    clamp_details(stored, Dock::Right).min(details_width_limit(window_width, sidebar_width))
+}
+
+/// The width the sidebar renders at: its stored width, but never so wide that
+/// the history pane drops below [`HISTORY_MIN_WIDTH`], and never below its own
+/// 160 px minimum.
+///
+/// `details_width` is the width the details panel actually renders at, which
+/// only counts while it is docked right and open. The stored width is kept.
+pub fn effective_sidebar_width(stored: f32, window_width: f32, details_width: f32) -> f32 {
+    let stored = stored.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
+    let room = window_width - HISTORY_MIN_WIDTH - details_width;
+    stored.min(room).max(SIDEBAR_WIDTH_MIN)
+}
+
 /// The six sidebar sections, in display order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
@@ -829,7 +865,7 @@ impl RepositoryView {
         titlebar_end(bar, client)
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_sidebar(&mut self, width: f32, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
         let nodes = self.tree_nodes(cx);
         let keys: Vec<SharedString> = nodes.iter().map(|node| node.key.clone()).collect();
@@ -850,7 +886,7 @@ impl RepositoryView {
         };
 
         div()
-            .w(px(self.sidebar_width))
+            .w(px(width))
             .flex_none()
             .h_full()
             .flex()
@@ -894,13 +930,18 @@ impl RepositoryView {
         )
     }
 
-    fn render_sidebar_splitter(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar_splitter(
+        &mut self,
+        width: f32,
+        max: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let view = cx.entity();
         let reset_view = view.clone();
         let persist_view = view.clone();
         Splitter::vertical("sidebar-splitter")
-            .size(px(self.sidebar_width))
-            .bounds(px(SIDEBAR_WIDTH_MIN), px(SIDEBAR_WIDTH_MAX))
+            .size(px(width))
+            .bounds(px(SIDEBAR_WIDTH_MIN), px(max))
             .on_resize(move |size, _, cx| {
                 view.update(cx, |view, cx| view.set_sidebar_width(size, cx));
             })
@@ -915,9 +956,14 @@ impl RepositoryView {
             })
     }
 
-    fn render_details_splitter(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (min, max) = dock_bounds(self.dock);
-        let size = px(clamp_details(self.details_size, self.dock));
+    fn render_details_splitter(
+        &mut self,
+        width: f32,
+        limit: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (min, _) = dock_bounds(self.dock);
+        let size = px(width);
         let splitter = match self.dock {
             Dock::Bottom => Splitter::horizontal("details-splitter"),
             Dock::Right => Splitter::vertical("details-splitter"),
@@ -927,7 +973,7 @@ impl RepositoryView {
         let persist_view = view.clone();
         splitter
             .size(size)
-            .bounds(px(min), px(max))
+            .bounds(px(min), px(limit))
             // A panel docked bottom or right grows as the pointer moves up or
             // left.
             .inverted(true)
@@ -942,13 +988,12 @@ impl RepositoryView {
             })
     }
 
-    fn render_details(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_details(&mut self, width: f32, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
-        let size = clamp_details(self.details_size, self.dock);
         let mut panel = div().flex_none().flex().flex_col().bg(colors.bg);
         panel = match self.dock {
-            Dock::Bottom => panel.w_full().h(px(size)).border_t_1(),
-            Dock::Right => panel.h_full().w(px(size)).border_l_1(),
+            Dock::Bottom => panel.w_full().h(px(width)).border_t_1(),
+            Dock::Right => panel.h_full().w(px(width)).border_l_1(),
         };
         panel
             .border_color(colors.border)
@@ -1165,13 +1210,48 @@ impl Render for RepositoryView {
         }
 
         let toolbar = self.render_toolbar(layout, client, cx);
-        let sidebar = self
-            .sidebar_open
-            .then(|| (self.render_sidebar(cx), self.render_sidebar_splitter(cx)));
+
+        // A stored sidebar (up to 420) plus a right-docked details panel (up to
+        // 900) could leave the history pane with nothing on a ~1270 px window.
+        // Only the rendered widths are capped; the stored sizes stay as saved.
+        let sidebar_space = if self.sidebar_open {
+            self.sidebar_width
+        } else {
+            0.
+        };
+        let details_limit = match self.dock {
+            Dock::Right => details_width_limit(width, sidebar_space),
+            Dock::Bottom => dock_bounds(Dock::Bottom).1,
+        };
+        let details_width = if self.details_open {
+            match self.dock {
+                Dock::Right => effective_details_width(self.details_size, width, sidebar_space),
+                Dock::Bottom => clamp_details(self.details_size, Dock::Bottom),
+            }
+        } else {
+            0.
+        };
+        let sidebar_width = if self.sidebar_open {
+            effective_sidebar_width(self.sidebar_width, width, details_width)
+        } else {
+            0.
+        };
+        // The splitter may not drag the sidebar past what renders either.
+        let sidebar_limit = SIDEBAR_WIDTH_MAX
+            .min(width - HISTORY_MIN_WIDTH - details_width)
+            .max(SIDEBAR_WIDTH_MIN);
+
+        let sidebar = self.sidebar_open.then(|| {
+            (
+                self.render_sidebar(sidebar_width, cx),
+                self.render_sidebar_splitter(sidebar_width, sidebar_limit, cx),
+            )
+        });
         let details_open = self.details_open;
         let dock = self.dock;
-        let splitter = details_open.then(|| self.render_details_splitter(cx));
-        let panel = details_open.then(|| self.render_details(cx));
+        let splitter =
+            details_open.then(|| self.render_details_splitter(details_width, details_limit, cx));
+        let panel = details_open.then(|| self.render_details(details_width, cx));
         let status = self.render_status_bar(cx);
 
         let history_pane = div()
@@ -1520,6 +1600,36 @@ mod tests {
         assert_eq!(clamp_details(999., Dock::Bottom), 560.);
         assert_eq!(clamp_details(999., Dock::Right), 900.);
         assert_eq!(clamp_details(f32::NAN, Dock::Right), 640.);
+    }
+
+    #[test]
+    fn right_docked_details_never_take_over_half_the_pane() {
+        // The live bug: 1270 px with a 420 px sidebar and a 900 px panel left
+        // the history pane ~200 px. Half the space right of the sidebar is
+        // 425 px.
+        assert_eq!(effective_details_width(900., 1270., 420.), 425.);
+        assert_eq!(details_width_limit(1270., 420.), 425.);
+        // A stored 640 px panel still fits on a wide window.
+        assert_eq!(effective_details_width(640., 1600., 240.), 640.);
+        assert_eq!(details_width_limit(1600., 240.), 680.);
+        // On a tiny window the 220 px minimum beats the half rule.
+        assert_eq!(effective_details_width(900., 500., 300.), 220.);
+        assert_eq!(details_width_limit(500., 300.), 220.);
+    }
+
+    #[test]
+    fn the_sidebar_never_squeezes_the_history_pane_below_360() {
+        // 1000 px, a 320 px right-docked panel and a stored 420 px sidebar:
+        // only 320 px of sidebar fit beside the 360 px the history needs.
+        assert_eq!(effective_sidebar_width(420., 1000., 320.), 320.);
+        // Nothing to squeeze: the stored width stands.
+        assert_eq!(effective_sidebar_width(240., 1000., 320.), 240.);
+        assert_eq!(effective_sidebar_width(240., 1270., 425.), 240.);
+        // The 160 px sidebar minimum beats the 360 px history rule.
+        assert_eq!(effective_sidebar_width(420., 800., 400.), 160.);
+        // No right-docked panel (bottom dock or closed): only the 360 px rule.
+        assert_eq!(effective_sidebar_width(420., 1000., 0.), 420.);
+        assert_eq!(effective_sidebar_width(420., 500., 0.), 160.);
     }
 
     #[test]
