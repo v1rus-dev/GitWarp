@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use git_core::{ChangedFile, CommitDetails, FileDiff, Git, Oid, Repo};
 
-use crate::diff_model::{build_rows, max_columns, DiffRow};
+use crate::diff_model::{build_rows, build_split_rows, max_columns, DiffRow, SplitRow};
 
 /// What the details dock knows about the selected commit.
 #[derive(Clone, Debug, Default)]
@@ -48,6 +48,7 @@ pub struct CommitDetailsData {
 pub struct DiffData {
     pub diff: FileDiff,
     pub rows: Vec<DiffRow>,
+    pub split_rows: Vec<SplitRow>,
     /// Widest row in display columns, for the horizontal scroll width.
     pub columns: usize,
 }
@@ -88,10 +89,12 @@ pub fn read_diff(
         .file_diff(oid, &file.path, file.old_path.as_deref())
         .map_err(|error| error.to_string())?;
     let rows = build_rows(&diff.hunks);
+    let split_rows = build_split_rows(&rows);
     let columns = max_columns(&rows);
     Ok(DiffData {
         diff,
         rows,
+        split_rows,
         columns,
     })
 }

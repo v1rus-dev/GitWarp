@@ -154,6 +154,113 @@ fn push_note(rows: &mut Vec<DiffRow>, line: &DiffLine) {
     }
 }
 
+/// Which side of a split row a cell belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitCellKind {
+    Context,
+    Added,
+    Removed,
+}
+
+/// One side of a side-by-side row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitCell {
+    pub line: u32,
+    pub kind: SplitCellKind,
+    pub text: String,
+    /// Byte ranges highlighted as changed against the other side.
+    pub emphasis: Vec<Range<usize>>,
+}
+
+/// One row of the side-by-side view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplitRow {
+    /// A `@@ … @@` header across both columns.
+    Header(String),
+    /// `\ No newline at end of file` across both columns.
+    Note(String),
+    /// Old and new cells; a missing side is drawn as a hatched filler.
+    Pair {
+        old: Option<SplitCell>,
+        new: Option<SplitCell>,
+    },
+}
+
+/// Pairs the unified rows into side-by-side rows.
+///
+/// [`build_rows`] already emits a paired removed line directly before its
+/// added line, so a removed row followed by an added row is one split row;
+/// context lines fill both sides and an unpaired line leaves its other side
+/// empty.
+pub fn build_split_rows(rows: &[DiffRow]) -> Vec<SplitRow> {
+    let mut split = Vec::with_capacity(rows.len());
+    let mut index = 0;
+    while index < rows.len() {
+        let row = &rows[index];
+        match row.kind {
+            RowKind::Hunk => {
+                split.push(SplitRow::Header(row.text.clone()));
+                index += 1;
+            }
+            RowKind::Note => {
+                split.push(SplitRow::Note(row.text.clone()));
+                index += 1;
+            }
+            RowKind::Context => {
+                let line = row.old_line.or(row.new_line).unwrap_or(0);
+                let cell = SplitCell {
+                    line,
+                    kind: SplitCellKind::Context,
+                    text: row.text.clone(),
+                    emphasis: Vec::new(),
+                };
+                split.push(SplitRow::Pair {
+                    old: Some(cell.clone()),
+                    new: Some(cell),
+                });
+                index += 1;
+            }
+            RowKind::Removed => {
+                let old = split_cell(row, SplitCellKind::Removed);
+                if rows
+                    .get(index + 1)
+                    .is_some_and(|next| next.kind == RowKind::Added)
+                {
+                    let new = split_cell(&rows[index + 1], SplitCellKind::Added);
+                    split.push(SplitRow::Pair {
+                        old: Some(old),
+                        new: Some(new),
+                    });
+                    index += 2;
+                } else {
+                    split.push(SplitRow::Pair {
+                        old: Some(old),
+                        new: None,
+                    });
+                    index += 1;
+                }
+            }
+            RowKind::Added => {
+                split.push(SplitRow::Pair {
+                    old: None,
+                    new: Some(split_cell(row, SplitCellKind::Added)),
+                });
+                index += 1;
+            }
+        }
+    }
+    split
+}
+
+fn split_cell(row: &DiffRow, kind: SplitCellKind) -> SplitCell {
+    SplitCell {
+        line: row.old_line.or(row.new_line).unwrap_or(0),
+        kind,
+        text: row.text.clone(),
+        emphasis: row.emphasis.clone(),
+    }
+}
+
 /// The widest row in display columns, for the horizontal scroll width.
 pub fn max_columns(rows: &[DiffRow]) -> usize {
     rows.iter()
@@ -431,6 +538,67 @@ mod tests {
         assert!(rows[2].no_newline);
         assert_eq!(rows[3].kind, RowKind::Note);
         assert_eq!(rows[3].text, "\\ No newline at end of file");
+    }
+
+    #[test]
+    fn split_rows_pair_removals_with_additions_and_fill_the_rest() {
+        let hunk = Hunk {
+            header: "@@ -1,3 +1,4 @@".to_string(),
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 4,
+            lines: vec![
+                line(LineKind::Context, Some(1), Some(1), "one"),
+                line(LineKind::Removed, Some(2), None, "two"),
+                line(LineKind::Added, None, Some(2), "TWO"),
+                line(LineKind::Added, None, Some(3), "extra"),
+                line(LineKind::Removed, Some(3), None, "three"),
+            ],
+        };
+        let split = build_split_rows(&build_rows(&[hunk]));
+        assert_eq!(split.len(), 5);
+        assert!(matches!(split[0], SplitRow::Header(_)));
+        match &split[1] {
+            SplitRow::Pair {
+                old: Some(old),
+                new: Some(new),
+            } => {
+                assert_eq!(old.text, "one");
+                assert_eq!(new.text, "one");
+                assert_eq!(old.kind, SplitCellKind::Context);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &split[2] {
+            SplitRow::Pair {
+                old: Some(old),
+                new: Some(new),
+            } => {
+                assert_eq!(old.kind, SplitCellKind::Removed);
+                assert_eq!(new.kind, SplitCellKind::Added);
+                assert_eq!(old.line, 2);
+                assert_eq!(new.line, 2);
+                assert!(!old.emphasis.is_empty() && !new.emphasis.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &split[3] {
+            SplitRow::Pair {
+                old: None,
+                new: Some(new),
+            } => {
+                assert_eq!(new.text, "extra");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &split[4] {
+            SplitRow::Pair {
+                old: Some(old),
+                new: None,
+            } => assert_eq!(old.text, "three"),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

@@ -29,11 +29,13 @@ use ui::{
 };
 
 use crate::details::{read_details, read_diff, DetailsState, DiffState};
-use crate::diff_model::{DiffRow, RowKind};
+use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
 use crate::format::{absolute_time, format_count, relative_time};
 use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
-use crate::settings::{Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
+use crate::settings::{
+    DiffLayout, Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN,
+};
 use crate::sidebar::{
     commit_for, read_sidebar_extras, sidebar_menu, sidebar_nodes, Expansion, SidebarAction,
     SidebarExtras, SidebarMenuEntry,
@@ -330,6 +332,8 @@ pub struct RepositoryView {
     diff_scroll: UniformListScrollHandle,
     /// Advance of one mono character at [`MONO`], for the diff's scroll width.
     mono_cell: Pixels,
+    /// Unified or side-by-side, persisted in the settings.
+    diff_layout: DiffLayout,
     info_scroll: ScrollHandle,
     files_scroll: ScrollHandle,
     /// The file list's keyboard focus; arrow keys move the file selection only
@@ -465,6 +469,7 @@ impl RepositoryView {
                     MONO,
                 )
                 .unwrap_or(px(7.2)),
+            diff_layout: settings.diff_layout,
             info_scroll: ScrollHandle::new(),
             files_scroll: ScrollHandle::new(),
             files_focus: cx.focus_handle().tab_stop(true),
@@ -872,6 +877,18 @@ impl RepositoryView {
                 .ok();
         })
         .detach();
+        cx.notify();
+    }
+
+    /// Switches the diff pane between unified and side-by-side and remembers
+    /// the choice.
+    fn set_diff_layout(&mut self, layout: DiffLayout, cx: &mut Context<Self>) {
+        if self.diff_layout == layout {
+            return;
+        }
+        self.diff_layout = layout;
+        self.diff_scroll = UniformListScrollHandle::new();
+        crate::update_settings(cx, |settings| settings.diff_layout = layout);
         cx.notify();
     }
 
@@ -1828,6 +1845,31 @@ impl RepositoryView {
             toolbar = toolbar.child(div().flex_1());
         }
 
+        let layout = self.diff_layout;
+        let view = cx.entity();
+        let switch = Segmented::new("diff-layout")
+            .small()
+            .item(
+                SegmentItem::new("Unified")
+                    .with_icon(IconName::Unified)
+                    .id("diff-unified"),
+            )
+            .item(
+                SegmentItem::new("Side-by-side")
+                    .with_icon(IconName::Split)
+                    .id("diff-split"),
+            )
+            .selected(if layout == DiffLayout::Split { 1 } else { 0 })
+            .on_select(move |index, _, cx| {
+                let layout = if index == 1 {
+                    DiffLayout::Split
+                } else {
+                    DiffLayout::Unified
+                };
+                view.update(cx, |view, cx| view.set_diff_layout(layout, cx));
+            });
+        toolbar = toolbar.child(no_shrink(switch));
+
         let body = match &self.diff {
             DiffState::Empty => diff_note("Select a file", colors),
             DiffState::Loading => div()
@@ -1852,20 +1894,48 @@ impl RepositoryView {
                 } else if data.rows.is_empty() {
                     diff_note("No changes", colors)
                 } else {
-                    let row_width = diff_width(self.mono_cell, data.columns, width);
                     let data = data.clone();
-                    let list = uniform_list(
-                        "details-diff",
-                        data.rows.len(),
-                        cx.processor(move |view, range, window, cx| {
-                            view.render_diff_rows(&data.rows, range, row_width, window, cx)
-                        }),
-                    )
-                    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-                    .track_scroll(&self.diff_scroll)
-                    .flex_1()
-                    .min_h_0()
-                    .w_full();
+                    let list = if layout == DiffLayout::Split {
+                        let row_width = split_width(self.mono_cell, data.columns, width);
+                        uniform_list(
+                            "details-diff",
+                            data.split_rows.len(),
+                            cx.processor(move |view, range, window, cx| {
+                                view.render_split_rows(
+                                    &data.split_rows,
+                                    range,
+                                    row_width,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                        )
+                        .with_horizontal_sizing_behavior(
+                            ListHorizontalSizingBehavior::Unconstrained,
+                        )
+                        .track_scroll(&self.diff_scroll)
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .into_any_element()
+                    } else {
+                        let row_width = diff_width(self.mono_cell, data.columns, width);
+                        uniform_list(
+                            "details-diff",
+                            data.rows.len(),
+                            cx.processor(move |view, range, window, cx| {
+                                view.render_diff_rows(&data.rows, range, row_width, window, cx)
+                            }),
+                        )
+                        .with_horizontal_sizing_behavior(
+                            ListHorizontalSizingBehavior::Unconstrained,
+                        )
+                        .track_scroll(&self.diff_scroll)
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .into_any_element()
+                    };
                     div()
                         .flex_1()
                         .min_h_0()
@@ -1902,6 +1972,24 @@ impl RepositoryView {
             .filter_map(|index| {
                 rows.get(index)
                     .map(|row| diff_row(row, index, width, colors))
+            })
+            .collect()
+    }
+
+    fn render_split_rows(
+        &mut self,
+        rows: &[SplitRow],
+        range: std::ops::Range<usize>,
+        width: Pixels,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let colors = cx.theme().colors;
+        let half = px(((f32::from(width) - 2. * DIFF_GUTTER) / 2.).max(0.));
+        range
+            .filter_map(|index| {
+                rows.get(index)
+                    .map(|row| split_row(row, index, width, half, colors))
             })
             .collect()
     }
@@ -2317,6 +2405,107 @@ fn diff_marker(kind: RowKind, background: Option<Hsla>, colors: ThemeColors) -> 
         .when_some(background, |this, background| this.bg(background))
         .text_color(color)
         .child(marker.to_string())
+}
+
+/// The width of one side-by-side row: two gutters and two equal text halves.
+fn split_width(cell: Pixels, columns: usize, pane: f32) -> Pixels {
+    let half = columns as f32 * f32::from(cell) + 12.;
+    px((2. * DIFF_GUTTER + 2. * half).max(pane))
+}
+
+/// One side-by-side row: a hunk header, a note, or an old/new cell pair.
+fn split_row(
+    row: &SplitRow,
+    index: usize,
+    width: Pixels,
+    half: Pixels,
+    colors: ThemeColors,
+) -> AnyElement {
+    let base = div()
+        .id(SharedString::from(format!("split-row-{index}")))
+        .debug_selector(move || format!("split-row-{index}"))
+        .h(px(DIFF_ROW))
+        .w(width)
+        .flex_none()
+        .flex()
+        .items_center()
+        .whitespace_nowrap();
+    match row {
+        SplitRow::Header(text) => base
+            .px(px(8.))
+            .bg(colors.diff_hunk_bg)
+            .text_size(FS_SM)
+            .text_color(colors.muted)
+            .child(text.clone())
+            .into_any_element(),
+        SplitRow::Note(text) => base
+            .px(px(8.))
+            .text_size(FS_SM)
+            .text_color(colors.muted)
+            .child(text.clone())
+            .into_any_element(),
+        SplitRow::Pair { old, new } => base
+            .child(split_gutter(old.as_ref(), colors))
+            .child(split_content(old.as_ref(), half, colors))
+            .child(
+                split_gutter(new.as_ref(), colors)
+                    .border_l_1()
+                    .border_color(colors.border),
+            )
+            .child(split_content(new.as_ref(), half, colors))
+            .into_any_element(),
+    }
+}
+
+/// A split row's line-number gutter; a missing side stays transparent.
+fn split_gutter(cell: Option<&SplitCell>, colors: ThemeColors) -> Div {
+    let background = cell.and_then(|cell| match cell.kind {
+        SplitCellKind::Added => Some(colors.diff_add_bg),
+        SplitCellKind::Removed => Some(colors.diff_del_bg),
+        SplitCellKind::Context => None,
+    });
+    div()
+        .w(px(DIFF_GUTTER))
+        .flex_none()
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_end()
+        .pr(px(6.))
+        .when_some(background, |this, background| this.bg(background))
+        .text_size(MONO)
+        .text_color(colors.muted)
+        .child(cell.map(|cell| cell.line.to_string()).unwrap_or_default())
+}
+
+/// One half of a split row. A missing side is a hatched filler.
+fn split_content(cell: Option<&SplitCell>, width: Pixels, colors: ThemeColors) -> Div {
+    let content = div()
+        .w(width)
+        .flex_none()
+        .h_full()
+        .flex()
+        .items_center()
+        .pl(px(6.))
+        .pr(px(6.))
+        .overflow_hidden();
+    let Some(cell) = cell else {
+        return content.bg(gpui::pattern_slash(colors.hover, 1., 5.));
+    };
+    let (background, strong) = match cell.kind {
+        SplitCellKind::Added => (Some(colors.diff_add_bg), colors.diff_add_strong),
+        SplitCellKind::Removed => (Some(colors.diff_del_bg), colors.diff_del_strong),
+        SplitCellKind::Context => (None, colors.diff_add_strong),
+    };
+    content
+        .when_some(background, |this, background| this.bg(background))
+        .text_color(colors.text)
+        .child(styled_diff_text(
+            &cell.text,
+            &cell.emphasis,
+            colors.text,
+            strong,
+        ))
 }
 
 /// A line's text with the word-diff ranges painted over the line background.
@@ -2804,6 +2993,45 @@ mod tests {
         view.read_with(&cx, |view, _| assert_eq!(view.selected_file, Some(0)));
         cx.simulate_keystrokes("down");
         view.read_with(&cx, |view, _| assert_eq!(view.selected_file, Some(1)));
+    }
+
+    /// The layout toggle switches the pane to side-by-side rows and stores the
+    /// choice in the settings.
+    #[gpui::test]
+    fn the_diff_toggle_switches_to_side_by_side_and_persists(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("details-split");
+        commit(repo.path(), "a.txt", "one\ntwo\n");
+        cx.update(|cx| {
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings: crate::settings::Settings::default(),
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.diff_layout, DiffLayout::Unified);
+        });
+
+        view.update(&mut cx, |view, cx| {
+            view.set_diff_layout(DiffLayout::Split, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.diff_layout, DiffLayout::Split);
+            let DiffState::Loaded(diff) = &view.diff else {
+                panic!("the diff did not load");
+            };
+            assert!(!diff.split_rows.is_empty());
+        });
+        assert!(
+            cx.debug_bounds("split-row-0").is_some(),
+            "the side-by-side rows were not drawn"
+        );
+        let saved = cx.update(|_, cx| cx.global::<crate::AppSettings>().settings.diff_layout);
+        assert_eq!(saved, DiffLayout::Split, "the layout was not persisted");
     }
 
     /// Lets the 150 ms search debounce and the background scan finish. The
