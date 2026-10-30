@@ -7,6 +7,7 @@ mod init_flow;
 mod open_dialog;
 mod repo_view;
 mod settings;
+mod sidebar;
 #[cfg(test)]
 mod test_support;
 mod theme;

@@ -1,0 +1,1429 @@
+//! The sidebar model: the six sections, their expansion state, the filter and
+//! the tree rows built from the repository's data.
+//!
+//! [`sidebar_nodes`] is a pure function of the loaded data, the expansion
+//! overrides and the filter. [`RepositoryView`](crate::repo_view::RepositoryView)
+//! only calls it while rendering; git never runs here.
+
+use std::cmp::{Ordering, Reverse};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use git_core::{Git, Head, Ref, RefKind, Repo, Stash, Submodule, SubmoduleState, Worktree};
+use gpui::SharedString;
+use ui::{IconName, TreeNodeData};
+
+/// The six sidebar sections, in display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Section {
+    Local,
+    Remotes,
+    Tags,
+    Stashes,
+    Worktrees,
+    Submodules,
+}
+
+impl Section {
+    /// The key prefix of a section's tree node.
+    fn key(self) -> &'static str {
+        match self {
+            Section::Local => "section:local",
+            Section::Remotes => "section:remotes",
+            Section::Tags => "section:tags",
+            Section::Stashes => "section:stashes",
+            Section::Worktrees => "section:worktrees",
+            Section::Submodules => "section:submodules",
+        }
+    }
+}
+
+/// A section or remote with more direct children than this starts collapsed:
+/// the tree is not virtualized, so a huge repository would otherwise build
+/// every row on the first paint.
+const MAX_DIRECT_CHILDREN: usize = 200;
+
+/// The expansion overrides over the defaults. Sections, folders and remotes
+/// start expanded (a section or remote with more than
+/// [`MAX_DIRECT_CHILDREN`] direct children starts collapsed); a toggle stores
+/// only the keys the user changed, so clearing the filter never loses them.
+#[derive(Clone, Debug, Default)]
+pub struct Expansion {
+    overrides: HashMap<SharedString, bool>,
+}
+
+impl Expansion {
+    /// Whether `key` is expanded: the recorded override, else `default`.
+    fn effective(&self, key: &str, default: bool) -> bool {
+        self.overrides.get(key).copied().unwrap_or(default)
+    }
+
+    /// Flips the effective state of `key` and records it.
+    pub fn toggle(&mut self, key: &str, current: bool) {
+        self.overrides.insert(key.into(), !current);
+    }
+}
+
+/// The lists the sidebar loads itself: everything the history view does not
+/// already read.
+#[derive(Clone, Debug, Default)]
+pub struct SidebarExtras {
+    pub remotes: Vec<String>,
+    pub stashes: Vec<Stash>,
+    pub worktrees: Vec<Worktree>,
+    pub submodules: Vec<Submodule>,
+}
+
+/// Reads the four sidebar lists off the UI thread. One failing list is logged
+/// and stays empty, so it never hides the others.
+pub(crate) fn read_sidebar_extras(git: Arc<Git>, root: &Path) -> SidebarExtras {
+    let repo = match Repo::open(git, root) {
+        Ok(repo) => repo,
+        Err(error) => {
+            log::warn!("could not open the repository for the sidebar: {error}");
+            return SidebarExtras::default();
+        }
+    };
+    let remotes = repo.remotes().unwrap_or_else(|error| {
+        log::warn!("could not list the remotes: {error}");
+        Vec::new()
+    });
+    let stashes = repo.stashes().unwrap_or_else(|error| {
+        log::warn!("could not list the stashes: {error}");
+        Vec::new()
+    });
+    let worktrees = repo.worktrees().unwrap_or_else(|error| {
+        log::warn!("could not list the worktrees: {error}");
+        Vec::new()
+    });
+    let submodules = repo.submodules().unwrap_or_else(|error| {
+        log::warn!("could not list the submodules: {error}");
+        Vec::new()
+    });
+    SidebarExtras {
+        remotes,
+        stashes,
+        worktrees,
+        submodules,
+    }
+}
+
+/// Builds the visible sidebar rows.
+///
+/// `refs` is `None` while they load or after a failure: then the ref-based
+/// sections show only their headers, without counts. `extras` is the same for
+/// the lists of its own: while it is `None` the remotes section counts the
+/// distinct prefixes of the remote refs, and the three later sections have no
+/// count.
+///
+/// `filter` is matched trimmed and case-insensitively. With a filter only the
+/// leaves that match (and the folders and remotes above them) are built, each
+/// section's count becomes its number of matches, and a section without one
+/// disappears; an empty result means "no matches at all".
+pub fn sidebar_nodes(
+    refs: Option<&[Ref]>,
+    head: Option<&Head>,
+    extras: Option<&SidebarExtras>,
+    expansion: &Expansion,
+    filter: &str,
+    selected: Option<&str>,
+) -> Vec<TreeNodeData> {
+    let filter = filter.trim().to_lowercase();
+    let filter = (!filter.is_empty()).then_some(filter.as_str());
+    Builder {
+        refs,
+        head,
+        extras,
+        expansion,
+        filter,
+        selected,
+    }
+    .build()
+}
+
+struct Builder<'a> {
+    refs: Option<&'a [Ref]>,
+    head: Option<&'a Head>,
+    extras: Option<&'a SidebarExtras>,
+    expansion: &'a Expansion,
+    /// Lowercased, trimmed and non-empty; `None` when not filtering.
+    filter: Option<&'a str>,
+    selected: Option<&'a str>,
+}
+
+/// One branch name split on `/`, the shape the local tree is grouped by.
+struct BranchEntry<'a> {
+    segments: Vec<&'a str>,
+    reference: &'a Ref,
+}
+
+impl<'a> BranchEntry<'a> {
+    fn new(reference: &'a Ref) -> Self {
+        Self {
+            segments: reference.name.split('/').collect(),
+            reference,
+        }
+    }
+
+    /// The same branch one folder level down.
+    fn nested(&self) -> Self {
+        Self {
+            segments: self.segments[1..].to_vec(),
+            reference: self.reference,
+        }
+    }
+}
+
+/// What one level of the local tree contributed.
+struct Level {
+    /// The rows of this level and their descendants.
+    nodes: Vec<TreeNodeData>,
+    /// Leaves built at this level and below (the filter's match count).
+    leaves: usize,
+}
+
+impl Builder<'_> {
+    fn build(&self) -> Vec<TreeNodeData> {
+        let mut nodes = Vec::new();
+        self.local_section(&mut nodes);
+        self.remotes_section(&mut nodes);
+        self.tags_section(&mut nodes);
+        self.stashes_section(&mut nodes);
+        self.worktrees_section(&mut nodes);
+        self.submodules_section(&mut nodes);
+        nodes
+    }
+
+    /// Whether `key` renders expanded: the filter forces everything open.
+    fn expanded(&self, key: &str, default: bool) -> bool {
+        self.filter.is_some() || self.expansion.effective(key, default)
+    }
+
+    fn filtering(&self) -> bool {
+        self.filter.is_some()
+    }
+
+    /// A section header; the caller decided its expansion and count.
+    fn section_node(
+        &self,
+        section: Section,
+        label: &str,
+        count: Option<usize>,
+        expanded: bool,
+    ) -> TreeNodeData {
+        let mut node = TreeNodeData::section(label.to_owned())
+            .key(section.key())
+            .has_children(true)
+            .expanded(expanded);
+        if let Some(count) = count {
+            node = node.count(count.to_string());
+        }
+        node
+    }
+
+    fn is_head(&self, name: &str) -> bool {
+        matches!(self.head, Some(Head::Branch { name: head, .. }) if head == name)
+    }
+
+    // ---- Local branches ------------------------------------------------
+
+    fn local_section(&self, nodes: &mut Vec<TreeNodeData>) {
+        let refs = self.refs.unwrap_or(&[]);
+        let locals: Vec<&Ref> = refs
+            .iter()
+            .filter(|r| r.kind == RefKind::LocalBranch)
+            .collect();
+        let entries: Vec<BranchEntry> = locals.iter().map(|r| BranchEntry::new(r)).collect();
+        let direct = local_direct_children(&entries);
+
+        if self.filtering() {
+            let level = self.local_level(1, &entries, "");
+            if level.leaves > 0 {
+                nodes.push(self.section_node(
+                    Section::Local,
+                    "Local branches",
+                    Some(level.leaves),
+                    true,
+                ));
+                nodes.extend(level.nodes);
+            }
+            return;
+        }
+
+        let expanded = self.expanded(Section::Local.key(), direct <= MAX_DIRECT_CHILDREN);
+        let count = self.refs.is_some().then_some(locals.len());
+        nodes.push(self.section_node(Section::Local, "Local branches", count, expanded));
+        // Children of a collapsed section are not built at all.
+        if expanded {
+            nodes.extend(self.local_level(1, &entries, "").nodes);
+        }
+    }
+
+    fn local_level(&self, level: usize, entries: &[BranchEntry<'_>], parent: &str) -> Level {
+        let mut leaf_entries: Vec<&BranchEntry<'_>> = Vec::new();
+        let mut folders: Vec<(String, Vec<BranchEntry<'_>>)> = Vec::new();
+        for entry in entries {
+            if entry.segments.len() <= 1 {
+                leaf_entries.push(entry);
+            } else {
+                let name = entry.segments[0].to_owned();
+                match folders.iter_mut().find(|(candidate, _)| candidate == &name) {
+                    Some((_, children)) => children.push(entry.nested()),
+                    None => folders.push((name, vec![entry.nested()])),
+                }
+            }
+        }
+        // Leaves first, then folders; each group case-insensitively sorted.
+        leaf_entries.sort_by(|a, b| {
+            leaf_segment(a)
+                .to_lowercase()
+                .cmp(&leaf_segment(b).to_lowercase())
+        });
+        folders.sort_by_key(|(name, _)| name.to_lowercase());
+
+        let mut out = Vec::new();
+        let mut leaves = 0;
+
+        for entry in leaf_entries {
+            if !self.matches(&entry.reference.name) {
+                continue;
+            }
+            out.push(self.local_leaf(level, entry.reference));
+            leaves += 1;
+        }
+
+        for (name, children) in folders {
+            let prefix = if parent.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent}/{name}")
+            };
+            let key = format!("folder:{prefix}");
+            let selected = self.selected == Some(key.as_str());
+            if self.filtering() {
+                // A folder exists only as the ancestor of a shown leaf.
+                let child = self.local_level(level + 1, &children, &prefix);
+                if child.leaves == 0 {
+                    continue;
+                }
+                out.push(
+                    TreeNodeData::new(name)
+                        .key(key)
+                        .level(level)
+                        .icon(IconName::Folder)
+                        .has_children(true)
+                        .expanded(true)
+                        .selected(selected),
+                );
+                out.extend(child.nodes);
+                leaves += child.leaves;
+                continue;
+            }
+            let expanded = self.expanded(&key, true);
+            out.push(
+                TreeNodeData::new(name)
+                    .key(key)
+                    .level(level)
+                    .icon(IconName::Folder)
+                    .has_children(true)
+                    .expanded(expanded)
+                    .selected(selected),
+            );
+            if expanded {
+                out.extend(self.local_level(level + 1, &children, &prefix).nodes);
+            }
+        }
+
+        Level { nodes: out, leaves }
+    }
+
+    fn local_leaf(&self, level: usize, reference: &Ref) -> TreeNodeData {
+        let key = format!("local:{}", reference.name);
+        let selected = self.selected == Some(key.as_str());
+        let label = reference.name.rsplit('/').next().unwrap_or("");
+        let mut node = TreeNodeData::new(label.to_owned())
+            .key(key)
+            .level(level)
+            .icon(IconName::Branch)
+            .selected(selected);
+        if self.is_head(&reference.name) {
+            node = node.current();
+        }
+        tracking(node, reference)
+    }
+
+    // ---- Remotes -------------------------------------------------------
+
+    fn remotes_section(&self, nodes: &mut Vec<TreeNodeData>) {
+        let refs = self.refs.unwrap_or(&[]);
+        // The configured remotes once they load; before that, the distinct
+        // prefixes of the remote refs.
+        let names: Vec<String> = match self.extras {
+            Some(extras) => extras.remotes.clone(),
+            None => distinct_prefixes(refs),
+        };
+        let count = self.refs.is_some().then_some(names.len());
+
+        let mut built = Vec::new();
+        let mut matches = 0;
+        for name in &names {
+            let mut branches: Vec<(&str, &Ref)> = refs
+                .iter()
+                .filter(|r| r.kind == RefKind::RemoteBranch)
+                .filter_map(|r| {
+                    let label = r.name.strip_prefix(name.as_str())?.strip_prefix('/')?;
+                    // `<remote>/HEAD` is a symbolic duplicate, not a branch.
+                    (!label.is_empty() && label != "HEAD").then_some((label, r))
+                })
+                .collect();
+            branches.sort_by_key(|(label, _)| label.to_lowercase());
+            let key = format!("remote:{name}");
+
+            if self.filtering() {
+                let mut children = Vec::new();
+                for (label, reference) in branches {
+                    if self.matches_remote(name, label) {
+                        children.push(self.remote_branch(reference, label));
+                    }
+                }
+                if children.is_empty() {
+                    continue;
+                }
+                matches += children.len();
+                built.push(self.remote_node(name, &key, true));
+                built.extend(children);
+                continue;
+            }
+
+            let expanded = self.expanded(&key, branches.len() <= MAX_DIRECT_CHILDREN);
+            // A remote with no branches is still shown, just empty.
+            built.push(self.remote_node(name, &key, expanded));
+            if expanded {
+                for (label, reference) in branches {
+                    built.push(self.remote_branch(reference, label));
+                }
+            }
+        }
+
+        if self.filtering() {
+            if matches > 0 {
+                nodes.push(self.section_node(Section::Remotes, "Remotes", Some(matches), true));
+                nodes.extend(built);
+            }
+            return;
+        }
+        let expanded = self.expanded(Section::Remotes.key(), names.len() <= MAX_DIRECT_CHILDREN);
+        nodes.push(self.section_node(Section::Remotes, "Remotes", count, expanded));
+        if expanded {
+            nodes.extend(built);
+        }
+    }
+
+    fn remote_node(&self, name: &str, key: &str, expanded: bool) -> TreeNodeData {
+        TreeNodeData::new(name.to_owned())
+            .key(key.to_owned())
+            .level(1)
+            .icon(IconName::Cloud)
+            .has_children(true)
+            .expanded(expanded)
+            .selected(self.selected == Some(key))
+    }
+
+    fn remote_branch(&self, reference: &Ref, label: &str) -> TreeNodeData {
+        let key = format!("rbranch:{}", reference.name);
+        TreeNodeData::new(label.to_owned())
+            .key(key.clone())
+            .level(2)
+            .icon(IconName::Branch)
+            .selected(self.selected == Some(key.as_str()))
+    }
+
+    // ---- Tags ----------------------------------------------------------
+
+    fn tags_section(&self, nodes: &mut Vec<TreeNodeData>) {
+        let refs = self.refs.unwrap_or(&[]);
+        let tags: Vec<&Ref> = refs.iter().filter(|r| r.kind == RefKind::Tag).collect();
+
+        if self.filtering() {
+            let mut matched: Vec<&Ref> = tags
+                .into_iter()
+                .filter(|reference| self.matches(&reference.name))
+                .collect();
+            matched.sort_by_cached_key(|reference| Reverse(natural_key(&reference.name)));
+            if !matched.is_empty() {
+                let count = matched.len();
+                nodes.push(self.section_node(Section::Tags, "Tags", Some(count), true));
+                nodes.extend(
+                    matched
+                        .into_iter()
+                        .map(|reference| self.tag_node(reference)),
+                );
+            }
+            return;
+        }
+
+        let expanded = self.expanded(Section::Tags.key(), tags.len() <= MAX_DIRECT_CHILDREN);
+        let count = self.refs.is_some().then_some(tags.len());
+        nodes.push(self.section_node(Section::Tags, "Tags", count, expanded));
+        // Children of a collapsed section are not built, and the sort only
+        // runs when they are needed.
+        if expanded {
+            let mut tags = tags;
+            // Newest version first; the version runs compare numerically.
+            tags.sort_by_cached_key(|reference| Reverse(natural_key(&reference.name)));
+            nodes.extend(tags.into_iter().map(|reference| self.tag_node(reference)));
+        }
+    }
+
+    fn tag_node(&self, reference: &Ref) -> TreeNodeData {
+        let key = format!("tag:{}", reference.name);
+        TreeNodeData::new(reference.name.clone())
+            .key(key.clone())
+            .level(1)
+            .icon(IconName::Tag)
+            .selected(self.selected == Some(key.as_str()))
+    }
+
+    // ---- Stashes -------------------------------------------------------
+
+    fn stashes_section(&self, nodes: &mut Vec<TreeNodeData>) {
+        let stashes: &[Stash] = self.extras.map(|e| e.stashes.as_slice()).unwrap_or(&[]);
+
+        if self.filtering() {
+            let mut matched: Vec<(&Stash, String)> = stashes
+                .iter()
+                .map(|stash| (stash, stash_label(&stash.message)))
+                .filter(|(stash, label)| {
+                    self.matches(label) || self.matches(&format!("stash@{{{}}}", stash.index))
+                })
+                .collect();
+            matched.sort_by_key(|(stash, _)| stash.index);
+            if !matched.is_empty() {
+                let count = matched.len();
+                nodes.push(self.section_node(Section::Stashes, "Stashes", Some(count), true));
+                nodes.extend(
+                    matched
+                        .into_iter()
+                        .map(|(stash, label)| self.stash_node(stash, label)),
+                );
+            }
+            return;
+        }
+
+        let expanded = self.expanded(Section::Stashes.key(), stashes.len() <= MAX_DIRECT_CHILDREN);
+        let count = self.extras.map(|_| stashes.len());
+        nodes.push(self.section_node(Section::Stashes, "Stashes", count, expanded));
+        if expanded {
+            let mut sorted: Vec<&Stash> = stashes.iter().collect();
+            sorted.sort_by_key(|stash| stash.index);
+            nodes.extend(
+                sorted
+                    .into_iter()
+                    .map(|stash| self.stash_node(stash, stash_label(&stash.message))),
+            );
+        }
+    }
+
+    fn stash_node(&self, stash: &Stash, label: String) -> TreeNodeData {
+        let key = format!("stash:{}", stash.index);
+        TreeNodeData::new(label)
+            .key(key.clone())
+            .level(1)
+            .icon(IconName::Stash)
+            .selected(self.selected == Some(key.as_str()))
+    }
+
+    // ---- Worktrees -----------------------------------------------------
+
+    fn worktrees_section(&self, nodes: &mut Vec<TreeNodeData>) {
+        let worktrees: &[Worktree] = self.extras.map(|e| e.worktrees.as_slice()).unwrap_or(&[]);
+
+        if self.filtering() {
+            let matched: Vec<&Worktree> = worktrees
+                .iter()
+                .filter(|worktree| {
+                    self.matches(&path_label(&worktree.path))
+                        || self.matches(&worktree.path.display().to_string())
+                })
+                .collect();
+            if !matched.is_empty() {
+                let count = matched.len();
+                nodes.push(self.section_node(Section::Worktrees, "Worktrees", Some(count), true));
+                nodes.extend(
+                    matched
+                        .into_iter()
+                        .map(|worktree| self.worktree_node(worktree)),
+                );
+            }
+            return;
+        }
+
+        let expanded = self.expanded(
+            Section::Worktrees.key(),
+            worktrees.len() <= MAX_DIRECT_CHILDREN,
+        );
+        let count = self.extras.map(|_| worktrees.len());
+        nodes.push(self.section_node(Section::Worktrees, "Worktrees", count, expanded));
+        if expanded {
+            nodes.extend(
+                worktrees
+                    .iter()
+                    .map(|worktree| self.worktree_node(worktree)),
+            );
+        }
+    }
+
+    fn worktree_node(&self, worktree: &Worktree) -> TreeNodeData {
+        let label = path_label(&worktree.path);
+        let path = worktree.path.display().to_string();
+        let key = format!("wt:{path}");
+        let mut node = TreeNodeData::new(label)
+            .key(key.clone())
+            .level(1)
+            .icon(IconName::Worktree)
+            .selected(self.selected == Some(key.as_str()));
+        if worktree.current {
+            node = node.current();
+        }
+        if let Some(state) = worktree_state(worktree) {
+            node = node.state(state);
+        }
+        node
+    }
+
+    // ---- Submodules ----------------------------------------------------
+
+    fn submodules_section(&self, nodes: &mut Vec<TreeNodeData>) {
+        let submodules: &[Submodule] = self.extras.map(|e| e.submodules.as_slice()).unwrap_or(&[]);
+
+        if self.filtering() {
+            let matched: Vec<&Submodule> = submodules
+                .iter()
+                .filter(|submodule| self.matches(&submodule.path))
+                .collect();
+            if !matched.is_empty() {
+                let count = matched.len();
+                nodes.push(self.section_node(Section::Submodules, "Submodules", Some(count), true));
+                nodes.extend(
+                    matched
+                        .into_iter()
+                        .map(|submodule| self.submodule_node(submodule)),
+                );
+            }
+            return;
+        }
+
+        let expanded = self.expanded(
+            Section::Submodules.key(),
+            submodules.len() <= MAX_DIRECT_CHILDREN,
+        );
+        let count = self.extras.map(|_| submodules.len());
+        nodes.push(self.section_node(Section::Submodules, "Submodules", count, expanded));
+        if expanded {
+            nodes.extend(
+                submodules
+                    .iter()
+                    .map(|submodule| self.submodule_node(submodule)),
+            );
+        }
+    }
+
+    fn submodule_node(&self, submodule: &Submodule) -> TreeNodeData {
+        let key = format!("sub:{}", submodule.path);
+        let mut node = TreeNodeData::new(submodule.path.clone())
+            .key(key.clone())
+            .level(1)
+            .icon(IconName::Box)
+            .selected(self.selected == Some(key.as_str()));
+        if let Some(state) = submodule_state(submodule.state) {
+            node = node.state(state);
+        }
+        node
+    }
+
+    // ---- Matching ------------------------------------------------------
+
+    /// Case-insensitive substring match; everything matches without a filter.
+    fn matches(&self, text: &str) -> bool {
+        match self.filter {
+            None => true,
+            Some(filter) => text.to_lowercase().contains(filter),
+        }
+    }
+
+    fn matches_remote(&self, remote: &str, branch: &str) -> bool {
+        match self.filter {
+            None => true,
+            Some(filter) => {
+                branch.to_lowercase().contains(filter)
+                    || format!("{remote}/{branch}").to_lowercase().contains(filter)
+            }
+        }
+    }
+}
+
+/// The label of the branch entry at its own level.
+fn leaf_segment<'a>(entry: &BranchEntry<'a>) -> &'a str {
+    entry.segments.last().copied().unwrap_or("")
+}
+
+/// The number of rows directly under the local-branches header: root leaves
+/// plus the root folders.
+fn local_direct_children(entries: &[BranchEntry<'_>]) -> usize {
+    let mut leaves = 0;
+    let mut folders: Vec<&str> = Vec::new();
+    for entry in entries {
+        if entry.segments.len() <= 1 {
+            leaves += 1;
+        } else if !folders.contains(&entry.segments[0]) {
+            folders.push(entry.segments[0]);
+        }
+    }
+    leaves + folders.len()
+}
+
+/// The distinct `<remote>` prefixes of the remote refs, in their order.
+fn distinct_prefixes(refs: &[Ref]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for reference in refs.iter().filter(|r| r.kind == RefKind::RemoteBranch) {
+        let Some((prefix, _)) = reference.name.split_once('/') else {
+            continue;
+        };
+        if !names.iter().any(|name| name == prefix) {
+            names.push(prefix.to_owned());
+        }
+    }
+    names
+}
+
+/// The ahead/behind arrows, or `gone` when the upstream disappeared.
+fn tracking(node: TreeNodeData, reference: &Ref) -> TreeNodeData {
+    if reference.upstream_gone {
+        return node.state("gone");
+    }
+    let mut node = node;
+    if reference.ahead > 0 {
+        node = node.ahead(reference.ahead);
+    }
+    if reference.behind > 0 {
+        node = node.behind(reference.behind);
+    }
+    node
+}
+
+/// The message a stash row shows:
+/// `WIP on <branch>: <sha> <subject>` → `WIP on <branch>`,
+/// `On <branch>: <message>` → `<message>`, anything else unchanged.
+fn stash_label(message: &str) -> String {
+    if let Some(rest) = message.strip_prefix("WIP on ") {
+        return match rest.split_once(':') {
+            Some((branch, _)) => format!("WIP on {branch}"),
+            None => message.to_owned(),
+        };
+    }
+    if let Some(rest) = message.strip_prefix("On ") {
+        if let Some((_, text)) = rest.split_once(':') {
+            return text.trim_start().to_owned();
+        }
+    }
+    message.to_owned()
+}
+
+fn worktree_state(worktree: &Worktree) -> Option<String> {
+    if worktree.prunable {
+        Some("missing".to_owned())
+    } else if worktree.locked.is_some() {
+        Some("locked".to_owned())
+    } else if worktree.bare {
+        Some("bare".to_owned())
+    } else if worktree.detached {
+        Some("detached".to_owned())
+    } else {
+        worktree.branch.clone()
+    }
+}
+
+fn submodule_state(state: SubmoduleState) -> Option<&'static str> {
+    match state {
+        SubmoduleState::Modified => Some("modified"),
+        SubmoduleState::Uninitialized => Some("not initialized"),
+        SubmoduleState::Conflict => Some("conflict"),
+        SubmoduleState::Clean => None,
+    }
+}
+
+/// The last path component, or the whole path when there is none.
+fn path_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// One natural-sort run of a tag name, precomputed once per tag so
+/// `sort_by_cached_key` never allocates while comparing.
+#[derive(Debug, PartialEq, Eq)]
+enum TagRun {
+    /// A digit run: the value without leading zeros, and the lowercased text
+    /// for the mixed digit/text comparison.
+    Num { value: String, text: String },
+    /// A non-digit run, lowercased.
+    Text(String),
+}
+
+impl TagRun {
+    fn text(&self) -> &str {
+        match self {
+            TagRun::Num { text, .. } | TagRun::Text(text) => text,
+        }
+    }
+}
+
+impl Ord for TagRun {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (TagRun::Num { value: a, .. }, TagRun::Num { value: b, .. }) => {
+                // More digits is a larger number; equal lengths compare
+                // lexicographically.
+                a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+            }
+            // Every other pair compares as lowercased text, exactly like the
+            // old per-comparison comparison.
+            _ => self.text().cmp(other.text()),
+        }
+    }
+}
+
+impl PartialOrd for TagRun {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The cached sort key of a tag name: alternating digit and non-digit runs.
+fn natural_key(name: &str) -> Vec<TagRun> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut previous: Option<bool> = None;
+    for (index, ch) in name.char_indices() {
+        let digit = ch.is_ascii_digit();
+        if let Some(previous) = previous {
+            if previous != digit {
+                out.push(TagRun::new(&name[start..index]));
+                start = index;
+            }
+        }
+        previous = Some(digit);
+    }
+    if start < name.len() {
+        out.push(TagRun::new(&name[start..]));
+    }
+    out
+}
+
+impl TagRun {
+    fn new(text: &str) -> Self {
+        let lower = text.to_lowercase();
+        if text.bytes().all(|byte| byte.is_ascii_digit()) {
+            TagRun::Num {
+                value: text.trim_start_matches('0').to_owned(),
+                text: lower,
+            }
+        } else {
+            TagRun::Text(lower)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    use git_core::Oid;
+    use ui::TreeNodeTrailing;
+
+    use super::*;
+
+    fn reference(kind: RefKind, name: &str) -> Ref {
+        Ref {
+            full_name: format!("refs/{name}"),
+            name: name.to_owned(),
+            kind,
+            target: Oid::from_hex(&"1".repeat(40)).unwrap(),
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            upstream_gone: false,
+        }
+    }
+
+    fn oid() -> Oid {
+        Oid::from_hex(&"2".repeat(40)).unwrap()
+    }
+
+    fn build_nodes(
+        refs: &[Ref],
+        extras: Option<&SidebarExtras>,
+        head: Option<&Head>,
+        expansion: &Expansion,
+        filter: &str,
+    ) -> Vec<TreeNodeData> {
+        sidebar_nodes(Some(refs), head, extras, expansion, filter, None)
+    }
+
+    fn keys(nodes: &[TreeNodeData]) -> Vec<&str> {
+        nodes.iter().map(|node| node.key.as_ref()).collect()
+    }
+
+    fn labels(nodes: &[TreeNodeData]) -> Vec<&str> {
+        nodes.iter().map(|node| node.label.as_ref()).collect()
+    }
+
+    fn find<'a>(nodes: &'a [TreeNodeData], key: &str) -> Option<&'a TreeNodeData> {
+        nodes.iter().find(|node| node.key == key)
+    }
+
+    fn local(name: &str) -> Ref {
+        reference(RefKind::LocalBranch, name)
+    }
+
+    #[test]
+    fn folders_group_branches_in_order() {
+        let refs = [
+            local("main"),
+            local("feat/a"),
+            local("feat/b"),
+            local("fix/c"),
+            local("feat/ui/d"),
+        ];
+        let nodes = build_nodes(&refs, None, None, &Expansion::default(), "");
+        assert_eq!(
+            labels(&nodes),
+            vec![
+                "Local branches",
+                "main",
+                "feat",
+                "a",
+                "b",
+                "ui",
+                "d",
+                "fix",
+                "c",
+                "Remotes",
+                "Tags",
+                "Stashes",
+                "Worktrees",
+                "Submodules",
+            ]
+        );
+        let levels: Vec<usize> = nodes.iter().map(|node| node.level).collect();
+        assert_eq!(levels, vec![0, 1, 1, 2, 2, 2, 3, 1, 2, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            find(&nodes, "folder:feat").unwrap().icon,
+            Some(IconName::Folder)
+        );
+        assert_eq!(find(&nodes, "folder:feat/ui").unwrap().label, "ui");
+        assert_eq!(find(&nodes, "local:feat/ui/d").unwrap().label, "d");
+        // Every key is unique.
+        let unique: HashSet<&str> = keys(&nodes).into_iter().collect();
+        assert_eq!(unique.len(), nodes.len());
+    }
+
+    #[test]
+    fn remotes_are_flat_and_skip_head() {
+        let refs = [
+            reference(RefKind::RemoteBranch, "origin/main"),
+            reference(RefKind::RemoteBranch, "origin/feat/idle-lanes"),
+            reference(RefKind::RemoteBranch, "origin/HEAD"),
+            reference(RefKind::LocalBranch, "main"),
+        ];
+        let extras = SidebarExtras {
+            remotes: vec!["origin".to_owned(), "empty".to_owned()],
+            ..Default::default()
+        };
+        let nodes = build_nodes(&refs, Some(&extras), None, &Expansion::default(), "");
+        let section = find(&nodes, "section:remotes").unwrap();
+        assert_eq!(section.trailing, Some(TreeNodeTrailing::Count("2".into())));
+        // Remote order is the configured order; a remote with no branches is
+        // still shown.
+        assert_eq!(
+            find(&nodes, "remote:origin").unwrap().icon,
+            Some(IconName::Cloud)
+        );
+        assert!(find(&nodes, "remote:empty").unwrap().has_children);
+        assert!(find(&nodes, "remote:empty").unwrap().expanded);
+        // Branches are flat under their remote, sorted by label, and the
+        // symbolic HEAD is gone.
+        let branch_labels: Vec<&str> = nodes
+            .iter()
+            .filter(|node| node.key.starts_with("rbranch:"))
+            .map(|node| node.label.as_ref())
+            .collect();
+        assert_eq!(branch_labels, vec!["feat/idle-lanes", "main"]);
+        assert!(find(&nodes, "rbranch:origin/feat/idle-lanes").is_some());
+        assert!(nodes.iter().all(|node| node.label != "HEAD"));
+        // Without the extras, the count comes from the ref prefixes.
+        let nodes = build_nodes(&refs, None, None, &Expansion::default(), "");
+        assert_eq!(
+            find(&nodes, "section:remotes").unwrap().trailing,
+            Some(TreeNodeTrailing::Count("1".into()))
+        );
+    }
+
+    #[test]
+    fn tags_sort_newest_version_first() {
+        let refs = [
+            reference(RefKind::Tag, "v0.2.0"),
+            reference(RefKind::Tag, "v0.10.0"),
+            reference(RefKind::Tag, "v0.9.1"),
+            reference(RefKind::Tag, "release"),
+        ];
+        let nodes = build_nodes(&refs, None, None, &Expansion::default(), "");
+        let tag_labels: Vec<&str> = nodes
+            .iter()
+            .filter(|node| node.key.starts_with("tag:"))
+            .map(|node| node.label.as_ref())
+            .collect();
+        assert_eq!(tag_labels, vec!["v0.10.0", "v0.9.1", "v0.2.0", "release"]);
+    }
+
+    #[test]
+    fn stash_labels_follow_the_three_message_shapes() {
+        let extras = SidebarExtras {
+            stashes: vec![
+                Stash {
+                    index: 0,
+                    oid: oid(),
+                    message: "WIP on main: 1a2b3c4 fix the thing".to_owned(),
+                },
+                Stash {
+                    index: 1,
+                    oid: oid(),
+                    message: "On feat/x: a deliberate message".to_owned(),
+                },
+                Stash {
+                    index: 2,
+                    oid: oid(),
+                    message: "something else".to_owned(),
+                },
+            ],
+            ..Default::default()
+        };
+        let nodes = build_nodes(&[], Some(&extras), None, &Expansion::default(), "");
+        let stash_labels: Vec<&str> = nodes
+            .iter()
+            .filter(|node| node.key.starts_with("stash:"))
+            .map(|node| node.label.as_ref())
+            .collect();
+        assert_eq!(
+            stash_labels,
+            vec!["WIP on main", "a deliberate message", "something else"]
+        );
+        // `stash@{0}` comes first.
+        let stash_keys: Vec<&str> = nodes
+            .iter()
+            .filter(|node| node.key.starts_with("stash:"))
+            .map(|node| node.key.as_ref())
+            .collect();
+        assert_eq!(stash_keys, vec!["stash:0", "stash:1", "stash:2"]);
+        assert_eq!(
+            find(&nodes, "section:stashes").unwrap().trailing,
+            Some(TreeNodeTrailing::Count("3".into()))
+        );
+    }
+
+    #[test]
+    fn worktree_state_prefers_prunable_then_locked_then_bare_then_detached() {
+        let worktree = |index: usize,
+                        branch: Option<&str>,
+                        bare: bool,
+                        detached: bool,
+                        locked: Option<&str>,
+                        prunable: bool| Worktree {
+            path: PathBuf::from(format!("/tmp/wt{index}")),
+            branch: branch.map(str::to_owned),
+            head: Some(oid()),
+            bare,
+            detached,
+            locked: locked.map(str::to_owned),
+            prunable,
+            current: index == 0,
+        };
+        let extras = SidebarExtras {
+            worktrees: vec![
+                worktree(0, Some("main"), true, true, Some("busy"), true),
+                worktree(1, None, true, true, Some("busy"), false),
+                worktree(2, None, true, true, None, false),
+                worktree(3, None, false, true, None, false),
+                worktree(4, Some("feat/x"), false, false, None, false),
+                worktree(5, None, false, false, None, false),
+            ],
+            ..Default::default()
+        };
+        let nodes = build_nodes(&[], Some(&extras), None, &Expansion::default(), "");
+        let states: Vec<Option<&TreeNodeTrailing>> = nodes
+            .iter()
+            .filter(|node| node.key.starts_with("wt:"))
+            .map(|node| node.trailing.as_ref())
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                Some(&TreeNodeTrailing::State("missing".into())),
+                Some(&TreeNodeTrailing::State("locked".into())),
+                Some(&TreeNodeTrailing::State("bare".into())),
+                Some(&TreeNodeTrailing::State("detached".into())),
+                Some(&TreeNodeTrailing::State("feat/x".into())),
+                None,
+            ]
+        );
+        // The worktree this repository was opened in is marked current; the
+        // others are not.
+        assert!(find(&nodes, "wt:/tmp/wt0").unwrap().current);
+        assert!(!find(&nodes, "wt:/tmp/wt1").unwrap().current);
+    }
+
+    #[test]
+    fn submodule_states_map_to_their_text() {
+        let extras = SidebarExtras {
+            submodules: vec![
+                Submodule {
+                    path: "vendor/a".to_owned(),
+                    oid: Some(oid()),
+                    state: SubmoduleState::Modified,
+                },
+                Submodule {
+                    path: "vendor/b".to_owned(),
+                    oid: None,
+                    state: SubmoduleState::Uninitialized,
+                },
+                Submodule {
+                    path: "vendor/c".to_owned(),
+                    oid: Some(oid()),
+                    state: SubmoduleState::Conflict,
+                },
+                Submodule {
+                    path: "vendor/d".to_owned(),
+                    oid: Some(oid()),
+                    state: SubmoduleState::Clean,
+                },
+            ],
+            ..Default::default()
+        };
+        let nodes = build_nodes(&[], Some(&extras), None, &Expansion::default(), "");
+        let states: Vec<Option<&TreeNodeTrailing>> = nodes
+            .iter()
+            .filter(|node| node.key.starts_with("sub:"))
+            .map(|node| node.trailing.as_ref())
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                Some(&TreeNodeTrailing::State("modified".into())),
+                Some(&TreeNodeTrailing::State("not initialized".into())),
+                Some(&TreeNodeTrailing::State("conflict".into())),
+                None,
+            ]
+        );
+        assert_eq!(find(&nodes, "sub:vendor/a").unwrap().label, "vendor/a");
+    }
+
+    #[test]
+    fn tracking_shows_ahead_behind_and_gone_and_the_head_branch() {
+        let mut ahead = local("feat/ahead");
+        ahead.ahead = 4;
+        ahead.behind = 2;
+        let mut gone = local("feat/gone");
+        gone.upstream_gone = true;
+        let refs = [local("main"), ahead, gone];
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        let nodes = build_nodes(&refs, None, Some(&head), &Expansion::default(), "");
+        assert_eq!(
+            find(&nodes, "local:feat/ahead").unwrap().trailing,
+            Some(TreeNodeTrailing::AheadBehind {
+                ahead: 4,
+                behind: 2
+            })
+        );
+        assert_eq!(
+            find(&nodes, "local:feat/gone").unwrap().trailing,
+            Some(TreeNodeTrailing::State("gone".into()))
+        );
+        assert!(find(&nodes, "local:main").unwrap().current);
+        assert!(!find(&nodes, "local:feat/gone").unwrap().current);
+        assert_eq!(find(&nodes, "local:main").unwrap().trailing, None);
+    }
+
+    #[test]
+    fn a_collapsed_section_has_no_children() {
+        let refs = [local("main"), local("feat/a")];
+        let mut expansion = Expansion::default();
+        expansion.toggle("section:local", true);
+        let nodes = build_nodes(&refs, None, None, &expansion, "");
+        assert!(!find(&nodes, "section:local").unwrap().expanded);
+        assert!(nodes.iter().all(|node| !node.key.starts_with("local:")));
+        assert!(nodes.iter().all(|node| !node.key.starts_with("folder:")));
+    }
+
+    #[test]
+    fn a_section_with_more_than_200_children_starts_collapsed() {
+        let refs: Vec<Ref> = (0..201).map(|i| local(&format!("b{i}"))).collect();
+        let nodes = build_nodes(&refs, None, None, &Expansion::default(), "");
+        assert!(!find(&nodes, "section:local").unwrap().expanded);
+        assert!(nodes.iter().all(|node| !node.key.starts_with("local:")));
+    }
+
+    #[test]
+    fn toggling_a_folder_expands_and_collapses_it() {
+        let refs = [local("feat/a"), local("fix/b")];
+        let mut expansion = Expansion::default();
+        let nodes = build_nodes(&refs, None, None, &expansion, "");
+        assert!(find(&nodes, "folder:feat").unwrap().expanded);
+        assert!(find(&nodes, "local:feat/a").is_some());
+
+        expansion.toggle("folder:feat", true);
+        let nodes = build_nodes(&refs, None, None, &expansion, "");
+        assert!(!find(&nodes, "folder:feat").unwrap().expanded);
+        assert!(find(&nodes, "local:feat/a").is_none());
+        // The other folder keeps its own state.
+        assert!(find(&nodes, "local:fix/b").is_some());
+
+        expansion.toggle("folder:feat", false);
+        let nodes = build_nodes(&refs, None, None, &expansion, "");
+        assert!(find(&nodes, "local:feat/a").is_some());
+    }
+
+    #[test]
+    fn a_remote_with_more_than_200_branches_starts_collapsed() {
+        let refs: Vec<Ref> = (0..201)
+            .map(|i| reference(RefKind::RemoteBranch, &format!("origin/b{i}")))
+            .collect();
+        let extras = SidebarExtras {
+            remotes: vec!["origin".to_owned()],
+            ..Default::default()
+        };
+        let nodes = build_nodes(&refs, Some(&extras), None, &Expansion::default(), "");
+        assert!(!find(&nodes, "remote:origin").unwrap().expanded);
+        assert!(nodes.iter().all(|node| !node.key.starts_with("rbranch:")));
+    }
+
+    #[test]
+    fn filtering_keeps_ancestors_and_hides_other_sections() {
+        let refs = [
+            local("main"),
+            local("feat/ui/d"),
+            local("fix/c"),
+            reference(RefKind::Tag, "v1.0.0"),
+        ];
+        let mut expansion = Expansion::default();
+        // A collapsed folder is forced open while filtering.
+        expansion.toggle("folder:feat", true);
+        let nodes = build_nodes(&refs, None, None, &expansion, "  UI  ");
+        assert_eq!(
+            keys(&nodes),
+            vec![
+                "section:local",
+                "folder:feat",
+                "folder:feat/ui",
+                "local:feat/ui/d",
+            ]
+        );
+        assert!(find(&nodes, "section:tags").is_none());
+        assert!(find(&nodes, "local:main").is_none());
+    }
+
+    #[test]
+    fn filtering_counts_matches() {
+        let refs = [
+            local("feat/a"),
+            local("feat/b"),
+            local("fix/c"),
+            reference(RefKind::Tag, "release-a"),
+            reference(RefKind::Tag, "release-b"),
+        ];
+        let nodes = build_nodes(&refs, None, None, &Expansion::default(), "a");
+        // "feat/a" and "feat/b" both match through the folder name.
+        assert_eq!(
+            find(&nodes, "section:local").unwrap().trailing,
+            Some(TreeNodeTrailing::Count("2".into()))
+        );
+        assert_eq!(
+            find(&nodes, "section:tags").unwrap().trailing,
+            Some(TreeNodeTrailing::Count("2".into()))
+        );
+        assert!(find(&nodes, "section:tags").unwrap().expanded);
+    }
+
+    #[test]
+    fn filtering_matches_remote_branches_by_both_names() {
+        let refs = [reference(RefKind::RemoteBranch, "origin/feat/idle-lanes")];
+        let extras = SidebarExtras {
+            remotes: vec!["origin".to_owned()],
+            ..Default::default()
+        };
+        let nodes = build_nodes(
+            &refs,
+            Some(&extras),
+            None,
+            &Expansion::default(),
+            "feat/idle",
+        );
+        assert_eq!(
+            keys(&nodes),
+            vec![
+                "section:remotes",
+                "remote:origin",
+                "rbranch:origin/feat/idle-lanes",
+            ]
+        );
+        // The `<remote>/<branch>` form matches too.
+        let nodes = build_nodes(
+            &refs,
+            Some(&extras),
+            None,
+            &Expansion::default(),
+            "origin/feat",
+        );
+        assert!(find(&nodes, "rbranch:origin/feat/idle-lanes").is_some());
+    }
+
+    #[test]
+    fn filtering_matches_stashes_worktrees_and_submodules() {
+        let extras = SidebarExtras {
+            stashes: vec![Stash {
+                index: 0,
+                oid: oid(),
+                message: "On main: keep me".to_owned(),
+            }],
+            worktrees: vec![Worktree {
+                path: PathBuf::from("/tmp/feature-wt"),
+                branch: Some("feature".to_owned()),
+                head: Some(oid()),
+                bare: false,
+                detached: false,
+                locked: None,
+                prunable: false,
+                current: true,
+            }],
+            submodules: vec![Submodule {
+                path: "vendor/lib".to_owned(),
+                oid: Some(oid()),
+                state: SubmoduleState::Clean,
+            }],
+            ..Default::default()
+        };
+        let nodes = build_nodes(&[], Some(&extras), None, &Expansion::default(), "keep me");
+        assert_eq!(keys(&nodes), vec!["section:stashes", "stash:0"]);
+        let nodes = build_nodes(
+            &[],
+            Some(&extras),
+            None,
+            &Expansion::default(),
+            "feature-wt",
+        );
+        assert!(find(&nodes, "wt:/tmp/feature-wt").is_some());
+        let nodes = build_nodes(&[], Some(&extras), None, &Expansion::default(), "stash@{0}");
+        assert!(find(&nodes, "stash:0").is_some());
+        let nodes = build_nodes(&[], Some(&extras), None, &Expansion::default(), "vendor");
+        assert!(find(&nodes, "sub:vendor/lib").is_some());
+    }
+
+    #[test]
+    fn a_filter_with_no_match_builds_nothing() {
+        let refs = [local("main")];
+        let nodes = build_nodes(&refs, None, None, &Expansion::default(), "zzz");
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn clearing_the_filter_restores_the_expansion_overrides() {
+        let refs = [local("feat/a")];
+        let mut expansion = Expansion::default();
+        expansion.toggle("folder:feat", true);
+        let collapsed = build_nodes(&refs, None, None, &expansion, "");
+        assert!(find(&collapsed, "local:feat/a").is_none());
+
+        // The filter forces the folder open and matches its leaf.
+        let filtered = build_nodes(&refs, None, None, &expansion, "a");
+        assert!(find(&filtered, "local:feat/a").is_some());
+        assert!(find(&filtered, "folder:feat").unwrap().expanded);
+
+        // Clearing it brings the user's collapse back untouched.
+        let cleared = build_nodes(&refs, None, None, &expansion, "");
+        assert!(find(&cleared, "local:feat/a").is_none());
+        assert!(!find(&cleared, "folder:feat").unwrap().expanded);
+    }
+
+    #[test]
+    fn sections_show_counts_and_the_head_branch() {
+        let refs = [
+            local("main"),
+            local("feat/lanes"),
+            reference(RefKind::RemoteBranch, "origin/main"),
+            reference(RefKind::RemoteBranch, "origin/HEAD"),
+            reference(RefKind::Tag, "v0.3.0"),
+        ];
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        let nodes = build_nodes(&refs, None, Some(&head), &Expansion::default(), "");
+        assert_eq!(
+            labels(&nodes),
+            vec![
+                "Local branches",
+                "main",
+                "feat",
+                "lanes",
+                "Remotes",
+                "origin",
+                "main",
+                "Tags",
+                "v0.3.0",
+                "Stashes",
+                "Worktrees",
+                "Submodules",
+            ]
+        );
+        assert!(nodes[0].section);
+        assert!(nodes[0].expanded);
+        assert_eq!(nodes[0].trailing, Some(TreeNodeTrailing::Count("2".into())));
+        assert!(find(&nodes, "local:main").unwrap().current);
+        assert!(!find(&nodes, "local:feat/lanes").unwrap().current);
+        // `origin/HEAD` is a symbolic ref, not a branch row.
+        assert!(nodes.iter().all(|node| node.label != "HEAD"));
+        // The later sections have headers but, without extras, no counts.
+        assert!(find(&nodes, "section:stashes").unwrap().trailing.is_none());
+        assert_eq!(
+            find(&nodes, "section:tags").unwrap().trailing,
+            Some(TreeNodeTrailing::Count("1".into()))
+        );
+    }
+
+    #[test]
+    fn loading_refs_show_headers_without_counts() {
+        let nodes = sidebar_nodes(None, None, None, &Expansion::default(), "", None);
+        assert_eq!(nodes.len(), 6);
+        assert!(nodes.iter().all(|node| node.section));
+        assert!(nodes.iter().all(|node| node.trailing.is_none()));
+    }
+
+    #[test]
+    fn selection_marks_the_matching_leaf() {
+        let refs = [reference(RefKind::Tag, "v1")];
+        let nodes = sidebar_nodes(
+            Some(&refs),
+            None,
+            None,
+            &Expansion::default(),
+            "",
+            Some("tag:v1"),
+        );
+        let tag = nodes.iter().find(|node| node.label == "v1").unwrap();
+        assert!(tag.selected);
+    }
+}
