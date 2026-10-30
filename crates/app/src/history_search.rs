@@ -44,7 +44,11 @@ impl Query {
             None
         };
         Some(Self {
-            chars: trimmed.to_lowercase().chars().collect(),
+            // Fold character by character, like `match_at` folds the haystack:
+            // `str::to_lowercase` uses the final-sigma rule (`Σ` at the end of
+            // a word becomes `ς`), which the per-character haystack never
+            // produces.
+            chars: trimmed.chars().flat_map(char::to_lowercase).collect(),
             hash,
         })
     }
@@ -362,6 +366,20 @@ mod tests {
         let found = matched("i", &c).expect("the summary matches");
         assert_eq!(found.fields.summary, vec![0..2]);
         assert_eq!(&c.summary[found.fields.summary[0].clone()], "İ");
+    }
+
+    #[test]
+    fn a_final_capital_sigma_matches_the_per_character_fold() {
+        // `str::to_lowercase("ΟΔΟΣ")` ends in the final sigma `ς`, while the
+        // haystack folds each `Σ` to `σ`; the needle must fold the same way.
+        let c = commit(
+            "ΟΔΟΣ parser",
+            "Name",
+            "mail@example.com",
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let found = matched("ΟΔΟΣ", &c).expect("the summary matches");
+        assert_eq!(found.fields.summary, vec![0..8]);
     }
 
     #[test]

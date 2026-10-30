@@ -2018,4 +2018,53 @@ mod tests {
             );
         });
     }
+
+    /// Enter inside the debounce window applies the field's text first, so the
+    /// step (and the scan's jump) uses the new query, not the previous one's
+    /// matches.
+    #[gpui::test]
+    fn enter_during_the_debounce_applies_the_new_query(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+
+        let repo = crate::test_support::TempRepo::new("history-search-debounce");
+        commit(repo.path(), "a.txt", "Alpha");
+        commit(repo.path(), "b.txt", "Beta one");
+        commit(repo.path(), "c.txt", "Gamma");
+        commit(repo.path(), "d.txt", "Beta two");
+
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        let history = view.read_with(&cx, |view, _| view.history());
+        let field = cx
+            .debug_bounds("toolbar-search")
+            .expect("the toolbar search was not drawn");
+        cx.simulate_click(field.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        // Apply "beta": it matches rows 0 and 2, and the jump selects row 0,
+        // the first match at or after the initial selection.
+        cx.simulate_input("beta");
+        settle_search(&mut cx);
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected_row()),
+            Some(0)
+        );
+
+        // A new query followed by Enter before the debounce fires must search
+        // "alpha" (row 3), not step over the old "beta" matches.
+        cx.simulate_keystrokes("escape");
+        cx.simulate_click(field.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_input("alpha");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected_row()),
+            Some(3),
+            "Enter inside the debounce did not apply the new query"
+        );
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.search_status().map(|s| s.to_string())),
+            Some("1 / 1".to_owned())
+        );
+    }
 }

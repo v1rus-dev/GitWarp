@@ -305,6 +305,50 @@ fn a_column_that_once_held_two_commits_never_folds() {
 }
 
 #[test]
+fn a_column_reused_back_to_back_splits_into_separate_instances() {
+    // Columns 1..3 each carry one idle instance: m opens them, b, c and d sit
+    // on them and close into the main line. Column 1 closes on b's row and the
+    // very next row reuses it for the tip t, so the two lanes touch the column
+    // back to back. They are two one-dot instances, not one two-dot instance,
+    // so the column stays foldable and the run still folds.
+    let g = idle(&[
+        ("m", &["a", "b", "c", "d"]),
+        ("a", &["z"]),
+        ("b", &["z"]),
+        ("t", &["z"]),
+        ("c", &["z"]),
+        ("d", &["z"]),
+        ("z", &[]),
+    ])
+    .geometry(true);
+    assert_eq!(g.folded, vec![false, true, true, true]);
+    assert_eq!(g.xs, vec![7.0, 20.0, 20.0, 20.0]);
+    assert_eq!(g.width, 26.0);
+    assert_eq!(g.folded_count, 3);
+}
+
+#[test]
+fn a_reused_column_with_a_two_commit_lane_does_not_fold() {
+    // Same shape, but b's lane carries b and z2 down column 1: that one
+    // instance holds two dots, so the column is not idle and the fold breaks.
+    let g = idle(&[
+        ("m", &["a", "b", "c", "d"]),
+        ("a", &["z"]),
+        ("b", &["z2"]),
+        ("z2", &["z"]),
+        ("t", &["z"]),
+        ("c", &["z"]),
+        ("d", &["z"]),
+        ("z", &[]),
+    ])
+    .geometry(true);
+    assert!(!g.folded[1], "a two-commit instance is not idle");
+    assert_eq!(g.folded_count, 0);
+    assert_eq!(g.xs.len(), 4);
+    assert_eq!(g.width, 56.0);
+}
+
+#[test]
 fn a_merge_tip_makes_its_column_non_foldable() {
     // `m` is a merge commit and a tip in column 1: its instance holds one dot,
     // but that dot is a merge, so the column is not idle.

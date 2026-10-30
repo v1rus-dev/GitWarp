@@ -886,9 +886,23 @@ impl HistoryView {
         }
     }
 
-    /// Selects `index`, scrolls it minimally into view and repaints. A pick by
-    /// the user stops the initial selection from following the load.
+    /// Selects `index` because the user picked it (a click, the row menu or a
+    /// navigation key): a pending search jump is cancelled, so a match from a
+    /// later page cannot yank the selection away.
     fn select_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.search_jump = false;
+        self.select(index, cx);
+    }
+
+    /// Selects `index` because the search found it; the deferred jump stays
+    /// armed until it lands.
+    fn select_row_from_search(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.select(index, cx);
+    }
+
+    /// Selects `index`, scrolls it minimally into view and repaints. Any pick
+    /// stops the initial selection from following the load.
+    fn select(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.items.len() || self.selected == Some(index) {
             self.user_selected = true;
             return;
@@ -1189,15 +1203,19 @@ impl HistoryView {
     /// field (the hint comes back then).
     pub fn search_status(&self) -> Option<SharedString> {
         self.search.as_ref()?;
+        // While rows are still arriving or unscanned, the count is a lower
+        // bound: "No matches" would be a lie about a scan that is not done.
+        let pending =
+            self.is_loading() || self.search_scanning || self.search_scanned < self.items.len();
         if self.search_matches.is_empty() {
-            return Some(if self.is_loading() {
+            return Some(if pending {
                 "– / 0+".into()
             } else {
                 "No matches".into()
             });
         }
         let total = self.search_matches.len();
-        let suffix = if self.is_loading() { "+" } else { "" };
+        let suffix = if pending { "+" } else { "" };
         let position = self
             .selected
             .and_then(|row| history_search::position_of(&self.search_matches, row))
@@ -1220,12 +1238,20 @@ impl HistoryView {
 
     /// Enter / F3 (next) and Shift+Enter / Shift+F3 (previous), both wrapping.
     pub fn search_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        // The timer handle stays in its slot after it fires, so compare the
+        // field with the applied query instead: different text means the
+        // debounce has not searched it yet, and Enter must apply it now rather
+        // than step over the previous query's matches.
+        if Query::parse(&self.search_text) != self.search {
+            self.search_debounce = None;
+            self.apply_search(cx);
+        }
         let Some(position) = history_search::step(&self.search_matches, self.selected, forward)
         else {
             return;
         };
         let row = self.search_matches[position].row;
-        self.select_row(row, cx);
+        self.select_row_from_search(row, cx);
     }
 
     /// The debounce elapsed: parse the field's text and start the scan.
@@ -1301,7 +1327,7 @@ impl HistoryView {
             {
                 self.search_jump = false;
                 let row = self.search_matches[position].row;
-                self.select_row(row, cx);
+                self.select_row_from_search(row, cx);
             }
         }
         self.scan_more(cx);
@@ -1311,6 +1337,10 @@ impl HistoryView {
     /// A new load replaces the rows: keep the query and search the new rows
     /// from the top.
     fn restart_search(&mut self, cx: &mut Context<Self>) {
+        // The field may show text typed since the last debounce fired; apply it
+        // here, or cancelling the timer would silently drop the new query.
+        self.search_debounce = None;
+        self.search = Query::parse(&self.search_text);
         self.search_matches.clear();
         self.search_scanned = 0;
         self.search_scanning = false;
@@ -1351,6 +1381,12 @@ impl HistoryView {
         self.selected = None;
         self.user_selected = false;
         self.hovered = None;
+        // The new load starts at the top, so the HEAD selection that settles
+        // later is visible instead of being left below the old scroll offset.
+        self.scroll.0.borrow().base_handle.set_offset(Point {
+            x: px(0.),
+            y: px(0.),
+        });
         // The query stays in the field; its matches belong to the old rows.
         self.restart_search(cx);
         self.start(cx);
@@ -3387,6 +3423,91 @@ mod tests {
                 "the row menu stayed open after its item was clicked"
             );
         });
+    }
+
+    /// The status only says "No matches" once the whole history was scanned; a
+    /// running or unfinished scan shows the partial count with a "+".
+    #[gpui::test]
+    fn the_search_status_is_partial_until_the_scan_finishes(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-search-status");
+        commit(repo.path(), "a.txt", "Alpha");
+        commit(repo.path(), "b.txt", "Beta");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, _| {
+            view.search = Query::parse("zzz");
+            view.selected = Some(0);
+            // A scan in flight over rows that are not covered yet.
+            view.search_matches.clear();
+            view.search_scanned = 0;
+            view.search_scanning = true;
+            assert_eq!(view.search_status().unwrap().as_ref(), "– / 0+");
+            // The scan ended, but rows are still unscanned: not "No matches".
+            view.search_scanning = false;
+            assert_eq!(
+                view.search_status().unwrap().as_ref(),
+                "– / 0+",
+                "unscanned rows are still pending"
+            );
+            // A match found by a scan that has not covered every row.
+            view.search_matches.push(history_search::HistoryMatch {
+                row: 0,
+                fields: Default::default(),
+            });
+            assert_eq!(view.search_status().unwrap().as_ref(), "1 / 1+");
+            // Every row scanned and no match: only now is "No matches" true.
+            view.search_scanned = view.items.len();
+            assert_eq!(view.search_status().unwrap().as_ref(), "1 / 1");
+            view.search_matches.clear();
+            assert_eq!(view.search_status().unwrap().as_ref(), "No matches");
+        });
+    }
+
+    /// A row the user picks cancels a pending search jump, so a match from a
+    /// later page cannot yank the selection; the jump stays armed when the
+    /// search itself picks the row.
+    #[gpui::test]
+    fn a_user_pick_cancels_the_deferred_search_jump(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-search-jump");
+        commit(repo.path(), "a.txt", "A");
+        commit(repo.path(), "b.txt", "B");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, cx| {
+            view.search_jump = true;
+            view.select_row(1, cx);
+            assert!(
+                !view.search_jump,
+                "a user pick must cancel the deferred search jump"
+            );
+            view.search_jump = true;
+            view.select_row_from_search(0, cx);
+            assert!(
+                view.search_jump,
+                "a search pick must keep the deferred jump armed"
+            );
+        });
+    }
+
+    /// Retry during the debounce applies the field's text instead of dropping
+    /// it with the cancelled timer.
+    #[gpui::test]
+    fn retry_during_the_debounce_keeps_the_typed_query(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-search-retry");
+        commit(repo.path(), "a.txt", "Alpha");
+        commit(repo.path(), "b.txt", "Beta");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, cx| {
+            view.set_search_query("Alpha".to_owned(), cx);
+            view.retry(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.search_status().map(|s| s.to_string())),
+            Some("1 / 1".to_owned()),
+            "retry dropped the query typed before the debounce fired"
+        );
     }
 
     /// The first selection is the HEAD row, even when HEAD is not row 0, and

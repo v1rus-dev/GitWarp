@@ -7,11 +7,13 @@
 //! and turns them into x positions with [`IdleLanes::geometry`].
 //!
 //! A column is *occupied* in a row when the commit dot or any segment of the
-//! row touches it. A *lane instance* is a maximal run of consecutive rows in
-//! which the column is occupied. An instance is *idle* when it holds at most
-//! one commit dot and that dot is not a merge. Passing lanes and lines joining
-//! another column do not count as a dot. A column is *foldable* when it has at
-//! least one instance and every instance so far is idle.
+//! row touches it. A *lane instance* is one occupancy of the column: a lane
+//! that leaves the column (a lane change, or the commit's own dot with nothing
+//! carrying down) ends the instance even when another lane takes the column on
+//! the next row. An instance is *idle* when it holds at most one commit dot and
+//! that dot is not a merge. Passing lanes and lines joining another column do
+//! not count as a dot. A column is *foldable* when it has at least one instance
+//! and every instance so far is idle.
 
 use crate::Row;
 
@@ -40,12 +42,15 @@ pub struct IdleLanes {
     has_instance: Vec<bool>,
     /// Whether every completed instance of the column was idle.
     all_idle: Vec<bool>,
-    /// Whether the last row occupied the column (the instance is open).
+    /// Whether the last row carried the column down to the next row (the
+    /// instance is open).
     open: Vec<bool>,
     /// Commit dots in the open instance.
     dots: Vec<u32>,
     /// Scratch marks: which columns the current row touches.
     occupied: Vec<bool>,
+    /// Scratch marks: which columns carry a lane down to the next row.
+    continuing: Vec<bool>,
 }
 
 impl IdleLanes {
@@ -63,6 +68,7 @@ impl IdleLanes {
             self.open.resize(lanes, false);
             self.dots.resize(lanes, 0);
             self.occupied.resize(lanes, false);
+            self.continuing.resize(lanes, false);
         }
         // Mark the columns this row touches once, then walk the columns once:
         // rescanning every segment for every column would be quadratic in the
@@ -72,6 +78,15 @@ impl IdleLanes {
         for s in row.above.iter().chain(&row.below) {
             self.occupied[s.from] = true;
             self.occupied[s.to] = true;
+        }
+        // A lane is only present at the bottom edge when it carries straight
+        // down in its column. A lane change (`c -> d`) leaves the column, and a
+        // line entering a column is a new lane there, not a continuation.
+        self.continuing.fill(false);
+        for s in &row.below {
+            if s.from == s.to {
+                self.continuing[s.from] = true;
+            }
         }
         for col in 0..self.has_instance.len() {
             if !self.occupied[col] {
@@ -89,6 +104,14 @@ impl IdleLanes {
                     self.all_idle[col] = false;
                 }
                 self.dots[col] += 1;
+            }
+        }
+        // A lane that does not carry down its column closes its instance here,
+        // even when another lane occupies the same column on the next row: the
+        // two occupancies are separate instances with their own dots.
+        for col in 0..self.open.len() {
+            if !self.continuing[col] {
+                self.open[col] = false;
             }
         }
     }

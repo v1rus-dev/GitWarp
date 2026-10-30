@@ -53,25 +53,22 @@ pub fn paint_row(
     let dash_offset = row_index as f32 * f32::from(ROW_HEIGHT);
 
     // Passing lanes first: one vertical per distinct x, so a folded group draws
-    // its dashed gap lane once.
-    let mut seen: Vec<f32> = Vec::new();
-    for segment in row
-        .above
-        .iter()
-        .chain(row.below.iter())
-        .filter(|s| s.from == s.to && s.from != row.column)
-    {
+    // its dashed gap lane once. `xs` never decreases with the column, so the
+    // lanes arrive in x order: an equal x is the same folded group, and the
+    // first lane past the column edge ends the row.
+    let mut last_x: Option<f32> = None;
+    for segment in passing_lanes(row) {
         let Some(x) = x_of(segment.from) else {
             continue;
         };
         let x_local = local_x(x);
-        if seen.contains(&x_local) {
-            continue;
-        }
-        seen.push(x_local);
         if !vertical_visible(x_local, cw) {
+            break;
+        }
+        if last_x == Some(x_local) {
             continue;
         }
+        last_x = Some(x_local);
         if folded(segment.from) {
             let color = theme.colors.muted.opacity(0.6);
             for (from, to) in dash_segments(0., f32::from(bounds.size.height), dash_offset) {
@@ -178,6 +175,37 @@ pub fn paint_row(
             ),
         ));
     }
+}
+
+/// The row's passing lanes (a full-height line in a column that is not the
+/// dot's) in column order. Every passing lane appears in both halves and both
+/// halves are sorted by `from`, so the merge keeps a lane's two entries next to
+/// each other: the painter's last-x dedup then draws each column once.
+fn passing_lanes<'a>(row: &'a Row<Oid>) -> impl Iterator<Item = &'a Segment> + 'a {
+    let column = row.column;
+    let mut above = row
+        .above
+        .iter()
+        .filter(move |s| s.from == s.to && s.from != column)
+        .peekable();
+    let mut below = row
+        .below
+        .iter()
+        .filter(move |s| s.from == s.to && s.from != column)
+        .peekable();
+    std::iter::from_fn(move || {
+        let take_above = match (above.peek(), below.peek()) {
+            (Some(a), Some(b)) => a.from <= b.from,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        if take_above {
+            above.next()
+        } else {
+            below.next()
+        }
+    })
 }
 
 /// The column whose colour a segment takes: `above` segments are coloured by
@@ -311,6 +339,27 @@ mod tests {
         // Dots may hang up to 6 px past the edge.
         assert!(dot_visible(118., 112.));
         assert!(!dot_visible(118.5, 112.));
+    }
+
+    #[test]
+    fn passing_lanes_merge_both_halves_in_column_order() {
+        let row = Row {
+            id: Oid::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            column: 2,
+            color: 0,
+            // A lane change and the dot's own column are not passing lanes.
+            above: vec![segment(0, 0), segment(1, 2), segment(4, 4)],
+            below: vec![segment(0, 0), segment(2, 1), segment(3, 3), segment(4, 4)],
+            width: 5,
+            is_tip: true,
+            is_merge: false,
+        };
+        let froms: Vec<usize> = passing_lanes(&row).map(|s| s.from).collect();
+        assert_eq!(froms, vec![0, 0, 3, 4, 4], "both halves, column order");
+        assert!(
+            froms.windows(2).all(|w| w[0] <= w[1]),
+            "the painter's early cull relies on non-decreasing columns"
+        );
     }
 
     #[test]
