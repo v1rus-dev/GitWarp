@@ -1143,9 +1143,9 @@ fn badges_section(colors: ThemeColors) -> impl IntoElement {
                         .flex()
                         .items_center()
                         .gap(px(12.))
-                        .child(Avatar::new("mira@example.com", px(24.)))
-                        .child(Avatar::new("feat/lane@example.com", px(32.)))
-                        .child(Avatar::new("pablo@example.com", px(44.)))
+                        .child(Avatar::new("mira@example.com", px(24.)).name("Mira Okonkwo"))
+                        .child(Avatar::new("feat/lane@example.com", px(32.)).name("Lin Zhao"))
+                        .child(Avatar::new("pablo@example.com", px(44.)).name("Pablo Ruiz"))
                         .child(
                             div()
                                 .text_size(FS_SM)

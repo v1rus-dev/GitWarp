@@ -10,6 +10,7 @@ use gpui::{
 pub struct Avatar {
     email: SharedString,
     size: Pixels,
+    name: Option<SharedString>,
 }
 
 impl Avatar {
@@ -17,7 +18,15 @@ impl Avatar {
         Self {
             email: email.into(),
             size,
+            name: None,
         }
+    }
+
+    /// Use the author's name for the initials; the colour still comes from the
+    /// e-mail.
+    pub fn name(mut self, name: impl Into<SharedString>) -> Self {
+        self.name = Some(name.into());
+        self
     }
 }
 
@@ -35,7 +44,7 @@ impl RenderOnce for Avatar {
             .text_color(white())
             .text_size(self.size * 0.42)
             .font_weight(FontWeight::SEMIBOLD)
-            .child(initials(&self.email))
+            .child(initials_for(self.name.as_deref(), &self.email))
     }
 }
 
@@ -44,6 +53,36 @@ pub fn hash_email(email: &str) -> u32 {
     email.to_lowercase().chars().fold(0u32, |hash, ch| {
         hash.wrapping_mul(31).wrapping_add(ch as u32)
     })
+}
+
+/// The design's initials: the first letter of the author's first and last
+/// words, upper-cased ("Mira Okonkwo" → "MO"). A single word gives one letter.
+///
+/// Names without a letter (and a missing name) fall back to the e-mail rule of
+/// [`initials`].
+pub fn initials_for(name: Option<&str>, email: &str) -> SharedString {
+    let Some(name) = name.filter(|name| name.chars().any(char::is_alphabetic)) else {
+        return initials(email);
+    };
+    let words: Vec<&str> = name
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let first = words.first().and_then(|word| word.chars().next());
+    let last = match words.len() {
+        0 | 1 => None,
+        _ => words.last().and_then(|word| word.chars().next()),
+    };
+    let text: String = first
+        .into_iter()
+        .chain(last)
+        .flat_map(|ch| ch.to_uppercase())
+        .collect();
+    if text.is_empty() {
+        initials(email)
+    } else {
+        text.into()
+    }
 }
 
 /// Up to two initials from the local part of the address.
@@ -88,5 +127,20 @@ mod tests {
         assert_eq!(initials("john.doe@example.com"), "JD");
         assert_eq!(initials("feat/lane@example.com"), "FL");
         assert_eq!(initials("@example.com"), "?");
+    }
+
+    #[test]
+    fn initials_come_from_the_author_name() {
+        assert_eq!(initials_for(Some("Mira Okonkwo"), "mira@example.com"), "MO");
+        assert_eq!(initials_for(Some("Lin Zhao"), "lin@example.com"), "LZ");
+        assert_eq!(initials_for(Some("cher"), "cher@example.com"), "C");
+        // Extra whitespace and separators do not invent words.
+        assert_eq!(
+            initials_for(Some("  Mira   Okonkwo "), "x@example.com"),
+            "MO"
+        );
+        // A name without letters falls back to the e-mail rule.
+        assert_eq!(initials_for(Some("123"), "john.doe@example.com"), "JD");
+        assert_eq!(initials_for(None, "john.doe@example.com"), "JD");
     }
 }
