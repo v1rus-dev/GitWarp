@@ -17,7 +17,7 @@ use gpui::{
 };
 
 use git_core::{CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo};
-use git_graph::{GraphBuilder, Row};
+use git_graph::{ColumnGeometry, GraphBuilder, IdleLanes, Row};
 use ui::metrics::{FONT_MONO, FONT_UI, FS_SM};
 use ui::theme::ThemeColors;
 use ui::{
@@ -212,6 +212,17 @@ pub struct HistoryView {
     /// The table layout for the pane's last measured width, so the virtualized
     /// rows paint with the same columns the header was built for.
     columns: Columns,
+    /// Per-column statistics for the idle-lane collapse, fed every emitted row
+    /// in order. Reset whenever the graph is rebuilt.
+    idle_lanes: IdleLanes,
+    /// The x positions the painter uses, recomputed when rows arrive or
+    /// `collapse` changes — never per row per frame.
+    geometry: Rc<ColumnGeometry>,
+    /// Whether idle lanes fold into gap lanes (the toggle arrives in step 3.3).
+    collapse: bool,
+    /// The row under the mouse. The canvas cannot see the CSS-like hover, so
+    /// the painter takes the halo and merge-ring fill from this.
+    hovered: Option<usize>,
 }
 
 impl HistoryView {
@@ -244,6 +255,10 @@ impl HistoryView {
             refs: RefsState::Loading,
             // Replaced with the pane's real width in the first prepaint.
             columns: columns(1200., 1),
+            idle_lanes: IdleLanes::new(),
+            geometry: Rc::new(IdleLanes::new().geometry(false)),
+            collapse: false,
+            hovered: None,
         };
         view.start(cx);
         view
@@ -257,6 +272,9 @@ impl HistoryView {
         self.generation += 1;
         let generation = self.generation;
         self.state = LoadState::Loading { total: None };
+        // The graph starts over with the load, so its geometry does too.
+        self.idle_lanes = IdleLanes::new();
+        self.refresh_geometry();
 
         let git = match &self.git {
             Ok(git) => git.clone(),
@@ -426,12 +444,20 @@ impl HistoryView {
     fn append(&mut self, page: Vec<(CommitInfo, Row<Oid>)>, cx: &mut Context<Self>) {
         for (commit, row) in page {
             self.max_lanes = self.max_lanes.max(row.width);
+            self.idle_lanes.push(&row);
             self.items.push(Item {
                 commit,
                 row: Rc::new(row),
             });
         }
+        self.refresh_geometry();
         cx.notify();
+    }
+
+    /// Rebuild the painter's x snapshot. Called when rows were added or the
+    /// collapse toggle changed, not while rendering.
+    fn refresh_geometry(&mut self) {
+        self.geometry = Rc::new(self.idle_lanes.geometry(self.collapse));
     }
 
     /// The commit count arrived; only the current load may set it.
@@ -499,6 +525,7 @@ impl HistoryView {
         self.items.clear();
         self.max_lanes = 1;
         self.selected = None;
+        self.hovered = None;
         self.start(cx);
         cx.notify();
     }
@@ -544,6 +571,15 @@ impl HistoryView {
     /// HEAD, once the background read finished and succeeded.
     pub fn head(&self) -> Option<&Head> {
         self.head.as_ref().and_then(|head| head.as_ref().ok())
+    }
+
+    /// The commit HEAD points at, for the graph's HEAD ring. Detached HEAD has
+    /// a ring too; a branch whose target could not be read does not.
+    fn head_oid(&self) -> Option<Oid> {
+        match self.head.as_ref()?.as_ref().ok()? {
+            Head::Branch { target, .. } => *target,
+            Head::Detached(oid) => Some(*oid),
+        }
     }
 
     /// The refs, once loaded; `None` while loading or after a failure.
@@ -711,18 +747,26 @@ impl HistoryView {
         let colors = cx.theme().colors;
         let ui_theme = cx.theme().clone();
         let columns = self.columns;
+        let geometry = self.geometry.clone();
+        let hovered = self.hovered;
+        let head = self.head_oid();
         range
             .map(|ix| {
                 let item = &self.items[ix];
                 let row = item.row.clone();
                 let selected = self.selected == Some(ix);
+                let is_hovered = hovered == Some(ix) && !selected;
                 let c = &item.commit;
                 let background = if selected {
                     colors.selection
+                } else if is_hovered {
+                    colors.hover
                 } else {
                     colors.bg
                 };
+                let is_head = head == Some(c.id);
                 let row_theme = ui_theme.clone();
+                let row_geometry = geometry.clone();
 
                 // The 6px gutter lives on the wrapper: a uniform_list lays
                 // each item out with a definite width and does not stretch it,
@@ -738,7 +782,22 @@ impl HistoryView {
                     .gap(px(COL_GAP))
                     .text_size(FS_SM)
                     .when(selected, |d| d.bg(colors.selection))
-                    .when(!selected, |d| d.hover(|d| d.bg(colors.hover)))
+                    .when(is_hovered, |d| d.bg(colors.hover))
+                    .on_hover(cx.listener(move |view, entered: &bool, _, cx| {
+                        // A leave only clears the row it belongs to: the next
+                        // row's enter may already have run.
+                        let next = if *entered {
+                            Some(ix)
+                        } else if view.hovered == Some(ix) {
+                            None
+                        } else {
+                            view.hovered
+                        };
+                        if view.hovered != next {
+                            view.hovered = next;
+                            cx.notify();
+                        }
+                    }))
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.selected = Some(ix);
                         cx.notify();
@@ -750,7 +809,16 @@ impl HistoryView {
                                 // Clip to the graph column so lanes past its
                                 // edge are cut instead of drawn over Summary.
                                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                                    paint_row(&row, bounds, background, &row_theme, window)
+                                    paint_row(
+                                        &row,
+                                        ix,
+                                        bounds,
+                                        background,
+                                        &row_geometry,
+                                        is_head,
+                                        &row_theme,
+                                        window,
+                                    )
                                 })
                             },
                         )
@@ -1470,14 +1538,18 @@ mod tests {
 
     #[test]
     fn columns_cap_the_graph_so_the_summary_keeps_its_room() {
-        // 30 lanes need 356 px: `graph_width` stops drawing lanes past
-        // MAX_GRAPH_LANES, so the 480 px design cap never binds at 1200 px.
-        assert_eq!(f32::from(graph_width(30)), 356.);
-        assert_eq!(columns(1200., 30).graph, 356.);
+        // 30 lanes are 420 px wide now that the old 10 px side padding and the
+        // 24-lane cap are gone (stage 3.2: x = 14·n + 7, no padding), so the
+        // 480 px design cap still never binds at 1200 px.
+        assert_eq!(f32::from(graph_width(30)), 420.);
+        assert_eq!(columns(1200., 30).graph, 420.);
         // At 800 px the 40 % share binds before the lane width does.
         assert_eq!(columns(800., 30).graph, 320.);
-        // A graph narrower than the share keeps the lanes' width.
-        assert_eq!(columns(800., 2).graph, f32::from(graph_width(2)));
+        // A graph narrower than the share keeps the lanes' width (14 px each),
+        // but never goes below the 40 px floor: two lanes are only 28 px.
+        assert_eq!(f32::from(graph_width(2)), 28.);
+        assert_eq!(columns(800., 2).graph, GRAPH_MIN);
+        assert_eq!(columns(800., 3).graph, 42.);
         // The 40 % share holds on any wide pane.
         assert_eq!(columns(700., 30).graph, 280.);
         // Never below the floor, however narrow the pane or the graph.
