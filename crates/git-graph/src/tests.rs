@@ -66,8 +66,11 @@ fn branch_and_merge() {
     assert_eq!(r[2].column, 1);
     assert_eq!(r[3].column, 1);
     assert_eq!(r[4].column, 0);
-    // Both lanes converge into the fork point.
-    assert_eq!(shape(&r[4].above), vec![seg(0, 0), seg(1, 0)]);
+    // D1: b1's line bends left into a1's waiting lane on b1's own row.
+    assert_eq!(shape(&r[3].below), vec![seg(0, 0), seg(1, 0)]);
+    // Both branches are already joined by then, so a1 has one incoming lane.
+    assert_eq!(shape(&r[4].above), vec![seg(0, 0)]);
+    assert_eq!(r[4].width, 1);
     // The merged branch keeps one color for its whole length.
     assert_eq!(r[2].color, r[3].color);
     assert_ne!(r[2].color, r[1].color);
@@ -75,17 +78,52 @@ fn branch_and_merge() {
 }
 
 #[test]
-fn two_tips_on_same_base_meet_at_the_base() {
+fn second_tip_bends_into_the_waiting_lane() {
+    // x waits for `base` in column 0, so D1 makes y's line bend into that
+    // lane on y's own row; y's column stays free and `base` has one incoming
+    // lane.
     let r = rows(&[("x", &["base"]), ("y", &["base"]), ("base", &[])]);
     assert_eq!(r[0].column, 0);
     assert_eq!(r[1].column, 1);
     assert!(r[0].is_tip && r[1].is_tip);
-    // x's lane passes by y.
     assert_eq!(shape(&r[1].above), vec![seg(0, 0)]);
-    assert_eq!(shape(&r[1].below), vec![seg(0, 0), seg(1, 1)]);
+    assert_eq!(shape(&r[1].below), vec![seg(0, 0), seg(1, 0)]);
     assert_eq!(r[2].column, 0);
-    assert_eq!(shape(&r[2].above), vec![seg(0, 0), seg(1, 0)]);
+    assert_eq!(shape(&r[2].above), vec![seg(0, 0)]);
+    assert_eq!(r[2].width, 1);
     assert_continuous(&r);
+
+    assert_eq!(
+        ascii::render(&r, |row| row.id.to_string()),
+        "●  x\n│\n│ ●  y\n├─╯\n●  base\n"
+    );
+}
+
+#[test]
+fn merge_opens_a_lane_left_of_the_merge_when_a_column_is_free() {
+    // `a` frees column 0 while `m` waits in column 1. D2 opens the merged-in
+    // lane for q there, left of the merge commit, instead of appending a
+    // third column on the right.
+    let r = rows(&[
+        ("x", &["a"]),
+        ("y", &["m"]),
+        ("a", &[]),
+        ("m", &["p", "q"]),
+        ("p", &[]),
+        ("q", &[]),
+    ]);
+    assert_eq!(r[3].column, 1);
+    // The first parent continues in column 1; the new lane opens in column 0.
+    assert_eq!(shape(&r[3].below), vec![seg(1, 0), seg(1, 1)]);
+    assert_eq!(r[3].width, 2);
+    assert_eq!(r[4].column, 1);
+    assert_eq!(r[5].column, 0);
+    assert_continuous(&r);
+
+    assert_eq!(
+        ascii::render(&r, |row| row.id.to_string()),
+        "●  x\n│\n│ ●  y\n│ │\n● │  a\n  │\n  ◆  m\n╭─┤\n│ ●  p\n│\n●  q\n"
+    );
 }
 
 #[test]
@@ -99,7 +137,11 @@ fn octopus_merge_opens_a_lane_per_parent() {
     ]);
     assert_eq!(shape(&r[0].below), vec![seg(0, 0), seg(0, 1), seg(0, 2)]);
     assert_eq!([r[1].column, r[2].column, r[3].column], [0, 1, 2]);
-    assert_eq!(shape(&r[4].above), vec![seg(0, 0), seg(1, 0), seg(2, 0)]);
+    // D1: b and c bend into a's waiting lane on their own rows.
+    assert_eq!(shape(&r[2].below), vec![seg(0, 0), seg(1, 0), seg(2, 2)]);
+    assert_eq!(shape(&r[3].below), vec![seg(0, 0), seg(2, 0)]);
+    assert_eq!(shape(&r[4].above), vec![seg(0, 0)]);
+    assert_eq!(r[4].width, 1);
     assert_eq!(r[0].width, 3);
     assert_continuous(&r);
 }
@@ -169,4 +211,157 @@ fn open_lanes_stay_bounded_on_long_linear_history() {
     b.push(0, &[]);
     assert_eq!(b.len(), 100_000);
     assert_eq!(b.open_lanes(), 0);
+}
+
+fn idle(history: &[(&'static str, &[&'static str])]) -> IdleLanes {
+    let mut idle = IdleLanes::new();
+    for row in rows(history) {
+        idle.push(&row);
+    }
+    idle
+}
+
+fn feed(
+    b: &mut GraphBuilder<&'static str>,
+    idle: &mut IdleLanes,
+    id: &'static str,
+    parents: &[&'static str],
+) {
+    let row = b.push(id, parents);
+    idle.push(&row);
+}
+
+#[test]
+fn geometry_without_collapse_is_lane_width_per_column() {
+    let g = idle(&[
+        ("m", &["a", "b", "c"]),
+        ("a", &["root"]),
+        ("b", &["root"]),
+        ("c", &["root"]),
+        ("root", &[]),
+    ])
+    .geometry(false);
+    assert_eq!(g.xs, vec![7.0, 21.0, 35.0]);
+    assert_eq!(g.folded, vec![false, false, false]);
+    assert_eq!(g.width, 42.0);
+    assert_eq!(g.folded_count, 0);
+}
+
+#[test]
+fn three_idle_lanes_fold_into_one_gap() {
+    // Column 0 is the main line (a merge dot, so never idle). b, c and d each
+    // occupy one column, passing rows included, and then join column 0 on
+    // their own row: one non-merge dot per lane instance. The three adjacent
+    // columns therefore fold into one 12 px gap.
+    let g = idle(&[
+        ("m", &["a", "b", "c", "d"]),
+        ("a", &["root"]),
+        ("b", &["root"]),
+        ("c", &["root"]),
+        ("d", &["root"]),
+        ("root", &[]),
+    ])
+    .geometry(true);
+    assert_eq!(g.folded, vec![false, true, true, true]);
+    assert_eq!(g.xs, vec![7.0, 20.0, 20.0, 20.0]);
+    assert_eq!(g.width, 26.0);
+    assert_eq!(g.folded_count, 3);
+}
+
+#[test]
+fn two_idle_lanes_do_not_fold() {
+    let g = idle(&[
+        ("m", &["a", "b", "c"]),
+        ("a", &["root"]),
+        ("b", &["root"]),
+        ("c", &["root"]),
+        ("root", &[]),
+    ])
+    .geometry(true);
+    assert_eq!(g.folded, vec![false, false, false]);
+    assert_eq!(g.xs, vec![7.0, 21.0, 35.0]);
+    assert_eq!(g.width, 42.0);
+    assert_eq!(g.folded_count, 0);
+}
+
+#[test]
+fn a_column_that_once_held_two_commits_never_folds() {
+    // Column 1 first carries y and base (two dots), so it is already
+    // non-foldable when it is reused later by the single-commit tip q.
+    let g = idle(&[
+        ("x", &["x2"]),
+        ("y", &["base"]),
+        ("x2", &["base"]),
+        ("base", &[]),
+        ("p", &["root2"]),
+        ("q", &["root2"]),
+        ("root2", &[]),
+    ])
+    .geometry(true);
+    assert!(!g.folded[1], "a reused non-idle column must not fold");
+    assert_eq!(g.folded_count, 0);
+    assert_eq!(g.xs, vec![7.0, 21.0]);
+    assert_eq!(g.width, 28.0);
+}
+
+#[test]
+fn a_merge_tip_makes_its_column_non_foldable() {
+    // `m` is a merge commit and a tip in column 1: its instance holds one dot,
+    // but that dot is a merge, so the column is not idle.
+    let r = rows(&[("a", &["p"]), ("m", &["p", "p"]), ("p", &[])]);
+    assert!(r[1].is_tip && r[1].is_merge);
+    let mut idle = IdleLanes::new();
+    for row in &r {
+        idle.push(row);
+    }
+    let g = idle.geometry(true);
+    assert!(!g.folded[1], "a merge dot is not idle");
+    assert_eq!(g.folded_count, 0);
+    assert_eq!(g.width, 28.0);
+}
+
+#[test]
+fn geometry_follows_new_rows_that_break_a_fold() {
+    let mut b = GraphBuilder::new();
+    let mut idle = IdleLanes::new();
+    feed(&mut b, &mut idle, "m", &["a", "b", "c", "d"]);
+    feed(&mut b, &mut idle, "a", &["root"]);
+    feed(&mut b, &mut idle, "b", &["root"]);
+    let g = idle.geometry(true);
+    assert_eq!(g.folded, vec![false, true, true, true]);
+    assert_eq!(g.width, 26.0);
+
+    // `c` is a merge, so its column stops being idle and the run breaks.
+    feed(&mut b, &mut idle, "c", &["root", "extra"]);
+    let g = idle.geometry(true);
+    assert_eq!(g.folded, vec![false, false, false, false]);
+    assert_eq!(g.folded_count, 0);
+    assert_eq!(g.width, 56.0);
+}
+
+#[test]
+fn a_wide_row_tracks_every_column() {
+    // 300 parents in one octopus merge: a 300-lane row. Column 0 is the merge
+    // itself (never idle); every merged-in column carries one non-merge dot
+    // and must be folded into the same gap.
+    const PARENTS: u32 = 300;
+    let parents: Vec<u32> = (1..=PARENTS).collect();
+    let mut b = GraphBuilder::new();
+    let mut idle = IdleLanes::new();
+    let row = b.push(0u32, &parents);
+    assert_eq!(row.width, PARENTS as usize);
+    idle.push(&row);
+    for &p in &parents {
+        let row = b.push(p, &[]);
+        idle.push(&row);
+    }
+
+    let g = idle.geometry(true);
+    assert_eq!(g.xs.len(), PARENTS as usize);
+    assert_eq!(g.xs[0], 7.0);
+    assert!(g.xs[1..].iter().all(|&x| x == 20.0));
+    assert!(!g.folded[0]);
+    assert!(g.folded[1..].iter().all(|&f| f));
+    assert_eq!(g.folded_count, PARENTS as usize - 1);
+    assert_eq!(g.width, 26.0);
 }
