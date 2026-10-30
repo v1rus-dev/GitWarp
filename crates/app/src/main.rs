@@ -29,9 +29,16 @@ struct AppSettings {
 
 impl Global for AppSettings {}
 
-/// A keybinding whose `secondary-` modifier is resolved for the host OS.
-fn binding(cx: &App, keystrokes: &str, action: impl Action) -> KeyBinding {
-    KeyBinding::load(keystrokes, Box::new(action), None, false, None, cx).expect("valid keystroke")
+/// A keybinding whose `secondary-` modifier is resolved for the host OS and
+/// which only applies in `context`, if given.
+fn binding(cx: &App, keystrokes: &str, action: impl Action, context: Option<&str>) -> KeyBinding {
+    let context = context.map(|context| {
+        std::rc::Rc::new(
+            gpui::KeyBindingContextPredicate::parse(context).expect("valid key binding context"),
+        )
+    });
+    KeyBinding::load(keystrokes, Box::new(action), context, false, None, cx)
+        .expect("valid keystroke")
 }
 
 /// Applies `f` to the loaded settings and saves them.
@@ -102,12 +109,17 @@ fn main() {
             // Repository shortcuts. `secondary-` is Ctrl on Linux and Windows
             // and Cmd on macOS. The views handle them, with a window-root
             // fallback for when nothing holds the focus.
-            let shortcuts = [
-                binding(cx, "secondary-b", repo_view::ToggleSidebar),
-                binding(cx, "secondary-j", repo_view::ToggleDetails),
-                binding(cx, "secondary-k", repo_view::FocusSearch),
-                binding(cx, "secondary-o", repo_view::OpenRepoSwitcher),
-                binding(cx, "secondary-shift-b", repo_view::OpenBranchSwitcher),
+            let shortcuts = vec![
+                binding(cx, "secondary-b", repo_view::ToggleSidebar, None),
+                binding(cx, "secondary-j", repo_view::ToggleDetails, None),
+                binding(cx, "secondary-k", repo_view::FocusSearch, None),
+                binding(cx, "secondary-o", repo_view::OpenRepoSwitcher, None),
+                binding(cx, "secondary-shift-b", repo_view::OpenBranchSwitcher, None),
+                // Welcome screen: Ctrl O keeps its repository meaning, Ctrl N
+                // opens the Initialize dialog and Del drops a recent entry.
+                binding(cx, "secondary-o", welcome::OpenRepository, Some("welcome")),
+                binding(cx, "secondary-n", welcome::NewRepository, Some("welcome")),
+                KeyBinding::new("delete", welcome::RemoveSelected, Some("welcome")),
             ];
             cx.bind_keys(shortcuts);
             cx.set_global(AppSettings {

@@ -111,14 +111,47 @@ impl Repo {
 
     /// Create a repository at `path` (`git init -q`) and open it.
     pub fn init(git: Arc<Git>, path: &Path) -> Result<Self> {
-        let out = git
-            .command()
-            .args(["init", "-q"])
-            .arg(path)
-            .output()
-            .map_err(Error::Spawn)?;
+        Self::init_with(git, path, None, false)
+    }
+
+    /// Create a repository at `path` and open it.
+    ///
+    /// `branch` names the initial branch (`git init -b`), and
+    /// `initial_commit_gitignore` writes an empty `.gitignore` and commits it
+    /// as "Initial commit". That commit needs a `user.name`/`user.email` from
+    /// the user's git configuration; when it fails the repository itself still
+    /// exists and the error is returned as git reported it.
+    pub fn init_with(
+        git: Arc<Git>,
+        path: &Path,
+        branch: Option<&str>,
+        initial_commit_gitignore: bool,
+    ) -> Result<Self> {
+        let mut cmd = git.command();
+        cmd.args(["init", "-q"]);
+        if let Some(branch) = branch {
+            cmd.args(["-b", branch]);
+        }
+        let out = cmd.arg(path).output().map_err(Error::Spawn)?;
         check_output(out, "init")?;
-        Self::open(git, path)
+        let repo = Self::open(git, path)?;
+
+        if initial_commit_gitignore {
+            std::fs::write(repo.root.join(".gitignore"), b"")?;
+            let out = repo
+                .command()
+                .args(["add", "--", ".gitignore"])
+                .output()
+                .map_err(Error::Spawn)?;
+            check_output(out, "add")?;
+            let out = repo
+                .command()
+                .args(["commit", "-q", "-m", "Initial commit"])
+                .output()
+                .map_err(Error::Spawn)?;
+            check_output(out, "commit")?;
+        }
+        Ok(repo)
     }
 
     pub fn root(&self) -> &Path {

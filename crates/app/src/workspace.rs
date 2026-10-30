@@ -63,8 +63,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let decorations = cx.observe_window_appearance(window, |_, _, cx| cx.notify());
+        let workspace = cx.weak_entity();
         let mut this = Self {
-            content: Content::Welcome(cx.new(|cx| WelcomeView::new(git.clone(), cx))),
+            content: Content::Welcome(
+                cx.new(|cx| WelcomeView::new(git.clone(), workspace, window, cx)),
+            ),
             git,
             git_choice,
             last_resize_edge: None,
@@ -91,10 +94,22 @@ impl Workspace {
     /// Switches back to the welcome screen.
     pub fn show_welcome(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.content, Content::Welcome(_)) {
-            self.content = Content::Welcome(cx.new(|cx| WelcomeView::new(self.git.clone(), cx)));
+            let workspace = cx.weak_entity();
+            let view = cx.new(|cx| WelcomeView::new(self.git.clone(), workspace, window, cx));
+            self.content = Content::Welcome(view);
+        }
+        if let Content::Welcome(view) = &self.content {
+            // The list takes the keyboard first, so ↑/↓ work without a click.
+            let focus = view.read(cx).list_focus();
+            window.focus(&focus, cx);
         }
         window.set_window_title("GitWarp");
         cx.notify();
+    }
+
+    /// Opens the repository picker (step 2.6 fills this in).
+    pub fn open_repository_dialog(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        log::info!("open repository dialog requested");
     }
 
     /// Resolve git again (the user may have installed it since) and, when a

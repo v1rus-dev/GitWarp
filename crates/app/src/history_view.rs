@@ -1187,7 +1187,7 @@ fn next_page(
 }
 
 /// Seconds since the unix epoch; 0 if the clock is before it.
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

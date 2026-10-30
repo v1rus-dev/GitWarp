@@ -239,6 +239,88 @@ fn init_creates_a_missing_directory_too() {
     assert_eq!(repo.commit_count().unwrap(), 0);
 }
 
+/// Gives the in-process git commands a user identity for the duration of a
+/// test. `Repo::init_with` deliberately uses the user's own configuration, so
+/// the test has to provide one instead of passing `-c`.
+struct TestIdentity {
+    global: Option<std::ffi::OsString>,
+    nosystem: Option<std::ffi::OsString>,
+}
+
+impl TestIdentity {
+    fn install(dir: &Path) -> Self {
+        let config = dir.join("gitconfig");
+        std::fs::write(
+            &config,
+            "[user]\n\tname = Test\n\temail = test@example.com\n[commit]\n\tgpgsign = false\n",
+        )
+        .unwrap();
+        let global = std::env::var_os("GIT_CONFIG_GLOBAL");
+        let nosystem = std::env::var_os("GIT_CONFIG_NOSYSTEM");
+        std::env::set_var("GIT_CONFIG_GLOBAL", &config);
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        Self { global, nosystem }
+    }
+}
+
+impl Drop for TestIdentity {
+    fn drop(&mut self) {
+        match &self.global {
+            Some(value) => std::env::set_var("GIT_CONFIG_GLOBAL", value),
+            None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+        }
+        match &self.nosystem {
+            Some(value) => std::env::set_var("GIT_CONFIG_NOSYSTEM", value),
+            None => std::env::remove_var("GIT_CONFIG_NOSYSTEM"),
+        }
+    }
+}
+
+#[test]
+fn init_with_sets_the_initial_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("fresh-branch");
+    let git = Arc::new(Git::resolve(GitChoice::System).unwrap().git);
+    let repo = Repo::init_with(git, &dir, Some("trunk"), false).unwrap();
+
+    assert_eq!(repo.root(), dir.canonicalize().unwrap());
+    assert_eq!(repo.commit_count().unwrap(), 0);
+    assert!(!dir.join(".gitignore").exists());
+    match repo.head().unwrap() {
+        Head::Branch { name, target } => {
+            assert_eq!(name, "trunk");
+            assert_eq!(target, None);
+        }
+        other => panic!("unexpected head {other:?}"),
+    }
+}
+
+#[test]
+fn init_with_makes_the_optional_initial_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("with-initial-commit");
+    let _identity = TestIdentity::install(tmp.path());
+    let git = Arc::new(Git::resolve(GitChoice::System).unwrap().git);
+    let repo = Repo::init_with(git, &dir, Some("main"), true).unwrap();
+
+    assert!(dir.join(".gitignore").is_file());
+    assert_eq!(repo.commit_count().unwrap(), 1);
+    let commits: Vec<_> = repo
+        .log(&LogOptions::default())
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(commits[0].summary, "Initial commit");
+    assert!(commits[0].parents.is_empty());
+    match repo.head().unwrap() {
+        Head::Branch { name, target } => {
+            assert_eq!(name, "main");
+            assert_eq!(target, Some(commits[0].id));
+        }
+        other => panic!("unexpected head {other:?}"),
+    }
+}
+
 #[test]
 fn a_broken_ref_makes_git_fail_with_its_exit_code() {
     let tmp = sample_repo();
