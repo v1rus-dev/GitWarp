@@ -37,6 +37,10 @@ use crate::history_state::{
     percent_text, progress_fraction, skeleton_percent, source_label, Failure, LoadState,
     SkeletonColumn,
 };
+use crate::ref_ops::{CommitCard, RefAction};
+
+/// What the history row menu asks the shell to do.
+pub(crate) type RefActionHandler = Rc<dyn Fn(RefAction, &mut Window, &mut App)>;
 use crate::settings::{GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MAX, GRAPH_WIDTH_MIN};
 use crate::theme;
 use crate::workspace::Workspace;
@@ -508,6 +512,8 @@ pub struct HistoryView {
     /// workspace's job; this is the handle for this repository.
     git: Result<Arc<Git>, Arc<Error>>,
     workspace: WeakEntity<Workspace>,
+    /// What the shell does with a row action (branch/tag/reset dialogs).
+    on_action: RefActionHandler,
     /// The repository root, once `Repo::open` succeeded.
     root: Option<PathBuf>,
     items: Vec<Item>,
@@ -604,6 +610,32 @@ pub struct HistoryView {
     search_jump: bool,
 }
 
+/// Adds one row-menu item that asks the shell to open a ref dialog.
+#[allow(clippy::too_many_arguments)]
+fn push_row_action(
+    entries: &mut Vec<MenuEntry>,
+    card: &CommitCard,
+    on_action: &RefActionHandler,
+    label: String,
+    icon: IconName,
+    shortcut: Option<&str>,
+    build: fn(CommitCard) -> RefAction,
+    danger: bool,
+) {
+    let on_action = on_action.clone();
+    let card = card.clone();
+    let mut item = MenuItem::new(label).icon(icon);
+    if let Some(shortcut) = shortcut {
+        item = item.shortcut(shortcut.to_owned());
+    }
+    if danger {
+        item = item.danger();
+    }
+    entries.push(MenuEntry::Item(item.action(move |window, cx| {
+        on_action(build(card.clone()), window, cx);
+    })));
+}
+
 impl HistoryView {
     /// Starts in the loading state; opening the repository, reading HEAD, the
     /// refs and the history all run in the background and fill in the rows or
@@ -613,6 +645,7 @@ impl HistoryView {
         path: PathBuf,
         git: Result<Arc<Git>, Arc<Error>>,
         workspace: WeakEntity<Workspace>,
+        on_action: RefActionHandler,
         cx: &mut Context<Self>,
     ) -> Self {
         let (graph_width, collapse) = cx
@@ -631,6 +664,7 @@ impl HistoryView {
             path,
             git,
             workspace,
+            on_action,
             root: None,
             items: Vec::new(),
             max_lanes: 1,
@@ -1061,52 +1095,91 @@ impl HistoryView {
         cx: &mut Context<Self>,
     ) {
         let hash = self.items.get(index).map(|item| item.commit.id.to_string());
+        let card = self.items.get(index).map(|item| {
+            CommitCard::from_commit(&item.commit, self.refs().unwrap_or(&[]), self.head())
+        });
         let branch = match self.head() {
             Some(Head::Branch { name, .. }) => name.clone(),
             _ => "HEAD".to_owned(),
         };
-        let entries = vec![
-            MenuEntry::Item(
-                MenuItem::new("Copy commit hash")
-                    .icon(IconName::Copy)
-                    .shortcut("Ctrl+C")
-                    .disabled(hash.is_none())
-                    .action(move |_, cx| {
-                        if let Some(hash) = hash.clone() {
-                            cx.write_to_clipboard(ClipboardItem::new_string(hash));
-                        }
-                    }),
-            ),
-            // The row actions arrive in a later version: they are shown, not
-            // clickable.
-            MenuEntry::Item(
-                MenuItem::new("Create branch here…")
-                    .icon(IconName::Branch)
-                    .disabled(true),
-            ),
-            MenuEntry::Item(
-                MenuItem::new("Create tag here…")
-                    .icon(IconName::Tag)
-                    .disabled(true),
-            ),
-            MenuEntry::Separator,
-            MenuEntry::Item(
-                MenuItem::new("Cherry-pick")
-                    .icon(IconName::Undo)
-                    .disabled(true),
-            ),
-            MenuEntry::Item(
-                MenuItem::new("Revert commit")
-                    .icon(IconName::Undo)
-                    .disabled(true),
-            ),
-            MenuEntry::Item(
-                MenuItem::new(format!("Reset {branch} to here…"))
-                    .danger()
-                    .disabled(true),
-            ),
-        ];
+        let mut entries = vec![MenuEntry::Item(
+            MenuItem::new("Copy commit hash")
+                .icon(IconName::Copy)
+                .shortcut("Ctrl+C")
+                .disabled(hash.is_none())
+                .action(move |_, cx| {
+                    if let Some(hash) = hash.clone() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(hash));
+                    }
+                }),
+        )];
+        if let Some(card) = card {
+            let on_action = self.on_action.clone();
+            push_row_action(
+                &mut entries,
+                &card,
+                &on_action,
+                "Create branch here…".to_owned(),
+                IconName::Branch,
+                Some("B"),
+                RefAction::CreateBranch,
+                false,
+            );
+            push_row_action(
+                &mut entries,
+                &card,
+                &on_action,
+                "Create tag here…".to_owned(),
+                IconName::Tag,
+                None,
+                RefAction::CreateTag,
+                false,
+            );
+            entries.push(MenuEntry::Separator);
+            push_row_action(
+                &mut entries,
+                &card,
+                &on_action,
+                "Cherry-pick".to_owned(),
+                IconName::Undo,
+                None,
+                RefAction::CherryPick,
+                false,
+            );
+            push_row_action(
+                &mut entries,
+                &card,
+                &on_action,
+                "Revert commit".to_owned(),
+                IconName::Undo,
+                None,
+                RefAction::Revert,
+                false,
+            );
+            push_row_action(
+                &mut entries,
+                &card,
+                &on_action,
+                format!("Reset {branch} to here…"),
+                IconName::Undo,
+                None,
+                RefAction::Reset,
+                true,
+            );
+        }
         menu::open_context_menu(position, entries, window, cx);
+    }
+
+    /// The commit card a dialog shows for `oid`; a commit outside the loaded
+    /// page still gets its hash.
+    pub fn card_for(&self, oid: Oid) -> CommitCard {
+        self.items
+            .iter()
+            .find(|item| item.commit.id == oid)
+            .map(|item| {
+                CommitCard::from_commit(&item.commit, self.refs().unwrap_or(&[]), self.head())
+            })
+            .unwrap_or_else(|| CommitCard::bare(oid))
     }
 
     /// Sets the idle-lane collapse, recomputes the geometry and persists it.
@@ -3270,6 +3343,7 @@ mod tests {
                             repo.path().to_path_buf(),
                             Ok(git.clone()),
                             workspace.downgrade(),
+                            Rc::new(|_, _, _| {}),
                             cx,
                         )
                     });
@@ -3384,6 +3458,7 @@ mod tests {
                             repo.path().to_path_buf(),
                             Ok(git.clone()),
                             workspace.downgrade(),
+                            Rc::new(|_, _, _| {}),
                             cx,
                         )
                     });
