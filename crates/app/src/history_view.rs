@@ -400,6 +400,47 @@ struct Item {
     row: Rc<Row<Oid>>,
 }
 
+/// A commit the user asked the history to reveal that has not arrived yet.
+///
+/// Pages are scanned as they land, so the pending commit never costs a full
+/// scan of the rows already loaded.
+#[derive(Debug, Default)]
+struct PendingReveal {
+    oid: Option<Oid>,
+}
+
+impl PendingReveal {
+    fn set(&mut self, oid: Oid) {
+        self.oid = Some(oid);
+    }
+
+    fn clear(&mut self) {
+        self.oid = None;
+    }
+
+    /// The commit still waiting to be revealed, for the tests.
+    #[cfg(test)]
+    fn oid(&self) -> Option<Oid> {
+        self.oid
+    }
+
+    fn take(&mut self) -> Option<Oid> {
+        self.oid.take()
+    }
+
+    /// Looks for the pending commit among the rows that just arrived
+    /// (`items[start..]`). When it is there, clears the reveal and returns its
+    /// row; the already loaded rows are never rescanned.
+    fn check(&mut self, items: &[Item], start: usize) -> Option<usize> {
+        let oid = self.oid?;
+        let offset = items[start..]
+            .iter()
+            .position(|item| item.commit.id == oid)?;
+        self.oid = None;
+        Some(start + offset)
+    }
+}
+
 /// The grip drag in flight: where the pointer started and the width it is
 /// resizing from. A click that never moved does not persist anything.
 struct GripDrag {
@@ -529,6 +570,9 @@ pub struct HistoryView {
     /// Whether the user picked a row themselves. Until then the selection
     /// follows the HEAD row as it arrives instead of staying on row 0.
     user_selected: bool,
+    /// A commit the sidebar asked to reveal that has not been loaded yet;
+    /// checked against each arriving page.
+    pending_reveal: PendingReveal,
     /// The one commit-graph writer of this view. Started only while nothing
     /// writes one and the repository has none, and never dropped by Retry or
     /// Cancel: it is useful work that finishes with the view.
@@ -614,6 +658,7 @@ impl HistoryView {
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             user_selected: false,
+            pending_reveal: PendingReveal::default(),
             commit_graph_task: None,
             commit_graph_running: false,
             search_text: String::new(),
@@ -832,6 +877,7 @@ impl HistoryView {
     }
 
     fn append(&mut self, page: Vec<(CommitInfo, Row<Oid>)>, cx: &mut Context<Self>) {
+        let start = self.items.len();
         for (commit, row) in page {
             self.max_lanes = self.max_lanes.max(row.width);
             self.idle_lanes.push(&row);
@@ -847,6 +893,11 @@ impl HistoryView {
         // A page that arrives while a query is active is searched as it lands,
         // never by rescanning the rows already covered.
         self.scan_more(cx);
+        // A sidebar reveal that was waiting for this page lands now, and only
+        // the rows that just arrived are scanned for it.
+        if let Some(index) = self.pending_reveal.check(&self.items, start) {
+            self.reveal_row(index, cx);
+        }
         cx.notify();
     }
 
@@ -887,16 +938,19 @@ impl HistoryView {
     }
 
     /// Selects `index` because the user picked it (a click, the row menu or a
-    /// navigation key): a pending search jump is cancelled, so a match from a
-    /// later page cannot yank the selection away.
+    /// navigation key): a pending search jump and a pending sidebar reveal are
+    /// cancelled, so a later page cannot yank the selection away.
     fn select_row(&mut self, index: usize, cx: &mut Context<Self>) {
         self.search_jump = false;
+        self.pending_reveal.clear();
         self.select(index, cx);
     }
 
     /// Selects `index` because the search found it; the deferred jump stays
-    /// armed until it lands.
+    /// armed until it lands. The search jump replaces any pending sidebar
+    /// reveal.
     fn select_row_from_search(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.pending_reveal.clear();
         self.select(index, cx);
     }
 
@@ -910,6 +964,29 @@ impl HistoryView {
         self.user_selected = true;
         self.selected = Some(index);
         self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    /// The sidebar asked for `oid`: selects its row as a user pick and centres
+    /// it in the list, without moving the keyboard focus (the sidebar keeps
+    /// it). While the history is still streaming the commit may not have
+    /// arrived yet; then it is remembered and applied when its page lands.
+    pub fn reveal_commit(&mut self, oid: Oid, cx: &mut Context<Self>) {
+        self.pending_reveal.clear();
+        if let Some(index) = self.items.iter().position(|item| item.commit.id == oid) {
+            self.reveal_row(index, cx);
+        } else if self.is_loading() {
+            self.pending_reveal.set(oid);
+        } else {
+            // The load is over, so no later page will bring it.
+            log::info!("the commit {oid} is not in the loaded history");
+        }
+    }
+
+    /// Selects the revealed row and centres it in the list.
+    fn reveal_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.select_row(index, cx);
+        self.scroll.scroll_to_item(index, ScrollStrategy::Center);
         cx.notify();
     }
 
@@ -1358,6 +1435,10 @@ impl HistoryView {
             Ok(()) => LoadState::Loaded,
             Err(failure) => LoadState::Failed(failure),
         };
+        // No later page can bring a commit the load did not deliver.
+        if let Some(oid) = self.pending_reveal.take() {
+            log::info!("the commit {oid} is not in the loaded history");
+        }
         cx.notify();
     }
 
@@ -2753,6 +2834,9 @@ mod tests {
             kind,
             target,
             upstream: None,
+            ahead: 0,
+            behind: 0,
+            upstream_gone: false,
         }
     }
 
@@ -3563,6 +3647,127 @@ mod tests {
             assert!(
                 !history.read(cx).focus.is_focused(window),
                 "the initial selection stole the focus"
+            );
+        });
+    }
+
+    fn commit_info(byte: u8) -> CommitInfo {
+        CommitInfo {
+            id: oid(byte),
+            parents: Vec::new(),
+            author_name: "Test User".to_owned(),
+            author_email: "test@example.com".to_owned(),
+            author_time: 0,
+            summary: format!("Commit {byte}"),
+        }
+    }
+
+    fn history_item(byte: u8) -> Item {
+        let commit = commit_info(byte);
+        let row = Row {
+            id: commit.id,
+            column: 0,
+            color: 0,
+            above: Vec::new(),
+            below: Vec::new(),
+            width: 1,
+            is_tip: true,
+            is_merge: false,
+        };
+        Item {
+            commit: Arc::new(commit),
+            row: Rc::new(row),
+        }
+    }
+
+    /// A pending reveal rides along until a later page brings the commit; the
+    /// page scan then finds it, clears the reveal and reports its row.
+    #[test]
+    fn a_pending_reveal_is_applied_when_a_later_page_brings_the_commit() {
+        let mut pending = PendingReveal::default();
+        let mut items = vec![history_item(1), history_item(2)];
+        pending.set(oid(3));
+        // The first page does not hold it: the reveal stays pending.
+        assert_eq!(pending.check(&items, 0), None);
+        assert_eq!(pending.oid(), Some(oid(3)));
+
+        items.push(history_item(3));
+        items.push(history_item(4));
+        assert_eq!(pending.check(&items, 2), Some(2));
+        assert_eq!(pending.oid(), None);
+        // Applied once: the next page does not re-select it.
+        assert_eq!(pending.check(&items, 4), None);
+    }
+
+    /// The per-page lookup only scans the rows that just arrived, never the
+    /// rows already on screen.
+    #[test]
+    fn a_pending_reveal_only_scans_the_new_rows() {
+        let mut pending = PendingReveal::default();
+        let items = vec![history_item(1), history_item(2), history_item(3)];
+        pending.set(oid(1));
+        assert_eq!(pending.check(&items, 2), None);
+        assert_eq!(pending.oid(), Some(oid(1)));
+    }
+
+    /// The sidebar's reveal selects a loaded commit and keeps the keyboard
+    /// focus where it is (the sidebar's), instead of focusing the list.
+    #[gpui::test]
+    fn reveal_commit_selects_a_loaded_commit_without_focusing_the_list(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = crate::test_support::TempRepo::new("history-reveal");
+        let a = commit(repo.path(), "a.txt", "A");
+        commit(repo.path(), "b.txt", "B");
+        commit(repo.path(), "c.txt", "C");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        // Newest first: row 2 is the oldest commit.
+        let target = history.read_with(&cx, |view, _| view.items[2].commit.id);
+        assert_eq!(target.to_string(), a);
+        history.update(&mut cx, |view, cx| view.reveal_commit(target, cx));
+        history.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.selected,
+                Some(2),
+                "the revealed commit is not selected"
+            );
+            assert!(view.user_selected, "a reveal must count as a user pick");
+            assert!(
+                view.pending_reveal.oid().is_none(),
+                "a loaded commit must not stay pending"
+            );
+        });
+        cx.update(|window, cx| {
+            assert!(
+                !history.read(cx).focus.is_focused(window),
+                "the reveal stole the keyboard focus from the sidebar"
+            );
+        });
+    }
+
+    /// A user pick or a search jump replaces the pending reveal, so a later
+    /// page cannot yank the selection back.
+    #[gpui::test]
+    fn a_user_pick_clears_the_pending_reveal(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-reveal-pick");
+        commit(repo.path(), "a.txt", "A");
+        commit(repo.path(), "b.txt", "B");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        let missing = oid(0x99);
+        history.update(&mut cx, |view, cx| {
+            view.pending_reveal.set(missing);
+            view.select_row(0, cx);
+            assert!(
+                view.pending_reveal.oid().is_none(),
+                "a user pick must clear the pending reveal"
+            );
+            view.pending_reveal.set(missing);
+            view.select_row_from_search(1, cx);
+            assert!(
+                view.pending_reveal.oid().is_none(),
+                "a search jump must clear the pending reveal"
             );
         });
     }

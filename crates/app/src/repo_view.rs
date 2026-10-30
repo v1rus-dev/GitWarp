@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, canvas, div, point, px, size, App, AppContext, Bounds, ClickEvent, Context,
-    Decorations, Div, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, WeakEntity, Window,
+    actions, canvas, div, point, px, size, App, AppContext, Bounds, ClickEvent, ClipboardItem,
+    Context, Decorations, Div, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, WeakEntity, Window,
 };
 
-use git_core::{Error, Git, Head, Ref, RefKind};
+use git_core::{Error, Git, Head, RefKind};
 use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_SM, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
@@ -29,6 +29,10 @@ use crate::format::format_count;
 use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
 use crate::settings::{Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
+use crate::sidebar::{
+    commit_for, read_sidebar_extras, sidebar_menu, sidebar_nodes, Expansion, SidebarAction,
+    SidebarExtras, SidebarMenuEntry,
+};
 use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
@@ -267,197 +271,6 @@ pub fn effective_sidebar_width(stored: f32, window_width: f32, details_width: f3
     stored.min(room).max(SIDEBAR_WIDTH_MIN)
 }
 
-/// The six sidebar sections, in display order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Section {
-    Local,
-    Remotes,
-    Tags,
-    Stashes,
-    Worktrees,
-    Submodules,
-}
-
-impl Section {
-    const ALL: [Section; 6] = [
-        Section::Local,
-        Section::Remotes,
-        Section::Tags,
-        Section::Stashes,
-        Section::Worktrees,
-        Section::Submodules,
-    ];
-
-    fn index(self) -> usize {
-        match self {
-            Section::Local => 0,
-            Section::Remotes => 1,
-            Section::Tags => 2,
-            Section::Stashes => 3,
-            Section::Worktrees => 4,
-            Section::Submodules => 5,
-        }
-    }
-
-    /// The key prefix of a section's tree node.
-    fn key(self) -> &'static str {
-        match self {
-            Section::Local => "section:local",
-            Section::Remotes => "section:remotes",
-            Section::Tags => "section:tags",
-            Section::Stashes => "section:stashes",
-            Section::Worktrees => "section:worktrees",
-            Section::Submodules => "section:submodules",
-        }
-    }
-
-    fn from_key(key: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|section| section.key() == key)
-    }
-}
-
-/// Which sidebar sections are expanded. The three filled in stage 4 start
-/// collapsed; the rest start open.
-#[derive(Clone, Debug)]
-pub struct Sections([bool; 6]);
-
-impl Default for Sections {
-    fn default() -> Self {
-        Self([true, true, true, false, false, false])
-    }
-}
-
-impl Sections {
-    fn expanded(&self, section: Section) -> bool {
-        self.0[section.index()]
-    }
-
-    fn toggle(&mut self, section: Section) {
-        let slot = &mut self.0[section.index()];
-        *slot = !*slot;
-    }
-}
-
-/// Builds the visible sidebar rows from the repository's refs.
-///
-/// `refs` is `None` while they load or after a failure: then only the section
-/// headers are shown, without counts. Sections without refs keep their header;
-/// the three later stages fill (stashes, worktrees, submodules) never get a
-/// count.
-pub fn sidebar_nodes(
-    refs: Option<&[Ref]>,
-    head: Option<&Head>,
-    sections: &Sections,
-    selected: Option<&str>,
-) -> Vec<TreeNodeData> {
-    let counts = refs.is_some();
-    let refs = refs.unwrap_or(&[]);
-    let locals: Vec<&Ref> = refs
-        .iter()
-        .filter(|r| r.kind == RefKind::LocalBranch)
-        .collect();
-    let remotes: Vec<&Ref> = refs
-        .iter()
-        .filter(|r| r.kind == RefKind::RemoteBranch && !r.name.ends_with("/HEAD"))
-        .collect();
-    let tags: Vec<&Ref> = refs.iter().filter(|r| r.kind == RefKind::Tag).collect();
-    let head_branch = match head {
-        Some(Head::Branch { name, .. }) => Some(name.as_str()),
-        _ => None,
-    };
-
-    let mut nodes = Vec::new();
-    let section =
-        |nodes: &mut Vec<TreeNodeData>, section: Section, label: &str, count: Option<usize>| {
-            let mut node = TreeNodeData::section(label.to_owned())
-                .key(section.key())
-                .has_children(true)
-                .expanded(sections.expanded(section));
-            if let Some(count) = count {
-                node = node.count(count.to_string());
-            }
-            nodes.push(node);
-        };
-
-    section(
-        &mut nodes,
-        Section::Local,
-        "Local branches",
-        counts.then_some(locals.len()),
-    );
-    if sections.expanded(Section::Local) {
-        for r in &locals {
-            nodes.push(branch_node(
-                &r.name,
-                head_branch == Some(r.name.as_str()),
-                selected,
-            ));
-        }
-    }
-
-    section(
-        &mut nodes,
-        Section::Remotes,
-        "Remotes",
-        counts.then_some(remotes.len()),
-    );
-    if sections.expanded(Section::Remotes) {
-        for r in &remotes {
-            nodes.push(leaf_node(
-                &format!("remote:{}", r.name),
-                &r.name,
-                IconName::Branch,
-                selected,
-            ));
-        }
-    }
-
-    section(
-        &mut nodes,
-        Section::Tags,
-        "Tags",
-        counts.then_some(tags.len()),
-    );
-    if sections.expanded(Section::Tags) {
-        for r in &tags {
-            nodes.push(leaf_node(
-                &format!("tag:{}", r.name),
-                &r.name,
-                IconName::Tag,
-                selected,
-            ));
-        }
-    }
-
-    // Filled by stage 4: headers only, no counts.
-    for (section_id, label) in [
-        (Section::Stashes, "Stashes"),
-        (Section::Worktrees, "Worktrees"),
-        (Section::Submodules, "Submodules"),
-    ] {
-        section(&mut nodes, section_id, label, None);
-    }
-
-    nodes
-}
-
-fn branch_node(name: &str, current: bool, selected: Option<&str>) -> TreeNodeData {
-    let key = format!("local:{name}");
-    let mut node = leaf_node(&key, name, IconName::Branch, selected);
-    if current {
-        node = node.current();
-    }
-    node
-}
-
-fn leaf_node(key: &str, label: &str, icon: IconName, selected: Option<&str>) -> TreeNodeData {
-    TreeNodeData::new(label.to_owned())
-        .key(key.to_owned())
-        .level(1)
-        .icon(icon)
-        .selected(selected == Some(key))
-}
-
 pub struct RepositoryView {
     /// The path the view was opened for, so the workspace can reopen it.
     path: PathBuf,
@@ -479,7 +292,20 @@ pub struct RepositoryView {
     sidebar_filter: Entity<TextInput>,
     sidebar_open: bool,
     sidebar_width: f32,
-    sections: Sections,
+    /// The sidebar's expansion overrides over the defaults.
+    sidebar: Expansion,
+    /// The sidebar filter field's text.
+    filter: String,
+    /// The sidebar's own lists; `None` while they load.
+    sidebar_extras: Option<SidebarExtras>,
+    /// The root the lists belong to, so they load once per root.
+    sidebar_root: Option<PathBuf>,
+    /// Bumped per load; an older result that finishes later is dropped.
+    sidebar_generation: u64,
+    /// The sidebar filter's text events.
+    _sidebar_filter_events: Subscription,
+    /// The resolved git, for the sidebar's own background reads.
+    git: Result<Arc<Git>, Arc<Error>>,
     selected_node: Option<SharedString>,
     dock: Dock,
     details_open: bool,
@@ -514,6 +340,9 @@ impl RepositoryView {
                     this.root = root.to_path_buf();
                     this.repo_name = repo_name(root);
                 }
+                // The sidebar's own lists need the root: load them once, when
+                // the history first reports it.
+                this.ensure_sidebar(cx);
             }
             cx.notify();
         });
@@ -541,6 +370,13 @@ impl RepositoryView {
             input.set_placeholder("Filter branches, tags…", cx);
             input
         });
+        let sidebar_filter_events =
+            cx.subscribe(&sidebar_filter, |this, _, event: &TextInputEvent, cx| {
+                if let TextInputEvent::Changed(text) = event {
+                    this.filter = text.clone();
+                    cx.notify();
+                }
+            });
 
         let settings = cx
             .try_global::<crate::AppSettings>()
@@ -571,7 +407,13 @@ impl RepositoryView {
             sidebar_width: settings
                 .sidebar_width
                 .clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX),
-            sections: Sections::default(),
+            sidebar: Expansion::default(),
+            filter: String::new(),
+            sidebar_extras: None,
+            sidebar_root: None,
+            sidebar_generation: 0,
+            _sidebar_filter_events: sidebar_filter_events,
+            git,
             selected_node: None,
             dock,
             details_open: true,
@@ -680,11 +522,169 @@ impl RepositoryView {
         cx.notify();
     }
 
-    fn toggle_section(&mut self, key: &str, cx: &mut Context<Self>) {
-        if let Some(section) = Section::from_key(key) {
-            self.sections.toggle(section);
-            cx.notify();
+    /// Flips the expansion of any expandable sidebar row, by key. `current`
+    /// is the row's effective state as it was built.
+    fn toggle_node(&mut self, key: &str, current: bool, cx: &mut Context<Self>) {
+        // While filtering every expandable row is forced open. Recording a
+        // flip here would silently change the state restored when the filter
+        // is cleared, so expansion toggles are ignored until then.
+        if !self.filter.trim().is_empty() {
+            return;
         }
+        self.sidebar.toggle(key, current);
+        cx.notify();
+    }
+
+    /// Click / Enter / Space on a leaf: selects it and reveals its commit in
+    /// the history. Folders, remotes and sections only toggle, so they never
+    /// reach this.
+    fn activate_node(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.selected_node = Some(key.into());
+        self.reveal_node(key, cx);
+        cx.notify();
+    }
+
+    /// Jumps the history to the commit a leaf points at, when it has one.
+    fn reveal_node(&mut self, key: &str, cx: &mut Context<Self>) {
+        let oid = {
+            let history = self.history.read(cx);
+            commit_for(
+                key,
+                history.refs().unwrap_or(&[]),
+                self.sidebar_extras.as_ref(),
+            )
+        };
+        if let Some(oid) = oid {
+            self.history
+                .update(cx, |history, cx| history.reveal_commit(oid, cx));
+        }
+    }
+
+    /// Right-click on a sidebar row: selects it (without the jump) and opens
+    /// its kind's menu at the pointer. A kind without a menu does nothing.
+    fn open_sidebar_menu(
+        &mut self,
+        key: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let model = sidebar_menu(
+            key,
+            self.history.read(cx).head(),
+            self.sidebar_extras.as_ref(),
+        );
+        if model.is_empty() {
+            return;
+        }
+        self.selected_node = Some(key.into());
+        let view = cx.entity();
+        let entries: Vec<MenuEntry> = model
+            .into_iter()
+            .map(|entry| match entry {
+                SidebarMenuEntry::Separator => MenuEntry::Separator,
+                SidebarMenuEntry::Item(item) => {
+                    let mut menu_item = MenuItem::new(item.label)
+                        .icon(item.icon)
+                        .disabled(!item.enabled);
+                    if let Some(shortcut) = item.shortcut {
+                        menu_item = menu_item.shortcut(shortcut);
+                    }
+                    if item.danger {
+                        menu_item = menu_item.danger();
+                    }
+                    menu_item = match item.action {
+                        SidebarAction::CopyText(text) => menu_item.action(move |_, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        }),
+                        SidebarAction::Refresh => {
+                            let view = view.clone();
+                            menu_item.action(move |_, cx| {
+                                view.update(cx, |view, cx| view.refresh(cx));
+                            })
+                        }
+                        SidebarAction::None => menu_item,
+                    };
+                    MenuEntry::Item(menu_item)
+                }
+            })
+            .collect();
+        menu::open_context_menu(position, entries, window, cx);
+        cx.notify();
+    }
+
+    /// Starts the sidebar's background load when the history first reports a
+    /// root. Loading is once per root; `refresh` forces it again.
+    fn ensure_sidebar(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self
+            .history
+            .read(cx)
+            .root()
+            .map(std::path::Path::to_path_buf)
+        else {
+            return;
+        };
+        if self.sidebar_root.as_ref() == Some(&root) {
+            return;
+        }
+        self.start_sidebar(root, cx);
+    }
+
+    /// Re-runs the sidebar's background load (the "Refresh list" action).
+    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        let root = self.sidebar_root.clone().or_else(|| {
+            self.history
+                .read(cx)
+                .root()
+                .map(std::path::Path::to_path_buf)
+        });
+        if let Some(root) = root {
+            self.start_sidebar(root, cx);
+        }
+    }
+
+    /// Reads the four sidebar lists in the background. Each failure is logged
+    /// and becomes an empty list for that section, so one failure never hides
+    /// the others.
+    fn start_sidebar(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.sidebar_root = Some(root.clone());
+        self.sidebar_generation = self.sidebar_generation.wrapping_add(1);
+        let generation = self.sidebar_generation;
+        self.sidebar_extras = None;
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                log::warn!("could not read the sidebar: {error}");
+                self.sidebar_extras = Some(SidebarExtras::default());
+                return;
+            }
+        };
+        cx.spawn(async move |this, cx| {
+            let extras = cx
+                .background_executor()
+                .spawn(async move { read_sidebar_extras(git, &root) })
+                .await;
+            this.update(cx, |view, cx| {
+                view.set_sidebar_extras(generation, extras, cx)
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn set_sidebar_extras(
+        &mut self,
+        generation: u64,
+        extras: SidebarExtras,
+        cx: &mut Context<Self>,
+    ) {
+        // A newer load owns the lists now; this older answer is stale.
+        if generation != self.sidebar_generation {
+            return;
+        }
+        self.sidebar_extras = Some(extras);
+        cx.notify();
     }
 
     /// Opens the recent-repositories dropdown under the repository switcher.
@@ -989,19 +989,43 @@ impl RepositoryView {
     fn render_sidebar(&mut self, width: f32, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
         let nodes = self.tree_nodes(cx);
-        let keys: Vec<SharedString> = nodes.iter().map(|node| node.key.clone()).collect();
+        let filtering = !self.filter.trim().is_empty();
+        let no_matches = filtering && nodes.is_empty();
+        // Every row's identity and expansion, so a click, Enter/Space or
+        // ←/→ can toggle any expandable node, not only the sections.
+        let rows: Vec<(SharedString, bool, bool)> = nodes
+            .iter()
+            .map(|node| (node.key.clone(), node.has_children, node.expanded))
+            .collect();
 
         let view = cx.entity();
         let activate = {
-            let keys = keys.clone();
+            let rows = rows.clone();
             let view = view.clone();
             move |index: usize, _: &mut Window, cx: &mut App| {
-                let Some(key) = keys.get(index).cloned() else {
+                let Some((key, has_children, expanded)) = rows.get(index).cloned() else {
                     return;
                 };
                 view.update(cx, |view, cx| {
-                    view.selected_node = Some(key);
-                    cx.notify();
+                    if has_children {
+                        view.toggle_node(&key, expanded, cx);
+                    } else {
+                        view.activate_node(&key, cx);
+                    }
+                });
+            }
+        };
+        // A right-click selects the row and opens its kind's menu at the
+        // pointer; the sidebar keeps the keyboard focus.
+        let context_menu = {
+            let rows = rows.clone();
+            let view = view.clone();
+            move |index: usize, position: Point<Pixels>, window: &mut Window, cx: &mut App| {
+                let Some((key, _, _)) = rows.get(index).cloned() else {
+                    return;
+                };
+                view.update(cx, |view, cx| {
+                    view.open_sidebar_menu(&key, position, window, cx);
                 });
             }
         };
@@ -1031,13 +1055,34 @@ impl RepositoryView {
                     )),
             )
             .child(
-                div().w_full().flex_1().min_h_0().child(
-                    Tree::new("sidebar-tree", nodes)
-                        .on_toggle(section_toggler(keys.clone(), view.clone()))
-                        .on_expand(section_toggler(keys.clone(), view.clone()))
-                        .on_collapse(section_toggler(keys, view))
-                        .on_activate(activate),
-                ),
+                div()
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .when(no_matches, |this| {
+                        this.child(
+                            div()
+                                .mx(px(6.))
+                                .pl(px(6.))
+                                .pr(px(8.))
+                                .h(px(26.))
+                                .flex()
+                                .items_center()
+                                .text_size(FS_SM)
+                                .text_color(colors.muted)
+                                .child("No matches"),
+                        )
+                    })
+                    .when(!no_matches, |this| {
+                        this.child(
+                            Tree::new("sidebar-tree", nodes)
+                                .on_toggle(node_toggler(rows.clone(), view.clone()))
+                                .on_expand(node_toggler(rows.clone(), view.clone()))
+                                .on_collapse(node_toggler(rows, view))
+                                .on_activate(activate)
+                                .on_context_menu(context_menu),
+                        )
+                    }),
             )
     }
 
@@ -1046,8 +1091,10 @@ impl RepositoryView {
         sidebar_nodes(
             history.refs(),
             history.head(),
-            &self.sections,
-            self.selected_node.as_ref().map(|key| key.as_str()),
+            self.sidebar_extras.as_ref(),
+            &self.sidebar,
+            &self.filter,
+            self.selected_node.as_deref(),
         )
     }
 
@@ -1520,34 +1567,26 @@ fn details_pane(label: &'static str, colors: ThemeColors) -> Div {
         .child(label)
 }
 
-/// A click, Enter/Space or ←/→ on a section header flips its expansion.
-fn section_toggler(
-    keys: Vec<SharedString>,
+/// A click, Enter/Space or ←/→ on an expandable row flips its expansion.
+fn node_toggler(
+    rows: Vec<(SharedString, bool, bool)>,
     view: Entity<RepositoryView>,
 ) -> impl Fn(usize, &mut Window, &mut App) + 'static {
     move |index, _, cx| {
-        let Some(key) = keys.get(index).cloned() else {
+        let Some((key, has_children, expanded)) = rows.get(index).cloned() else {
             return;
         };
-        view.update(cx, |view, cx| view.toggle_section(&key, cx));
+        if !has_children {
+            return;
+        }
+        view.update(cx, |view, cx| view.toggle_node(&key, expanded, cx));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git_core::Oid;
     use gpui::px;
-
-    fn reference(kind: RefKind, name: &str) -> Ref {
-        Ref {
-            full_name: format!("refs/{name}"),
-            name: name.to_owned(),
-            kind,
-            target: Oid::from_hex(&"1".repeat(40)).unwrap(),
-            upstream: None,
-        }
-    }
 
     /// Builds the real window (the workspace frame around the repository
     /// view) in a test window and returns the bounds of the sidebar filter.
@@ -1734,83 +1773,6 @@ mod tests {
         // No right-docked panel (bottom dock or closed): only the 360 px rule.
         assert_eq!(effective_sidebar_width(420., 1000., 0.), 420.);
         assert_eq!(effective_sidebar_width(420., 500., 0.), 160.);
-    }
-
-    #[test]
-    fn sidebar_lists_sections_with_counts_and_the_current_branch() {
-        let refs = vec![
-            reference(RefKind::LocalBranch, "main"),
-            reference(RefKind::LocalBranch, "feat/lanes"),
-            reference(RefKind::RemoteBranch, "origin/main"),
-            reference(RefKind::RemoteBranch, "origin/HEAD"),
-            reference(RefKind::Tag, "v0.3.0"),
-        ];
-        let head = Head::Branch {
-            name: "main".into(),
-            target: None,
-        };
-        let nodes = sidebar_nodes(Some(&refs), Some(&head), &Sections::default(), None);
-
-        let labels: Vec<&str> = nodes.iter().map(|n| n.label.as_ref()).collect();
-        assert_eq!(
-            labels,
-            vec![
-                "Local branches",
-                "main",
-                "feat/lanes",
-                "Remotes",
-                "origin/main",
-                "Tags",
-                "v0.3.0",
-                "Stashes",
-                "Worktrees",
-                "Submodules",
-            ]
-        );
-        assert!(nodes[0].section);
-        assert!(nodes[0].expanded);
-        assert_eq!(
-            nodes[0].trailing,
-            Some(ui::TreeNodeTrailing::Count("2".into()))
-        );
-        assert!(nodes[1].current);
-        assert!(!nodes[2].current);
-        // `origin/HEAD` is a symbolic ref, not a branch row.
-        assert!(nodes.iter().all(|n| n.label != "origin/HEAD"));
-        // The stage-4 sections have headers but no counts.
-        assert!(nodes[7].trailing.is_none());
-        assert!(!nodes[7].expanded);
-        assert_eq!(
-            nodes[5].trailing,
-            Some(ui::TreeNodeTrailing::Count("1".into()))
-        );
-    }
-
-    #[test]
-    fn loading_refs_show_headers_without_counts() {
-        let nodes = sidebar_nodes(None, None, &Sections::default(), None);
-        assert_eq!(nodes.len(), 6);
-        assert!(nodes.iter().all(|node| node.section));
-        assert!(nodes.iter().all(|node| node.trailing.is_none()));
-    }
-
-    #[test]
-    fn collapsed_sections_hide_their_leaves() {
-        let refs = vec![reference(RefKind::LocalBranch, "main")];
-        let mut sections = Sections::default();
-        sections.toggle(Section::Local);
-        let nodes = sidebar_nodes(Some(&refs), None, &sections, None);
-        assert_eq!(nodes.len(), 6);
-        assert!(!nodes[0].expanded);
-        assert_eq!(nodes[0].label.as_ref(), "Local branches");
-    }
-
-    #[test]
-    fn selection_marks_the_matching_leaf() {
-        let refs = vec![reference(RefKind::Tag, "v1")];
-        let nodes = sidebar_nodes(Some(&refs), None, &Sections::default(), Some("tag:v1"));
-        let tag = nodes.iter().find(|n| n.label == "v1").unwrap();
-        assert!(tag.selected);
     }
 
     #[test]

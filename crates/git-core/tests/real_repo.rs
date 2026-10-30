@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use git_core::{
     probe_folder, ErrorClass, FolderProbe, Git, GitChoice, GitSource, Head, LogOptions, RefKind,
-    Repo,
+    Repo, SubmoduleState, Worktree,
 };
 use git_graph::GraphBuilder;
 
@@ -144,6 +144,287 @@ fn reads_refs_and_head() {
         }
         other => panic!("unexpected head {other:?}"),
     }
+}
+
+#[test]
+fn reads_ahead_and_behind_against_the_upstream() {
+    let origin = tempfile::tempdir().unwrap();
+    git(origin.path(), &["init", "-q"]);
+    commit(origin.path(), "A");
+
+    let work = tempfile::tempdir().unwrap();
+    let checkout = work.path().join("work");
+    git(
+        work.path(),
+        &[
+            "clone",
+            "-q",
+            origin.path().to_str().unwrap(),
+            checkout.to_str().unwrap(),
+        ],
+    );
+    commit(&checkout, "ahead");
+    commit(origin.path(), "behind");
+    git(&checkout, &["fetch", "-q", "origin"]);
+
+    let repo = open(&checkout).unwrap();
+    let main = repo
+        .refs()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.kind == RefKind::LocalBranch && r.name == "main")
+        .unwrap();
+    assert_eq!(main.upstream.as_deref(), Some("origin/main"));
+    assert_eq!((main.ahead, main.behind, main.upstream_gone), (1, 1, false));
+}
+
+#[test]
+fn a_deleted_upstream_is_marked_gone() {
+    let tmp = sample_repo();
+    git(
+        tmp.path(),
+        &["remote", "add", "origin", "https://example.invalid/x.git"],
+    );
+    git(tmp.path(), &["checkout", "-q", "-b", "orphaned"]);
+    git(tmp.path(), &["config", "branch.orphaned.remote", "origin"]);
+    git(
+        tmp.path(),
+        &[
+            "config",
+            "branch.orphaned.merge",
+            "refs/heads/does-not-exist",
+        ],
+    );
+    let repo = open(tmp.path()).unwrap();
+    let orphaned = repo
+        .refs()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "orphaned")
+        .unwrap();
+    assert!(orphaned.upstream_gone);
+    assert_eq!((orphaned.ahead, orphaned.behind), (0, 0));
+}
+
+#[test]
+fn lists_remotes_in_gits_order() {
+    let tmp = sample_repo();
+    // `git remote` sorts by name; the list must keep that order.
+    git(
+        tmp.path(),
+        &["remote", "add", "zeta", "https://example.invalid/z.git"],
+    );
+    git(
+        tmp.path(),
+        &["remote", "add", "alpha", "https://example.invalid/a.git"],
+    );
+    assert_eq!(
+        open(tmp.path()).unwrap().remotes().unwrap(),
+        ["alpha", "zeta"]
+    );
+}
+
+#[test]
+fn lists_stashes_newest_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q"]);
+    std::fs::write(tmp.path().join("work.txt"), b"one").unwrap();
+    git(tmp.path(), &["add", "work.txt"]);
+    commit(tmp.path(), "A");
+
+    let repo = open(tmp.path()).unwrap();
+    assert!(repo.stashes().unwrap().is_empty());
+
+    std::fs::write(tmp.path().join("work.txt"), b"two").unwrap();
+    git(tmp.path(), &["stash", "push", "-q", "-m", "first"]);
+    std::fs::write(tmp.path().join("work.txt"), b"three").unwrap();
+    git(tmp.path(), &["stash", "push", "-q", "-m", "second"]);
+
+    let stashes = repo.stashes().unwrap();
+    assert_eq!(stashes.len(), 2);
+    assert_eq!(stashes[0].index, 0);
+    assert_eq!(stashes[1].index, 1);
+    assert_eq!(stashes[0].message, "On main: second");
+    assert_eq!(stashes[1].message, "On main: first");
+    assert_ne!(stashes[0].oid, stashes[1].oid);
+}
+
+fn worktree<'a>(list: &'a [Worktree], path: &Path) -> &'a Worktree {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    list.iter()
+        .find(|w| w.path == path)
+        .unwrap_or_else(|| panic!("no worktree at {}", path.display()))
+}
+
+#[test]
+fn lists_worktrees_and_marks_the_current_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main_dir = tmp.path().join("main");
+    std::fs::create_dir(&main_dir).unwrap();
+    git(&main_dir, &["init", "-q"]);
+    commit(&main_dir, "A");
+
+    let linked = tmp.path().join("linked");
+    git(
+        &main_dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt-branch",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let detached = tmp.path().join("detached");
+    git(
+        &main_dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            detached.to_str().unwrap(),
+            "main",
+        ],
+    );
+    git(
+        &main_dir,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "testing",
+            detached.to_str().unwrap(),
+        ],
+    );
+    let gone = tmp.path().join("gone");
+    git(
+        &main_dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt-gone",
+            gone.to_str().unwrap(),
+        ],
+    );
+    std::fs::remove_dir_all(&gone).unwrap();
+
+    let repo = open(&main_dir).unwrap();
+    let list = repo.worktrees().unwrap();
+    assert_eq!(list.len(), 4);
+
+    let main = worktree(&list, &main_dir);
+    assert!(main.current && !main.detached && !main.bare);
+    assert_eq!(main.branch.as_deref(), Some("main"));
+    assert!(main.head.is_some());
+    assert!(main.locked.is_none() && !main.prunable);
+
+    let branch = worktree(&list, &linked);
+    assert!(!branch.current);
+    assert_eq!(branch.branch.as_deref(), Some("wt-branch"));
+    assert!(!branch.detached);
+
+    let det = worktree(&list, &detached);
+    assert!(det.detached && det.branch.is_none());
+    assert_eq!(det.locked.as_deref(), Some("testing"));
+    assert!(!det.current);
+
+    let pruned = worktree(&list, &gone);
+    assert!(pruned.prunable && !pruned.current);
+
+    // Opened from the added worktree, that one is current.
+    let linked_repo = open(&linked).unwrap();
+    let list = linked_repo.worktrees().unwrap();
+    assert_eq!(list.iter().filter(|w| w.current).count(), 1);
+    assert!(worktree(&list, &linked).current);
+    assert!(!worktree(&list, &main_dir).current);
+}
+
+#[test]
+fn lists_submodules_and_their_state() {
+    let lib = tempfile::tempdir().unwrap();
+    git(lib.path(), &["init", "-q"]);
+    commit(lib.path(), "L1");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("parent");
+    std::fs::create_dir(&d).unwrap();
+    git(&d, &["init", "-q"]);
+    commit(&d, "P1");
+    // Local-path submodules need the file protocol allowed explicitly.
+    git(
+        &d,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            lib.path().to_str().unwrap(),
+            "vendor/lib",
+        ],
+    );
+    commit(&d, "add submodule");
+
+    let repo = open(&d).unwrap();
+    let subs = repo.submodules().unwrap();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].path, "vendor/lib");
+    assert_eq!(subs[0].state, SubmoduleState::Clean);
+    let clean_oid = subs[0].oid.expect("the checked-out commit");
+
+    // A new commit inside the submodule is "modified".
+    commit(&d.join("vendor/lib"), "L2");
+    let subs = repo.submodules().unwrap();
+    assert_eq!(subs[0].state, SubmoduleState::Modified);
+    assert_ne!(subs[0].oid, Some(clean_oid));
+
+    // A plain clone leaves the submodule uninitialized.
+    let clone = tmp.path().join("clone");
+    git(
+        tmp.path(),
+        &["clone", "-q", d.to_str().unwrap(), clone.to_str().unwrap()],
+    );
+    let cloned = open(&clone).unwrap();
+    assert_eq!(
+        cloned.submodules().unwrap()[0].state,
+        SubmoduleState::Uninitialized
+    );
+    git(
+        &clone,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "-q",
+            "--init",
+        ],
+    );
+    assert_eq!(cloned.submodules().unwrap()[0].state, SubmoduleState::Clean);
+
+    // A bare repository has no work tree to report submodules from.
+    let bare = tmp.path().join("bare.git");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            d.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    assert!(open(&bare).unwrap().submodules().unwrap().is_empty());
+}
+
+#[test]
+fn a_repository_without_a_gitmodules_has_no_submodules() {
+    let tmp = sample_repo();
+    assert!(open(tmp.path()).unwrap().submodules().unwrap().is_empty());
 }
 
 #[test]
