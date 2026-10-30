@@ -15,8 +15,8 @@ use gpui::{
 use ui::Theme;
 
 use crate::theme::{
-    DOT_HALO_RADIUS, DOT_RADIUS, GRAPH_FADE_WIDTH, HEAD_RING_RADIUS, HEAD_RING_WIDTH, LANE_WIDTH,
-    LINE_WIDTH, MERGE_INNER_RADIUS, ROW_HEIGHT,
+    DOT_HALO_RADIUS, DOT_RADIUS, GRAPH_FADE_WIDTH, HEAD_RING_RADIUS, HEAD_RING_WIDTH, LINE_WIDTH,
+    MERGE_INNER_RADIUS, ROW_HEIGHT,
 };
 
 /// A dot whose centre is further than this past the column edge is not drawn.
@@ -24,11 +24,6 @@ const DOT_CLIP_MARGIN: f32 = 6.;
 /// Dash pattern of a folded lane: 2 px on, 3 px off.
 const DASH_ON: f32 = 2.;
 const DASH_PERIOD: f32 = 5.;
-
-/// Width the graph column needs for `lanes` unfolded lanes.
-pub fn graph_width(lanes: usize) -> Pixels {
-    LANE_WIDTH * lanes.max(1) as f32
-}
 
 /// Paints one row. `background` is the row's current fill (`bg`, `hover` or
 /// `selection`): it colours the dot halo and the merge ring's interior, and it
@@ -335,12 +330,5 @@ mod tests {
         // The next row starts at absolute y 26, which is one pixel into a
         // dash: the first dash of the row only lasts one more pixel.
         assert_eq!(dash_segments(0., 5., 26.), vec![(0., 1.), (4., 5.)]);
-    }
-
-    #[test]
-    fn graph_width_is_lane_width_times_lanes() {
-        assert_eq!(f32::from(graph_width(1)), 14.);
-        // No cap and no side padding: the full design width of a wide graph.
-        assert_eq!(f32::from(graph_width(241)), 3374.);
     }
 }

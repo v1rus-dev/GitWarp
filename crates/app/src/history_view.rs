@@ -12,24 +12,27 @@ use std::sync::{Arc, Mutex};
 use gpui::prelude::*;
 use gpui::{
     canvas, container_query, div, px, uniform_list, AnyElement, AsyncApp, ClipboardItem,
-    ContentMask, Context, Div, FontWeight, IntoElement, Pixels, Render, SharedString, StyledText,
-    Task, TextRun, TextStyle, WeakEntity, Window,
+    ContentMask, Context, Div, DragMoveEvent, EmptyView, FontWeight, IntoElement, MouseButton,
+    MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString, StyledText, Task, TextRun,
+    TextStyle, WeakEntity, Window,
 };
 
 use git_core::{CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo};
 use git_graph::{ColumnGeometry, GraphBuilder, IdleLanes, Row};
-use ui::metrics::{FONT_MONO, FONT_UI, FS_SM};
+use ui::metrics::{FONT_MONO, FONT_UI, FS_SM, FS_XS};
 use ui::theme::ThemeColors;
 use ui::{
-    ActiveTheme, Button, ButtonSize, EmptyState, Icon, IconName, Progress, Skeleton, Spinner,
+    menu, ActiveTheme, Button, ButtonSize, EmptyState, Icon, IconName, MenuEntry, MenuItem,
+    Progress, Skeleton, Spinner, Tooltip,
 };
 
 use crate::format::format_count;
-use crate::graph_paint::{graph_width, paint_row};
+use crate::graph_paint::paint_row;
 use crate::history_state::{
     percent_text, progress_fraction, skeleton_percent, source_label, Failure, LoadState,
     SkeletonColumn,
 };
+use crate::settings::{GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MAX, GRAPH_WIDTH_MIN};
 use crate::theme;
 use crate::workspace::Workspace;
 
@@ -49,11 +52,10 @@ const COL_HASH: f32 = 64.;
 /// queries do: 560 px loses Hash, 460 px loses Author.
 const PANE_MEDIUM: f32 = 560.;
 const PANE_NARROW: f32 = 460.;
-/// The graph column's design range: at most 480 px on a wide pane and 112 px
-/// from 560 px down; on top of that it never takes more than a share of the
-/// pane, so the summary always keeps room.
-const GRAPH_MAX_WIDE: f32 = 480.;
-const GRAPH_MAX_NARROW: f32 = 112.;
+/// The graph column's design cap on a wide pane and on top of that its share
+/// of the pane, so the summary always keeps room. The user width `gw` (40–480)
+/// replaces the old lane auto-fit; the 480 cap stays a belt-and-braces bound.
+const GRAPH_MAX_WIDE: f32 = GRAPH_WIDTH_MAX;
 const GRAPH_SHARE_WIDE: f32 = 0.40;
 const GRAPH_SHARE_MEDIUM: f32 = 0.40;
 const GRAPH_SHARE_NARROW: f32 = 0.36;
@@ -62,7 +64,11 @@ const SIDE_MARGIN: f32 = 6.;
 const PAD_LEFT: f32 = 14.;
 const PAD_RIGHT: f32 = 18.;
 /// The graph column never gets narrower than this, even with one lane.
-const GRAPH_MIN: f32 = 40.;
+const GRAPH_MIN: f32 = GRAPH_WIDTH_MIN;
+/// Fitting the graph to its content never widens it past this, and leaves this
+/// much room beside the lanes.
+const GRAPH_FIT_MAX: f32 = 420.;
+const GRAPH_FIT_PAD: f32 = 8.;
 /// The summary column is flexible; its skeleton bars are percentages of this.
 const SKELETON_SUMMARY_REF: f32 = 360.;
 /// Skeleton rows shown until the first page of history arrives.
@@ -84,22 +90,25 @@ pub struct Columns {
     pub hash: Option<f32>,
 }
 
-/// The table layout for a history pane `pane_width` wide whose graph needs
-/// `lanes` lanes.
+/// The table layout for a history pane `pane_width` wide whose graph column
+/// has the user width `graph_width` (`gw`, 40–480).
 ///
-/// This is the design's container-query table: the graph column shrinks to a
-/// share of the pane (and to 112 px from 560 px down), the hash column goes at
-/// 560 px and the author column at 460 px.
-pub fn columns(pane_width: f32, lanes: usize) -> Columns {
-    let lanes_width = f32::from(graph_width(lanes)).max(GRAPH_MIN);
-    let (max, share) = if pane_width <= PANE_NARROW {
-        (GRAPH_MAX_NARROW, GRAPH_SHARE_NARROW)
+/// This is the design's container-query table: the user width shrinks to a
+/// share of the pane (40 % down to 560 px, 36 % below 460 px), the hash column
+/// goes at 560 px and the author column at 460 px.
+pub fn columns(pane_width: f32, graph_width: f32) -> Columns {
+    let gw = clamp_graph_width(graph_width);
+    let share = if pane_width <= PANE_NARROW {
+        GRAPH_SHARE_NARROW
     } else if pane_width <= PANE_MEDIUM {
-        (GRAPH_MAX_NARROW, GRAPH_SHARE_MEDIUM)
+        GRAPH_SHARE_MEDIUM
     } else {
-        (GRAPH_MAX_WIDE, GRAPH_SHARE_WIDE)
+        GRAPH_SHARE_WIDE
     };
-    let graph = lanes_width.min(max).min(share * pane_width).max(GRAPH_MIN);
+    let graph = gw
+        .min(GRAPH_MAX_WIDE)
+        .min(share * pane_width)
+        .max(GRAPH_MIN);
 
     if pane_width <= PANE_NARROW {
         Columns {
@@ -125,10 +134,45 @@ pub fn columns(pane_width: f32, lanes: usize) -> Columns {
     }
 }
 
+/// The graph width clamped to its persisted range; a value from a broken file
+/// falls back to the design default.
+fn clamp_graph_width(graph_width: f32) -> f32 {
+    if graph_width.is_finite() {
+        graph_width.clamp(GRAPH_MIN, GRAPH_MAX_WIDE)
+    } else {
+        GRAPH_WIDTH_DEFAULT
+    }
+}
+
+/// The "fit the graph to its content" width: the graph's current full width
+/// plus a little room, never past 420 px and never below the 40 px floor.
+pub fn fit_width(graph_width: f32) -> f32 {
+    (graph_width + GRAPH_FIT_PAD).clamp(GRAPH_MIN, GRAPH_FIT_MAX)
+}
+
+/// How many lanes have their centre past the graph column's right edge, i.e.
+/// the `N` of the header's "+N" pill. `column_width` is the effective column
+/// width, not the raw user setting (the pane's share may have narrowed it).
+pub fn clipped_lanes(geometry: &ColumnGeometry, column_width: f32) -> usize {
+    geometry.xs.iter().filter(|&&x| x > column_width).count()
+}
+
 struct Item {
     commit: CommitInfo,
     row: Rc<Row<Oid>>,
 }
+
+/// The grip drag in flight: where the pointer started and the width it is
+/// resizing from. A click that never moved does not persist anything.
+struct GripDrag {
+    start_x: f32,
+    start_width: f32,
+    dragging: bool,
+}
+
+/// The drag payload of the graph grip; `on_drag_move` only reacts to this type.
+#[derive(Clone)]
+struct GripDragPayload;
 
 /// A kill handle for a git child that is started on a background thread:
 /// Cancel can arrive before the child exists, and then the child must die as
@@ -212,14 +256,19 @@ pub struct HistoryView {
     /// The table layout for the pane's last measured width, so the virtualized
     /// rows paint with the same columns the header was built for.
     columns: Columns,
+    /// The user's graph column width (`gw`), kept live while the grip drags
+    /// and persisted on drag end.
+    graph_width: f32,
     /// Per-column statistics for the idle-lane collapse, fed every emitted row
     /// in order. Reset whenever the graph is rebuilt.
     idle_lanes: IdleLanes,
     /// The x positions the painter uses, recomputed when rows arrive or
     /// `collapse` changes — never per row per frame.
     geometry: Rc<ColumnGeometry>,
-    /// Whether idle lanes fold into gap lanes (the toggle arrives in step 3.3).
+    /// Whether idle lanes fold into gap lanes, persisted in the settings.
     collapse: bool,
+    /// The grip drag in flight, if any: the pointer x and width it started at.
+    grip_drag: Option<GripDrag>,
     /// The row under the mouse. The canvas cannot see the CSS-like hover, so
     /// the painter takes the halo and merge-ring fill from this.
     hovered: Option<usize>,
@@ -236,6 +285,16 @@ impl HistoryView {
         workspace: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (graph_width, collapse) = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| {
+                (
+                    state.settings.graph_width,
+                    state.settings.collapse_idle_lanes,
+                )
+            })
+            .unwrap_or((GRAPH_WIDTH_DEFAULT, false));
+        let graph_width = clamp_graph_width(graph_width);
         let mut view = Self {
             path,
             git,
@@ -254,10 +313,12 @@ impl HistoryView {
             head: None,
             refs: RefsState::Loading,
             // Replaced with the pane's real width in the first prepaint.
-            columns: columns(1200., 1),
+            columns: columns(1200., graph_width),
+            graph_width,
             idle_lanes: IdleLanes::new(),
-            geometry: Rc::new(IdleLanes::new().geometry(false)),
-            collapse: false,
+            geometry: Rc::new(IdleLanes::new().geometry(collapse)),
+            collapse,
+            grip_drag: None,
             hovered: None,
         };
         view.start(cx);
@@ -460,6 +521,79 @@ impl HistoryView {
         self.geometry = Rc::new(self.idle_lanes.geometry(self.collapse));
     }
 
+    /// Sets the idle-lane collapse, recomputes the geometry and persists it.
+    fn set_collapse(&mut self, collapse: bool, cx: &mut Context<Self>) {
+        if self.collapse == collapse {
+            return;
+        }
+        self.collapse = collapse;
+        self.refresh_geometry();
+        crate::update_settings(cx, move |settings| {
+            settings.collapse_idle_lanes = collapse;
+        });
+        cx.notify();
+    }
+
+    /// Fits the graph column to the current geometry and persists the width.
+    /// Used by the grip's double-click, the "+N" pill and the context menu.
+    fn fit_graph(&mut self, cx: &mut Context<Self>) {
+        let width = fit_width(self.geometry.width);
+        self.graph_width = width;
+        crate::update_settings(cx, move |settings| settings.graph_width = width);
+        cx.notify();
+    }
+
+    /// Ends a grip drag: only a drag that actually moved is persisted, so a
+    /// plain click on the grip does not write the settings.
+    fn finish_grip_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.grip_drag.take() else {
+            return;
+        };
+        if !drag.dragging {
+            return;
+        }
+        let width = self.graph_width;
+        crate::update_settings(cx, move |settings| settings.graph_width = width);
+        cx.notify();
+    }
+
+    /// Opens the graph header's context menu at the pointer.
+    fn open_graph_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity().downgrade();
+        let toggle = view.clone();
+        let fit = view;
+        let checked = self.collapse;
+        let entries = vec![
+            MenuEntry::Item(
+                MenuItem::new("Collapse idle lanes")
+                    // The kit menu has no checked state: the icon says it.
+                    .icon(if checked {
+                        IconName::Check
+                    } else {
+                        IconName::Lanes
+                    })
+                    .action(move |_, cx| {
+                        toggle
+                            .update(cx, |view, cx| view.set_collapse(!view.collapse, cx))
+                            .ok();
+                    }),
+            ),
+            MenuEntry::Item(
+                MenuItem::new("Fit graph to content")
+                    .icon(IconName::Split)
+                    .action(move |_, cx| {
+                        fit.update(cx, |view, cx| view.fit_graph(cx)).ok();
+                    }),
+            ),
+        ];
+        menu::open_context_menu(position, entries, window, cx);
+    }
+
     /// The commit count arrived; only the current load may set it.
     fn set_total(&mut self, generation: u64, total: u64, cx: &mut Context<Self>) {
         if generation != self.generation {
@@ -612,6 +746,106 @@ impl HistoryView {
             .map(|item| item.commit.id.short().into())
     }
 
+    /// The graph header cell: the label, the "+N" clipped-lanes pill, the
+    /// resize grip and the right-click menu.
+    fn render_graph_header(&self, columns: Columns, cx: &Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let accent = colors.accent;
+        let clipped = clipped_lanes(&self.geometry, columns.graph);
+        let dragging = self.grip_drag.as_ref().is_some_and(|drag| drag.dragging);
+
+        let mut cell = div()
+            .id("history-graph-header")
+            .w(px(columns.graph))
+            .flex_none()
+            .h_full()
+            .relative()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .debug_selector(|| "history-graph-header".to_string())
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                    view.open_graph_menu(event.position, window, cx);
+                }),
+            )
+            .child("Graph");
+        if clipped > 0 {
+            cell = cell.child(
+                div()
+                    .id("history-graph-clipped")
+                    .flex_none()
+                    .px(px(6.))
+                    .rounded(px(8.))
+                    .bg(colors.accent_soft)
+                    .text_size(FS_XS)
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(accent)
+                    .cursor_pointer()
+                    .tooltip(Tooltip::text(format!(
+                        "{clipped} lanes are clipped. Click to widen the column."
+                    )))
+                    .on_click(cx.listener(|view, _, _, cx| view.fit_graph(cx)))
+                    .child(format!("+{clipped}")),
+            );
+        }
+
+        let grip = div()
+            .id("history-graph-grip")
+            .absolute()
+            .right(px(-8.))
+            .top(px(3.))
+            .bottom(px(3.))
+            .w(px(7.))
+            .rounded(px(2.))
+            .cursor_col_resize()
+            .hover(move |style| style.bg(accent.opacity(0.7)))
+            .when(dragging, |this| this.bg(accent.opacity(0.7)))
+            .tooltip(Tooltip::text(
+                "Drag to resize the graph column · double-click to fit",
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, event: &MouseDownEvent, _, cx| {
+                    if event.click_count >= 2 {
+                        view.fit_graph(cx);
+                    } else {
+                        view.grip_drag = Some(GripDrag {
+                            start_x: f32::from(event.position.x),
+                            start_width: view.graph_width,
+                            dragging: false,
+                        });
+                    }
+                }),
+            )
+            .on_drag(GripDragPayload, |_, _, _, cx| cx.new(|_| EmptyView))
+            .on_drag_move(
+                cx.listener(|view, event: &DragMoveEvent<GripDragPayload>, _, cx| {
+                    let Some(drag) = &mut view.grip_drag else {
+                        return;
+                    };
+                    let dx = f32::from(event.event.position.x) - drag.start_x;
+                    drag.dragging = true;
+                    let width = (drag.start_width + dx).clamp(GRAPH_MIN, GRAPH_MAX_WIDE);
+                    if view.graph_width != width {
+                        view.graph_width = width;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, _, cx| view.finish_grip_drag(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, _, cx| view.finish_grip_drag(cx)),
+            );
+
+        cell.child(grip)
+    }
+
     fn render_header(&self, columns: Columns, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         // A 6px gutter around the header, so it lines up with the rows.
@@ -629,7 +863,7 @@ impl HistoryView {
             .text_size(FS_SM)
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(colors.muted)
-            .child(div().w(px(columns.graph)).flex_none().child("Graph"))
+            .child(self.render_graph_header(columns, cx))
             .child(div().flex_1().min_w_0().truncate().child("Summary"));
         if let Some(author) = columns.author {
             head = head.child(div().w(px(author)).flex_none().child("Author"));
@@ -647,6 +881,13 @@ impl HistoryView {
         let progress = match progress_fraction(loaded, total) {
             Some(value) => Progress::new("history-progress", value).fill(),
             None => Progress::new("history-progress", 0.).indeterminate().fill(),
+        };
+        // The folded lanes are part of the history's own progress line: say
+        // how many the graph is hiding while the rows stream in.
+        let folded = if self.collapse && self.geometry.folded_count > 0 {
+            format!(" · {} idle lanes folded", self.geometry.folded_count)
+        } else {
+            String::new()
         };
         div()
             .w_full()
@@ -666,7 +907,7 @@ impl HistoryView {
                     .font_weight(FontWeight::BOLD)
                     .text_color(colors.text)
                     .child(format!(
-                        "Loading… {} commits",
+                        "Loading… {} commits{folded}",
                         format_count(loaded as usize)
                     )),
             )
@@ -1283,7 +1524,7 @@ impl HistoryView {
     /// current state. Called with the width the pane was actually assigned.
     fn render_at(&mut self, pane_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
-        let columns = columns(pane_width, self.max_lanes.max(1));
+        let columns = columns(pane_width, self.graph_width);
         // The virtualized rows are painted after this and must agree with the
         // header.
         self.columns = columns;
@@ -1409,6 +1650,9 @@ fn centred(state: EmptyState) -> AnyElement {
 
 /// The graph column's placeholder: a lane line and one dot per row.
 fn graph_skeleton(width: Pixels, colors: ThemeColors) -> Div {
+    // The lane centre, plus the half-width of the 2 px line the placeholder
+    // draws there. (The skeleton's dot is centred on the same x.)
+    let centre = theme::LANE_WIDTH * 0.5 + px(1.);
     div()
         .w(width)
         .h_full()
@@ -1419,14 +1663,14 @@ fn graph_skeleton(width: Pixels, colors: ThemeColors) -> Div {
                 .absolute()
                 .top_0()
                 .bottom_0()
-                .left(px(7.))
+                .left(centre - px(1.))
                 .w(px(2.))
                 .bg(colors.border_strong),
         )
         .child(
             div()
                 .absolute()
-                .left(px(3.5))
+                .left(centre - px(4.5))
                 .top(px(8.5))
                 .w(px(9.))
                 .h(px(9.))
@@ -1510,56 +1754,74 @@ mod tests {
     #[test]
     fn columns_drop_the_wide_columns_at_the_container_queries() {
         // 560 px is the design's first breakpoint: Hash goes, Author and Date
-        // take their narrow widths.
-        let medium = columns(560., 30);
+        // take their narrow widths; the default graph width still fits.
+        let medium = columns(560., GRAPH_WIDTH_DEFAULT);
         assert_eq!(medium.hash, None);
         assert_eq!(medium.author, Some(COL_AUTHOR_NARROW));
         assert_eq!(medium.date, COL_DATE_NARROW);
-        assert!(medium.graph <= 112., "{}", medium.graph);
-        assert!(medium.graph <= 0.40 * 560. + f32::EPSILON);
+        assert_eq!(medium.graph, GRAPH_WIDTH_DEFAULT);
 
         // 460 px is the second: Author goes too.
-        let narrow = columns(460., 30);
+        let narrow = columns(460., GRAPH_WIDTH_DEFAULT);
         assert_eq!(narrow.hash, None);
         assert_eq!(narrow.author, None);
         assert_eq!(narrow.date, COL_DATE_NARROW);
-        assert!(
-            narrow.graph <= 112_f32.min(0.36 * 460.) + f32::EPSILON,
-            "{}",
-            narrow.graph
-        );
+        assert_eq!(narrow.graph, GRAPH_WIDTH_DEFAULT);
 
         // A wide pane keeps all five columns.
-        let wide = columns(1200., 2);
+        let wide = columns(1200., GRAPH_WIDTH_DEFAULT);
         assert_eq!(wide.author, Some(COL_AUTHOR));
         assert_eq!(wide.date, COL_DATE);
         assert_eq!(wide.hash, Some(COL_HASH));
     }
 
     #[test]
-    fn columns_cap_the_graph_so_the_summary_keeps_its_room() {
-        // 30 lanes are 420 px wide now that the old 10 px side padding and the
-        // 24-lane cap are gone (stage 3.2: x = 14·n + 7, no padding), so the
-        // 480 px design cap still never binds at 1200 px.
-        assert_eq!(f32::from(graph_width(30)), 420.);
-        assert_eq!(columns(1200., 30).graph, 420.);
-        // At 800 px the 40 % share binds before the lane width does.
-        assert_eq!(columns(800., 30).graph, 320.);
-        // A graph narrower than the share keeps the lanes' width (14 px each),
-        // but never goes below the 40 px floor: two lanes are only 28 px.
-        assert_eq!(f32::from(graph_width(2)), 28.);
-        assert_eq!(columns(800., 2).graph, GRAPH_MIN);
-        assert_eq!(columns(800., 3).graph, 42.);
-        // The 40 % share holds on any wide pane.
-        assert_eq!(columns(700., 30).graph, 280.);
-        // Never below the floor, however narrow the pane or the graph.
-        assert_eq!(columns(300., 1).graph, GRAPH_MIN);
-        assert_eq!(columns(100., 30).graph, GRAPH_MIN);
+    fn columns_use_the_user_graph_width_at_the_three_pane_widths() {
+        // The user width is the column width while it fits the pane's share.
+        assert_eq!(columns(1200., 400.).graph, 400.);
+        // A 300 px user width still fits the 40 % share at 560 px.
+        assert_eq!(columns(560., 200.).graph, 200.);
+        assert_eq!(columns(460., 150.).graph, 150.);
+
+        // Above 560 px the 40 % share and the 480 cap bound it.
+        assert_eq!(columns(800., 400.).graph, 320.);
+        assert_eq!(columns(1200., 9999.).graph, GRAPH_MAX_WIDE);
+        // At and below 560 / 460 the pane's share narrows it further.
+        assert_eq!(columns(560., 480.).graph, GRAPH_SHARE_MEDIUM * 560.);
+        assert_eq!(columns(460., 480.).graph, GRAPH_SHARE_NARROW * 460.);
+        // The 40 px floor holds whatever the file or the pane says.
+        assert_eq!(columns(1200., 1.).graph, GRAPH_MIN);
+        assert_eq!(columns(300., 480.).graph, GRAPH_SHARE_NARROW * 300.);
+        assert_eq!(columns(100., 480.).graph, GRAPH_MIN);
+    }
+
+    #[test]
+    fn fitting_the_graph_leaves_room_and_stays_in_range() {
+        assert_eq!(fit_width(0.), GRAPH_MIN);
+        assert_eq!(fit_width(GRAPH_WIDTH_DEFAULT), 120.);
+        assert_eq!(fit_width(412.), GRAPH_FIT_MAX);
+        // A wide graph (241 lanes, 3374 px) still fits at the 420 px cap.
+        assert_eq!(fit_width(3374.), GRAPH_FIT_MAX);
+    }
+
+    #[test]
+    fn clipped_lanes_count_the_centres_past_the_column_edge() {
+        let geometry = ColumnGeometry {
+            xs: vec![7., 21., 35., 49.],
+            folded: vec![false; 4],
+            width: 56.,
+            folded_count: 0,
+        };
+        // A centre exactly on the edge is not clipped.
+        assert_eq!(clipped_lanes(&geometry, 56.), 0);
+        assert_eq!(clipped_lanes(&geometry, 28.), 2);
+        assert_eq!(clipped_lanes(&geometry, 21.), 2);
+        assert_eq!(clipped_lanes(&geometry, 7.), 3);
     }
 
     #[test]
     fn skeleton_widths_are_cell_percentages() {
-        let wide = columns(1200., 1);
+        let wide = columns(1200., GRAPH_WIDTH_DEFAULT);
         assert_eq!(skeleton_width(SkeletonColumn::Summary, 0, wide), px(144.));
         assert_eq!(
             skeleton_width(SkeletonColumn::Summary, 1, wide),
@@ -1569,7 +1831,7 @@ mod tests {
         assert_eq!(skeleton_width(SkeletonColumn::Date, 4, wide), px(62.4));
         assert_eq!(skeleton_width(SkeletonColumn::Hash, 4, wide), px(51.2));
         // The narrow table uses the narrow date column.
-        let narrow = columns(460., 1);
+        let narrow = columns(460., GRAPH_WIDTH_DEFAULT);
         assert_eq!(
             skeleton_width(SkeletonColumn::Date, 4, narrow),
             px(COL_DATE_NARROW * (skeleton_percent(SkeletonColumn::Date, 4) / 100.))
@@ -1612,5 +1874,109 @@ mod tests {
         // Same colour across the sentence.
         assert!(runs.iter().all(|run| run.color == style.color));
         assert!(runs.iter().all(|run| run.font.weight == style.font_weight));
+    }
+
+    /// The test root: the history view plus the overlay stack, like the
+    /// workspace renders them in the app.
+    struct GraphMenuTestRoot {
+        history: gpui::Entity<HistoryView>,
+    }
+
+    impl Render for GraphMenuTestRoot {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .relative()
+                .child(self.history.clone())
+                .child(ui::overlay::render_overlays(window, cx))
+        }
+    }
+
+    /// Right-clicking the graph header opens the two-item graph menu, and its
+    /// first item toggles the idle-lane collapse.
+    #[gpui::test]
+    fn right_clicking_the_graph_header_opens_the_graph_menu(cx: &mut gpui::TestAppContext) {
+        use git_core::GitChoice;
+        use gpui::{
+            point, size, AppContext, Bounds, Modifiers, VisualTestContext,
+            WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
+        };
+
+        let repo = crate::test_support::TempRepo::new("graph-header-menu");
+        let git = crate::test_support::git();
+        cx.update(ui::init).expect("ui::init");
+        let handle = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(960.), px(620.)),
+                    ))),
+                    window_decorations: Some(WindowDecorations::Client),
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    // The history view is the window root so the test can read
+                    // its state; the workspace only supplies the weak handle.
+                    let workspace = cx.new(|cx| {
+                        Workspace::new(None, Ok(git.clone()), GitChoice::Auto, window, cx)
+                    });
+                    let history = cx.new(|cx| {
+                        HistoryView::open(
+                            repo.path().to_path_buf(),
+                            Ok(git.clone()),
+                            workspace.downgrade(),
+                            cx,
+                        )
+                    });
+                    cx.new(|_| GraphMenuTestRoot { history })
+                },
+            )
+            .expect("open window")
+        });
+
+        let mut cx = VisualTestContext::from_window(handle.into(), cx);
+        cx.run_until_parked();
+        let root = cx
+            .update(|window, _| window.root::<GraphMenuTestRoot>().flatten())
+            .expect("the history test root is the window root");
+        let history = root.read_with(&cx, |root, _| root.history.clone());
+
+        let header = cx
+            .debug_bounds("history-graph-header")
+            .expect("the graph header was not drawn");
+        let position = header.center();
+        cx.simulate_mouse_down(position, MouseButton::Right, Modifiers::default());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(
+                ui::overlay::layer_count(window, cx),
+                1,
+                "right-clicking the graph header did not open a menu"
+            );
+        });
+
+        // Item 0 sits 20 px below the menu's top-left corner: the 6 px panel
+        // padding plus half of the 28 px first row.
+        cx.simulate_click(
+            point(position.x + px(40.), position.y + px(20.)),
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert!(
+                view.collapse,
+                "the first menu item did not toggle the idle-lane collapse"
+            );
+        });
+        cx.update(|window, cx| {
+            assert_eq!(
+                ui::overlay::layer_count(window, cx),
+                0,
+                "the menu stayed open after an item was clicked"
+            );
+        });
     }
 }
