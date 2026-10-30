@@ -36,7 +36,8 @@ use crate::format::{absolute_time, format_count, relative_time};
 use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
 use crate::settings::{
-    DiffLayout, Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN,
+    sidebar_width_limit, DiffLayout, Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX,
+    SIDEBAR_WIDTH_MIN,
 };
 use crate::sidebar::{
     commit_for, read_sidebar_extras, sidebar_menu, sidebar_nodes, Expansion, SidebarAction,
@@ -252,8 +253,6 @@ pub fn clamp_details(size: f32, dock: Dock) -> f32 {
     }
 }
 
-/// The room the history pane always keeps for itself.
-pub const HISTORY_MIN_WIDTH: f32 = 360.;
 /// A right-docked details panel never takes more than this share of the space
 /// right of the sidebar.
 const DETAILS_MAX_SHARE: f32 = 0.5;
@@ -276,16 +275,12 @@ pub fn effective_details_width(stored: f32, window_width: f32, sidebar_width: f3
     clamp_details(stored, Dock::Right).min(details_width_limit(window_width, sidebar_width))
 }
 
-/// The width the sidebar renders at: its stored width, but never so wide that
-/// the history pane drops below [`HISTORY_MIN_WIDTH`], and never below its own
-/// 160 px minimum.
+/// The width the sidebar renders at: its stored width, capped to half the
+/// visible area and never below its own 160 px minimum.
 ///
-/// `details_width` is the width the details panel actually renders at, which
-/// only counts while it is docked right and open. The stored width is kept.
-pub fn effective_sidebar_width(stored: f32, window_width: f32, details_width: f32) -> f32 {
-    let stored = stored.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX);
-    let room = window_width - HISTORY_MIN_WIDTH - details_width;
-    stored.min(room).max(SIDEBAR_WIDTH_MIN)
+/// The stored width is kept as saved; only the rendered width shrinks.
+pub fn effective_sidebar_width(stored: f32, window_width: f32) -> f32 {
+    stored.clamp(SIDEBAR_WIDTH_MIN, sidebar_width_limit(window_width))
 }
 
 pub struct RepositoryView {
@@ -312,6 +307,8 @@ pub struct RepositoryView {
     sidebar_filter: Entity<TextInput>,
     sidebar_open: bool,
     sidebar_width: f32,
+    /// The sidebar tree's scroll state, shared with its horizontal scrollbar.
+    sidebar_scroll: ScrollHandle,
     /// The sidebar's expansion overrides over the defaults.
     sidebar: Expansion,
     /// The sidebar filter field's text.
@@ -468,6 +465,7 @@ impl RepositoryView {
             sidebar_width: settings
                 .sidebar_width
                 .clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX),
+            sidebar_scroll: ScrollHandle::new(),
             sidebar: Expansion::default(),
             filter: String::new(),
             sidebar_extras: None,
@@ -1359,7 +1357,10 @@ impl RepositoryView {
                 div()
                     .w_full()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
+                    .flex()
+                    .flex_col()
                     .when(no_matches, |this| {
                         this.child(
                             div()
@@ -1376,13 +1377,21 @@ impl RepositoryView {
                     })
                     .when(!no_matches, |this| {
                         this.child(
-                            Tree::new("sidebar-tree", nodes)
-                                .on_toggle(node_toggler(rows.clone(), view.clone()))
-                                .on_expand(node_toggler(rows.clone(), view.clone()))
-                                .on_collapse(node_toggler(rows, view))
-                                .on_activate(activate)
-                                .on_context_menu(context_menu),
+                            div().w_full().flex_1().min_w_0().min_h_0().child(
+                                Tree::new("sidebar-tree", nodes)
+                                    .horizontal_scroll()
+                                    .scroll_handle(self.sidebar_scroll.clone())
+                                    .on_toggle(node_toggler(rows.clone(), view.clone()))
+                                    .on_expand(node_toggler(rows.clone(), view.clone()))
+                                    .on_collapse(node_toggler(rows, view))
+                                    .on_activate(activate)
+                                    .on_context_menu(context_menu),
+                            ),
                         )
+                        .child(Scrollbar::horizontal(
+                            "sidebar-scrollbar",
+                            self.sidebar_scroll.clone(),
+                        ))
                     }),
             )
     }
@@ -2223,35 +2232,27 @@ impl Render for RepositoryView {
 
         let toolbar = self.render_toolbar(layout, client, cx);
 
-        // A stored sidebar (up to 420) plus a right-docked details panel (up to
-        // 900) could leave the history pane with nothing on a ~1270 px window.
-        // Only the rendered widths are capped; the stored sizes stay as saved.
-        let sidebar_space = if self.sidebar_open {
-            self.sidebar_width
+        // The sidebar may take at most half of the visible area. Only the
+        // rendered width is capped; the stored width stays as saved.
+        let sidebar_width = if self.sidebar_open {
+            effective_sidebar_width(self.sidebar_width, width)
         } else {
             0.
         };
         let details_limit = match self.dock {
-            Dock::Right => details_width_limit(width, sidebar_space),
+            Dock::Right => details_width_limit(width, sidebar_width),
             Dock::Bottom => dock_bounds(Dock::Bottom).1,
         };
         let details_width = if self.details_open {
             match self.dock {
-                Dock::Right => effective_details_width(self.details_size, width, sidebar_space),
+                Dock::Right => effective_details_width(self.details_size, width, sidebar_width),
                 Dock::Bottom => clamp_details(self.details_size, Dock::Bottom),
             }
         } else {
             0.
         };
-        let sidebar_width = if self.sidebar_open {
-            effective_sidebar_width(self.sidebar_width, width, details_width)
-        } else {
-            0.
-        };
-        // The splitter may not drag the sidebar past what renders either.
-        let sidebar_limit = SIDEBAR_WIDTH_MAX
-            .min(width - HISTORY_MIN_WIDTH - details_width)
-            .max(SIDEBAR_WIDTH_MIN);
+        // The splitter may not drag the sidebar past half the window either.
+        let sidebar_limit = sidebar_width_limit(width);
 
         let sidebar = self.sidebar_open.then(|| {
             (
@@ -2958,18 +2959,19 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_never_squeezes_the_history_pane_below_360() {
-        // 1000 px, a 320 px right-docked panel and a stored 420 px sidebar:
-        // only 320 px of sidebar fit beside the 360 px the history needs.
-        assert_eq!(effective_sidebar_width(420., 1000., 320.), 320.);
-        // Nothing to squeeze: the stored width stands.
-        assert_eq!(effective_sidebar_width(240., 1000., 320.), 240.);
-        assert_eq!(effective_sidebar_width(240., 1270., 425.), 240.);
-        // The 160 px sidebar minimum beats the 360 px history rule.
-        assert_eq!(effective_sidebar_width(420., 800., 400.), 160.);
-        // No right-docked panel (bottom dock or closed): only the 360 px rule.
-        assert_eq!(effective_sidebar_width(420., 1000., 0.), 420.);
-        assert_eq!(effective_sidebar_width(420., 500., 0.), 160.);
+    fn the_sidebar_never_takes_more_than_half_the_window() {
+        assert_eq!(sidebar_width_limit(1600.), 800.);
+        assert_eq!(sidebar_width_limit(1000.), 500.);
+        // The 160 px minimum beats the half rule on a tiny window.
+        assert_eq!(sidebar_width_limit(300.), 160.);
+
+        // The stored width stands while it fits in the allowed half.
+        assert_eq!(effective_sidebar_width(240., 1600.), 240.);
+        assert_eq!(effective_sidebar_width(420., 1000.), 420.);
+        // Wider stored values render at half the visible area.
+        assert_eq!(effective_sidebar_width(900., 1600.), 800.);
+        assert_eq!(effective_sidebar_width(420., 500.), 250.);
+        assert_eq!(effective_sidebar_width(420., 300.), 160.);
     }
 
     #[test]

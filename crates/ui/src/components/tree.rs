@@ -192,6 +192,7 @@ pub struct Tree {
     id: ElementId,
     nodes: Vec<TreeNodeData>,
     nav: bool,
+    horizontal_scroll: bool,
     focus_handle: Option<FocusHandle>,
     scroll_handle: Option<ScrollHandle>,
     on_activate: Option<NodeHandler>,
@@ -208,6 +209,7 @@ impl Tree {
             id: id.into(),
             nodes,
             nav: false,
+            horizontal_scroll: false,
             focus_handle: None,
             scroll_handle: None,
             on_activate: None,
@@ -222,6 +224,13 @@ impl Tree {
     /// The settings-navigation variant: no indentation, 10px left padding.
     pub fn nav(mut self) -> Self {
         self.nav = true;
+        self
+    }
+
+    /// Lets long labels widen the rows and scrolls the tree horizontally
+    /// instead of truncating them.
+    pub fn horizontal_scroll(mut self) -> Self {
+        self.horizontal_scroll = true;
         self
     }
 
@@ -317,6 +326,7 @@ impl RenderOnce for Tree {
             )
         };
 
+        let horizontal = self.horizontal_scroll;
         let mut root = div()
             .id(self.id.clone())
             .relative()
@@ -324,6 +334,10 @@ impl RenderOnce for Tree {
             .flex_col()
             .h_full()
             .pb(px(8.))
+            .when(horizontal, |this| {
+                // Rows size to their content and the tree scrolls sideways.
+                this.items_start().px(px(6.)).overflow_x_scroll()
+            })
             .track_scroll(&scroll)
             .overflow_y_scroll()
             .key_context("ui-tree")
@@ -556,6 +570,21 @@ impl RenderOnce for Tree {
 
             let row_id = ElementId::named_usize(id_name.clone(), index);
             let debug_name = id_name.clone();
+            let label_element = if horizontal {
+                div()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .font_weight(label_weight)
+                    .child(label)
+            } else {
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .font_weight(label_weight)
+                    .child(label)
+            };
+
             let mut row = div()
                 .id(row_id)
                 .relative()
@@ -567,8 +596,8 @@ impl RenderOnce for Tree {
                 // this every row shrinks below its fixed height when the
                 // content overflows, instead of the tree scrolling.
                 .flex_none()
-                .ml(px(6.))
-                .mr(px(6.))
+                .when(horizontal, |this| this.min_w_full())
+                .when(!horizontal, |this| this.ml(px(6.)).mr(px(6.)))
                 .pl(pad_left)
                 .pr(px(8.))
                 .rounded(R_SM)
@@ -580,14 +609,7 @@ impl RenderOnce for Tree {
                 .debug_selector(move || format!("{debug_name}-node-{index}"))
                 .child(twisty)
                 .when_some(icon_slot, |this, slot| this.child(slot))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .truncate()
-                        .font_weight(label_weight)
-                        .child(label),
-                );
+                .child(label_element);
 
             if let Some(trailing) = node.trailing.as_ref() {
                 row = row.child(trailing_element(trailing, selected, secondary, colors));

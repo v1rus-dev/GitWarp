@@ -16,10 +16,21 @@ use serde_json::{Map, Value};
 pub const RECENT_LIMIT: usize = 20;
 /// The narrowest usable sidebar.
 pub const SIDEBAR_WIDTH_MIN: f32 = 160.0;
-/// The widest sidebar that still leaves room for the history.
-pub const SIDEBAR_WIDTH_MAX: f32 = 420.0;
+/// The widest share of the window the sidebar may take. The other half stays
+/// for the history and the details pane.
+pub const SIDEBAR_MAX_SHARE: f32 = 0.5;
+/// A sanity cap for the value persisted in the settings file. The rendered
+/// width is additionally capped to [`sidebar_width_limit`].
+pub const SIDEBAR_WIDTH_MAX: f32 = 10_000.0;
 /// The sidebar width used when the file has no usable value.
 pub const SIDEBAR_WIDTH_DEFAULT: f32 = 240.0;
+
+/// The widest the sidebar may be at `window_width`: half the visible area,
+/// but never below its own minimum on a very narrow window.
+pub fn sidebar_width_limit(window_width: f32) -> f32 {
+    (window_width * SIDEBAR_MAX_SHARE).max(SIDEBAR_WIDTH_MIN)
+}
+
 /// The narrowest graph column.
 pub const GRAPH_WIDTH_MIN: f32 = 40.0;
 /// The widest graph column; the pane's own share can still narrow it.
@@ -437,7 +448,7 @@ mod tests {
     fn clamps_sizes_on_load() {
         let dir = TempDir::new("clamp");
         assert_eq!(
-            load_json(dir.path(), r#"{"sidebar_width":9999}"#).sidebar_width,
+            load_json(dir.path(), r#"{"sidebar_width":99999}"#).sidebar_width,
             SIDEBAR_WIDTH_MAX
         );
         assert_eq!(
