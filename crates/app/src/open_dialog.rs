@@ -128,8 +128,9 @@ impl OpenRepoDialog {
             }),
         ];
         let flow_observer = cx.observe(&flow, |this, _, cx| {
-            this.notify_host(cx);
             this.sync_error_border(cx);
+            this.sync_busy(cx);
+            this.notify_host(cx);
             cx.notify();
         });
 
@@ -215,17 +216,28 @@ impl OpenRepoDialog {
     /// The folder and branch fields show the error border only for input the
     /// dialog itself cannot act on.
     fn sync_error_border(&mut self, cx: &mut Context<Self>) {
-        let empty = self.folder.read(cx).text().trim().is_empty();
         let branch_blank = self.branch.read(cx).text().trim().is_empty();
         let flow = self.flow.read(cx);
-        let spec = flow.spec(DialogKind::Open, empty, branch_blank);
         let missing = matches!(flow.result(), Some(Ok(FolderProbe::Missing)));
+        // The last probe decides, not the status: while the next probe runs
+        // the controls stay and their borders must not reset mid-keystroke.
+        let plain = matches!(flow.result(), Some(Ok(FolderProbe::Plain)));
         let folder_error = self.touched && missing;
-        let branch_error = spec.kind == StatusKind::Plain && branch_blank;
+        let branch_error = plain && branch_blank;
         self.folder
             .update(cx, |input, cx| input.set_error(folder_error, cx));
         self.branch
             .update(cx, |input, cx| input.set_error(branch_error, cx));
+    }
+
+    /// The folder and branch fields are read-only while `git init` runs, so
+    /// the path the init started with cannot change under it.
+    fn sync_busy(&self, cx: &mut Context<Self>) {
+        let busy = self.flow.read(cx).busy();
+        self.folder
+            .update(cx, |input, cx| input.set_disabled(busy, cx));
+        self.branch
+            .update(cx, |input, cx| input.set_disabled(busy, cx));
     }
 
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -258,6 +270,11 @@ impl OpenRepoDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A picker that was already open when `git init` started must not
+        // change the folder the init is running for.
+        if self.flow.read(cx).busy() {
+            return;
+        }
         match outcome {
             Browse::Picked(Some(path)) => {
                 let label = display_path(&path, home.as_deref());
@@ -284,6 +301,10 @@ impl OpenRepoDialog {
 
     /// A recent row: fill the field, mark it touched and probe immediately.
     fn choose_recent(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        // The field is read-only while `git init` runs; the list follows it.
+        if self.busy(cx) {
+            return;
+        }
         let label = display_path(&path, self.home.as_deref());
         self.touched = true;
         self.set_folder_text(label, cx);
@@ -459,7 +480,7 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
     if has_status {
         body = body.child(status);
     }
-    if spec.kind == StatusKind::Plain && matches!(flow.result(), Some(Ok(FolderProbe::Plain))) {
+    if matches!(flow.result(), Some(Ok(FolderProbe::Plain))) {
         body = body.child(init_controls(
             state,
             dialog.checkbox_focus.clone(),
@@ -525,7 +546,7 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
         DialogFocus::input(dialog.folder_focus.clone()),
         DialogFocus::control(dialog.browse_focus.clone()),
     ];
-    if matches!(spec.kind, StatusKind::Plain) {
+    if matches!(flow.result(), Some(Ok(FolderProbe::Plain))) {
         focus_order.push(DialogFocus::input(dialog.branch_focus.clone()));
         focus_order.push(DialogFocus::control(dialog.checkbox_focus.clone()));
     }
@@ -673,6 +694,47 @@ fn read_recent(cx: &App) -> Vec<RecentRepo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opening a repository the folder field already points at runs from the
+    /// dialog's own update; the flow re-enters the dialog only after that
+    /// returned, so no double entity lease.
+    #[gpui::test]
+    fn opening_an_existing_repository_closes_the_dialog(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("open-dialog");
+        let git = crate::test_support::git();
+        let (mut cx, workspace) = crate::test_support::open_workspace(git.clone(), cx);
+
+        let dialog = cx.update(|window, cx| {
+            workspace.update(cx, |_, cx| {
+                let weak = cx.weak_entity();
+                super::open(window, cx, Ok(git.clone()), weak)
+            })
+        });
+        dialog.update(&mut cx, |dialog, cx| {
+            dialog.choose_recent(repo.path().to_path_buf(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            dialog.update(&mut cx, |dialog, cx| dialog.spec(cx).kind),
+            StatusKind::Repo,
+            "the folder was not classified as a repository"
+        );
+
+        cx.update(|window, cx| {
+            dialog.update(cx, |dialog, cx| dialog.activate(window, cx));
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|window, cx| overlay::layer_count(window, cx)),
+            0,
+            "the dialog stayed open"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-filter").is_some(),
+            "the workspace did not open the repository"
+        );
+    }
 
     /// Opens the real window and drives the dialog through the workspace
     /// action, so the builder, its focus trap and Esc are exercised.

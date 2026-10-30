@@ -202,6 +202,13 @@ impl SettingsStore {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
+        // The quit flush can run while a background save is still writing:
+        // saves in this process take turns, so the later snapshot is renamed
+        // last and wins.
+        static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _turn = SAVING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Unique per process, so two instances saving at once cannot rename
         // each other's half-written file over the settings.
         let tmp = self

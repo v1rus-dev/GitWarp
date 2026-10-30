@@ -508,9 +508,11 @@ pub fn git_tooltip(git: &Result<Arc<Git>, Arc<Error>>) -> SharedString {
     }
 }
 
-/// The last path component, for the titlebar; "." and ".." resolve first.
+/// The last path component, for the titlebar.
+///
+/// Purely textual on purpose: this runs on the UI thread while the repository
+/// opens. Recent roots are stored canonical, so there is nothing to resolve.
 pub fn repo_name(path: &Path) -> SharedString {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
@@ -598,5 +600,12 @@ mod tests {
     fn repo_name_is_the_last_component() {
         assert_eq!(repo_name(Path::new("/home/user/gitwarp")), "gitwarp");
         assert_eq!(repo_name(Path::new("/")), "/");
+        // No canonicalize on the UI thread: the name is read off the text.
+        assert_eq!(
+            repo_name(Path::new("/home/user/../user/gitwarp")),
+            "gitwarp"
+        );
+        assert_eq!(repo_name(Path::new("/does/not/exist/notes")), "notes");
+        assert_eq!(repo_name(Path::new(".")), ".");
     }
 }

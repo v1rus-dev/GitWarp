@@ -299,6 +299,9 @@ pub(crate) struct InitFlow {
     result: Option<ProbeResult>,
     initial_commit: bool,
     busy: bool,
+    /// Set once an open is scheduled; a second activation before it runs must
+    /// not open the same folder twice.
+    opening: bool,
     error: Option<SharedString>,
     on_open: Option<OpenCallback>,
 }
@@ -313,6 +316,7 @@ impl InitFlow {
             // Both dialogs start with the initial commit on.
             initial_commit: true,
             busy: false,
+            opening: false,
             error: None,
             on_open: None,
         }
@@ -460,6 +464,10 @@ impl InitFlow {
         cx: &mut Context<Self>,
     ) {
         self.busy = false;
+        // The fields were disabled while `git init` ran, so `path` is still
+        // what the folder field shows; the re-probe below cannot resurrect an
+        // older folder.
+        cx.notify();
         match result {
             Ok(root) => {
                 if let Some(on_open) = self.on_open.clone() {
@@ -491,15 +499,26 @@ impl InitFlow {
     }
 
     /// Opens a folder that already is a repository root.
+    ///
+    /// Both dialogs call this from inside their own update, which still holds
+    /// the dialog's entity lease; the callback re-enters the dialog to close
+    /// it, so it has to run after that update returned — otherwise gpui
+    /// panics with a double lease.
     pub fn open_root(
         &mut self,
         root: std::path::PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(on_open) = self.on_open.clone() {
-            on_open(root, false, window, cx);
+        if self.opening {
+            return;
         }
+        self.opening = true;
+        cx.defer_in(window, move |flow, window, cx| {
+            if let Some(on_open) = flow.on_open.clone() {
+                on_open(root, false, window, cx);
+            }
+        });
     }
 }
 

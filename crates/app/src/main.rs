@@ -6,6 +6,8 @@ mod init_flow;
 mod open_dialog;
 mod repo_view;
 mod settings;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod welcome;
 mod workspace;
@@ -98,6 +100,30 @@ fn finish_save(cx: &mut App) {
     }
 }
 
+/// Writes the settings right now when a save is in flight or a change is
+/// still dirty: on quit there is no executor left to finish the background
+/// save, and the last change would otherwise be lost.
+fn flush_settings(cx: &mut App) {
+    if cx.try_global::<AppSettings>().is_none() {
+        return;
+    }
+    let pending = {
+        let state = cx.global_mut::<AppSettings>();
+        if !(state.save_in_flight || state.dirty) {
+            return;
+        }
+        state.save_in_flight = false;
+        state.dirty = false;
+        let Some(path) = state.path.clone() else {
+            return;
+        };
+        (path, state.settings.clone())
+    };
+    if let Err(e) = SettingsStore::new(pending.0.clone()).save(&pending.1) {
+        log::warn!("failed to save settings to {}: {e}", pending.0.display());
+    }
+}
+
 const USAGE: &str = "Usage: gitwarp [--git <auto|system|bundled|PATH>] [REPO]
 
 Options:
@@ -182,6 +208,14 @@ fn main() {
                 save_in_flight: false,
                 dirty: false,
             });
+            // A background save may still be in flight when the user quits;
+            // closing the last window does reach `on_app_quit` on Linux, so
+            // this is the one place that has to write the last change.
+            cx.on_app_quit(|cx| {
+                flush_settings(cx);
+                async {}
+            })
+            .detach();
             let window_size = if path.is_some() {
                 size(px(1200.), px(800.))
             } else {
@@ -305,5 +339,31 @@ mod tests {
                 git: GitChoice::Auto
             })
         );
+    }
+
+    /// The last change is still dirty (or a save is still running) when the
+    /// app quits: quitting has to write it instead of dropping it.
+    #[gpui::test]
+    fn quitting_writes_the_change_a_background_save_did_not_finish(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("gitwarp-quit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        cx.update(|cx| {
+            cx.set_global(AppSettings {
+                path: Some(path.clone()),
+                settings: Settings {
+                    theme: ThemePref::Dark,
+                    ..Default::default()
+                },
+                save_in_flight: true,
+                dirty: true,
+            });
+            flush_settings(cx);
+        });
+
+        assert_eq!(SettingsStore::new(&path).load().theme, ThemePref::Dark);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

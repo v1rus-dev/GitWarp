@@ -83,6 +83,22 @@ impl LogKiller {
             None => false,
         }
     }
+
+    /// The git process id, while this handle still owns the child. The tests
+    /// use it to prove that `kill` really stopped the process.
+    #[doc(hidden)]
+    pub fn pid(&self) -> Option<u32> {
+        child_pid(&self.child)
+    }
+}
+
+/// The process id of the child in the slot, if there is one.
+fn child_pid(slot: &Mutex<Option<Child>>) -> Option<u32> {
+    let slot = match slot.lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    slot.as_ref().map(Child::id)
 }
 
 /// Takes the child out of the slot; a poisoned lock still holds a usable child.
@@ -284,6 +300,13 @@ impl CommitCount {
         LogKiller {
             child: self.child.clone(),
         }
+    }
+
+    /// The git process id, while the count is still running. The tests use it
+    /// to prove that killing the handle really stopped the process.
+    #[doc(hidden)]
+    pub fn pid(&self) -> Option<u32> {
+        child_pid(&self.child)
     }
 
     /// Block until git finished and return the count.

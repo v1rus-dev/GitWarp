@@ -30,7 +30,9 @@ use crate::format::{display_path, expand_home, home_dir, relative_time};
 use crate::history_view::unix_now;
 use crate::init_flow::{banner_body, details, DialogKind, InitFlow, StatusKind};
 use crate::settings::RecentRepo;
-use crate::workspace::{git_label, git_tooltip, titlebar, titlebar_end, titlebar_fill, Workspace};
+use crate::workspace::{
+    git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
+};
 
 actions!(welcome, [NewRepository, RemoveSelected]);
 
@@ -341,7 +343,7 @@ impl WelcomeView {
                     id: "welcome-open",
                     icon: IconName::Folder,
                     label: "Open repository…",
-                    kbd: "Ctrl O",
+                    kbd: Some("Ctrl O"),
                     disabled: false,
                     tooltip: "Open an existing repository",
                 },
@@ -355,7 +357,8 @@ impl WelcomeView {
                     id: "welcome-clone",
                     icon: IconName::Clone,
                     label: "Clone repository…",
-                    kbd: "Ctrl Shift O",
+                    // No shortcut: clone is not bound yet.
+                    kbd: None,
                     disabled: true,
                     tooltip: "Clone arrives in a later version",
                 },
@@ -369,7 +372,7 @@ impl WelcomeView {
                     id: "welcome-init",
                     icon: IconName::Init,
                     label: "Init new repository…",
-                    kbd: "Ctrl N",
+                    kbd: Some("Ctrl N"),
                     disabled: false,
                     tooltip: "Create a new repository",
                 },
@@ -535,6 +538,7 @@ impl WelcomeView {
                 };
                 view.update(cx, |view, cx| {
                     let label = display_path(&root, view.home.as_deref());
+                    let name = repo_name(&root);
                     if let Some(dialog) = view.dialog.take() {
                         dialog.update(cx, |dialog, cx| dialog.close(window, cx));
                     }
@@ -550,6 +554,8 @@ impl WelcomeView {
                             window,
                             cx,
                         );
+                    } else {
+                        toast::show(ToastKind::Ok, format!("Opened {name}"), window, cx);
                     }
                 });
             }));
@@ -728,6 +734,7 @@ impl InitDialog {
         ];
         let flow_observer = cx.observe(&flow, |this, _, cx| {
             this.sync_error_border(cx);
+            this.sync_busy(cx);
             this.notify_host(cx);
             cx.notify();
         });
@@ -798,6 +805,16 @@ impl InitDialog {
             .update(cx, |input, cx| input.set_error(error, cx));
     }
 
+    /// The folder and branch fields are read-only while `git init` runs, so
+    /// the path the init started with cannot change under it.
+    fn sync_busy(&self, cx: &mut Context<Self>) {
+        let busy = self.flow.read(cx).busy();
+        self.folder
+            .update(cx, |input, cx| input.set_disabled(busy, cx));
+        self.branch
+            .update(cx, |input, cx| input.set_disabled(busy, cx));
+    }
+
     /// The primary button and Enter: open the repository the folder already
     /// belongs to, or initialize a plain folder.
     fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -833,6 +850,18 @@ impl InitDialog {
         }
     }
 
+    /// Fills the field from the dialog itself. The input still queues a
+    /// change event for it; `ignore_change` keeps that from restarting the
+    /// probe with the debounce, because the caller probes at once.
+    fn set_folder_text(&mut self, label: String, cx: &mut Context<Self>) {
+        if self.folder.read(cx).text() == label {
+            return;
+        }
+        self.ignore_change = true;
+        self.folder
+            .update(cx, |input, cx| input.set_text(label, cx));
+    }
+
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let home = self.home.clone();
         let receiver = cx.prompt_for_paths(PathPromptOptions {
@@ -863,11 +892,15 @@ impl InitDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A picker that was already open when `git init` started must not
+        // change the folder the init is running for.
+        if self.flow.read(cx).busy() {
+            return;
+        }
         match outcome {
             PickerOutcome::Picked(Some(path)) => {
                 let label = display_path(&path, home.as_deref());
-                self.folder
-                    .update(cx, |input, cx| input.set_text(label, cx));
+                self.set_folder_text(label, cx);
                 // The picker is an explicit choice: probe at once.
                 self.flow.update(cx, |flow, cx| flow.probe(path, false, cx));
                 self.notify_host(cx);
@@ -1065,7 +1098,8 @@ struct ActionSpec {
     id: &'static str,
     icon: IconName,
     label: &'static str,
-    kbd: &'static str,
+    /// Shown only for shortcuts that are actually bound.
+    kbd: Option<&'static str>,
     disabled: bool,
     tooltip: &'static str,
 }
@@ -1142,13 +1176,15 @@ fn action_row(
 
     row = row
         .child(Icon::new(spec.icon).size(px(16.)).color(foreground))
-        .child(div().flex_1().min_w_0().truncate().child(spec.label))
-        .child(
+        .child(div().flex_1().min_w_0().truncate().child(spec.label));
+    if let Some(kbd) = spec.kbd {
+        row = row.child(
             div()
                 .flex_none()
                 .when(spec.disabled, |this| this.opacity(0.6))
-                .child(Kbd::new(spec.kbd)),
+                .child(Kbd::new(kbd)),
         );
+    }
 
     if ring {
         row = row.child(focus::focus_ring(focus::RingOffset::Inset2, R_MD, cx));
@@ -1326,6 +1362,61 @@ mod tests {
     fn the_row_name_is_the_last_component() {
         assert_eq!(recent_name(Path::new("/home/user/gitwarp")), "gitwarp");
         assert_eq!(recent_name(Path::new("/")), "/");
+    }
+
+    /// Opening an existing repository from the Initialize dialog runs from
+    /// the dialog's own update; the flow re-enters it only after that
+    /// returned, so no double entity lease.
+    #[gpui::test]
+    fn opening_an_existing_repository_closes_the_initialize_dialog(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("init-dialog");
+        let git = crate::test_support::git();
+        let (mut cx, workspace) = crate::test_support::open_workspace(git.clone(), cx);
+
+        let view = cx.update(|window, cx| {
+            cx.new(|cx| WelcomeView::new(Ok(git), workspace.downgrade(), window, cx))
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_init_dialog(window, cx));
+        });
+        let dialog = view
+            .read_with(&cx, |view, _| view.dialog.clone())
+            .expect("the Initialize dialog is open");
+
+        dialog.update(&mut cx, |dialog, cx| {
+            dialog.ignore_change = true;
+            dialog.folder.update(cx, |input, cx| {
+                input.set_text(repo.path().display().to_string(), cx)
+            });
+            dialog.flow.update(cx, |flow, cx| {
+                flow.probe(repo.path().to_path_buf(), false, cx)
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            dialog.update(&mut cx, |dialog, cx| dialog.spec(cx).kind),
+            StatusKind::Repo,
+            "the folder was not classified as a repository"
+        );
+
+        cx.update(|window, cx| {
+            dialog.update(cx, |dialog, cx| dialog.activate(window, cx));
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|window, cx| overlay::layer_count(window, cx)),
+            0,
+            "the dialog stayed open"
+        );
+        assert!(
+            view.read_with(&cx, |view, _| view.dialog.is_none()),
+            "the welcome view kept the closed dialog"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-filter").is_some(),
+            "the workspace did not open the repository"
+        );
     }
 
     /// Opens the real welcome window and drives the Initialize dialog through

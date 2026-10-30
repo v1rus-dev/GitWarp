@@ -128,7 +128,8 @@ impl Repo {
     /// A folder that is already inside a working tree is not initialized
     /// again: git would reuse that repository and the "initial commit" would
     /// land in someone else's history. [`Error::AlreadyARepository`] names the
-    /// root instead.
+    /// root instead. A folder that does not exist yet counts as inside the
+    /// work tree that `git init` would put it in.
     pub fn init_with(
         git: Arc<Git>,
         path: &Path,
@@ -293,7 +294,26 @@ pub enum FolderProbe {
 /// question open are returned as `Err`.
 pub fn probe_folder(git: Arc<Git>, path: &Path) -> Result<FolderProbe> {
     if !path.is_dir() {
-        return Ok(FolderProbe::Missing);
+        // A folder that does not exist yet could still be created by `git
+        // init`; when the closest folder that does exist lies in a working
+        // tree, the new repository would be nested inside it. Reporting it
+        // like any other folder inside a repository keeps the dialogs and
+        // `init_with` on one classification.
+        if path.exists() {
+            return Ok(FolderProbe::Missing);
+        }
+        return match nearest_existing_dir(path) {
+            Some(dir) => match Repo::open(git, dir) {
+                Ok(repo) => Ok(FolderProbe::Nested {
+                    root: repo.root().to_path_buf(),
+                }),
+                Err(Error::NotARepository { .. }) | Err(Error::PathNotFound { .. }) => {
+                    Ok(FolderProbe::Missing)
+                }
+                Err(error) => Err(error),
+            },
+            None => Ok(FolderProbe::Missing),
+        };
     }
     let repo = match Repo::open(git, path) {
         Ok(repo) => repo,
@@ -330,6 +350,18 @@ fn create_gitignore(root: &Path) -> Result<()> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// `path` or its closest ancestor that still is a directory.
+fn nearest_existing_dir(path: &Path) -> Option<&Path> {
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        if dir.is_dir() {
+            return Some(dir);
+        }
+        current = dir.parent();
+    }
+    None
 }
 
 /// Whether two paths name the same directory, following symlinks where they

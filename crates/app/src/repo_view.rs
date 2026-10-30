@@ -650,7 +650,7 @@ impl RepositoryView {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| repo.path.display().to_string());
-            let current = same_path(&repo.path, &self.root);
+            let current = repo.path == self.root;
             let workspace = self.workspace.clone();
             let path = repo.path.clone();
             entries.push(MenuEntry::Item(
@@ -1446,12 +1446,6 @@ fn section_toggler(
         };
         view.update(cx, |view, cx| view.toggle_section(&key, cx));
     }
-}
-
-/// Best-effort path equality, for the "current repository" marker.
-fn same_path(a: &Path, b: &Path) -> bool {
-    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    canonical(a) == canonical(b)
 }
 
 #[cfg(test)]

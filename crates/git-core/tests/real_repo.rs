@@ -399,16 +399,85 @@ fn init_with_refuses_a_subfolder_of_a_repository() {
 }
 
 #[test]
+fn init_with_refuses_a_missing_subfolder_of_a_repository() {
+    let tmp = sample_repo();
+    // The folder does not exist, so a plain probe sees `Missing`; git init
+    // would nevertheless create it inside the sample repository.
+    let missing = tmp.path().join("new").join("project");
+    let git = Arc::new(Git::resolve(GitChoice::System).unwrap().git);
+    match Repo::init(git, &missing) {
+        Err(git_core::Error::AlreadyARepository { root }) => {
+            assert_eq!(root, tmp.path().canonicalize().unwrap());
+        }
+        other => panic!("unexpected result {other:?}"),
+    }
+    assert!(
+        !tmp.path().join("new").exists(),
+        "git init created a nested repository"
+    );
+}
+
+#[test]
+fn probe_reports_a_missing_folder_inside_a_repository_as_nested() {
+    let tmp = sample_repo();
+    assert_eq!(
+        probe(&tmp.path().join("new").join("project")).unwrap(),
+        FolderProbe::Nested {
+            root: tmp.path().canonicalize().unwrap(),
+        }
+    );
+}
+
+#[test]
+fn probe_reports_a_missing_folder_outside_any_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    assert_eq!(
+        probe(&plain.join("new").join("project")).unwrap(),
+        FolderProbe::Missing
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn killing_a_log_stops_git() {
     let tmp = sample_repo();
     let repo = open(tmp.path()).unwrap();
     let mut stream = repo.log(&LogOptions::default()).unwrap();
     let killer = stream.killer();
+    let pid = killer.pid().expect("the log has a child process");
     killer.kill();
-    assert!(!killer.is_running(), "git log is still running");
+    assert!(
+        !process_alive(pid),
+        "git log (pid {pid}) is still running after the kill"
+    );
     // The stream ends after the kill: either with no commits or an error.
     let rest: Vec<_> = stream.by_ref().collect();
     assert!(rest.iter().all(|item| item.is_err()) || rest.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn killing_a_commit_count_stops_git() {
+    let tmp = sample_repo();
+    let repo = open(tmp.path()).unwrap();
+    let count = repo.commit_count_cancellable().unwrap();
+    let pid = count.pid().expect("the count has a child process");
+    count.killer().kill();
+    assert!(
+        !process_alive(pid),
+        "git rev-list (pid {pid}) is still running after the kill"
+    );
+    // The killed child was reaped by the killer: no exit status is left.
+    assert!(count.wait().is_err(), "a killed count must not report one");
+}
+
+/// Whether `pid` still has a process on Linux; the killed child is reaped, so
+/// its `/proc` entry goes away with it.
+#[cfg(target_os = "linux")]
+fn process_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
 }
 
 #[test]
