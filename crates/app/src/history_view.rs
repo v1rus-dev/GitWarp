@@ -2753,6 +2753,9 @@ mod tests {
             kind,
             target,
             upstream: None,
+            ahead: 0,
+            behind: 0,
+            upstream_gone: false,
         }
     }
 

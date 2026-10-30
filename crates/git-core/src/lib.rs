@@ -11,6 +11,9 @@ mod git;
 mod log;
 mod oid;
 mod refs;
+mod stash;
+mod submodule;
+mod worktree;
 
 use std::fs::OpenOptions;
 use std::io;
@@ -23,6 +26,9 @@ pub use git::{Git, GitChoice, GitSource, GitVersion, Resolution};
 pub use log::{CommitCount, CommitInfo, LogKiller, LogOptions, LogStream};
 pub use oid::Oid;
 pub use refs::{Head, Ref, RefKind};
+pub use stash::Stash;
+pub use submodule::{Submodule, SubmoduleState};
+pub use worktree::Worktree;
 
 /// An opened repository (work tree or bare).
 #[derive(Debug, Clone)]
@@ -33,6 +39,7 @@ pub struct Repo {
     git_dir: PathBuf,
     /// `objects/info`, where the commit-graph lives.
     objects_info: PathBuf,
+    bare: bool,
 }
 
 impl Repo {
@@ -108,6 +115,7 @@ impl Repo {
             root,
             git_dir,
             objects_info,
+            bare,
         })
     }
 
@@ -212,6 +220,11 @@ impl Repo {
         cmd
     }
 
+    /// Whether this is a bare repository (no work tree).
+    pub(crate) fn is_bare(&self) -> bool {
+        self.bare
+    }
+
     /// Stream commits in topological order. Commits arrive as git produces
     /// them, so the first screen of history renders before the log finishes.
     pub fn log(&self, options: &LogOptions) -> Result<LogStream> {
@@ -266,6 +279,27 @@ impl Repo {
     /// What HEAD points at.
     pub fn head(&self) -> Result<Head> {
         refs::head(self)
+    }
+
+    /// The configured remotes, in git's order.
+    pub fn remotes(&self) -> Result<Vec<String>> {
+        refs::remotes(self)
+    }
+
+    /// The stash entries, newest first (`stash@{0}` first).
+    pub fn stashes(&self) -> Result<Vec<Stash>> {
+        stash::list(self)
+    }
+
+    /// The worktrees attached to this repository. The one this repository was
+    /// opened in is marked `current`.
+    pub fn worktrees(&self) -> Result<Vec<Worktree>> {
+        worktree::list(self)
+    }
+
+    /// The submodules recorded in `.gitmodules`.
+    pub fn submodules(&self) -> Result<Vec<Submodule>> {
+        submodule::list(self)
     }
 }
 

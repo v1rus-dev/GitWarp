@@ -1546,6 +1546,9 @@ mod tests {
             kind,
             target: Oid::from_hex(&"1".repeat(40)).unwrap(),
             upstream: None,
+            ahead: 0,
+            behind: 0,
+            upstream_gone: false,
         }
     }
 
