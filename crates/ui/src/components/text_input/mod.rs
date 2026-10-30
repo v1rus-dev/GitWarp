@@ -1,6 +1,7 @@
 //! Single-line text input, ported from GPUI's `examples/input.rs`.
 
 mod model;
+mod textarea;
 
 use std::ops::Range;
 
@@ -17,6 +18,8 @@ use gpui::{
 use crate::metrics::{CTL, FONT_UI, FS_BASE, R_SM};
 use crate::theme::ActiveTheme;
 use model::EditModel;
+
+pub use textarea::{TextArea, TextAreaEvent};
 
 actions!(
     text_input,
@@ -856,4 +859,5 @@ pub(crate) fn bind_keys(cx: &mut App) {
         crate::actions::key_binding(cx, "secondary-v", Paste, Some("TextInput")),
         KeyBinding::new("enter", Submit, Some("TextInput")),
     ]);
+    textarea::bind_keys(cx);
 }

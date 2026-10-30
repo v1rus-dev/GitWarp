@@ -29,6 +29,7 @@ use ui::{
     Tooltip, Tree, TreeNodeData,
 };
 
+use crate::changes_view::{ChangesEvent, ChangesView};
 use crate::details::{read_details, read_diff, DetailsState, DiffState};
 use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
 use crate::format::{absolute_time, format_count, relative_time};
@@ -60,6 +61,13 @@ actions!(
         OpenBranchSwitcher
     ]
 );
+
+/// The two centre views the toolbar switches between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    History,
+    Changes,
+}
 
 /// Binds the search field's own keys in its `history-search` context, so
 /// Enter/F3/Esc/↓ never fire while another input has the keyboard. Enter is
@@ -292,6 +300,9 @@ pub struct RepositoryView {
     git_tooltip: SharedString,
     history: Entity<HistoryView>,
     _history_observer: Subscription,
+    changes: Entity<ChangesView>,
+    _changes_observer: Subscription,
+    view: ViewMode,
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
     search: Entity<TextInput>,
@@ -387,6 +398,12 @@ impl RepositoryView {
             this.sync_details(selected, cx);
             cx.notify();
         });
+        let changes = cx.new(|cx| ChangesView::new(path.clone(), git.clone(), window, cx));
+        let changes_observer = cx.subscribe(&changes, |this, _, event: &ChangesEvent, cx| {
+            if *event == ChangesEvent::Committed {
+                this.history.update(cx, |history, cx| history.reload(cx));
+            }
+        });
         let search = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
             input.set_placeholder("Search commits, authors, hashes", cx);
@@ -438,6 +455,9 @@ impl RepositoryView {
             git_tooltip,
             history,
             _history_observer: observer,
+            changes,
+            _changes_observer: changes_observer,
+            view: ViewMode::History,
             workspace,
             focus: focus.clone(),
             search,
@@ -506,6 +526,26 @@ impl RepositoryView {
 
     pub(crate) fn toggle_details(&mut self, cx: &mut Context<Self>) {
         self.details_open = !self.details_open;
+        cx.notify();
+    }
+
+    /// Switches the centre pane and moves the keyboard to the new content.
+    fn set_view(&mut self, mode: ViewMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view == mode {
+            return;
+        }
+        self.view = mode;
+        match mode {
+            ViewMode::Changes => {
+                self.changes.update(cx, |changes, cx| changes.refresh(cx));
+                let focus = self.changes.read(cx).focus_handle();
+                window.focus(&focus, cx);
+            }
+            ViewMode::History => {
+                let focus = self.history.read(cx).list_focus();
+                window.focus(&focus, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -1177,7 +1217,6 @@ impl RepositoryView {
             )))
             .child(titlebar_fill());
 
-        // History is the only view in this stage; Changes is stage 6.
         let history_item = if layout.labels {
             SegmentItem::new("History").with_icon(IconName::Lanes)
         } else {
@@ -1188,15 +1227,23 @@ impl RepositoryView {
         } else {
             SegmentItem::icon(IconName::Edit)
         };
+        let switch_view = cx.entity();
         bar = bar.child(no_shrink(
             Segmented::new("view-switch")
                 .item(history_item)
-                .item(
-                    changes_item
-                        .disabled(true)
-                        .tooltip("Changes — arrives in a later version"),
-                )
-                .selected(0),
+                .item(changes_item.tooltip("Local changes"))
+                .selected(match self.view {
+                    ViewMode::History => 0,
+                    ViewMode::Changes => 1,
+                })
+                .on_select(move |index, window, cx| {
+                    let mode = if index == 1 {
+                        ViewMode::Changes
+                    } else {
+                        ViewMode::History
+                    };
+                    switch_view.update(cx, |view, cx| view.set_view(mode, window, cx));
+                }),
         ));
 
         let mut field = SearchField::new("toolbar-search", self.search.clone());
@@ -2057,7 +2104,6 @@ impl RepositoryView {
 
     fn render_status_bar(&self, cx: &Context<Self>) -> Div {
         let colors = cx.theme().colors;
-        let history = self.history.read(cx);
         let mut bar = div()
             .h(STATUS)
             .px(px(8.))
@@ -2070,60 +2116,86 @@ impl RepositoryView {
             .text_size(FS_SM)
             .text_color(colors.muted);
 
-        let mut fill = true;
-        match history.state() {
-            LoadState::Loading { .. } => {
+        if self.view == ViewMode::Changes {
+            let changes = self.changes.read(cx);
+            if changes.is_loading() {
                 bar = bar.child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(8.))
                         .child(Spinner::new("status-spinner", px(12.)))
-                        .child("Loading history…"),
+                        .child("Loading changes…"),
                 );
-            }
-            LoadState::Cancelled => {
-                bar = bar.child(div().text_color(colors.muted).child("Loading cancelled"));
-            }
-            LoadState::Failed(failure) => {
-                // The failure takes the left side and the stretch, so it
-                // cannot push the counters and the git button off the bar.
+            } else if let Some(error) = changes.failure() {
                 bar = bar.child(
                     div()
                         .flex_1()
                         .min_w_0()
                         .truncate()
                         .text_color(colors.error)
-                        .child(failure.title()),
+                        .child(error.to_string()),
                 );
-                fill = false;
             }
-            LoadState::Loaded => {}
-        }
-        if fill {
             bar = bar.child(div().flex_1());
-        }
-
-        bar = bar
-            .child(format!(
+            bar = bar.child(format!(
+                "{} unstaged · {} staged",
+                changes.unstaged_count(),
+                changes.staged_count()
+            ));
+        } else {
+            let history = self.history.read(cx);
+            let mut fill = true;
+            match history.state() {
+                LoadState::Loading { .. } => {
+                    bar = bar.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(Spinner::new("status-spinner", px(12.)))
+                            .child("Loading history…"),
+                    );
+                }
+                LoadState::Cancelled => {
+                    bar = bar.child(div().text_color(colors.muted).child("Loading cancelled"));
+                }
+                LoadState::Failed(failure) => {
+                    bar = bar.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(colors.error)
+                            .child(failure.title()),
+                    );
+                    fill = false;
+                }
+                LoadState::Loaded => {}
+            }
+            if fill {
+                bar = bar.child(div().flex_1());
+            }
+            bar = bar.child(format!(
                 "{} commits loaded",
                 format_count(history.commit_count())
-            ))
-            .child(
-                div()
-                    .id("status-git")
-                    .h(px(20.))
-                    .px(px(6.))
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .rounded(R_SM)
-                    .text_color(colors.muted)
-                    .tooltip(Tooltip::text(self.git_tooltip.clone()))
-                    .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
-                    .child(self.git_label.clone()),
-            );
-        bar
+            ));
+        }
+
+        bar.child(
+            div()
+                .id("status-git")
+                .h(px(20.))
+                .px(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .rounded(R_SM)
+                .text_color(colors.muted)
+                .tooltip(Tooltip::text(self.git_tooltip.clone()))
+                .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
+                .child(self.git_label.clone()),
+        )
     }
 }
 
@@ -2187,7 +2259,9 @@ impl Render for RepositoryView {
                 self.render_sidebar_splitter(sidebar_width, sidebar_limit, cx),
             )
         });
-        let details_open = self.details_open;
+        // The local-changes view has its own diff pane; the commit details
+        // dock belongs to history only.
+        let details_open = self.details_open && self.view == ViewMode::History;
         let dock = self.dock;
         let splitter =
             details_open.then(|| self.render_details_splitter(details_width, details_limit, cx));
@@ -2195,13 +2269,17 @@ impl Render for RepositoryView {
             .then(|| self.render_details(details_width, width - sidebar_width - 5., cx));
         let status = self.render_status_bar(cx);
 
+        let content = match self.view {
+            ViewMode::History => self.history.clone().into_any_element(),
+            ViewMode::Changes => self.changes.clone().into_any_element(),
+        };
         let history_pane = div()
             .flex_1()
             .min_w_0()
             .min_h_0()
             .flex()
             .flex_col()
-            .child(self.history.clone());
+            .child(content);
 
         let main = match (details_open, dock) {
             (false, _) => div().flex_1().min_w_0().flex().child(history_pane),
@@ -2975,6 +3053,87 @@ mod tests {
             .update(|window, _| window.root::<RepositoryView>().flatten())
             .expect("the repository view is the window root");
         (cx, view)
+    }
+
+    /// The toolbar switch replaces the history pane with the local-changes
+    /// view and back; the changes view loads the work-tree status.
+    #[gpui::test]
+    fn the_view_switch_opens_local_changes(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("view-switch");
+        commit(repo.path(), "a.txt", "one\n");
+        std::fs::write(repo.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.set_view(ViewMode::Changes, window, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(view.view, ViewMode::Changes);
+            let changes = view.changes.read(cx);
+            assert_eq!(changes.unstaged_count(), 1, "{:?}", changes.status());
+        });
+        assert!(cx.debug_bounds("changes-view").is_some());
+        assert!(
+            cx.debug_bounds("changes-unstaged-0").is_some(),
+            "the changed file was not drawn"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.set_view(ViewMode::History, window, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert_eq!(view.view, ViewMode::History));
+        assert!(cx.debug_bounds("changes-view").is_none());
+    }
+
+    /// A commit made in the changes view reloads the history behind it.
+    #[gpui::test]
+    fn committing_from_changes_reloads_the_history(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-commit-reload");
+        commit(repo.path(), "a.txt", "one\n");
+        std::fs::write(repo.path().join("a.txt"), "two\n").unwrap();
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.set_view(ViewMode::Changes, window, cx));
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.changes.update(cx, |changes, cx| {
+                    changes.refresh(cx);
+                    changes.set_message_for_test("feat: two", cx);
+                });
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.changes.update(cx, |changes, cx| {
+                    changes.stage_all(crate::changes_view::Side::Unstaged, cx)
+                });
+            });
+            let _ = window;
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.changes
+                    .update(cx, |changes, cx| changes.commit(window, cx));
+            });
+        });
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            let history = view.history.read(cx);
+            assert_eq!(history.commit_count(), 2, "the new commit is missing");
+            assert_eq!(
+                history.selected_commit().expect("HEAD is selected").summary,
+                "feat: two"
+            );
+        });
     }
 
     /// Selecting a commit loads its details and changed files into the dock,

@@ -60,7 +60,9 @@ pub use spinner::Spinner;
 pub use splitter::{clamp_size, SplitAxis, Splitter};
 pub use status_glyph::StatusGlyph;
 pub use tabs::{Tab, Tabs};
-pub use text_input::{Submit as TextInputSubmit, TextInput, TextInputEvent};
+pub use text_input::{
+    Submit as TextInputSubmit, TextArea, TextAreaEvent, TextInput, TextInputEvent,
+};
 pub use toast::{Toast, ToastId, ToastKind, ToastQueue};
 pub use toggles::{Checkbox, Radio, Switch};
 pub use tooltip::Tooltip;

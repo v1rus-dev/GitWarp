@@ -300,18 +300,18 @@ fn diff_tree(repo: &Repo, parent: Option<&str>, oid: Oid, mode: &'static str) ->
 
 /// One file's line counts, from `--numstat -z`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Stat {
-    added: usize,
-    deleted: usize,
-    binary: bool,
+pub(crate) struct Stat {
+    pub(crate) added: usize,
+    pub(crate) deleted: usize,
+    pub(crate) binary: bool,
 }
 
 /// One file's status, from `--name-status -z`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct NamedFile {
-    kind: ChangeKind,
-    old_path: Option<String>,
-    path: String,
+pub(crate) struct NamedFile {
+    pub(crate) kind: ChangeKind,
+    pub(crate) old_path: Option<String>,
+    pub(crate) path: String,
 }
 
 fn parse_details(raw: &[u8]) -> Result<CommitDetails> {
@@ -367,7 +367,7 @@ fn message_body(message: &str) -> String {
 ///
 /// A rename prints an empty path field before the NUL and then the old and
 /// new paths, so its counts are filed under the new path.
-fn parse_numstat(raw: &[u8]) -> Result<std::collections::HashMap<String, Stat>> {
+pub(crate) fn parse_numstat(raw: &[u8]) -> Result<std::collections::HashMap<String, Stat>> {
     let mut stats = std::collections::HashMap::new();
     let mut fields = raw.split(|&b| b == 0);
     while let Some(record) = fields.next() {
@@ -408,7 +408,7 @@ fn parse_numstat(raw: &[u8]) -> Result<std::collections::HashMap<String, Stat>> 
 }
 
 /// Parses `--name-status -z` output, keeping git's order.
-fn parse_name_status(raw: &[u8]) -> Result<Vec<NamedFile>> {
+pub(crate) fn parse_name_status(raw: &[u8]) -> Result<Vec<NamedFile>> {
     let mut files = Vec::new();
     let mut fields = raw.split(|&b| b == 0);
     while let Some(record) = fields.next() {
@@ -442,7 +442,7 @@ fn parse_name_status(raw: &[u8]) -> Result<Vec<NamedFile>> {
 }
 
 /// Parses one file's unified patch.
-fn parse_patch(raw: &[u8]) -> Result<FileDiff> {
+pub(crate) fn parse_patch(raw: &[u8]) -> Result<FileDiff> {
     let text = String::from_utf8_lossy(raw);
     if text.lines().count() > LINE_CAP {
         return Err(Error::TooLarge { what: "diff" });
