@@ -1554,11 +1554,7 @@ fn reads_a_staged_rename_against_its_old_path() {
         .staged_diff(&file.path, file.old_path.as_deref())
         .unwrap();
     assert_eq!(diff.old_path.as_deref(), Some("a.txt"));
-    let kinds: Vec<_> = diff.hunks[0]
-        .lines
-        .iter()
-        .map(|line| line.kind)
-        .collect();
+    let kinds: Vec<_> = diff.hunks[0].lines.iter().map(|line| line.kind).collect();
     assert!(kinds.contains(&git_core::LineKind::Removed), "{kinds:?}");
     assert!(kinds.contains(&git_core::LineKind::Added), "{kinds:?}");
 }

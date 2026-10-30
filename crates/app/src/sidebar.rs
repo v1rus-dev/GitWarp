@@ -70,6 +70,10 @@ impl Expansion {
 #[derive(Clone, Debug, Default)]
 pub struct SidebarExtras {
     pub remotes: Vec<String>,
+    /// The fetch URL of every remote, for the Edit remote dialog.
+    pub remote_urls: Vec<(String, String)>,
+    /// `user.signingkey`, for the tag dialog's signing option.
+    pub signing_key: Option<String>,
     pub stashes: Vec<Stash>,
     pub worktrees: Vec<Worktree>,
     pub submodules: Vec<Submodule>,
@@ -89,6 +93,21 @@ pub(crate) fn read_sidebar_extras(git: Arc<Git>, root: &Path) -> SidebarExtras {
         log::warn!("could not list the remotes: {error}");
         Vec::new()
     });
+    let remote_urls = remotes
+        .iter()
+        .filter_map(|name| match repo.remote_url(name) {
+            Ok(Some(url)) => Some((name.clone(), url)),
+            Ok(None) => None,
+            Err(error) => {
+                log::warn!("could not read the URL of {name}: {error}");
+                None
+            }
+        })
+        .collect();
+    let signing_key = repo.signing_key().unwrap_or_else(|error| {
+        log::warn!("could not read the signing key: {error}");
+        None
+    });
     let stashes = repo.stashes().unwrap_or_else(|error| {
         log::warn!("could not list the stashes: {error}");
         Vec::new()
@@ -103,6 +122,8 @@ pub(crate) fn read_sidebar_extras(git: Arc<Git>, root: &Path) -> SidebarExtras {
     });
     SidebarExtras {
         remotes,
+        remote_urls,
+        signing_key,
         stashes,
         worktrees,
         submodules,
@@ -163,6 +184,28 @@ pub enum SidebarAction {
     ///
     /// [`RepositoryView::refresh`]: crate::repo_view::RepositoryView::refresh
     Refresh,
+    /// Checks out a local branch.
+    CheckoutBranch(String),
+    /// Checks out a remote branch, creating a local tracking branch if needed.
+    CheckoutRemoteBranch(String),
+    /// Checks out a tag with a detached HEAD.
+    CheckoutTag(String),
+    /// Opens "Create branch here" at `oid`.
+    CreateBranchAt(Oid),
+    RenameBranch(String),
+    DeleteBranch(String),
+    RenameTag(String),
+    DeleteTag(String),
+    /// Applies a stash by index without dropping it.
+    ApplyStash(usize),
+    PopStash(usize),
+    DropStash(usize),
+    /// Opens "Create tag" at HEAD.
+    CreateTag,
+    /// Opens the add-remote dialog.
+    AddRemote,
+    EditRemote(String),
+    RemoveRemote(String),
 }
 
 /// One item of a sidebar context menu, free of GPUI so the labels, order and
@@ -230,36 +273,52 @@ impl SidebarMenuEntry {
             other => other,
         }
     }
+
+    /// [`Self::action`] for an action that is only available in some states.
+    fn maybe_action(self, action: Option<SidebarAction>) -> Self {
+        match action {
+            Some(action) => self.action(action),
+            None => self,
+        }
+    }
 }
 
 /// The context menu of a sidebar node, in the design's order, or an empty list
 /// for a node that has none (the other sections, folders and unknown keys).
 ///
 /// `head` is the current branch name (`Head::Branch`), or `HEAD` when detached
-/// or still loading; `extras` supplies the worktree's lock state.
+/// or still loading; `extras` supplies the worktree's lock state; `refs`
+/// resolves a tag's commit for "Create branch here…".
 pub fn sidebar_menu(
     key: &str,
     head: Option<&Head>,
     extras: Option<&SidebarExtras>,
+    refs: Option<&[Ref]>,
 ) -> Vec<SidebarMenuEntry> {
     let head = match head {
         Some(Head::Branch { name, .. }) => name.as_str(),
         Some(Head::Detached(_)) | None => "HEAD",
     };
-    // The items that act arrive with later stages — 5 (View changes),
-    // 7 (ref operations, stash), 8 (network) and 9 (worktrees): they are
-    // shown, not clickable, until then.
+    // Stage 7 wires checkout, rename/delete and the stash/remote dialogs; the
+    // network (stage 8), worktree (stage 9) and merge/rebase (stage 12) items
+    // stay shown-but-disabled.
     if let Some(name) = key.strip_prefix("local:") {
+        let current = name == head;
         return vec![
-            item("Checkout", IconName::Check).shortcut("Enter"),
+            item("Checkout", IconName::Check)
+                .shortcut("Enter")
+                .maybe_action((!current).then(|| SidebarAction::CheckoutBranch(name.to_owned()))),
             item(&format!("Merge {name} into {head}"), IconName::Branch),
             item(&format!("Rebase {head} onto {name}"), IconName::Branch),
             SidebarMenuEntry::Separator,
-            item("Rename…", IconName::Edit).shortcut("F2"),
+            item("Rename…", IconName::Edit)
+                .shortcut("F2")
+                .action(SidebarAction::RenameBranch(name.to_owned())),
             item("Set upstream…", IconName::Link),
             item("Delete branch", IconName::Trash)
                 .danger()
-                .shortcut("Del"),
+                .shortcut("Del")
+                .maybe_action((!current).then(|| SidebarAction::DeleteBranch(name.to_owned()))),
             SidebarMenuEntry::Separator,
             item("Copy branch name", IconName::Copy)
                 .action(SidebarAction::CopyText(name.to_owned())),
@@ -267,37 +326,55 @@ pub fn sidebar_menu(
     }
     if let Some(name) = key.strip_prefix("rbranch:") {
         return vec![
-            item("Checkout as local branch", IconName::Check),
+            item("Checkout as local branch", IconName::Check)
+                .action(SidebarAction::CheckoutRemoteBranch(name.to_owned())),
             item(&format!("Merge {name} into {head}"), IconName::Branch),
             SidebarMenuEntry::Separator,
+            // Deleting a remote branch is a push; it arrives with stage 8.
             item("Delete remote branch…", IconName::Trash).danger(),
             item("Copy branch name", IconName::Copy)
                 .action(SidebarAction::CopyText(name.to_owned())),
         ];
     }
-    if key.starts_with("tag:") {
+    if let Some(name) = key.strip_prefix("tag:") {
+        let target = refs.and_then(|refs| {
+            refs.iter()
+                .find(|r| r.kind == RefKind::Tag && r.name == name)
+                .map(|r| r.target)
+        });
         return vec![
-            item("Checkout", IconName::Check),
-            item("Create branch here…", IconName::Branch),
+            item("Checkout", IconName::Check).action(SidebarAction::CheckoutTag(name.to_owned())),
+            item("Create branch here…", IconName::Branch)
+                .maybe_action(target.map(SidebarAction::CreateBranchAt)),
             item("Push tag to origin", IconName::Up),
             SidebarMenuEntry::Separator,
-            item("Delete tag", IconName::Trash).danger(),
+            item("Rename tag…", IconName::Edit).action(SidebarAction::RenameTag(name.to_owned())),
+            item("Delete tag", IconName::Trash)
+                .danger()
+                .action(SidebarAction::DeleteTag(name.to_owned())),
         ];
     }
-    if key.starts_with("stash:") {
+    if let Some(index) = key.strip_prefix("stash:") {
+        let index = index.parse::<usize>().ok();
         return vec![
-            item("Apply stash", IconName::Check),
-            item("Pop stash", IconName::Undo),
+            item("Apply stash", IconName::Check).maybe_action(index.map(SidebarAction::ApplyStash)),
+            item("Pop stash", IconName::Undo).maybe_action(index.map(SidebarAction::PopStash)),
+            // Viewing a stash needs the detail diff of a stash commit; that is
+            // part of the history work, not this stage.
             item("View changes", IconName::Eye),
             SidebarMenuEntry::Separator,
-            item("Drop stash", IconName::Trash).danger(),
+            item("Drop stash", IconName::Trash)
+                .danger()
+                .maybe_action(index.map(SidebarAction::DropStash)),
         ];
     }
-    if key.starts_with("remote:") {
+    if let Some(name) = key.strip_prefix("remote:") {
         return vec![
             item("Fetch", IconName::Fetch),
-            item("Edit remote…", IconName::Edit),
-            item("Remove remote", IconName::Trash).danger(),
+            item("Edit remote…", IconName::Edit).action(SidebarAction::EditRemote(name.to_owned())),
+            item("Remove remote", IconName::Trash)
+                .danger()
+                .action(SidebarAction::RemoveRemote(name.to_owned())),
         ];
     }
     if let Some(path) = key.strip_prefix("wt:") {
@@ -325,13 +402,13 @@ pub fn sidebar_menu(
     }
     match key {
         "section:remotes" => vec![
-            item("Add remote…", IconName::Plus),
+            item("Add remote…", IconName::Plus).action(SidebarAction::AddRemote),
             SidebarMenuEntry::Separator,
             item("Fetch all remotes", IconName::Fetch).shortcut("Ctrl+Shift+F"),
             item("Prune stale remote branches", IconName::Trash),
         ],
         "section:tags" => vec![
-            item("Create tag…", IconName::Plus),
+            item("Create tag…", IconName::Plus).action(SidebarAction::CreateTag),
             SidebarMenuEntry::Separator,
             item("Fetch tags from origin", IconName::Fetch),
             item("Push all tags to origin", IconName::Up),
@@ -1796,7 +1873,8 @@ mod tests {
             menu_labels(&sidebar_menu(
                 "local:feat/idle-lanes",
                 Some(&head),
-                Some(&extras)
+                Some(&extras),
+                None
             )),
             vec![
                 "Checkout",
@@ -1814,7 +1892,8 @@ mod tests {
             menu_labels(&sidebar_menu(
                 "rbranch:origin/feat/idle-lanes",
                 Some(&head),
-                Some(&extras)
+                Some(&extras),
+                None
             )),
             vec![
                 "Checkout as local branch",
@@ -1825,17 +1904,18 @@ mod tests {
             ]
         );
         assert_eq!(
-            menu_labels(&sidebar_menu("tag:v1", Some(&head), Some(&extras))),
+            menu_labels(&sidebar_menu("tag:v1", Some(&head), Some(&extras), None)),
             vec![
                 "Checkout",
                 "Create branch here…",
                 "Push tag to origin",
                 "—",
+                "Rename tag…",
                 "Delete tag",
             ]
         );
         assert_eq!(
-            menu_labels(&sidebar_menu("stash:0", Some(&head), Some(&extras))),
+            menu_labels(&sidebar_menu("stash:0", Some(&head), Some(&extras), None)),
             vec![
                 "Apply stash",
                 "Pop stash",
@@ -1845,11 +1925,21 @@ mod tests {
             ]
         );
         assert_eq!(
-            menu_labels(&sidebar_menu("remote:origin", Some(&head), Some(&extras))),
+            menu_labels(&sidebar_menu(
+                "remote:origin",
+                Some(&head),
+                Some(&extras),
+                None
+            )),
             vec!["Fetch", "Edit remote…", "Remove remote"]
         );
         assert_eq!(
-            menu_labels(&sidebar_menu("wt:/tmp/plain", Some(&head), Some(&extras))),
+            menu_labels(&sidebar_menu(
+                "wt:/tmp/plain",
+                Some(&head),
+                Some(&extras),
+                None
+            )),
             vec![
                 "Open in new window",
                 "Add worktree…",
@@ -1859,7 +1949,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            menu_labels(&sidebar_menu("wt:/tmp/locked", Some(&head), Some(&extras))),
+            menu_labels(&sidebar_menu(
+                "wt:/tmp/locked",
+                Some(&head),
+                Some(&extras),
+                None
+            )),
             vec![
                 "Open in new window",
                 "Add worktree…",
@@ -1869,11 +1964,21 @@ mod tests {
             ]
         );
         assert_eq!(
-            menu_labels(&sidebar_menu("sub:vendor/a", Some(&head), Some(&extras))),
+            menu_labels(&sidebar_menu(
+                "sub:vendor/a",
+                Some(&head),
+                Some(&extras),
+                None
+            )),
             vec!["Update submodule", "Open in new window"]
         );
         assert_eq!(
-            menu_labels(&sidebar_menu("section:remotes", Some(&head), Some(&extras))),
+            menu_labels(&sidebar_menu(
+                "section:remotes",
+                Some(&head),
+                Some(&extras),
+                None
+            )),
             vec![
                 "Add remote…",
                 "—",
@@ -1882,7 +1987,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            menu_labels(&sidebar_menu("section:tags", Some(&head), Some(&extras))),
+            menu_labels(&sidebar_menu(
+                "section:tags",
+                Some(&head),
+                Some(&extras),
+                None
+            )),
             vec![
                 "Create tag…",
                 "—",
@@ -1894,7 +2004,8 @@ mod tests {
             menu_labels(&sidebar_menu(
                 "section:worktrees",
                 Some(&head),
-                Some(&extras)
+                Some(&extras),
+                None
             )),
             vec![
                 "Add worktree…",
@@ -1904,18 +2015,18 @@ mod tests {
             ]
         );
         // The other sections, folders and unknown keys have no menu.
-        assert!(sidebar_menu("section:local", Some(&head), Some(&extras)).is_empty());
-        assert!(sidebar_menu("section:stashes", Some(&head), Some(&extras)).is_empty());
-        assert!(sidebar_menu("section:submodules", Some(&head), Some(&extras)).is_empty());
-        assert!(sidebar_menu("folder:feat", Some(&head), Some(&extras)).is_empty());
-        assert!(sidebar_menu("unknown", Some(&head), Some(&extras)).is_empty());
+        assert!(sidebar_menu("section:local", Some(&head), Some(&extras), None).is_empty());
+        assert!(sidebar_menu("section:stashes", Some(&head), Some(&extras), None).is_empty());
+        assert!(sidebar_menu("section:submodules", Some(&head), Some(&extras), None).is_empty());
+        assert!(sidebar_menu("folder:feat", Some(&head), Some(&extras), None).is_empty());
+        assert!(sidebar_menu("unknown", Some(&head), Some(&extras), None).is_empty());
     }
 
     #[test]
     fn a_detached_head_says_head_in_the_branch_menus() {
         let detached = Head::Detached(oid());
         assert_eq!(
-            menu_labels(&sidebar_menu("local:feat/x", Some(&detached), None)),
+            menu_labels(&sidebar_menu("local:feat/x", Some(&detached), None, None)),
             vec![
                 "Checkout",
                 "Merge feat/x into HEAD",
@@ -1932,6 +2043,7 @@ mod tests {
             menu_labels(&sidebar_menu(
                 "rbranch:origin/feat/x",
                 Some(&detached),
+                None,
                 None
             )),
             vec![
@@ -1944,18 +2056,19 @@ mod tests {
         );
         // HEAD not read yet is named the same way.
         assert_eq!(
-            menu_labels(&sidebar_menu("local:feat/x", None, None))[1],
+            menu_labels(&sidebar_menu("local:feat/x", None, None, None))[1],
             "Merge feat/x into HEAD"
         );
     }
 
     #[test]
-    fn only_copy_branch_name_and_refresh_list_are_enabled() {
+    fn stage_seven_actions_are_enabled_and_network_stays_disabled() {
         let head = Head::Branch {
             name: "main".into(),
             target: None,
         };
         let extras = SidebarExtras {
+            remotes: vec!["origin".into()],
             worktrees: vec![worktree("/tmp/wt", None)],
             ..Default::default()
         };
@@ -1972,7 +2085,7 @@ mod tests {
             "section:worktrees",
         ];
         for key in keys {
-            let entries = sidebar_menu(key, Some(&head), Some(&extras));
+            let entries = sidebar_menu(key, Some(&head), Some(&extras), None);
             let enabled: Vec<&str> = entries
                 .iter()
                 .filter_map(|entry| match entry {
@@ -1981,8 +2094,17 @@ mod tests {
                 })
                 .collect();
             let expected: &[&str] = match key {
-                "local:feat/idle-lanes" => &["Copy branch name"],
-                "rbranch:origin/feat/idle-lanes" => &["Copy branch name"],
+                "local:feat/idle-lanes" => {
+                    &["Checkout", "Rename…", "Delete branch", "Copy branch name"]
+                }
+                "rbranch:origin/feat/idle-lanes" => {
+                    &["Checkout as local branch", "Copy branch name"]
+                }
+                "tag:v1" => &["Checkout", "Rename tag…", "Delete tag"],
+                "stash:0" => &["Apply stash", "Pop stash", "Drop stash"],
+                "remote:origin" => &["Edit remote…", "Remove remote"],
+                "section:remotes" => &["Add remote…"],
+                "section:tags" => &["Create tag…"],
                 "section:worktrees" => &["Refresh list"],
                 _ => &[],
             };
@@ -1990,33 +2112,56 @@ mod tests {
         }
 
         // The local branch copies its full name.
-        let local_menu = sidebar_menu("local:feat/idle-lanes", Some(&head), Some(&extras));
+        let local_menu = sidebar_menu("local:feat/idle-lanes", Some(&head), Some(&extras), None);
         assert_eq!(
             menu_item(&local_menu, "Copy branch name").action,
             SidebarAction::CopyText("feat/idle-lanes".to_owned())
         );
         // A remote branch copies `<remote>/<branch>`.
-        let remote_menu =
-            sidebar_menu("rbranch:origin/feat/idle-lanes", Some(&head), Some(&extras));
+        let remote_menu = sidebar_menu(
+            "rbranch:origin/feat/idle-lanes",
+            Some(&head),
+            Some(&extras),
+            None,
+        );
         assert_eq!(
             menu_item(&remote_menu, "Copy branch name").action,
             SidebarAction::CopyText("origin/feat/idle-lanes".to_owned())
         );
         // Refresh list reloads the sidebar's lists.
-        let worktrees_menu = sidebar_menu("section:worktrees", Some(&head), Some(&extras));
+        let worktrees_menu = sidebar_menu("section:worktrees", Some(&head), Some(&extras), None);
         assert_eq!(
             menu_item(&worktrees_menu, "Refresh list").action,
             SidebarAction::Refresh
         );
-        // Every other item is shown but disabled and does nothing.
-        for entry in &local_menu {
-            if let SidebarMenuEntry::Item(item) = entry {
-                if item.label != "Copy branch name" {
-                    assert!(!item.enabled);
-                    assert_eq!(item.action, SidebarAction::None);
-                }
-            }
-        }
+        // A tag resolves its commit so "Create branch here…" can open.
+        let refs = vec![Ref {
+            full_name: "refs/tags/v1".into(),
+            name: "v1".into(),
+            kind: RefKind::Tag,
+            target: oid(),
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            upstream_gone: false,
+        }];
+        let tag_menu = sidebar_menu("tag:v1", Some(&head), Some(&extras), Some(&refs));
+        assert_eq!(
+            menu_item(&tag_menu, "Create branch here…").action,
+            SidebarAction::CreateBranchAt(oid())
+        );
+        // The current branch is neither checked out nor deleted.
+        let current = sidebar_menu("local:main", Some(&head), Some(&extras), None);
+        assert_eq!(menu_item(&current, "Checkout").action, SidebarAction::None);
+        assert_eq!(
+            menu_item(&current, "Delete branch").action,
+            SidebarAction::None
+        );
+        // Network items keep their place and stay disabled.
+        assert!(!menu_item(&remote_menu, "Delete remote branch…").enabled);
+        assert!(!menu_item(&tag_menu, "Push tag to origin").enabled);
+        let stash_menu = sidebar_menu("stash:0", Some(&head), Some(&extras), None);
+        assert!(!menu_item(&stash_menu, "View changes").enabled);
         // The shortcut hints of the design are kept.
         assert_eq!(
             menu_item(&local_menu, "Checkout").shortcut.as_deref(),
@@ -2031,7 +2176,7 @@ mod tests {
             Some("Del")
         );
         assert!(menu_item(&local_menu, "Delete branch").danger);
-        let remotes_menu = sidebar_menu("section:remotes", Some(&head), Some(&extras));
+        let remotes_menu = sidebar_menu("section:remotes", Some(&head), Some(&extras), None);
         assert_eq!(
             menu_item(&remotes_menu, "Fetch all remotes")
                 .shortcut

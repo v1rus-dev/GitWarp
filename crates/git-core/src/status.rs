@@ -354,12 +354,7 @@ pub(crate) fn staged_diff(repo: &Repo, path: &str, old_path: Option<&str>) -> Re
     file_patch(repo, path, old_path, true)
 }
 
-fn file_patch(
-    repo: &Repo,
-    path: &str,
-    old_path: Option<&str>,
-    cached: bool,
-) -> Result<FileDiff> {
+fn file_patch(repo: &Repo, path: &str, old_path: Option<&str>, cached: bool) -> Result<FileDiff> {
     let mut command = repo.command();
     command.arg("diff");
     if cached {

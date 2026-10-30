@@ -8,6 +8,8 @@ mod history_state;
 mod history_view;
 mod init_flow;
 mod open_dialog;
+mod ref_dialog;
+mod ref_ops;
 mod repo_view;
 mod settings;
 mod sidebar;
@@ -197,6 +199,7 @@ fn main() {
                     repo_view::OpenBranchSwitcher,
                     None,
                 ),
+                ui::actions::key_binding(cx, "secondary-shift-s", repo_view::StashChanges, None),
                 // Welcome screen: Ctrl N opens the Initialize dialog and Del
                 // drops a recent entry.
                 ui::actions::key_binding(

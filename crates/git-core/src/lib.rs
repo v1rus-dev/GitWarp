@@ -11,6 +11,7 @@ mod error;
 mod git;
 mod log;
 mod oid;
+mod ops;
 mod refs;
 mod stash;
 mod status;
@@ -30,6 +31,7 @@ pub use error::{Error, ErrorClass, Result};
 pub use git::{Git, GitChoice, GitSource, GitVersion, Resolution};
 pub use log::{CommitCount, CommitInfo, LogKiller, LogOptions, LogStream};
 pub use oid::Oid;
+pub use ops::ResetMode;
 pub use refs::{Head, Ref, RefKind};
 pub use stash::Stash;
 pub use status::{HeadCommit, HunkPick, WorkingFile, WorkingStatus};
@@ -396,6 +398,117 @@ impl Repo {
     /// HEAD's commit, or `None` while the branch is unborn.
     pub fn head_commit(&self) -> Result<Option<HeadCommit>> {
         status::head_commit(self)
+    }
+
+    // ---- ref and history operations (stage 7) -------------------------
+
+    /// Checks out a local branch.
+    pub fn checkout_branch(&self, name: &str) -> Result<()> {
+        ops::checkout_branch(self, name)
+    }
+
+    /// Checks out a commit with a detached HEAD (a tag or an older commit).
+    pub fn checkout_detached(&self, oid: Oid) -> Result<()> {
+        ops::checkout_detached(self, oid)
+    }
+
+    /// Checks out a remote branch, creating a local tracking branch when one
+    /// with the same leaf name does not exist yet.
+    pub fn checkout_remote(&self, remote_ref: &str) -> Result<()> {
+        ops::checkout_remote(self, remote_ref)
+    }
+
+    /// Creates a branch at `start`; `checkout` switches to it straight away.
+    pub fn create_branch(&self, name: &str, start: Oid, checkout: bool) -> Result<()> {
+        ops::create_branch(self, name, start, checkout)
+    }
+
+    pub fn rename_branch(&self, old: &str, new: &str) -> Result<()> {
+        ops::rename_branch(self, old, new)
+    }
+
+    /// Deletes a local branch; `force` also drops unmerged commits.
+    pub fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
+        ops::delete_branch(self, name, force)
+    }
+
+    /// Creates a lightweight tag, or an annotated (and optionally signed) one
+    /// when `message` is given.
+    pub fn create_tag(
+        &self,
+        name: &str,
+        target: Oid,
+        message: Option<&str>,
+        sign: bool,
+    ) -> Result<()> {
+        ops::create_tag(self, name, target, message, sign)
+    }
+
+    pub fn rename_tag(&self, old: &str, new: &str) -> Result<()> {
+        ops::rename_tag(self, old, new)
+    }
+
+    pub fn delete_tag(&self, name: &str) -> Result<()> {
+        ops::delete_tag(self, name)
+    }
+
+    pub fn add_remote(&self, name: &str, url: &str) -> Result<()> {
+        ops::add_remote(self, name, url)
+    }
+
+    pub fn set_remote_url(&self, name: &str, url: &str) -> Result<()> {
+        ops::set_remote_url(self, name, url)
+    }
+
+    pub fn rename_remote(&self, old: &str, new: &str) -> Result<()> {
+        ops::rename_remote(self, old, new)
+    }
+
+    pub fn remove_remote(&self, name: &str) -> Result<()> {
+        ops::remove_remote(self, name)
+    }
+
+    /// The fetch URL of `name`, or `None` when no such remote is configured.
+    pub fn remote_url(&self, name: &str) -> Result<Option<String>> {
+        ops::remote_url(self, name)
+    }
+
+    /// Applies `oid` on top of HEAD; a conflict is aborted and returned.
+    pub fn cherry_pick(&self, oid: Oid) -> Result<()> {
+        ops::cherry_pick(self, oid)
+    }
+
+    /// Reverts `oid` with a new commit; a conflict is aborted and returned.
+    pub fn revert(&self, oid: Oid) -> Result<()> {
+        ops::revert(self, oid)
+    }
+
+    /// Moves HEAD to `oid`, rewriting the index and work tree per `mode`.
+    pub fn reset(&self, oid: Oid, mode: ResetMode) -> Result<()> {
+        ops::reset(self, oid, mode)
+    }
+
+    /// Stashes all local changes including untracked files; `false` when the
+    /// work tree was already clean.
+    pub fn stash_save(&self, message: Option<&str>) -> Result<bool> {
+        ops::stash_save(self, message)
+    }
+
+    pub fn stash_apply(&self, index: usize) -> Result<()> {
+        ops::stash_apply(self, index)
+    }
+
+    pub fn stash_pop(&self, index: usize) -> Result<()> {
+        ops::stash_pop(self, index)
+    }
+
+    pub fn stash_drop(&self, index: usize) -> Result<()> {
+        ops::stash_drop(self, index)
+    }
+
+    /// `user.signingkey`, for the tag dialog's signing option.
+    pub fn signing_key(&self) -> Result<Option<String>> {
+        ops::signing_key(self)
     }
 }
 

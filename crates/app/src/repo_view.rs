@@ -24,9 +24,9 @@ use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
 use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, MONO, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    menu, Avatar, Button, CountPill, FileRow, Icon, IconName, MenuEntry, MenuItem, Scrollbar,
-    SearchField, SegmentItem, Segmented, Skeleton, Spinner, Splitter, TextInput, TextInputEvent,
-    Tooltip, Tree, TreeNodeData,
+    menu, toast, Avatar, Button, CountPill, Counter, FileRow, Icon, IconName, MenuEntry, MenuItem,
+    Scrollbar, SearchField, SegmentItem, Segmented, Skeleton, Spinner, Splitter, TextInput,
+    TextInputEvent, Tooltip, Tree, TreeNodeData,
 };
 
 use crate::changes_view::{ChangesEvent, ChangesView};
@@ -35,6 +35,8 @@ use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
 use crate::format::{absolute_time, format_count, relative_time};
 use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
+use crate::ref_dialog::{self, RefDialog, RefDialogContext, RefDialogKind, RemoteEdit};
+use crate::ref_ops::{CommitCard, RefAction};
 use crate::settings::{
     DiffLayout, Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN,
 };
@@ -58,7 +60,8 @@ actions!(
         SearchClear,
         SearchFocusList,
         OpenRepoSwitcher,
-        OpenBranchSwitcher
+        OpenBranchSwitcher,
+        StashChanges
     ]
 );
 
@@ -357,6 +360,10 @@ pub struct RepositoryView {
     /// Window bounds of the two dropdown anchors, captured while painting.
     repo_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     branch_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The stage 7 dialog currently open, if any.
+    ref_dialog: Option<Entity<RefDialog>>,
+    /// A ref operation without a dialog (checkout, stash apply, …) is running.
+    ref_action_running: bool,
 }
 
 impl RepositoryView {
@@ -374,8 +381,23 @@ impl RepositoryView {
         let name = repo_name(&path);
         let git_label = git_label(&git);
         let git_tooltip = git_tooltip(&git);
-        let history =
-            cx.new(|cx| HistoryView::open(path.clone(), git.clone(), workspace.clone(), cx));
+        let action_view = cx.entity();
+        let on_history_action = Rc::new(
+            move |action: RefAction, window: &mut Window, cx: &mut App| {
+                action_view.update(cx, |view, cx| {
+                    view.handle_history_action(action, window, cx);
+                });
+            },
+        );
+        let history = cx.new(|cx| {
+            HistoryView::open(
+                path.clone(),
+                git.clone(),
+                workspace.clone(),
+                on_history_action,
+                cx,
+            )
+        });
         let observer = cx.observe(&history, |this, history, cx| {
             // A repository opened from a subdirectory is remembered by its
             // root, so the switcher's "current" marker must follow it.
@@ -500,6 +522,8 @@ impl RepositoryView {
             files_focus: cx.focus_handle().tab_stop(true),
             repo_bounds: Rc::new(Cell::new(None)),
             branch_bounds: Rc::new(Cell::new(None)),
+            ref_dialog: None,
+            ref_action_running: false,
         }
     }
 
@@ -669,11 +693,15 @@ impl RepositoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let model = sidebar_menu(
-            key,
-            self.history.read(cx).head(),
-            self.sidebar_extras.as_ref(),
-        );
+        let model = {
+            let history = self.history.read(cx);
+            sidebar_menu(
+                key,
+                history.head(),
+                self.sidebar_extras.as_ref(),
+                history.refs(),
+            )
+        };
         if model.is_empty() {
             return;
         }
@@ -693,24 +721,327 @@ impl RepositoryView {
                     if item.danger {
                         menu_item = menu_item.danger();
                     }
-                    menu_item = match item.action {
-                        SidebarAction::CopyText(text) => menu_item.action(move |_, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                        }),
-                        SidebarAction::Refresh => {
-                            let view = view.clone();
-                            menu_item.action(move |_, cx| {
-                                view.update(cx, |view, cx| view.refresh(cx));
-                            })
-                        }
-                        SidebarAction::None => menu_item,
-                    };
+                    if !matches!(item.action, SidebarAction::None) {
+                        let action = item.action.clone();
+                        let view = view.clone();
+                        menu_item = menu_item.action(move |window, cx| {
+                            view.update(cx, |view, cx| {
+                                view.run_sidebar_action(action.clone(), window, cx);
+                            });
+                        });
+                    }
                     MenuEntry::Item(menu_item)
                 }
             })
             .collect();
         menu::open_context_menu(position, entries, window, cx);
         cx.notify();
+    }
+
+    /// Runs one stage 7 sidebar action: the checkout/stash operations start at
+    /// once, the rest open a dialog.
+    fn run_sidebar_action(
+        &mut self,
+        action: SidebarAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            SidebarAction::None => {}
+            SidebarAction::CopyText(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            SidebarAction::Refresh => self.refresh(cx),
+            SidebarAction::CheckoutBranch(name) => {
+                self.run_repo_action(window, cx, move |repo| {
+                    repo.checkout_branch(&name)?;
+                    Ok((ui::ToastKind::Ok, format!("Switched to {name}")))
+                });
+            }
+            SidebarAction::CheckoutRemoteBranch(remote) => {
+                self.run_repo_action(window, cx, move |repo| {
+                    repo.checkout_remote(&remote)?;
+                    Ok((ui::ToastKind::Ok, format!("Checked out {remote}")))
+                });
+            }
+            SidebarAction::CheckoutTag(name) => {
+                let target = {
+                    let history = self.history.read(cx);
+                    commit_for(
+                        &format!("tag:{name}"),
+                        history.refs().unwrap_or(&[]),
+                        self.sidebar_extras.as_ref(),
+                    )
+                };
+                let Some(target) = target else {
+                    toast::show(
+                        ui::ToastKind::Warn,
+                        "The tag has no commit to check out",
+                        window,
+                        cx,
+                    );
+                    return;
+                };
+                self.run_repo_action(window, cx, move |repo| {
+                    repo.checkout_detached(target)?;
+                    Ok((
+                        ui::ToastKind::Ok,
+                        format!("Checked out tag {name} (detached HEAD)"),
+                    ))
+                });
+            }
+            SidebarAction::CreateBranchAt(oid) => {
+                let card = self.card_for(oid, cx);
+                self.open_ref_dialog(RefDialogKind::CreateBranch { card }, window, cx);
+            }
+            SidebarAction::RenameBranch(old) => {
+                self.open_ref_dialog(RefDialogKind::RenameBranch { old }, window, cx);
+            }
+            SidebarAction::DeleteBranch(name) => {
+                self.open_ref_dialog(
+                    RefDialogKind::DeleteBranch { name, force: false },
+                    window,
+                    cx,
+                );
+            }
+            SidebarAction::RenameTag(old) => {
+                self.open_ref_dialog(RefDialogKind::RenameTag { old }, window, cx);
+            }
+            SidebarAction::DeleteTag(name) => {
+                self.open_ref_dialog(RefDialogKind::DeleteTag { name }, window, cx);
+            }
+            SidebarAction::ApplyStash(index) => {
+                self.run_repo_action(window, cx, move |repo| {
+                    repo.stash_apply(index)?;
+                    Ok((ui::ToastKind::Ok, format!("Applied stash@{{{index}}}")))
+                });
+            }
+            SidebarAction::PopStash(index) => {
+                self.run_repo_action(window, cx, move |repo| {
+                    repo.stash_pop(index)?;
+                    Ok((ui::ToastKind::Ok, format!("Popped stash@{{{index}}}")))
+                });
+            }
+            SidebarAction::DropStash(index) => {
+                let label = self
+                    .sidebar_extras
+                    .as_ref()
+                    .and_then(|extras| {
+                        extras
+                            .stashes
+                            .iter()
+                            .find(|stash| stash.index == index)
+                            .map(|stash| stash.message.clone())
+                    })
+                    .unwrap_or_else(|| format!("stash@{{{index}}}"));
+                self.open_ref_dialog(RefDialogKind::DropStash { index, label }, window, cx);
+            }
+            SidebarAction::CreateTag => {
+                // "Here" is the selected commit, as in the design, with HEAD
+                // as the fallback when nothing is selected yet.
+                let oid = self
+                    .history
+                    .read(cx)
+                    .selected_commit()
+                    .map(|commit| commit.id)
+                    .or_else(|| self.head_oid(cx));
+                let Some(oid) = oid else {
+                    toast::show(
+                        ui::ToastKind::Warn,
+                        "Create a commit before tagging",
+                        window,
+                        cx,
+                    );
+                    return;
+                };
+                let card = self.card_for(oid, cx);
+                self.open_ref_dialog(RefDialogKind::CreateTag { card }, window, cx);
+            }
+            SidebarAction::AddRemote => {
+                self.open_ref_dialog(RefDialogKind::Remote { editing: None }, window, cx);
+            }
+            SidebarAction::EditRemote(name) => {
+                let url = self
+                    .sidebar_extras
+                    .as_ref()
+                    .and_then(|extras| {
+                        extras
+                            .remote_urls
+                            .iter()
+                            .find(|(remote, _)| *remote == name)
+                            .map(|(_, url)| url.clone())
+                    })
+                    .unwrap_or_default();
+                self.open_ref_dialog(
+                    RefDialogKind::Remote {
+                        editing: Some(RemoteEdit { name, url }),
+                    },
+                    window,
+                    cx,
+                );
+            }
+            SidebarAction::RemoveRemote(name) => {
+                self.open_ref_dialog(RefDialogKind::RemoveRemote { name }, window, cx);
+            }
+        }
+    }
+
+    /// Runs one history-row action.
+    fn handle_history_action(
+        &mut self,
+        action: RefAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let kind = match action {
+            RefAction::CreateBranch(card) => RefDialogKind::CreateBranch { card },
+            RefAction::CreateTag(card) => RefDialogKind::CreateTag { card },
+            RefAction::CherryPick(card) => RefDialogKind::CherryPick { card },
+            RefAction::Revert(card) => RefDialogKind::Revert { card },
+            RefAction::Reset(card) => RefDialogKind::Reset { card },
+        };
+        self.open_ref_dialog(kind, window, cx);
+    }
+
+    /// HEAD's commit, or `None` while the branch is unborn.
+    fn head_oid(&self, cx: &App) -> Option<Oid> {
+        match self.history.read(cx).head()? {
+            Head::Branch { target, .. } => *target,
+            Head::Detached(oid) => Some(*oid),
+        }
+    }
+
+    /// The commit card for a history row or a sidebar ref target.
+    fn card_for(&self, oid: Oid, cx: &Context<Self>) -> CommitCard {
+        self.history.read(cx).card_for(oid)
+    }
+
+    /// The refs, remotes and HEAD a ref dialog needs.
+    fn ref_dialog_context(&self, cx: &Context<Self>) -> RefDialogContext {
+        let (refs, head_oid, branch) = {
+            let history = self.history.read(cx);
+            let refs = history.refs().unwrap_or(&[]).to_vec();
+            let head_oid = match history.head() {
+                Some(Head::Branch { target, .. }) => *target,
+                Some(Head::Detached(oid)) => Some(*oid),
+                None => None,
+            };
+            let branch = match history.head() {
+                Some(Head::Branch { name, .. }) => name.clone(),
+                _ => "HEAD".to_owned(),
+            };
+            (refs, head_oid, branch)
+        };
+        let remotes = self
+            .sidebar_extras
+            .as_ref()
+            .map(|extras| extras.remotes.clone())
+            .unwrap_or_default();
+        let signing_key = self
+            .sidebar_extras
+            .as_ref()
+            .and_then(|extras| extras.signing_key.clone());
+        let changes = self.changes.read(cx);
+        let dirty = changes.staged_count() + changes.unstaged_count();
+        RefDialogContext {
+            root: self.root.clone(),
+            git: self.git.clone(),
+            refs,
+            remotes,
+            signing_key,
+            head_oid,
+            branch,
+            dirty,
+        }
+    }
+
+    fn open_ref_dialog(
+        &mut self,
+        kind: RefDialogKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A second menu action while one dialog is still open replaces it
+        // rather than stacking two modals.
+        if let Some(previous) = self.ref_dialog.clone() {
+            previous.update(cx, |dialog, cx| dialog.close(window, cx));
+        }
+        let context = self.ref_dialog_context(cx);
+        let view = cx.entity();
+        let on_done = Rc::new(move |window: &mut Window, cx: &mut App| {
+            view.update(cx, |view, cx| {
+                // The dialog entity stays owned until the next one replaces
+                // it: dropping it here would free the state that is running
+                // this callback.
+                view.after_ref_change(cx);
+                window.refresh();
+            });
+        });
+        let dialog = ref_dialog::open(kind, context, on_done, window, cx);
+        self.ref_dialog = Some(dialog);
+    }
+
+    /// Reloads everything a ref operation can have changed: the history and
+    /// its badges, the sidebar's lists, the local-changes view and HEAD.
+    fn after_ref_change(&mut self, cx: &mut Context<Self>) {
+        self.history.update(cx, |history, cx| history.reload(cx));
+        self.changes.update(cx, |changes, cx| changes.refresh(cx));
+        self.refresh(cx);
+        cx.notify();
+    }
+
+    /// Runs a repository mutation without a dialog, then reloads the views.
+    fn run_repo_action<F>(&mut self, window: &mut Window, cx: &mut Context<Self>, action: F)
+    where
+        F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)> + Send + 'static,
+    {
+        if self.ref_action_running {
+            return;
+        }
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+                return;
+            }
+        };
+        self.ref_action_running = true;
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = git_core::Repo::open(git, &root)?;
+                    action(&repo)
+                })
+                .await;
+            this.update_in(cx, |view, window, cx| {
+                view.ref_action_running = false;
+                match result {
+                    Ok((kind, notice)) => {
+                        toast::show(kind, notice, window, cx);
+                        view.after_ref_change(cx);
+                    }
+                    Err(error) => {
+                        toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The toolbar's Stash button: stashes every local change.
+    fn stash_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_repo_action(window, cx, |repo| {
+            if repo.stash_save(None)? {
+                Ok((ui::ToastKind::Ok, "Stashed local changes".to_owned()))
+            } else {
+                Ok((ui::ToastKind::Info, "No local changes to stash".to_owned()))
+            }
+        });
     }
 
     /// Starts the sidebar's background load when the history first reports a
@@ -1068,55 +1399,70 @@ impl RepositoryView {
             _ => None,
         };
         let Some(refs) = history.refs() else {
-            return vec![
-                MenuEntry::Item(
-                    MenuItem::new("Checkout arrives in a later version")
-                        .icon(IconName::Branch)
-                        .disabled(true),
-                ),
-                MenuEntry::Separator,
-                MenuEntry::Item(
-                    MenuItem::new("Loading branches…")
-                        .icon(IconName::Branch)
-                        .disabled(true),
-                ),
-            ];
-        };
-        // The rows are branch targets for a checkout that does not exist yet;
-        // say so before the (disabled) rows instead of leaving them looking
-        // broken.
-        let mut entries: Vec<MenuEntry> = vec![
-            MenuEntry::Item(
-                MenuItem::new("Checkout arrives in a later version")
+            return vec![MenuEntry::Item(
+                MenuItem::new("Loading branches…")
                     .icon(IconName::Branch)
                     .disabled(true),
-            ),
-            MenuEntry::Separator,
-        ];
-        entries.extend(
-            refs.iter()
-                .filter(|r| r.kind == RefKind::LocalBranch)
-                .map(|r| {
-                    let current = head_branch == Some(r.name.as_str());
-                    MenuEntry::Item(
-                        MenuItem::new(r.name.clone())
-                            .icon(if current {
-                                IconName::Check
-                            } else {
-                                IconName::Branch
-                            })
-                            // Checkout is stage 7.
-                            .disabled(true),
-                    )
-                }),
-        );
-        if entries.len() == 2 {
+            )];
+        };
+        let mut entries: Vec<MenuEntry> = Vec::new();
+        let mut count = 0;
+        for branch in refs.iter().filter(|r| r.kind == RefKind::LocalBranch) {
+            let current = head_branch == Some(branch.name.as_str());
+            let mut item = MenuItem::new(branch.name.clone())
+                .icon(if current {
+                    IconName::Check
+                } else {
+                    IconName::Branch
+                })
+                .disabled(current);
+            if !current {
+                let name = branch.name.clone();
+                let view = cx.entity();
+                item = item.action(move |window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.run_sidebar_action(
+                            SidebarAction::CheckoutBranch(name.clone()),
+                            window,
+                            cx,
+                        );
+                    });
+                });
+            }
+            entries.push(MenuEntry::Item(item));
+            count += 1;
+        }
+        if count == 0 {
             entries.push(MenuEntry::Item(
                 MenuItem::new("No local branches")
                     .icon(IconName::Branch)
                     .disabled(true),
             ));
         }
+        entries.push(MenuEntry::Separator);
+        let head_oid = match history.head() {
+            Some(Head::Branch { target, .. }) => *target,
+            Some(Head::Detached(oid)) => Some(*oid),
+            None => None,
+        };
+        let card = head_oid.map(CommitCard::bare);
+        let mut create = MenuItem::new("Create branch…").icon(IconName::Plus);
+        if let Some(card) = card {
+            let view = cx.entity();
+            let card = history.card_for(card.oid);
+            create = create.action(move |window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_ref_dialog(
+                        RefDialogKind::CreateBranch { card: card.clone() },
+                        window,
+                        cx,
+                    );
+                });
+            });
+        } else {
+            create = create.disabled(true);
+        }
+        entries.push(MenuEntry::Item(create));
         entries
     }
 
@@ -1178,6 +1524,25 @@ impl RepositoryView {
             colors,
         );
 
+        let stash_count = self
+            .sidebar_extras
+            .as_ref()
+            .map(|extras| extras.stashes.len())
+            .unwrap_or(0);
+        let stash_view = cx.entity();
+        let mut stash_button = Button::tool("toolbar-stash")
+            .icon(IconName::Stash)
+            .tooltip_kbd("Stash local changes", "Ctrl Shift S")
+            .on_click(move |_, window, cx| {
+                stash_view.update(cx, |view, cx| view.stash_changes(window, cx));
+            });
+        if layout.labels {
+            stash_button = stash_button.label("Stash");
+        }
+        if stash_count > 0 {
+            stash_button = stash_button.counter(Counter::new(stash_count.to_string()));
+        }
+
         let mut bar = titlebar(cx)
             .gap(px(layout.gap))
             .px(px(layout.padding))
@@ -1208,13 +1573,7 @@ impl RepositoryView {
                 "Push — arrives in a later version",
                 layout.labels,
             )))
-            .child(no_shrink(tool_button(
-                "toolbar-stash",
-                IconName::Stash,
-                "Stash",
-                "Stash — arrives in a later version",
-                layout.labels,
-            )))
+            .child(no_shrink(stash_button))
             .child(titlebar_fill());
 
         let history_item = if layout.labels {
@@ -2333,6 +2692,9 @@ impl Render for RepositoryView {
             }))
             .on_action(cx.listener(|view, _: &OpenBranchSwitcher, window, cx| {
                 view.open_branch_menu(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &StashChanges, window, cx| {
+                view.stash_changes(window, cx);
             }))
             .child(toolbar)
             .child(body)
@@ -3516,5 +3878,117 @@ mod tests {
             history.read_with(&cx, |view, _| view.search_status().map(|s| s.to_string())),
             Some("1 / 1".to_owned())
         );
+    }
+    /// The history row's "Create branch here…" opens the dialog, and its
+    /// primary button creates the branch and switches to it.
+    #[gpui::test]
+    fn the_create_branch_dialog_creates_and_switches(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("branch-dialog");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+
+        let oid = view
+            .read_with(&cx, |view, cx| view.head_oid(cx))
+            .expect("the history loaded HEAD");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let card = view.card_for(oid, cx);
+                view.handle_history_action(
+                    crate::ref_ops::RefAction::CreateBranch(card),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let dialog = view
+            .read_with(&cx, |view, _| view.ref_dialog.clone())
+            .expect("the branch dialog opened");
+        dialog.update(&mut cx, |dialog, cx| {
+            dialog.set_name_for_test("feat/two", cx)
+        });
+        cx.update(|window, cx| {
+            dialog.update(cx, |dialog, cx| dialog.submit_for_test(window, cx));
+        });
+        cx.run_until_parked();
+        cx.run_until_parked();
+
+        let repo = git_core::Repo::open(crate::test_support::git(), repo.path()).unwrap();
+        assert!(repo
+            .refs()
+            .unwrap()
+            .iter()
+            .any(|r| r.name == "feat/two" && r.kind == git_core::RefKind::LocalBranch));
+        match repo.head().unwrap() {
+            Head::Branch { name, .. } => assert_eq!(name, "feat/two"),
+            Head::Detached(_) => panic!("creating a branch left a detached HEAD"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("a.txt")).unwrap(),
+            "one\n"
+        );
+    }
+
+    /// The toolbar's Stash button stashes every local change.
+    #[gpui::test]
+    fn the_stash_button_saves_local_changes(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("stash-button");
+        commit(repo.path(), "a.txt", "one\n");
+        std::fs::write(repo.path().join("a.txt"), "two\n").unwrap();
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.stash_changes(window, cx));
+        });
+        cx.run_until_parked();
+        cx.run_until_parked();
+
+        let repo = git_core::Repo::open(crate::test_support::git(), repo.path()).unwrap();
+        assert_eq!(repo.stashes().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("a.txt")).unwrap(),
+            "one\n"
+        );
+    }
+
+    /// Checking out a branch from the sidebar switcher moves HEAD and reloads
+    /// the history.
+    #[gpui::test]
+    fn a_sidebar_checkout_moves_head(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("sidebar-checkout");
+        commit(repo.path(), "a.txt", "one\n");
+        let oid = git_core::Repo::open(crate::test_support::git(), repo.path())
+            .unwrap()
+            .head_commit()
+            .unwrap()
+            .unwrap()
+            .id;
+        git_core::Repo::open(crate::test_support::git(), repo.path())
+            .unwrap()
+            .create_branch("feature", oid, false)
+            .unwrap();
+
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.run_sidebar_action(
+                    crate::sidebar::SidebarAction::CheckoutBranch("feature".into()),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.run_until_parked();
+
+        let repo = git_core::Repo::open(crate::test_support::git(), repo.path()).unwrap();
+        match repo.head().unwrap() {
+            Head::Branch { name, .. } => assert_eq!(name, "feature"),
+            Head::Detached(_) => panic!("checkout left a detached HEAD"),
+        }
     }
 }
