@@ -1551,9 +1551,18 @@ impl HistoryView {
 
     /// The short hash of the selected commit, for the details header.
     pub fn selected_short(&self) -> Option<SharedString> {
+        self.selected.and_then(|ix| self.items.get(ix)).map(|item| {
+            let mut hash = item.commit.id.to_string();
+            hash.truncate(7);
+            hash.into()
+        })
+    }
+
+    /// The selected commit, for the details dock.
+    pub fn selected_commit(&self) -> Option<Arc<CommitInfo>> {
         self.selected
             .and_then(|ix| self.items.get(ix))
-            .map(|item| item.commit.id.short().into())
+            .map(|item| item.commit.clone())
     }
 
     /// The graph header cell: the label, the "+N" clipped-lanes pill, the

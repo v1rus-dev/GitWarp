@@ -45,6 +45,8 @@ pub struct Settings {
     pub graph_width: f32,
     /// Whether idle lanes fold into gap lanes.
     pub collapse_idle_lanes: bool,
+    /// How the commit diff pane lays out a file.
+    pub diff_layout: DiffLayout,
 }
 
 impl Default for Settings {
@@ -57,6 +59,7 @@ impl Default for Settings {
             details_size: None,
             graph_width: GRAPH_WIDTH_DEFAULT,
             collapse_idle_lanes: false,
+            diff_layout: DiffLayout::default(),
         }
     }
 }
@@ -128,6 +131,17 @@ impl From<ThemePref> for ui::ThemeMode {
             ThemePref::Light => ui::ThemeMode::Light,
         }
     }
+}
+
+/// How the diff pane lays out a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiffLayout {
+    /// One column with `-`/`+` rows.
+    #[default]
+    Unified,
+    /// Old and new side by side.
+    Split,
 }
 
 /// Where the dock sits.
@@ -266,6 +280,7 @@ fn settings_from_value(value: Value) -> Settings {
             "collapse_idle_lanes",
             defaults.collapse_idle_lanes,
         ),
+        diff_layout: take(&mut object, "diff_layout", defaults.diff_layout),
     }
 }
 
@@ -367,6 +382,7 @@ mod tests {
             details_size: Some(180.0),
             graph_width: 176.0,
             collapse_idle_lanes: true,
+            diff_layout: DiffLayout::Split,
         };
         store.save(&settings).unwrap();
         assert_eq!(store.load(), settings);
@@ -459,6 +475,22 @@ mod tests {
             GRAPH_WIDTH_DEFAULT
         );
         assert!(load_json(dir.path(), r#"{"collapse_idle_lanes":true}"#).collapse_idle_lanes);
+    }
+
+    #[test]
+    fn diff_layout_defaults_to_unified_and_round_trips() {
+        assert_eq!(Settings::default().diff_layout, DiffLayout::Unified);
+        let dir = TempDir::new("diff-layout");
+        let old = load_json(dir.path(), r#"{"theme":"dark"}"#);
+        assert_eq!(old.diff_layout, DiffLayout::Unified);
+        assert_eq!(
+            load_json(dir.path(), r#"{"diff_layout":"split"}"#).diff_layout,
+            DiffLayout::Split
+        );
+        assert_eq!(
+            load_json(dir.path(), r#"{"diff_layout":"diagonal"}"#).diff_layout,
+            DiffLayout::Unified
+        );
     }
 
     #[test]

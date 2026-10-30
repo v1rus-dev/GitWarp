@@ -5,34 +5,43 @@
 //! stage is a placeholder or a disabled control, never a dead click.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, canvas, div, point, px, size, App, AppContext, Bounds, ClickEvent, ClipboardItem,
-    Context, Decorations, Div, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, WeakEntity, Window,
+    actions, canvas, div, point, px, size, uniform_list, AnyElement, App, AppContext, Bounds,
+    ClickEvent, ClipboardItem, Context, Decorations, Div, Entity, FocusHandle, FontWeight, Hsla,
+    InteractiveElement, IntoElement, ListHorizontalSizingBehavior, MouseButton, ParentElement,
+    Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    StyledText, Subscription, TextRun, UniformListScrollHandle, WeakEntity, Window,
 };
 
-use git_core::{Error, Git, Head, RefKind};
-use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_SM, R_SM, STATUS};
+use git_core::{ChangedFile, CommitDetails, CommitInfo, Error, Git, Head, Oid, RefKind};
+use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
+use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, MONO, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    menu, Button, Icon, IconName, MenuEntry, MenuItem, SearchField, SegmentItem, Segmented,
-    Spinner, Splitter, TextInput, TextInputEvent, Tooltip, Tree, TreeNodeData,
+    menu, Avatar, Button, CountPill, FileRow, Icon, IconName, MenuEntry, MenuItem, Scrollbar,
+    SearchField, SegmentItem, Segmented, Skeleton, Spinner, Splitter, TextInput, TextInputEvent,
+    Tooltip, Tree, TreeNodeData,
 };
 
-use crate::format::format_count;
+use crate::details::{read_details, read_diff, DetailsState, DiffState};
+use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
+use crate::format::{absolute_time, format_count, relative_time};
 use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
-use crate::settings::{Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
+use crate::settings::{
+    DiffLayout, Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN,
+};
 use crate::sidebar::{
     commit_for, read_sidebar_extras, sidebar_menu, sidebar_nodes, Expansion, SidebarAction,
     SidebarExtras, SidebarMenuEntry,
 };
+use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
@@ -310,6 +319,30 @@ pub struct RepositoryView {
     dock: Dock,
     details_open: bool,
     details_size: f32,
+    /// What the selected commit's details dock shows.
+    details: DetailsState,
+    /// The commit `details` belongs to; `None` while nothing is selected.
+    details_oid: Option<Oid>,
+    /// Bumped per details load; an older result that finishes later is dropped.
+    details_generation: u64,
+    /// The row of `details.files()` the diff pane shows.
+    selected_file: Option<usize>,
+    /// The selected file's diff.
+    diff: DiffState,
+    /// Bumped per diff load; an older result that finishes later is dropped.
+    diff_generation: u64,
+    diff_scroll: UniformListScrollHandle,
+    /// Advance of one mono character at [`MONO`], for the diff's scroll width.
+    mono_cell: Pixels,
+    /// Unified or side-by-side, persisted in the settings.
+    diff_layout: DiffLayout,
+    /// Syntax spans per (commit, path), so revisiting a file is free.
+    highlight_cache: HashMap<(Oid, String), Arc<Highlighted>>,
+    info_scroll: ScrollHandle,
+    files_scroll: ScrollHandle,
+    /// The file list's keyboard focus; arrow keys move the file selection only
+    /// while it is focused.
+    files_focus: FocusHandle,
     /// Window bounds of the two dropdown anchors, captured while painting.
     repo_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     branch_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -335,15 +368,23 @@ impl RepositoryView {
         let observer = cx.observe(&history, |this, history, cx| {
             // A repository opened from a subdirectory is remembered by its
             // root, so the switcher's "current" marker must follow it.
-            if let Some(root) = history.read(cx).root() {
+            let (root, selected) = {
+                let history = history.read(cx);
+                (
+                    history.root().map(std::path::Path::to_path_buf),
+                    history.selected_commit(),
+                )
+            };
+            if let Some(root) = root {
                 if this.root != root {
-                    this.root = root.to_path_buf();
-                    this.repo_name = repo_name(root);
+                    this.root = root.clone();
+                    this.repo_name = repo_name(&root);
                 }
                 // The sidebar's own lists need the root: load them once, when
                 // the history first reports it.
                 this.ensure_sidebar(cx);
             }
+            this.sync_details(selected, cx);
             cx.notify();
         });
         let search = cx.new(|cx| {
@@ -418,6 +459,25 @@ impl RepositoryView {
             dock,
             details_open: true,
             details_size,
+            details: DetailsState::Empty,
+            details_oid: None,
+            details_generation: 0,
+            selected_file: None,
+            diff: DiffState::Empty,
+            diff_generation: 0,
+            diff_scroll: UniformListScrollHandle::new(),
+            mono_cell: window
+                .text_system()
+                .ch_advance(
+                    window.text_system().resolve_font(&gpui::font(FONT_MONO)),
+                    MONO,
+                )
+                .unwrap_or(px(7.2)),
+            diff_layout: settings.diff_layout,
+            highlight_cache: HashMap::new(),
+            info_scroll: ScrollHandle::new(),
+            files_scroll: ScrollHandle::new(),
+            files_focus: cx.focus_handle().tab_stop(true),
             repo_bounds: Rc::new(Cell::new(None)),
             branch_bounds: Rc::new(Cell::new(None)),
         }
@@ -684,6 +744,200 @@ impl RepositoryView {
             return;
         }
         self.sidebar_extras = Some(extras);
+        cx.notify();
+    }
+
+    /// Loads the details when the history selection moved to another commit,
+    /// and clears them when nothing is selected.
+    fn sync_details(&mut self, selected: Option<Arc<CommitInfo>>, cx: &mut Context<Self>) {
+        let Some(commit) = selected else {
+            if self.details_oid.take().is_some() {
+                self.details_generation = self.details_generation.wrapping_add(1);
+                self.details = DetailsState::Empty;
+                self.selected_file = None;
+                self.diff_generation = self.diff_generation.wrapping_add(1);
+                self.diff = DiffState::Empty;
+                cx.notify();
+            }
+            return;
+        };
+        if self.details_oid == Some(commit.id) {
+            return;
+        }
+        self.start_details(commit.id, cx);
+    }
+
+    /// Reads one commit's details and changed files in the background.
+    fn start_details(&mut self, oid: Oid, cx: &mut Context<Self>) {
+        self.details_oid = Some(oid);
+        self.selected_file = None;
+        self.diff_generation = self.diff_generation.wrapping_add(1);
+        self.diff = DiffState::Empty;
+        self.details_generation = self.details_generation.wrapping_add(1);
+        let generation = self.details_generation;
+        self.details = DetailsState::Loading;
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                self.details = DetailsState::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { read_details(git, &root, oid) })
+                .await;
+            this.update(cx, |view, cx| view.set_details(generation, result, cx))
+                .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn set_details(
+        &mut self,
+        generation: u64,
+        result: Result<crate::details::CommitDetailsData, String>,
+        cx: &mut Context<Self>,
+    ) {
+        // A newer selection owns the pane now; this older answer is stale.
+        if generation != self.details_generation {
+            return;
+        }
+        match result {
+            Ok(data) => {
+                self.selected_file = (!data.files.is_empty()).then_some(0);
+                self.details = DetailsState::Loaded(Box::new(data));
+                self.start_diff(cx);
+            }
+            Err(error) => {
+                log::warn!("could not read the commit details: {error}");
+                self.details = DetailsState::Failed(error);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Selects one changed file and scrolls it into view.
+    fn select_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        let count = self.details.files().map(<[ChangedFile]>::len).unwrap_or(0);
+        if index >= count || self.selected_file == Some(index) {
+            return;
+        }
+        self.selected_file = Some(index);
+        self.files_scroll.scroll_to_item(index);
+        self.start_diff(cx);
+        cx.notify();
+    }
+
+    /// Moves the file selection by `step`, clamped at the ends.
+    fn step_file(&mut self, step: isize, cx: &mut Context<Self>) {
+        let count = self.details.files().map(<[ChangedFile]>::len).unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        let current = self.selected_file.unwrap_or(0) as isize;
+        let next = current.saturating_add(step).clamp(0, count as isize - 1) as usize;
+        self.select_file(next, cx);
+    }
+
+    /// Focuses the file list, so its arrow keys work.
+    fn focus_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.files_focus, cx);
+    }
+
+    /// Reads the selected file's diff in the background.
+    fn start_diff(&mut self, cx: &mut Context<Self>) {
+        self.diff_generation = self.diff_generation.wrapping_add(1);
+        let generation = self.diff_generation;
+        self.diff_scroll = UniformListScrollHandle::new();
+        self.diff = DiffState::Loading;
+        let (Some(oid), Some(file)) = (
+            self.details_oid,
+            self.selected_file
+                .and_then(|index| self.details.files().and_then(|files| files.get(index)))
+                .cloned(),
+        ) else {
+            self.diff = DiffState::Empty;
+            return;
+        };
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                self.diff = DiffState::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let key = (oid, file.path.clone());
+        let cached = self.highlight_cache.get(&key).cloned();
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { read_diff(git, &root, oid, &file, cached) })
+                .await;
+            this.update(cx, |view, cx| view.set_diff(generation, result, cx))
+                .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Keeps the syntax spans of a file, dropping the oldest entry past the
+    /// cache's small cap.
+    fn cache_highlight(&mut self, key: (Oid, String), spans: Arc<Highlighted>) {
+        const LIMIT: usize = 64;
+        if self.highlight_cache.len() >= LIMIT && !self.highlight_cache.contains_key(&key) {
+            if let Some(oldest) = self.highlight_cache.keys().next().cloned() {
+                self.highlight_cache.remove(&oldest);
+            }
+        }
+        self.highlight_cache.insert(key, spans);
+    }
+
+    /// Switches the diff pane between unified and side-by-side and remembers
+    /// the choice.
+    fn set_diff_layout(&mut self, layout: DiffLayout, cx: &mut Context<Self>) {
+        if self.diff_layout == layout {
+            return;
+        }
+        self.diff_layout = layout;
+        self.diff_scroll = UniformListScrollHandle::new();
+        crate::update_settings(cx, |settings| settings.diff_layout = layout);
+        cx.notify();
+    }
+
+    fn set_diff(
+        &mut self,
+        generation: u64,
+        result: Result<crate::details::DiffData, String>,
+        cx: &mut Context<Self>,
+    ) {
+        // A newer file owns the pane now; this older answer is stale.
+        if generation != self.diff_generation {
+            return;
+        }
+        match result {
+            Ok(data) => {
+                if let (Some(oid), Some(file)) = (
+                    self.details_oid,
+                    self.selected_file
+                        .and_then(|index| self.details.files().and_then(|files| files.get(index)))
+                        .cloned(),
+                ) {
+                    self.cache_highlight((oid, file.path.clone()), data.highlight.clone());
+                }
+                self.diff = DiffState::Loaded(Arc::new(data));
+            }
+            Err(error) => {
+                log::warn!("could not read the file diff: {error}");
+                self.diff = DiffState::Failed(error);
+            }
+        }
         cx.notify();
     }
 
@@ -1156,17 +1410,17 @@ impl RepositoryView {
             })
     }
 
-    fn render_details(&mut self, width: f32, cx: &mut Context<Self>) -> Div {
+    fn render_details(&mut self, size: f32, main_width: f32, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
         let mut panel = div().flex_none().flex().flex_col().bg(colors.bg);
         panel = match self.dock {
-            Dock::Bottom => panel.w_full().h(px(width)).border_t_1(),
-            Dock::Right => panel.h_full().w(px(width)).border_l_1(),
+            Dock::Bottom => panel.w_full().h(px(size)).border_t_1(),
+            Dock::Right => panel.h_full().w(px(size)).border_l_1(),
         };
         panel
             .border_color(colors.border)
             .child(self.render_details_header(cx))
-            .child(self.render_details_body(colors))
+            .child(self.render_details_body(size, main_width, colors, cx))
     }
 
     fn render_details_header(&mut self, cx: &mut Context<Self>) -> Div {
@@ -1223,7 +1477,17 @@ impl RepositoryView {
             .child(no_shrink(switch))
     }
 
-    fn render_details_body(&self, colors: ThemeColors) -> Div {
+    fn render_details_body(
+        &mut self,
+        size: f32,
+        main_width: f32,
+        colors: ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let diff_width = match self.dock {
+            Dock::Bottom => (main_width - 560.).max(0.),
+            Dock::Right => size,
+        };
         match self.dock {
             Dock::Bottom => div()
                 .flex_1()
@@ -1231,20 +1495,25 @@ impl RepositoryView {
                 .w_full()
                 .flex()
                 .child(
-                    details_pane("Commit details", colors)
+                    self.render_info_pane(colors, cx)
                         .w(px(310.))
                         .flex_none()
                         .h_full()
                         .border_r_1(),
                 )
                 .child(
-                    details_pane("Changed files", colors)
+                    self.render_files_pane(colors, cx)
                         .w(px(250.))
                         .flex_none()
                         .h_full()
                         .border_r_1(),
                 )
-                .child(details_pane("Diff", colors).flex_1().min_w_0().h_full()),
+                .child(
+                    self.render_diff_pane(diff_width, colors, cx)
+                        .flex_1()
+                        .min_w_0()
+                        .h_full(),
+                ),
             Dock::Right => div()
                 .flex_1()
                 .min_h_0()
@@ -1252,23 +1521,538 @@ impl RepositoryView {
                 .flex()
                 .flex_col()
                 .child(
-                    // Stage 5 fills this pane; until then it keeps the
-                    // design's maximum height so the three panes are visible.
-                    details_pane("Commit details", colors)
+                    self.render_info_pane(colors, cx)
                         .h(px(230.))
                         .flex_none()
                         .w_full()
                         .border_b_1(),
                 )
                 .child(
-                    details_pane("Changed files", colors)
+                    self.render_files_pane(colors, cx)
                         .h(px(160.))
                         .flex_none()
                         .w_full()
                         .border_b_1(),
                 )
-                .child(details_pane("Diff", colors).flex_1().w_full()),
+                .child(
+                    self.render_diff_pane(diff_width, colors, cx)
+                        .flex_1()
+                        .w_full(),
+                ),
         }
+    }
+
+    /// The commit's message and metadata, scrolling when it is long.
+    fn render_info_pane(&mut self, colors: ThemeColors, cx: &mut Context<Self>) -> Div {
+        let content = self.render_info_content(colors, cx);
+        let viewport = div()
+            .id("details-info-scroll")
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.info_scroll)
+            .child(content);
+        div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .min_h_0()
+            .border_color(colors.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(viewport)
+                    .child(Scrollbar::vertical(
+                        "details-info-bar",
+                        self.info_scroll.clone(),
+                    )),
+            )
+    }
+
+    fn render_info_content(&self, colors: ThemeColors, cx: &mut Context<Self>) -> AnyElement {
+        match &self.details {
+            DetailsState::Empty => muted_note("Select a commit", colors).into_any_element(),
+            DetailsState::Loading => div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .px(px(18.))
+                .py(px(16.))
+                .child(Skeleton::new("details-skeleton-title", px(190.)))
+                .child(Skeleton::new("details-skeleton-body", px(240.)))
+                .child(Skeleton::new("details-skeleton-meta", px(150.)))
+                .into_any_element(),
+            DetailsState::Failed(message) => div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .px(px(18.))
+                .py(px(16.))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Could not load the commit"),
+                )
+                .child(div().text_color(colors.error).child(message.clone()))
+                .into_any_element(),
+            DetailsState::Loaded(data) => self.render_loaded_info(&data.details, cx),
+        }
+    }
+
+    fn render_loaded_info(&self, details: &CommitDetails, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors;
+        let now = crate::history_view::unix_now();
+        let mut column = div().flex().flex_col().px(px(18.)).py(px(16.)).child(
+            div()
+                .mb(px(8.))
+                .text_size(FS_MD)
+                .line_height(px(19.))
+                .font_weight(FontWeight::BOLD)
+                .child(details.summary.clone()),
+        );
+        if !details.body.is_empty() {
+            column = column.child(
+                div()
+                    .mb(px(8.))
+                    .text_size(FS_BASE)
+                    .child(details.body.clone()),
+            );
+        }
+
+        let author = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                Avatar::new(details.author_email.clone(), px(20.))
+                    .name(details.author_name.clone()),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(format!(
+                "{} <{}>",
+                details.author_name, details.author_email
+            )));
+        let committer = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                Avatar::new(details.committer_email.clone(), px(20.))
+                    .name(details.committer_name.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(details.committer_name.clone()),
+            );
+        let authored = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(absolute_time(details.author_time))
+            .child(div().text_color(colors.muted).child(format!(
+                "({})",
+                relative_time(now, details.author_time.max(0) as u64)
+            )));
+        let full_hash = details.id.to_string();
+        let mut hash = full_hash.clone();
+        hash.truncate(20);
+        hash.push('…');
+        let hash = div()
+            .id("details-hash")
+            .font_family(FONT_MONO)
+            .text_size(FS_SM)
+            .truncate()
+            .tooltip(Tooltip::text(full_hash))
+            .child(hash);
+
+        let parents = if details.parents.is_empty() {
+            div().text_color(colors.muted).child("none (root commit)")
+        } else {
+            let view = cx.entity();
+            let mut row = div().flex().items_center().gap(px(6.));
+            for (index, parent) in details.parents.iter().copied().enumerate() {
+                let view = view.clone();
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("details-parent-{index}")))
+                        .debug_selector(move || format!("details-parent-{index}"))
+                        .font_family(FONT_MONO)
+                        .text_size(FS_SM)
+                        .text_color(colors.accent)
+                        .cursor_pointer()
+                        .hover(move |style| style.text_color(colors.accent_hover))
+                        .child({
+                            let mut hash = parent.to_string();
+                            hash.truncate(7);
+                            hash
+                        })
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |view, cx| {
+                                view.history.update(cx, |history, cx| {
+                                    history.reveal_commit(parent, cx);
+                                });
+                            });
+                        }),
+                );
+            }
+            row
+        };
+
+        column
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .text_size(FS_SM)
+                    .child(meta_row("Author", author, colors))
+                    .child(meta_row("Authored", authored, colors))
+                    .child(meta_row("Committer", committer, colors))
+                    .child(meta_row("Hash", hash, colors))
+                    .child(meta_row("Parents", parents, colors)),
+            )
+            .into_any_element()
+    }
+
+    /// The changed-file header and rows.
+    fn render_files_pane(&mut self, colors: ThemeColors, cx: &mut Context<Self>) -> Div {
+        let count = self.details.files().map(<[ChangedFile]>::len);
+        let is_merge = self
+            .details
+            .details()
+            .is_some_and(|details| details.parents.len() > 1);
+        let mut header = div()
+            .h(px(34.))
+            .flex_none()
+            .pl(px(16.))
+            .pr(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(colors.border)
+            .text_size(FS_SM)
+            .text_color(colors.muted)
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(colors.text)
+                    .child("Changed files"),
+            );
+        if let Some(count) = count {
+            header = header.child(CountPill::new(count.to_string()));
+        }
+        header = header.child(div().flex_1());
+        if is_merge {
+            header = header.child(
+                div()
+                    .id("details-vs-parent")
+                    .tooltip(Tooltip::text("Combined diff against first parent"))
+                    .child("vs parent 1"),
+            );
+        }
+
+        let body = self.render_files_body(colors, cx);
+        div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .min_h_0()
+            .border_color(colors.border)
+            .child(header)
+            .child(body)
+    }
+
+    fn render_files_body(&mut self, colors: ThemeColors, cx: &mut Context<Self>) -> Div {
+        let Some(files) = self.details.files() else {
+            return match &self.details {
+                DetailsState::Loading => {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .p(px(8.))
+                        .children((0..4).map(|index| {
+                            Skeleton::new(
+                                SharedString::from(format!("details-files-skeleton-{index}")),
+                                px(180.),
+                            )
+                        }))
+                }
+                DetailsState::Failed(message) => div()
+                    .p(px(12.))
+                    .text_color(colors.error)
+                    .child(message.clone()),
+                _ => muted_note("No files changed", colors),
+            };
+        };
+        if files.is_empty() {
+            return muted_note("No files changed", colors);
+        }
+
+        let view = cx.entity();
+        let selected = self.selected_file;
+        let mut list = div()
+            .id("details-files-list")
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.files_scroll)
+            .track_focus(&self.files_focus)
+            .key_context("details-files")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, _, window, cx| view.focus_files(window, cx)),
+            )
+            .on_action(cx.listener(|view, _: &SelectNext, _, cx| view.step_file(1, cx)))
+            .on_action(cx.listener(|view, _: &SelectPrev, _, cx| view.step_file(-1, cx)))
+            .on_action(cx.listener(|view, _: &SelectFirst, _, cx| view.step_file(isize::MIN, cx)))
+            .on_action(cx.listener(|view, _: &SelectLast, _, cx| view.step_file(isize::MAX, cx)));
+        for (index, file) in files.iter().enumerate() {
+            let view = view.clone();
+            list = list.child(
+                div()
+                    .debug_selector(move || format!("details-file-{index}"))
+                    .child(
+                        FileRow::new(
+                            SharedString::from(format!("details-file-{index}")),
+                            file.kind.letter(),
+                            file.path.clone(),
+                        )
+                        .added(file.added)
+                        .deleted(file.deleted)
+                        .selected(selected == Some(index))
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |view, cx| view.select_file(index, cx));
+                        }),
+                    ),
+            );
+        }
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .child(list)
+            .child(Scrollbar::vertical(
+                "details-files-bar",
+                self.files_scroll.clone(),
+            ))
+    }
+
+    /// The diff toolbar and the selected file's unified diff.
+    fn render_diff_pane(&mut self, width: f32, colors: ThemeColors, cx: &mut Context<Self>) -> Div {
+        let path = self
+            .selected_file
+            .and_then(|index| self.details.files().and_then(|files| files.get(index)))
+            .map(|file| match &file.old_path {
+                Some(old) => format!("{} ← {old}", file.path),
+                None => file.path.clone(),
+            });
+        let mut toolbar = div()
+            .id("details-diff-toolbar")
+            .h(px(34.))
+            .flex_none()
+            .pl(px(16.))
+            .pr(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(colors.border);
+        if let Some(path) = path {
+            toolbar = toolbar.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(FONT_MONO)
+                    .text_size(FS_SM)
+                    .text_color(colors.text)
+                    .child(path),
+            );
+        } else {
+            toolbar = toolbar.child(div().flex_1());
+        }
+
+        let layout = self.diff_layout;
+        let view = cx.entity();
+        let switch = Segmented::new("diff-layout")
+            .small()
+            .item(
+                SegmentItem::new("Unified")
+                    .with_icon(IconName::Unified)
+                    .id("diff-unified"),
+            )
+            .item(
+                SegmentItem::new("Side-by-side")
+                    .with_icon(IconName::Split)
+                    .id("diff-split"),
+            )
+            .selected(if layout == DiffLayout::Split { 1 } else { 0 })
+            .on_select(move |index, _, cx| {
+                let layout = if index == 1 {
+                    DiffLayout::Split
+                } else {
+                    DiffLayout::Unified
+                };
+                view.update(cx, |view, cx| view.set_diff_layout(layout, cx));
+            });
+        toolbar = toolbar.child(no_shrink(switch));
+
+        let body = match &self.diff {
+            DiffState::Empty => diff_note("Select a file", colors),
+            DiffState::Loading => div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .p(px(12.))
+                .child(Skeleton::new("diff-skeleton-1", px(320.)))
+                .child(Skeleton::new("diff-skeleton-2", px(260.)))
+                .child(Skeleton::new("diff-skeleton-3", px(290.))),
+            DiffState::Failed(message) if message.contains("too large") => {
+                diff_note("Diff too large to display", colors)
+            }
+            DiffState::Failed(message) => div()
+                .flex_1()
+                .min_h_0()
+                .p(px(12.))
+                .text_color(colors.error)
+                .child(message.clone()),
+            DiffState::Loaded(data) => {
+                if data.diff.binary {
+                    diff_note("Binary file", colors)
+                } else if data.rows.is_empty() {
+                    diff_note("No changes", colors)
+                } else {
+                    let data = data.clone();
+                    let list = if layout == DiffLayout::Split {
+                        let row_width = split_width(self.mono_cell, data.columns, width);
+                        uniform_list(
+                            "details-diff",
+                            data.split_rows.len(),
+                            cx.processor(move |view, range, window, cx| {
+                                view.render_split_rows(
+                                    &data.split_rows,
+                                    &data.highlight,
+                                    range,
+                                    row_width,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                        )
+                        .with_horizontal_sizing_behavior(
+                            ListHorizontalSizingBehavior::Unconstrained,
+                        )
+                        .track_scroll(&self.diff_scroll)
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .into_any_element()
+                    } else {
+                        let row_width = diff_width(self.mono_cell, data.columns, width);
+                        uniform_list(
+                            "details-diff",
+                            data.rows.len(),
+                            cx.processor(move |view, range, window, cx| {
+                                view.render_diff_rows(
+                                    &data.rows,
+                                    &data.highlight,
+                                    range,
+                                    row_width,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                        )
+                        .with_horizontal_sizing_behavior(
+                            ListHorizontalSizingBehavior::Unconstrained,
+                        )
+                        .track_scroll(&self.diff_scroll)
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .into_any_element()
+                    };
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .child(list)
+                        .child(Scrollbar::uniform(
+                            "details-diff-bar",
+                            self.diff_scroll.clone(),
+                        ))
+                }
+            }
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .min_h_0()
+            .text_size(MONO)
+            .child(toolbar)
+            .child(body)
+    }
+
+    fn render_diff_rows(
+        &mut self,
+        rows: &[DiffRow],
+        highlight: &Highlighted,
+        range: std::ops::Range<usize>,
+        width: Pixels,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let colors = cx.theme().colors;
+        range
+            .filter_map(|index| {
+                rows.get(index).map(|row| {
+                    let (old_spans, new_spans) = match row.kind {
+                        RowKind::Removed => (highlight.spans(true, row.old_line), &[][..]),
+                        RowKind::Added => (&[][..], highlight.spans(false, row.new_line)),
+                        _ => {
+                            let spans = if row.old_line.is_some() {
+                                highlight.spans(true, row.old_line)
+                            } else {
+                                highlight.spans(false, row.new_line)
+                            };
+                            (spans, &[][..])
+                        }
+                    };
+                    diff_row(row, index, width, colors, old_spans, new_spans)
+                })
+            })
+            .collect()
+    }
+
+    fn render_split_rows(
+        &mut self,
+        rows: &[SplitRow],
+        highlight: &Highlighted,
+        range: std::ops::Range<usize>,
+        width: Pixels,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let colors = cx.theme().colors;
+        let half = px(((f32::from(width) - 2. * DIFF_GUTTER) / 2.).max(0.));
+        range
+            .filter_map(|index| {
+                rows.get(index)
+                    .map(|row| split_row(row, index, width, half, colors, highlight))
+            })
+            .collect()
     }
 
     fn render_status_bar(&self, cx: &Context<Self>) -> Div {
@@ -1407,7 +2191,8 @@ impl Render for RepositoryView {
         let dock = self.dock;
         let splitter =
             details_open.then(|| self.render_details_splitter(details_width, details_limit, cx));
-        let panel = details_open.then(|| self.render_details(details_width, cx));
+        let panel = details_open
+            .then(|| self.render_details(details_width, width - sidebar_width - 5., cx));
         let status = self.render_status_bar(cx);
 
         let history_pane = div()
@@ -1555,16 +2340,350 @@ fn tool_button(
     }
 }
 
-/// One empty details pane: a centred, muted label between its borders.
-fn details_pane(label: &'static str, colors: ThemeColors) -> Div {
+/// One diff row and its cells, in pixels.
+const DIFF_ROW: f32 = 22.;
+const DIFF_GUTTER: f32 = 44.;
+const DIFF_MARKER: f32 = 16.;
+
+/// A muted, centred message for a diff that has nothing to paint.
+fn diff_note(text: &'static str, colors: ThemeColors) -> Div {
+    div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(FS_SM)
+        .text_color(colors.muted)
+        .child(text)
+}
+
+/// The width of one diff row: its gutters plus the widest line, or the pane
+/// width when the lines are shorter, so a line's background fills the pane.
+fn diff_width(cell: Pixels, columns: usize, pane: f32) -> Pixels {
+    let text = columns as f32 * f32::from(cell) + 24.;
+    px((DIFF_GUTTER * 2. + DIFF_MARKER + text).max(pane))
+}
+
+/// One unified-view row: a hunk header, a numbered line or a no-newline note.
+fn diff_row(
+    row: &DiffRow,
+    index: usize,
+    width: Pixels,
+    colors: ThemeColors,
+    old_spans: &[HighlightSpan],
+    new_spans: &[HighlightSpan],
+) -> AnyElement {
+    let base = div()
+        .id(SharedString::from(format!("diff-row-{index}")))
+        .debug_selector(move || format!("diff-row-{index}"))
+        .h(px(DIFF_ROW))
+        .w(width)
+        .flex_none()
+        .flex()
+        .items_center()
+        .whitespace_nowrap();
+    match row.kind {
+        RowKind::Hunk => base
+            .px(px(8.))
+            .bg(colors.diff_hunk_bg)
+            .text_size(FS_SM)
+            .text_color(colors.muted)
+            .child(row.text.clone())
+            .into_any_element(),
+        RowKind::Note => base
+            .px(px(8.))
+            .text_size(FS_SM)
+            .text_color(colors.muted)
+            .child(row.text.clone())
+            .into_any_element(),
+        RowKind::Context | RowKind::Added | RowKind::Removed => {
+            let (old_background, new_background, line_background, strong) = match row.kind {
+                RowKind::Added => (
+                    None,
+                    Some(colors.diff_add_bg),
+                    Some(colors.diff_add_bg),
+                    colors.diff_add_strong,
+                ),
+                RowKind::Removed => (
+                    Some(colors.diff_del_bg),
+                    None,
+                    Some(colors.diff_del_bg),
+                    colors.diff_del_strong,
+                ),
+                _ => (None, None, None, colors.diff_add_strong),
+            };
+            let spans = match row.kind {
+                RowKind::Removed => old_spans,
+                RowKind::Added => new_spans,
+                _ => old_spans,
+            };
+            base.child(diff_gutter(row.old_line, old_background, colors))
+                .child(diff_gutter(row.new_line, new_background, colors))
+                .child(diff_marker(row.kind, line_background, colors))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .pl(px(6.))
+                        .pr(px(6.))
+                        .when_some(line_background, |this, background| this.bg(background))
+                        .text_color(colors.text)
+                        .child(styled_diff_text(
+                            &row.text,
+                            &row.emphasis,
+                            spans,
+                            colors,
+                            strong,
+                        )),
+                )
+                .into_any_element()
+        }
+    }
+}
+
+/// One 44 px line-number gutter; an empty cell when the line is not on that
+/// side of the diff.
+fn diff_gutter(line: Option<u32>, background: Option<Hsla>, colors: ThemeColors) -> Div {
+    div()
+        .w(px(DIFF_GUTTER))
+        .flex_none()
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_end()
+        .pr(px(6.))
+        .when_some(background, |this, background| this.bg(background))
+        .text_size(MONO)
+        .text_color(colors.muted)
+        .child(line.map(|line| line.to_string()).unwrap_or_default())
+}
+
+/// The 16 px `+` / `−` marker column.
+fn diff_marker(kind: RowKind, background: Option<Hsla>, colors: ThemeColors) -> Div {
+    let (marker, color) = match kind {
+        RowKind::Added => ('+', colors.success),
+        RowKind::Removed => ('−', colors.error),
+        _ => (' ', colors.muted),
+    };
+    div()
+        .w(px(DIFF_MARKER))
+        .flex_none()
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .when_some(background, |this, background| this.bg(background))
+        .text_color(color)
+        .child(marker.to_string())
+}
+
+/// The width of one side-by-side row: two gutters and two equal text halves.
+fn split_width(cell: Pixels, columns: usize, pane: f32) -> Pixels {
+    let half = columns as f32 * f32::from(cell) + 12.;
+    px((2. * DIFF_GUTTER + 2. * half).max(pane))
+}
+
+/// One side-by-side row: a hunk header, a note, or an old/new cell pair.
+fn split_row(
+    row: &SplitRow,
+    index: usize,
+    width: Pixels,
+    half: Pixels,
+    colors: ThemeColors,
+    highlight: &Highlighted,
+) -> AnyElement {
+    let base = div()
+        .id(SharedString::from(format!("split-row-{index}")))
+        .debug_selector(move || format!("split-row-{index}"))
+        .h(px(DIFF_ROW))
+        .w(width)
+        .flex_none()
+        .flex()
+        .items_center()
+        .whitespace_nowrap();
+    match row {
+        SplitRow::Header(text) => base
+            .px(px(8.))
+            .bg(colors.diff_hunk_bg)
+            .text_size(FS_SM)
+            .text_color(colors.muted)
+            .child(text.clone())
+            .into_any_element(),
+        SplitRow::Note(text) => base
+            .px(px(8.))
+            .text_size(FS_SM)
+            .text_color(colors.muted)
+            .child(text.clone())
+            .into_any_element(),
+        SplitRow::Pair { old, new } => base
+            .child(split_gutter(old.as_ref(), colors))
+            .child(split_content(
+                old.as_ref(),
+                half,
+                colors,
+                highlight.spans(true, old.as_ref().map(|cell| cell.line)),
+            ))
+            .child(
+                split_gutter(new.as_ref(), colors)
+                    .border_l_1()
+                    .border_color(colors.border),
+            )
+            .child(split_content(
+                new.as_ref(),
+                half,
+                colors,
+                highlight.spans(false, new.as_ref().map(|cell| cell.line)),
+            ))
+            .into_any_element(),
+    }
+}
+
+/// A split row's line-number gutter; a missing side stays transparent.
+fn split_gutter(cell: Option<&SplitCell>, colors: ThemeColors) -> Div {
+    let background = cell.and_then(|cell| match cell.kind {
+        SplitCellKind::Added => Some(colors.diff_add_bg),
+        SplitCellKind::Removed => Some(colors.diff_del_bg),
+        SplitCellKind::Context => None,
+    });
+    div()
+        .w(px(DIFF_GUTTER))
+        .flex_none()
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_end()
+        .pr(px(6.))
+        .when_some(background, |this, background| this.bg(background))
+        .text_size(MONO)
+        .text_color(colors.muted)
+        .child(cell.map(|cell| cell.line.to_string()).unwrap_or_default())
+}
+
+/// One half of a split row. A missing side is a hatched filler.
+fn split_content(
+    cell: Option<&SplitCell>,
+    width: Pixels,
+    colors: ThemeColors,
+    spans: &[HighlightSpan],
+) -> Div {
+    let content = div()
+        .w(width)
+        .flex_none()
+        .h_full()
+        .flex()
+        .items_center()
+        .pl(px(6.))
+        .pr(px(6.))
+        .overflow_hidden();
+    let Some(cell) = cell else {
+        return content.bg(gpui::pattern_slash(colors.active, 1., 5.));
+    };
+    let (background, strong) = match cell.kind {
+        SplitCellKind::Added => (Some(colors.diff_add_bg), colors.diff_add_strong),
+        SplitCellKind::Removed => (Some(colors.diff_del_bg), colors.diff_del_strong),
+        SplitCellKind::Context => (None, colors.diff_add_strong),
+    };
+    content
+        .when_some(background, |this, background| this.bg(background))
+        .text_color(colors.text)
+        .child(styled_diff_text(
+            &cell.text,
+            &cell.emphasis,
+            spans,
+            colors,
+            strong,
+        ))
+}
+
+/// A line's text with the word-diff ranges painted over the line background.
+///
+/// GPUI text runs carry the background but no corner radius, so the design's
+/// 2 px radius is dropped, like the history search's highlight.
+fn styled_diff_text(
+    text: &str,
+    emphasis: &[std::ops::Range<usize>],
+    spans: &[HighlightSpan],
+    colors: ThemeColors,
+    background: Hsla,
+) -> StyledText {
+    if emphasis.is_empty() && spans.is_empty() {
+        return StyledText::new(SharedString::from(text.to_owned()));
+    }
+    let font = gpui::font(FONT_MONO);
+    let runs = syntax::line_segments(text, spans, emphasis)
+        .into_iter()
+        .map(|segment| {
+            let color = segment
+                .token
+                .map(|token| token_color(token, colors))
+                .unwrap_or(colors.text);
+            diff_text_run(
+                segment.range.len(),
+                &font,
+                color,
+                segment.changed.then_some(background),
+            )
+        })
+        .collect::<Vec<_>>();
+    if runs.is_empty() {
+        return StyledText::new(SharedString::from(text.to_owned()));
+    }
+    StyledText::new(SharedString::from(text.to_owned())).with_runs(runs)
+}
+
+/// The theme colour of a syntax token.
+fn token_color(token: Token, colors: ThemeColors) -> Hsla {
+    match token {
+        Token::Keyword => colors.code_kw,
+        Token::String => colors.code_str,
+        Token::Number => colors.code_num,
+        Token::Comment => colors.code_com,
+        Token::Type => colors.code_ty,
+        Token::Function => colors.code_fn,
+    }
+}
+
+fn diff_text_run(len: usize, font: &gpui::Font, color: Hsla, background: Option<Hsla>) -> TextRun {
+    TextRun {
+        len,
+        font: font.clone(),
+        color,
+        background_color: background,
+        underline: None,
+        strikethrough: None,
+    }
+}
+
+/// A muted one-line note, for an empty pane or a cleared selection.
+fn muted_note(label: &'static str, colors: ThemeColors) -> Div {
     div()
         .flex()
         .items_center()
         .justify_center()
-        .border_color(colors.border)
+        .p(px(16.))
         .text_size(FS_SM)
         .text_color(colors.muted)
         .child(label)
+}
+
+/// One label/value row of the details metadata grid.
+fn meta_row(label: &'static str, value: impl IntoElement, colors: ThemeColors) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .child(
+            div()
+                .w(px(74.))
+                .flex_none()
+                .text_color(colors.muted)
+                .child(label),
+        )
+        .child(div().flex_1().min_w_0().child(value))
 }
 
 /// A click, Enter/Space or ←/→ on an expandable row flips its expansion.
@@ -1856,6 +2975,216 @@ mod tests {
             .update(|window, _| window.root::<RepositoryView>().flatten())
             .expect("the repository view is the window root");
         (cx, view)
+    }
+
+    /// Selecting a commit loads its details and changed files into the dock,
+    /// and clicking another row replaces them.
+    #[gpui::test]
+    fn selecting_a_commit_fills_the_details_dock(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+
+        let repo = crate::test_support::TempRepo::new("details-panel");
+        commit(repo.path(), "a.txt", "one\ntwo\n");
+        commit(repo.path(), "b.txt", "three\n");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, _| {
+            let details = view
+                .details
+                .details()
+                .expect("the selected commit's details did not load");
+            assert_eq!(details.summary, "three");
+            let files = view
+                .details
+                .files()
+                .expect("the changed files did not load");
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].path, "b.txt");
+            assert_eq!(
+                view.selected_file,
+                Some(0),
+                "the first file is not selected"
+            );
+            let DiffState::Loaded(diff) = &view.diff else {
+                panic!("the selected file's diff did not load");
+            };
+            assert!(diff.rows.len() > 1, "the diff has no body rows");
+            assert!(diff.rows.iter().any(|row| row.text.contains("three")));
+        });
+        assert!(
+            cx.debug_bounds("details-file-0").is_some(),
+            "the changed file row was not drawn"
+        );
+        assert!(
+            cx.debug_bounds("diff-row-0").is_some(),
+            "the diff rows were not drawn"
+        );
+
+        // Clicking the older row loads that commit instead.
+        let row = cx
+            .debug_bounds("history-row-1")
+            .expect("the second history row was not drawn");
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            let details = view
+                .details
+                .details()
+                .expect("the clicked commit's details did not load");
+            assert_eq!(details.summary, "one two");
+            let files = view
+                .details
+                .files()
+                .expect("the changed files did not load");
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].path, "a.txt");
+            assert_eq!(view.selected_file, Some(0));
+        });
+    }
+
+    /// Clicking a changed file selects it, loads its diff and takes the
+    /// keyboard: ↑/↓ then move the file selection.
+    #[gpui::test]
+    fn the_file_list_selects_files_and_answers_arrow_keys(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+
+        let repo = crate::test_support::TempRepo::new("details-files");
+        std::fs::write(repo.path().join("a.txt"), "alpha\n").unwrap();
+        std::fs::write(repo.path().join("b.txt"), "beta\n").unwrap();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["add", "-A"])
+            .output()
+            .expect("git runs");
+        assert!(out.status.success());
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["commit", "-q", "-m", "two files"])
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success());
+
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.details.files().map(<[git_core::ChangedFile]>::len),
+                Some(2)
+            );
+            assert_eq!(view.selected_file, Some(0));
+        });
+
+        let row = cx
+            .debug_bounds("details-file-1")
+            .expect("the second changed file was not drawn");
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.selected_file, Some(1));
+            let DiffState::Loaded(diff) = &view.diff else {
+                panic!("the second file's diff did not load");
+            };
+            assert!(diff.rows.iter().any(|row| row.text.contains("beta")));
+        });
+
+        cx.simulate_keystrokes("up");
+        view.read_with(&cx, |view, _| assert_eq!(view.selected_file, Some(0)));
+        cx.simulate_keystrokes("down");
+        view.read_with(&cx, |view, _| assert_eq!(view.selected_file, Some(1)));
+    }
+
+    /// Clicking a parent's short hash selects that commit in the history.
+    #[gpui::test]
+    fn clicking_a_parent_hash_selects_that_commit(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+
+        let repo = crate::test_support::TempRepo::new("details-parent");
+        commit(repo.path(), "a.txt", "one\n");
+        commit(repo.path(), "b.txt", "two\n");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.details
+                    .details()
+                    .map(|details| details.summary.as_str()),
+                Some("two")
+            );
+        });
+
+        let parent = cx
+            .debug_bounds("details-parent-0")
+            .expect("the parent link was not drawn");
+        cx.simulate_click(parent.center(), Modifiers::default());
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(
+                view.details
+                    .details()
+                    .map(|details| details.summary.as_str()),
+                Some("one"),
+                "the parent commit's details did not load"
+            );
+            assert_eq!(
+                view.history
+                    .read(cx)
+                    .selected_commit()
+                    .map(|c| c.summary.clone()),
+                Some("one".to_string()),
+                "the parent was not selected in the history"
+            );
+        });
+    }
+
+    /// The layout toggle switches the pane to side-by-side rows and stores the
+    /// choice in the settings.
+    #[gpui::test]
+    fn the_diff_toggle_switches_to_side_by_side_and_persists(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("details-split");
+        commit(repo.path(), "main.rs", "fn main() {}\n");
+        cx.update(|cx| {
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings: crate::settings::Settings::default(),
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.diff_layout, DiffLayout::Unified);
+        });
+
+        view.update(&mut cx, |view, cx| {
+            view.set_diff_layout(DiffLayout::Split, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.diff_layout, DiffLayout::Split);
+            let DiffState::Loaded(diff) = &view.diff else {
+                panic!("the diff did not load");
+            };
+            assert!(!diff.split_rows.is_empty());
+            assert_eq!(diff.highlight.language, Some("rust"));
+            assert!(
+                !diff.highlight.new.is_empty(),
+                "the new side was not highlighted"
+            );
+        });
+        assert!(
+            cx.debug_bounds("split-row-0").is_some(),
+            "the side-by-side rows were not drawn"
+        );
+        let saved = cx.update(|_, cx| cx.global::<crate::AppSettings>().settings.diff_layout);
+        assert_eq!(saved, DiffLayout::Split, "the layout was not persisted");
     }
 
     /// Lets the 150 ms search debounce and the background scan finish. The

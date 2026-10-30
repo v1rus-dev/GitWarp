@@ -1,3 +1,5 @@
+mod details;
+mod diff_model;
 mod format;
 mod graph_paint;
 mod history_search;
@@ -8,6 +10,7 @@ mod open_dialog;
 mod repo_view;
 mod settings;
 mod sidebar;
+mod syntax;
 #[cfg(test)]
 mod test_support;
 mod theme;

@@ -6,6 +6,7 @@
 //! (log, status, diff) can later move to `gix` behind the same API without
 //! touching the UI.
 
+mod diff;
 mod error;
 mod git;
 mod log;
@@ -21,6 +22,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
+pub use diff::{
+    ChangeKind, ChangedFile, CommitDetails, DiffLine, FileDiff, FileTexts, Hunk, LineKind,
+};
 pub use error::{Error, ErrorClass, Result};
 pub use git::{Git, GitChoice, GitSource, GitVersion, Resolution};
 pub use log::{CommitCount, CommitInfo, LogKiller, LogOptions, LogStream};
@@ -300,6 +304,29 @@ impl Repo {
     /// The submodules recorded in `.gitmodules`.
     pub fn submodules(&self) -> Result<Vec<Submodule>> {
         submodule::list(self)
+    }
+
+    /// One commit's full message, author and committer.
+    pub fn commit_details(&self, oid: Oid) -> Result<CommitDetails> {
+        diff::details(self, oid)
+    }
+
+    /// The files `oid` changed, against its first parent (the empty tree for
+    /// a root commit).
+    pub fn commit_changes(&self, oid: Oid) -> Result<Vec<ChangedFile>> {
+        diff::changes(self, oid)
+    }
+
+    /// The unified diff of one file in `oid`, against its first parent.
+    ///
+    /// `old_path` is the parent's path for a rename or a copy.
+    pub fn file_diff(&self, oid: Oid, path: &str, old_path: Option<&str>) -> Result<FileDiff> {
+        diff::file_diff(self, oid, path, old_path)
+    }
+
+    /// The old and new text of one file, for syntax highlighting.
+    pub fn file_texts(&self, oid: Oid, path: &str, old_path: Option<&str>) -> Result<FileTexts> {
+        diff::file_texts(self, oid, path, old_path)
     }
 }
 

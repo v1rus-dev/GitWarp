@@ -48,6 +48,10 @@ pub enum Error {
         stderr: String,
     },
     Parse(&'static str),
+    /// A diff or blob is too large to load into the view.
+    TooLarge {
+        what: &'static str,
+    },
 }
 
 /// What kind of failure an [`Error`] is, for the UI to match on instead of
@@ -166,6 +170,7 @@ impl fmt::Display for Error {
                 stderr,
             } => write!(f, "git {command} failed: {}", stderr.trim()),
             Error::Parse(what) => write!(f, "could not parse {what}"),
+            Error::TooLarge { what } => write!(f, "the {what} is too large to show"),
         }
     }
 }

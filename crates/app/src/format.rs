@@ -53,6 +53,40 @@ pub fn relative_time(now: u64, then: u64) -> String {
     }
 }
 
+/// `YYYY-MM-DD HH:MM` in UTC for a unix timestamp.
+///
+/// The details pane uses the same value the design prototype shows; no
+/// external date crate is needed for it.
+pub fn absolute_time(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let days = seconds / 86_400;
+    let rest = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        rest / 3_600,
+        (rest % 3_600) / 60
+    )
+}
+
+/// Civil date for days since 1970-01-01 (Howard Hinnant's algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (
+        if month <= 2 { year + 1 } else { year },
+        month as u32,
+        day as u32,
+    )
+}
+
 /// The user's home directory, from the environment.
 pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -102,6 +136,14 @@ mod tests {
         assert_eq!(format_count(1_000), "1,000");
         assert_eq!(format_count(12_400), "12,400");
         assert_eq!(format_count(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn absolute_time_is_utc_yyyy_mm_dd_hh_mm() {
+        assert_eq!(absolute_time(0), "1970-01-01 00:00");
+        assert_eq!(absolute_time(1_793_282_880), "2026-10-29 14:08");
+        assert_eq!(absolute_time(1_700_000_000), "2023-11-14 22:13");
+        assert_eq!(absolute_time(-5), "1970-01-01 00:00");
     }
 
     #[test]
