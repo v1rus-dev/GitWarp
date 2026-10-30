@@ -19,7 +19,7 @@ use gpui::{
     Window,
 };
 
-use git_core::Git;
+use git_core::{Error, Git, GitChoice};
 use ui::metrics::{BAR, FONT_UI, FS_BASE, R_WINDOW};
 use ui::theme::ActiveTheme;
 use ui::WindowControls;
@@ -41,7 +41,10 @@ enum Content {
 /// The window root: frame, decorations and the current content view.
 pub struct Workspace {
     content: Content,
-    git: Result<Arc<Git>, String>,
+    /// The resolved git, or why there is none; shared by the views.
+    git: Result<Arc<Git>, Arc<Error>>,
+    /// What the user asked for; [`Workspace::retry_git`] resolves it again.
+    git_choice: GitChoice,
     /// The resize edge under the pointer in the frame's inset band, if any.
     /// The band only repaints when this changes, so the cursor follows it.
     last_resize_edge: Option<ResizeEdge>,
@@ -54,7 +57,8 @@ impl Workspace {
     /// Opens `path` as the repository, or the welcome screen when it is `None`.
     pub fn new(
         path: Option<PathBuf>,
-        git: Result<Arc<Git>, String>,
+        git: Result<Arc<Git>, Arc<Error>>,
+        git_choice: GitChoice,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -62,6 +66,7 @@ impl Workspace {
         let mut this = Self {
             content: Content::Welcome(cx.new(|cx| WelcomeView::new(git.clone(), cx))),
             git,
+            git_choice,
             last_resize_edge: None,
             _decorations: decorations,
         };
@@ -90,6 +95,41 @@ impl Workspace {
         }
         window.set_window_title("GitWarp");
         cx.notify();
+    }
+
+    /// Resolve git again (the user may have installed it since) and, when a
+    /// repository is open, reopen it so its history starts over with the new
+    /// handle.
+    pub fn retry_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let choice = self.git_choice.clone();
+        let path = match &self.content {
+            Content::Repository(view) => Some(view.read(cx).path().to_path_buf()),
+            Content::Welcome(_) => None,
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let resolved = cx
+                .background_executor()
+                .spawn(async move {
+                    Git::resolve(choice)
+                        .map(|resolution| {
+                            if let Some(reason) = resolution.fallback {
+                                log::warn!("bundled git unusable, using system git: {reason}");
+                            }
+                            Arc::new(resolution.git)
+                        })
+                        .map_err(Arc::new)
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.git = resolved;
+                match path {
+                    Some(path) => this.open_repository(path, window, cx),
+                    None => this.show_welcome(window, cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Runs `f` on the open repository, if there is one.
@@ -343,6 +383,17 @@ fn resize_edge(pos: Point<Pixels>, inset: Pixels, size: gpui::Size<Pixels>) -> O
         Some(ResizeEdge::Right)
     } else {
         None
+    }
+}
+
+/// The status bar's git label: the version and source, or why there is none.
+pub fn git_label(git: &Result<Arc<Git>, Arc<Error>>) -> SharedString {
+    match git {
+        Ok(git) => format!("git {} · {}", git.version(), git.source()).into(),
+        Err(error) => match error.class() {
+            git_core::ErrorClass::GitTooOld { found, .. } => format!("git {found} too old").into(),
+            _ => "git not found".into(),
+        },
     }
 }
 

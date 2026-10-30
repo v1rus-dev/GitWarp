@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use git_core::{Git, GitChoice, GitSource, Head, LogOptions, RefKind, Repo};
+use git_core::{ErrorClass, Git, GitChoice, GitSource, Head, LogOptions, RefKind, Repo};
 use git_graph::GraphBuilder;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -171,9 +171,90 @@ fn empty_repository_has_empty_log_with_all() {
 #[test]
 fn rejects_non_repository() {
     let tmp = tempfile::tempdir().unwrap();
-    match open(tmp.path()) {
-        Err(git_core::Error::Git { stderr, .. }) => {
-            assert!(stderr.contains("not a git repository"))
+    let err = open(tmp.path()).unwrap_err();
+    assert!(
+        matches!(err.class(), ErrorClass::NotARepository(path) if path == tmp.path()),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn classifies_a_missing_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("does-not-exist");
+    let err = open(&missing).unwrap_err();
+    assert!(
+        matches!(err.class(), ErrorClass::PathNotFound(path) if path == missing),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn counts_commits_on_every_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    commit(d, "A");
+    commit(d, "B");
+    git(d, &["checkout", "-q", "-b", "feature"]);
+    commit(d, "C");
+    git(d, &["checkout", "-q", "main"]);
+    let repo = open(d).unwrap();
+    assert_eq!(repo.commit_count().unwrap(), 3);
+}
+
+#[test]
+fn counts_no_commits_in_an_empty_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q"]);
+    let repo = open(tmp.path()).unwrap();
+    assert_eq!(repo.commit_count().unwrap(), 0);
+    let commits: Vec<_> = repo
+        .log(&LogOptions::default())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(commits.is_empty());
+}
+
+#[test]
+fn init_makes_a_repository_that_opens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("fresh");
+    std::fs::create_dir(&dir).unwrap();
+    let git = Arc::new(Git::resolve(GitChoice::System).unwrap().git);
+    let repo = Repo::init(git, &dir).unwrap();
+    assert_eq!(repo.root(), dir.canonicalize().unwrap());
+    assert_eq!(repo.commit_count().unwrap(), 0);
+}
+
+#[test]
+fn init_creates_a_missing_directory_too() {
+    // `git init <path>` creates the directory, so the action works on a
+    // folder the user has not made yet either.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("not-there");
+    let git = Arc::new(Git::resolve(GitChoice::System).unwrap().git);
+    let repo = Repo::init(git, &dir).unwrap();
+    assert_eq!(repo.commit_count().unwrap(), 0);
+}
+
+#[test]
+fn a_broken_ref_makes_git_fail_with_its_exit_code() {
+    let tmp = sample_repo();
+    let repo = open(tmp.path()).unwrap();
+    std::fs::write(
+        tmp.path().join(".git/refs/heads/broken"),
+        "0000000000000000000000000000000000000001\n",
+    )
+    .unwrap();
+    match repo.commit_count() {
+        Err(git_core::Error::Git {
+            code, ref stderr, ..
+        }) => {
+            assert!(code.is_some(), "no exit code: {stderr}");
+            assert_eq!(code, Some(128), "{stderr}");
+            assert!(!stderr.trim().is_empty());
         }
         other => panic!("unexpected result {other:?}"),
     }

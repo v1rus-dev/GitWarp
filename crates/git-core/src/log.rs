@@ -130,8 +130,9 @@ impl LogStream {
             .unwrap_or_default();
         match status {
             Ok(status) if status.success() => None,
-            Ok(_) => Some(Error::Git {
-                command: "log",
+            Ok(status) => Some(Error::Git {
+                command: "log --all --topo-order",
+                code: status.code(),
                 stderr,
             }),
             Err(e) => Some(Error::Io(e)),

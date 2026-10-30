@@ -2,8 +2,8 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, AnyElement, App, Hsla, IntoElement, ParentElement, RenderOnce, SharedString, Styled,
-    Window,
+    div, px, AnyElement, App, FontWeight, Hsla, IntoElement, ParentElement, RenderOnce,
+    SharedString, Styled, Window,
 };
 
 use crate::icon::{Icon, IconName};
@@ -16,6 +16,7 @@ use crate::theme::ActiveTheme;
 pub struct EmptyState {
     title: SharedString,
     text: Option<SharedString>,
+    body: Option<AnyElement>,
     icon: IconName,
     icon_color: Option<Hsla>,
     error: Option<SharedString>,
@@ -27,6 +28,7 @@ impl EmptyState {
         Self {
             title: title.into(),
             text: None,
+            body: None,
             icon: IconName::Folder,
             icon_color: None,
             error: None,
@@ -36,6 +38,13 @@ impl EmptyState {
 
     pub fn text(mut self, text: impl Into<SharedString>) -> Self {
         self.text = Some(text.into());
+        self
+    }
+
+    /// A rich body that replaces [`EmptyState::text`], for bodies with inline
+    /// code or other mixed runs.
+    pub fn body(mut self, body: impl IntoElement) -> Self {
+        self.body = Some(body.into_any_element());
         self
     }
 
@@ -70,6 +79,7 @@ impl RenderOnce for EmptyState {
         } else {
             colors.muted
         });
+        let text = self.text.filter(|_| self.body.is_none());
 
         div()
             .flex()
@@ -96,10 +106,14 @@ impl RenderOnce for EmptyState {
                 div()
                     .mt(px(4.))
                     .text_size(FS_MD)
+                    .font_weight(FontWeight::BOLD)
                     .text_color(colors.text)
                     .child(self.title),
             )
-            .when_some(self.text, |this, text| {
+            .when_some(self.body, |this, body| {
+                this.child(div().max_w(px(46. * 7.)).text_center().child(body))
+            })
+            .when_some(text, |this, text| {
                 this.child(div().max_w(px(46. * 7.)).text_center().child(text))
             })
             .when_some(self.error, |this, error| {

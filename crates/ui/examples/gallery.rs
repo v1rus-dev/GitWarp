@@ -1435,6 +1435,18 @@ fn progress_section(colors: ThemeColors) -> impl IntoElement {
                         .child(Progress::new("progress-indet", 0.).indeterminate()),
                 )
                 .child(
+                    component_row("Filled (stretches)", colors)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .child(Progress::new("progress-fill", 0.62).fill()),
+                        )
+                        .child(div().text_size(FS_SM).text_color(colors.muted).child("62%")),
+                )
+                .child(
                     component_row("Spinners", colors)
                         .child(Spinner::new("spinner-12", px(12.)))
                         .child(Spinner::new("spinner-14", px(14.)))

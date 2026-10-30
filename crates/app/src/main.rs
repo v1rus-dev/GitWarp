@@ -1,4 +1,6 @@
+mod format;
 mod graph_paint;
+mod history_state;
 mod history_view;
 mod repo_view;
 mod settings;
@@ -56,28 +58,28 @@ Without REPO the welcome screen opens.";
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-    let (path, git) = match parse_args(std::env::args_os().skip(1), std::env::var_os("GITWARP_GIT"))
-    {
-        Ok(Cli::Run { path, git }) => (path, git),
-        Ok(Cli::Help) => {
-            println!("{USAGE}");
-            return;
-        }
-        Err(message) => {
-            eprintln!("gitwarp: {message}\n\n{USAGE}");
-            std::process::exit(2);
-        }
-    };
+    let (path, git_choice) =
+        match parse_args(std::env::args_os().skip(1), std::env::var_os("GITWARP_GIT")) {
+            Ok(Cli::Run { path, git }) => (path, git),
+            Ok(Cli::Help) => {
+                println!("{USAGE}");
+                return;
+            }
+            Err(message) => {
+                eprintln!("gitwarp: {message}\n\n{USAGE}");
+                std::process::exit(2);
+            }
+        };
 
     // Resolved once, before any window exists, so the probe cannot freeze the UI.
-    let git = Git::resolve(git)
+    let git: Result<Arc<Git>, Arc<git_core::Error>> = Git::resolve(git_choice.clone())
         .map(|r| {
             if let Some(reason) = r.fallback {
                 log::warn!("bundled git unusable, using system git: {reason}");
             }
             Arc::new(r.git)
         })
-        .map_err(|e| e.to_string());
+        .map_err(Arc::new);
 
     let config_path = settings::config_dir().map(|dir| dir.join("settings.json"));
     let loaded = match &config_path {
@@ -136,7 +138,7 @@ fn main() {
                 },
                 |window, cx| {
                     ui::theme::follow_system(window, cx);
-                    cx.new(|cx| Workspace::new(path, git, window, cx))
+                    cx.new(|cx| Workspace::new(path, git, git_choice, window, cx))
                 },
             )
             .expect("failed to open the main window");

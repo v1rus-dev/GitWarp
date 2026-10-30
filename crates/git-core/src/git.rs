@@ -197,6 +197,7 @@ impl Git {
                 let _ = child.wait();
                 return Err(Error::Git {
                     command: "--version",
+                    code: None,
                     stderr: format!("timed out after {timeout:?}"),
                 });
             }
@@ -205,7 +206,7 @@ impl Git {
         let out = check_output(child.wait_with_output()?, "--version")?;
         let text = String::from_utf8_lossy(&out.stdout);
         git.version = GitVersion::parse(&text).ok_or(Error::Parse("git --version output"))?;
-        check_floor(git.version)?;
+        check_floor(git.version, source, &git.exe)?;
         Ok(git)
     }
 
@@ -243,11 +244,13 @@ impl Git {
     }
 }
 
-fn check_floor(found: GitVersion) -> Result<()> {
+fn check_floor(found: GitVersion, source: GitSource, path: &Path) -> Result<()> {
     if found < GitVersion::MIN {
         Err(Error::UnsupportedGit {
             found,
             required: GitVersion::MIN,
+            source,
+            path: path.to_path_buf(),
         })
     } else {
         Ok(())
@@ -334,20 +337,29 @@ mod tests {
 
     #[test]
     fn rejects_versions_below_the_floor() {
+        let path = Path::new("/usr/bin/git");
         assert!(matches!(
-            check_floor(GitVersion {
-                major: 2,
-                minor: 30,
-                patch: 9
-            }),
+            check_floor(
+                GitVersion {
+                    major: 2,
+                    minor: 30,
+                    patch: 9
+                },
+                GitSource::System,
+                path
+            ),
             Err(Error::UnsupportedGit { .. })
         ));
-        assert!(check_floor(GitVersion::MIN).is_ok());
-        assert!(check_floor(GitVersion {
-            major: 3,
-            minor: 0,
-            patch: 0
-        })
+        assert!(check_floor(GitVersion::MIN, GitSource::System, path).is_ok());
+        assert!(check_floor(
+            GitVersion {
+                major: 3,
+                minor: 0,
+                patch: 0
+            },
+            GitSource::System,
+            path
+        )
         .is_ok());
     }
 

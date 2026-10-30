@@ -17,7 +17,7 @@ use gpui::{
     Subscription, WeakEntity, Window,
 };
 
-use git_core::{Git, Head, Ref, RefKind};
+use git_core::{Error, Git, Head, Ref, RefKind};
 use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_SM, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
@@ -25,9 +25,11 @@ use ui::{
     Spinner, Splitter, TextInput, Tooltip, Tree, TreeNodeData,
 };
 
+use crate::format::format_count;
+use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
 use crate::settings::{Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
-use crate::workspace::{repo_name, titlebar, titlebar_end, titlebar_fill, Workspace};
+use crate::workspace::{git_label, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace};
 
 actions!(
     gitwarp,
@@ -400,20 +402,9 @@ fn leaf_node(key: &str, label: &str, icon: IconName, selected: Option<&str>) -> 
         .selected(selected == Some(key))
 }
 
-/// `12,400`: thousands separated by commas, like the status bar shows.
-fn format_count(count: usize) -> String {
-    let digits = count.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(digit);
-    }
-    out
-}
-
 pub struct RepositoryView {
+    /// The path the view was opened for, so the workspace can reopen it.
+    path: PathBuf,
     /// Canonical root, for the "current" marker in the repository menu.
     root: PathBuf,
     repo_name: SharedString,
@@ -441,18 +432,16 @@ pub struct RepositoryView {
 impl RepositoryView {
     pub fn new(
         path: PathBuf,
-        git: Result<Arc<Git>, String>,
+        git: Result<Arc<Git>, Arc<Error>>,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let root = path.canonicalize().unwrap_or_else(|_| path.clone());
         let name = repo_name(&path);
-        let git_label: SharedString = match &git {
-            Ok(git) => format!("git {} · {}", git.version(), git.source()).into(),
-            Err(_) => "git not found".into(),
-        };
-        let history = cx.new(|cx| HistoryView::open(path.clone(), git.clone(), cx));
+        let git_label = git_label(&git);
+        let history =
+            cx.new(|cx| HistoryView::open(path.clone(), git.clone(), workspace.clone(), cx));
         let observer = cx.observe(&history, |this, history, cx| {
             // A repository opened from a subdirectory is remembered by its
             // root, so the switcher's "current" marker must follow it.
@@ -488,6 +477,7 @@ impl RepositoryView {
         let focus = cx.focus_handle().tab_stop(false);
 
         Self {
+            path,
             root,
             repo_name: name,
             git_label,
@@ -515,6 +505,11 @@ impl RepositoryView {
     /// The focus handle of the toolbar search field.
     pub fn search_focus(&self) -> FocusHandle {
         self.search_focus.clone()
+    }
+
+    /// The path this view was opened for; reopened after a git retry.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -1079,27 +1074,34 @@ impl RepositoryView {
             .text_color(colors.muted);
 
         let mut fill = true;
-        if history.is_loading() {
-            bar = bar.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(Spinner::new("status-spinner", px(12.)))
-                    .child("Loading history…"),
-            );
-        } else if let Some(error) = history.error() {
-            // The error takes the left side and the stretch, so it cannot
-            // push the counters and the git button off the bar.
-            bar = bar.child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(colors.error)
-                    .child(error.clone()),
-            );
-            fill = false;
+        match history.state() {
+            LoadState::Loading { .. } => {
+                bar = bar.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(Spinner::new("status-spinner", px(12.)))
+                        .child("Loading history…"),
+                );
+            }
+            LoadState::Cancelled => {
+                bar = bar.child(div().text_color(colors.muted).child("Loading cancelled"));
+            }
+            LoadState::Failed(failure) => {
+                // The failure takes the left side and the stretch, so it
+                // cannot push the counters and the git button off the bar.
+                bar = bar.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(colors.error)
+                        .child(failure.title()),
+                );
+                fill = false;
+            }
+            LoadState::Loaded => {}
         }
         if fill {
             bar = bar.child(div().flex_1());
@@ -1388,7 +1390,10 @@ mod tests {
                     cx.new(|cx| {
                         crate::workspace::Workspace::new(
                             Some(PathBuf::from("/nonexistent")),
-                            Err("no git".to_owned()),
+                            Err(Arc::new(Error::PathNotFound {
+                                path: PathBuf::from("/nonexistent"),
+                            })),
+                            git_core::GitChoice::Auto,
                             window,
                             cx,
                         )
@@ -1592,15 +1597,6 @@ mod tests {
         let nodes = sidebar_nodes(Some(&refs), None, &Sections::default(), Some("tag:v1"));
         let tag = nodes.iter().find(|n| n.label == "v1").unwrap();
         assert!(tag.selected);
-    }
-
-    #[test]
-    fn counts_use_thousands_separators() {
-        assert_eq!(format_count(0), "0");
-        assert_eq!(format_count(999), "999");
-        assert_eq!(format_count(1_000), "1,000");
-        assert_eq!(format_count(12_400), "12,400");
-        assert_eq!(format_count(1_234_567), "1,234,567");
     }
 
     #[test]

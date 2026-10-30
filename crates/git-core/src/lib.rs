@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-pub use error::{Error, Result};
+pub use error::{Error, ErrorClass, Result};
 pub use git::{Git, GitChoice, GitSource, GitVersion, Resolution};
 pub use log::{CommitInfo, LogOptions, LogStream};
 pub use oid::Oid;
@@ -36,10 +36,18 @@ pub struct Repo {
 impl Repo {
     /// Open the repository containing `path`.
     pub fn open(git: Arc<Git>, path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        // Checked here so a missing folder is not reported as "not a git
+        // repository" by git itself.
+        if !path.is_dir() {
+            return Err(Error::PathNotFound {
+                path: path.to_path_buf(),
+            });
+        }
         let out = git
             .command()
             .arg("-C")
-            .arg(path.as_ref())
+            .arg(path)
             .args([
                 "rev-parse",
                 "--path-format=absolute",
@@ -59,7 +67,28 @@ impl Repo {
         // and git's own message ("not a git repository", unknown extension,
         // dubious ownership, ...) is what the user needs to see.
         if !bare {
-            check_output(out, "rev-parse")?;
+            match check_output(out, "rev-parse") {
+                Ok(_) => {}
+                // The one failure the UI treats separately: a folder that is
+                // simply not inside a working tree.
+                Err(Error::Git {
+                    command,
+                    code,
+                    stderr,
+                }) => {
+                    if stderr.contains("not a git repository") {
+                        return Err(Error::NotARepository {
+                            path: path.to_path_buf(),
+                        });
+                    }
+                    return Err(Error::Git {
+                        command,
+                        code,
+                        stderr,
+                    });
+                }
+                Err(e) => return Err(e),
+            }
         }
         let line = |i: usize| {
             lines
@@ -78,6 +107,18 @@ impl Repo {
             git_dir,
             objects_info,
         })
+    }
+
+    /// Create a repository at `path` (`git init -q`) and open it.
+    pub fn init(git: Arc<Git>, path: &Path) -> Result<Self> {
+        let out = git
+            .command()
+            .args(["init", "-q"])
+            .arg(path)
+            .output()
+            .map_err(Error::Spawn)?;
+        check_output(out, "init")?;
+        Self::open(git, path)
     }
 
     pub fn root(&self) -> &Path {
@@ -99,6 +140,21 @@ impl Repo {
     /// them, so the first screen of history renders before the log finishes.
     pub fn log(&self, options: &LogOptions) -> Result<LogStream> {
         LogStream::spawn(self, options)
+    }
+
+    /// How many commits the history log will show: every branch, remote and
+    /// tag, minus the stash. An empty repository counts 0.
+    pub fn commit_count(&self) -> Result<u64> {
+        let out = self
+            .command()
+            .args(["rev-list", "--count", "--exclude=refs/stash", "--all"])
+            .output()
+            .map_err(Error::Spawn)?;
+        let out = check_output(out, "rev-list --count")?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.trim()
+            .parse()
+            .map_err(|_| Error::Parse("rev-list --count output"))
     }
 
     /// Whether git keeps a commit-graph file for this repository.
@@ -147,6 +203,7 @@ pub(crate) fn check_output(out: Output, command: &'static str) -> Result<Output>
     } else {
         Err(Error::Git {
             command,
+            code: out.status.code(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
