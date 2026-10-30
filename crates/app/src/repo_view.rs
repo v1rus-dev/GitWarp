@@ -22,7 +22,7 @@ use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_SM, R_SM, STATUS}
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
     menu, Button, Icon, IconName, MenuEntry, MenuItem, SearchField, SegmentItem, Segmented,
-    Spinner, Splitter, TextInput, Tooltip, Tree, TreeNodeData,
+    Spinner, Splitter, TextInput, TextInputEvent, Tooltip, Tree, TreeNodeData,
 };
 
 use crate::format::format_count;
@@ -39,10 +39,28 @@ actions!(
         ToggleSidebar,
         ToggleDetails,
         FocusSearch,
+        SearchNext,
+        SearchPrev,
+        SearchClear,
+        SearchFocusList,
         OpenRepoSwitcher,
         OpenBranchSwitcher
     ]
 );
+
+/// Binds the search field's own keys in its `history-search` context, so
+/// Enter/F3/Esc/↓ never fire while another input has the keyboard. Enter is
+/// handled through the input's own `Submit` event instead. Called once at
+/// startup.
+pub(crate) fn bind_search_keys(cx: &mut App) {
+    cx.bind_keys([
+        ui::actions::key_binding(cx, "shift-enter", SearchPrev, Some("history-search")),
+        ui::actions::key_binding(cx, "f3", SearchNext, Some("history-search")),
+        ui::actions::key_binding(cx, "shift-f3", SearchPrev, Some("history-search")),
+        ui::actions::key_binding(cx, "escape", SearchClear, Some("history-search")),
+        ui::actions::key_binding(cx, "down", SearchFocusList, Some("history-search")),
+    ]);
+}
 
 /// Height of a toolbar tool button.
 const TOOL_H: f32 = 28.;
@@ -456,6 +474,8 @@ pub struct RepositoryView {
     focus: FocusHandle,
     search: Entity<TextInput>,
     search_focus: FocusHandle,
+    /// The search field's text and submit events, forwarded to the history.
+    _search_events: Subscription,
     sidebar_filter: Entity<TextInput>,
     sidebar_open: bool,
     sidebar_width: f32,
@@ -503,6 +523,19 @@ impl RepositoryView {
             input
         });
         let search_focus = search.read(cx).focus_handle().clone();
+        let search_events = cx.subscribe(&search, |this, _, event: &TextInputEvent, cx| {
+            match event {
+                TextInputEvent::Changed(text) => {
+                    this.history
+                        .update(cx, |history, cx| history.set_search_query(text.clone(), cx));
+                }
+                // Enter in the field: the next match, wrapping.
+                TextInputEvent::Submit => {
+                    this.history
+                        .update(cx, |history, cx| history.search_step(true, cx));
+                }
+            }
+        });
         let sidebar_filter = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
             input.set_placeholder("Filter branches, tags…", cx);
@@ -532,6 +565,7 @@ impl RepositoryView {
             focus: focus.clone(),
             search,
             search_focus,
+            _search_events: search_events,
             sidebar_filter,
             sidebar_open: true,
             sidebar_width: settings
@@ -571,6 +605,41 @@ impl RepositoryView {
     pub(crate) fn toggle_details(&mut self, cx: &mut Context<Self>) {
         self.details_open = !self.details_open;
         cx.notify();
+    }
+
+    /// The history view, for the search's focus hand-off and the tests.
+    #[cfg(test)]
+    pub(crate) fn history(&self) -> Entity<HistoryView> {
+        self.history.clone()
+    }
+
+    /// Enter / F3 in the search field: the next match.
+    fn search_next(&mut self, cx: &mut Context<Self>) {
+        self.history
+            .update(cx, |history, cx| history.search_step(true, cx));
+    }
+
+    /// Shift+Enter / Shift+F3: the previous match.
+    fn search_prev(&mut self, cx: &mut Context<Self>) {
+        self.history
+            .update(cx, |history, cx| history.search_step(false, cx));
+    }
+
+    /// Esc: clear the field's text (which clears the search) and give the list
+    /// the keyboard, keeping its selection.
+    fn search_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search.update(cx, |input, cx| input.set_text("", cx));
+        self.history
+            .update(cx, |history, cx| history.clear_search(cx));
+        let focus = self.history.read(cx).list_focus();
+        window.focus(&focus, cx);
+    }
+
+    /// ↓ in the field: hand the keyboard to the list without moving the
+    /// selection.
+    fn search_focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = self.history.read(cx).list_focus();
+        window.focus(&focus, cx);
     }
 
     fn set_dock(&mut self, dock: Dock, cx: &mut Context<Self>) {
@@ -877,8 +946,11 @@ impl RepositoryView {
         ));
 
         let mut field = SearchField::new("toolbar-search", self.search.clone());
-        if layout.search_kbd {
-            field = field.hint("Ctrl K");
+        match self.history.read(cx).search_status() {
+            // A query replaces the key hint with its count (or "No matches").
+            Some(status) => field = field.trailing_text(status),
+            None if layout.search_kbd => field = field.hint("Ctrl K"),
+            None => {}
         }
         bar = bar.child(
             div()
@@ -886,6 +958,17 @@ impl RepositoryView {
                 .flex_basis(px(layout.search_basis))
                 .flex_shrink(1.)
                 .min_w(px(layout.search_min))
+                // The field's own keys live here, so they never fire while
+                // the sidebar filter or another input has the keyboard.
+                .key_context("history-search")
+                .on_action(cx.listener(|view, _: &SearchNext, _, cx| view.search_next(cx)))
+                .on_action(cx.listener(|view, _: &SearchPrev, _, cx| view.search_prev(cx)))
+                .on_action(cx.listener(|view, _: &SearchClear, window, cx| {
+                    view.search_clear(window, cx);
+                }))
+                .on_action(cx.listener(|view, _: &SearchFocusList, window, cx| {
+                    view.search_focus_list(window, cx);
+                }))
                 .tooltip(Tooltip::with_kbd(
                     "Search commits, authors, hashes",
                     "Ctrl K",
@@ -1331,6 +1414,8 @@ impl Render for RepositoryView {
             .on_action(cx.listener(|view, _: &FocusSearch, window, cx| {
                 let handle = view.search_focus();
                 window.focus(&handle, cx);
+                // Ctrl+K selects the field's text, so typing replaces it.
+                view.search.update(cx, |input, cx| input.select_all(cx));
                 cx.notify();
             }))
             .on_action(cx.listener(|view, _: &OpenRepoSwitcher, window, cx| {
@@ -1733,5 +1818,204 @@ mod tests {
         assert_eq!(DOCK_HEADER, px(34.));
         assert_eq!(ui::metrics::BAR, px(40.));
         assert_eq!(STATUS, px(24.));
+    }
+
+    /// Makes one commit on the repository.
+    fn commit(repo: &Path, file: &str, message: &str) {
+        std::fs::write(repo.join(file), message).expect("write the committed file");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test User")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test User")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["add", file]);
+        run(&["commit", "-q", "-m", message]);
+    }
+
+    /// Opens the repository view as the window root on a real repository and
+    /// waits for its history to load.
+    fn open_repository_view(
+        repo: &crate::test_support::TempRepo,
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::VisualTestContext, Entity<RepositoryView>) {
+        use gpui::{
+            point, size, AppContext, Bounds, VisualTestContext, WindowBackgroundAppearance,
+            WindowBounds, WindowDecorations, WindowOptions,
+        };
+
+        let git = crate::test_support::git();
+        cx.update(ui::init).expect("ui::init");
+        cx.update(bind_search_keys);
+        let handle = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(1400.), px(900.)),
+                    ))),
+                    window_decorations: Some(WindowDecorations::Client),
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let workspace = cx.new(|cx| {
+                        Workspace::new(None, Ok(git.clone()), git_core::GitChoice::Auto, window, cx)
+                    });
+                    let weak = workspace.downgrade();
+                    cx.new(|cx| {
+                        RepositoryView::new(
+                            repo.path().to_path_buf(),
+                            Ok(git.clone()),
+                            weak,
+                            window,
+                            cx,
+                        )
+                    })
+                },
+            )
+            .expect("open window")
+        });
+        let mut cx = VisualTestContext::from_window(handle.into(), cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let view = cx
+            .update(|window, _| window.root::<RepositoryView>().flatten())
+            .expect("the repository view is the window root");
+        (cx, view)
+    }
+
+    /// Lets the 150 ms search debounce and the background scan finish. The
+    /// test scheduler does not advance its clock on its own while parked.
+    fn settle_search(cx: &mut gpui::VisualTestContext) {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(150));
+        cx.run_until_parked();
+    }
+
+    /// Typing a query into the toolbar field jumps the list to the first
+    /// match; Enter / F3 step forward and Shift+Enter back, both wrapping; Esc
+    /// clears the field and hands the list the keyboard.
+    #[gpui::test]
+    fn the_search_field_jumps_to_matches_and_steps_through_them(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+
+        let repo = crate::test_support::TempRepo::new("history-search");
+        commit(repo.path(), "a.txt", "Alpha");
+        commit(repo.path(), "b.txt", "Beta one");
+        commit(repo.path(), "c.txt", "Gamma");
+        commit(repo.path(), "d.txt", "Beta two");
+
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        let history = view.read_with(&cx, |view, _| view.history());
+        // Newest first: 0 "Beta two", 1 "Gamma", 2 "Beta one", 3 "Alpha".
+        assert_eq!(history.read_with(&cx, |view, _| view.commit_count()), 4);
+
+        let field = cx
+            .debug_bounds("toolbar-search")
+            .expect("the toolbar search was not drawn");
+        cx.simulate_click(field.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        // A match below the current selection is selected after the debounce.
+        cx.simulate_input("gamma");
+        settle_search(&mut cx);
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected_row()),
+            Some(1),
+            "typing did not jump to the matching row"
+        );
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.search_status().map(|s| s.to_string())),
+            Some("1 / 1".to_owned())
+        );
+
+        // Esc clears the query, the count disappears and the list gets the
+        // keyboard without moving the selection.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.search_status()),
+            None,
+            "Esc did not clear the search"
+        );
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected_row()),
+            Some(1)
+        );
+        let text = view.read_with(&cx, |view, app| view.search.read(app).text().to_owned());
+        assert!(text.is_empty(), "Esc did not clear the field's text");
+        cx.update(|window, app| {
+            assert!(
+                history.read(app).list_focus().is_focused(window),
+                "Esc did not focus the history list"
+            );
+        });
+
+        // Two matches, and the selection is on row 1 ("Gamma"), so the first
+        // match at or after it is row 2.
+        cx.simulate_click(field.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_input("beta");
+        settle_search(&mut cx);
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected_row()),
+            Some(2)
+        );
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.search_status().map(|s| s.to_string())),
+            Some("2 / 2".to_owned())
+        );
+
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected_row()),
+            Some(0),
+            "Enter did not wrap to the first match"
+        );
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.search_status().map(|s| s.to_string())),
+            Some("1 / 2".to_owned())
+        );
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected_row()),
+            Some(2)
+        );
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected_row()),
+            Some(0),
+            "Shift+Enter did not wrap back to the first match"
+        );
+        cx.simulate_keystrokes("f3");
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected_row()),
+            Some(2),
+            "F3 did not step to the next match"
+        );
+
+        // ↓ keeps the selection and gives the list the keyboard.
+        cx.simulate_keystrokes("down");
+        assert_eq!(
+            history.read_with(&cx, |view, _| view.selected_row()),
+            Some(2)
+        );
+        cx.update(|window, app| {
+            assert!(
+                history.read(app).list_focus().is_focused(window),
+                "↓ did not focus the history list"
+            );
+        });
     }
 }

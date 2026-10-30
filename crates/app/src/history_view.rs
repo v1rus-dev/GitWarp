@@ -32,6 +32,7 @@ use ui::{
 
 use crate::format::{format_count, relative_time};
 use crate::graph_paint::paint_row;
+use crate::history_search::{self, Query};
 use crate::history_state::{
     percent_text, progress_fraction, skeleton_percent, source_label, Failure, LoadState,
     SkeletonColumn,
@@ -42,6 +43,9 @@ use crate::workspace::Workspace;
 
 /// Rows are delivered to the UI in pages of this size.
 const PAGE: usize = 2_000;
+
+/// How long the field waits after the last keystroke before the search runs.
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Column widths of the history table, shared by the header and the rows.
 const COL_GAP: f32 = 18.;
@@ -392,7 +396,7 @@ pub fn clipped_lanes(geometry: &ColumnGeometry, column_width: f32) -> usize {
 }
 
 struct Item {
-    commit: CommitInfo,
+    commit: Arc<CommitInfo>,
     row: Rc<Row<Oid>>,
 }
 
@@ -533,6 +537,27 @@ pub struct HistoryView {
     /// second one. The finished task stays in its slot (inert) until it is
     /// replaced.
     commit_graph_running: bool,
+    /// The search field's current text. Applied after [`SEARCH_DEBOUNCE`].
+    search_text: String,
+    /// The query the matches belong to; `None` while the field is empty.
+    search: Option<Query>,
+    /// The matching rows of the applied query, sorted by row.
+    search_matches: Vec<history_search::HistoryMatch>,
+    /// How many rows the matches cover. Pages that arrive later are scanned
+    /// from here, never rescanned from the top.
+    search_scanned: usize,
+    /// Whether a background scan is in flight; new pages wait for it.
+    search_scanning: bool,
+    /// Bumped on every query or load change; results of an older scan are
+    /// dropped instead of appended to the wrong query.
+    search_generation: u64,
+    /// The pending debounce timer; dropping it cancels the wait.
+    search_debounce: Option<Task<()>>,
+    /// The running background scan.
+    search_task: Option<Task<()>>,
+    /// Whether the next finished scan should select the first match. Cleared
+    /// once the selection jumped, or with the query.
+    search_jump: bool,
 }
 
 impl HistoryView {
@@ -591,6 +616,15 @@ impl HistoryView {
             user_selected: false,
             commit_graph_task: None,
             commit_graph_running: false,
+            search_text: String::new(),
+            search: None,
+            search_matches: Vec::new(),
+            search_scanned: 0,
+            search_scanning: false,
+            search_generation: 0,
+            search_debounce: None,
+            search_task: None,
+            search_jump: false,
         };
         view.start(cx);
         // Relative dates are derived at render time from the clock, so the
@@ -802,7 +836,7 @@ impl HistoryView {
             self.max_lanes = self.max_lanes.max(row.width);
             self.idle_lanes.push(&row);
             self.items.push(Item {
-                commit,
+                commit: Arc::new(commit),
                 row: Rc::new(row),
             });
         }
@@ -810,6 +844,9 @@ impl HistoryView {
         // The HEAD row may only arrive now; the initial selection follows it
         // until the user picks a row.
         self.settle_initial_selection(cx);
+        // A page that arrives while a query is active is searched as it lands,
+        // never by rescanning the rows already covered.
+        self.scan_more(cx);
         cx.notify();
     }
 
@@ -1100,6 +1137,189 @@ impl HistoryView {
         cx.notify();
     }
 
+    /// The search field's text changed. The actual search waits for the
+    /// debounce; an empty query clears the matches at once.
+    pub fn set_search_query(&mut self, text: String, cx: &mut Context<Self>) {
+        if self.search_text == text {
+            return;
+        }
+        self.search_text = text;
+        // Dropping the old timer and the old scan cancels both.
+        self.search_debounce = None;
+        self.search_task = None;
+        self.search_scanning = false;
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        if Query::parse(&self.search_text).is_none() {
+            self.search = None;
+            self.search_matches.clear();
+            self.search_scanned = 0;
+            self.search_jump = false;
+            cx.notify();
+            return;
+        }
+        self.search_debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            this.update(cx, |view, cx| {
+                if view.search_generation == generation {
+                    view.apply_search(cx);
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Esc: no query, no matches, and the next query starts a fresh scan.
+    pub fn clear_search(&mut self, cx: &mut Context<Self>) {
+        self.search_text.clear();
+        self.search = None;
+        self.search_matches.clear();
+        self.search_scanned = 0;
+        self.search_scanning = false;
+        self.search_jump = false;
+        self.search_debounce = None;
+        self.search_task = None;
+        self.search_generation = self.search_generation.wrapping_add(1);
+        cx.notify();
+    }
+
+    /// What the search field's trailing text says: the position of the
+    /// selected match and the total, "No matches", or `None` for an empty
+    /// field (the hint comes back then).
+    pub fn search_status(&self) -> Option<SharedString> {
+        self.search.as_ref()?;
+        if self.search_matches.is_empty() {
+            return Some(if self.is_loading() {
+                "– / 0+".into()
+            } else {
+                "No matches".into()
+            });
+        }
+        let total = self.search_matches.len();
+        let suffix = if self.is_loading() { "+" } else { "" };
+        let position = self
+            .selected
+            .and_then(|row| history_search::position_of(&self.search_matches, row))
+            .map(|position| (position + 1).to_string())
+            .unwrap_or_else(|| "–".to_owned());
+        Some(format!("{position} / {total}{suffix}").into())
+    }
+
+    /// The history list's focus handle, so Esc and ↓ in the search field can
+    /// hand the keyboard back without moving the selection.
+    pub fn list_focus(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
+    /// The selected row, for the search's gpui test in the repository shell.
+    #[cfg(test)]
+    pub(crate) fn selected_row(&self) -> Option<usize> {
+        self.selected
+    }
+
+    /// Enter / F3 (next) and Shift+Enter / Shift+F3 (previous), both wrapping.
+    pub fn search_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(position) = history_search::step(&self.search_matches, self.selected, forward)
+        else {
+            return;
+        };
+        let row = self.search_matches[position].row;
+        self.select_row(row, cx);
+    }
+
+    /// The debounce elapsed: parse the field's text and start the scan.
+    fn apply_search(&mut self, cx: &mut Context<Self>) {
+        let Some(query) = Query::parse(&self.search_text) else {
+            return;
+        };
+        self.search = Some(query);
+        self.search_matches.clear();
+        self.search_scanned = 0;
+        self.search_scanning = false;
+        self.search_task = None;
+        // The first finished scan jumps to the first match at or after the
+        // selection, even when the match only arrives with a later page.
+        self.search_jump = true;
+        self.scan_more(cx);
+        cx.notify();
+    }
+
+    /// Scan the rows that were not searched yet. The snapshot shares the
+    /// commits with the view (`Arc`), and the match runs on the background
+    /// executor: even a 100k-row history never blocks a frame.
+    fn scan_more(&mut self, cx: &mut Context<Self>) {
+        let Some(query) = self.search.clone() else {
+            return;
+        };
+        if self.search_scanning || self.search_scanned >= self.items.len() {
+            return;
+        }
+        let start = self.search_scanned;
+        let end = self.items.len();
+        let rows: Vec<Arc<CommitInfo>> = self.items[start..end]
+            .iter()
+            .map(|item| item.commit.clone())
+            .collect();
+        let generation = self.search_generation;
+        let executor = cx.background_executor().clone();
+        self.search_scanning = true;
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            let found = executor
+                .spawn(async move {
+                    history_search::search(
+                        &query,
+                        rows.iter()
+                            .enumerate()
+                            .map(|(offset, commit)| (start + offset, &**commit)),
+                    )
+                })
+                .await;
+            this.update(cx, |view, cx| view.finish_scan(generation, end, found, cx))
+                .ok();
+        }));
+    }
+
+    /// A background scan finished: keep its matches when it still belongs to
+    /// the current query, then either jump or search the rows that arrived
+    /// while it ran.
+    fn finish_scan(
+        &mut self,
+        generation: u64,
+        end: usize,
+        found: Vec<history_search::HistoryMatch>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.search_generation {
+            return;
+        }
+        self.search_scanning = false;
+        self.search_matches.extend(found);
+        self.search_scanned = end;
+        if self.search_jump {
+            if let Some(position) = history_search::first_from(&self.search_matches, self.selected)
+            {
+                self.search_jump = false;
+                let row = self.search_matches[position].row;
+                self.select_row(row, cx);
+            }
+        }
+        self.scan_more(cx);
+        cx.notify();
+    }
+
+    /// A new load replaces the rows: keep the query and search the new rows
+    /// from the top.
+    fn restart_search(&mut self, cx: &mut Context<Self>) {
+        self.search_matches.clear();
+        self.search_scanned = 0;
+        self.search_scanning = false;
+        self.search_task = None;
+        self.search_jump = self.search.is_some();
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.scan_more(cx);
+    }
+
     fn finish(&mut self, generation: u64, result: Result<(), Failure>, cx: &mut Context<Self>) {
         if generation != self.generation {
             return;
@@ -1131,6 +1351,8 @@ impl HistoryView {
         self.selected = None;
         self.user_selected = false;
         self.hovered = None;
+        // The query stays in the field; its matches belong to the old rows.
+        self.restart_search(cx);
         self.start(cx);
         cx.notify();
     }
@@ -1474,6 +1696,7 @@ impl HistoryView {
         let items = &self.items;
         let badges = &self.badges;
         let badge_widths = &mut self.badge_widths;
+        let search_matches = &self.search_matches;
         range
             .map(|ix| {
                 let item = &items[ix];
@@ -1481,6 +1704,10 @@ impl HistoryView {
                 let selected = selected_index == Some(ix);
                 let is_hovered = hovered == Some(ix) && !selected;
                 let c = &item.commit;
+                let fields = search_matches
+                    .binary_search_by_key(&ix, |found| found.row)
+                    .ok()
+                    .map(|position| &search_matches[position].fields);
                 let background = if selected {
                     if list_focused {
                         colors.selection
@@ -1501,6 +1728,8 @@ impl HistoryView {
                 let is_head = head == Some(c.id);
                 let row_theme = ui_theme.clone();
                 let row_geometry = geometry.clone();
+                let summary_ranges = fields.map(|f| f.summary.as_slice()).unwrap_or(&[]);
+                let author_ranges = fields.map(|f| f.author_name.as_slice()).unwrap_or(&[]);
 
                 // The 6px gutter lives on the wrapper: a uniform_list lays
                 // each item out with a definite width and does not stretch it,
@@ -1631,20 +1860,41 @@ impl HistoryView {
                             .tooltip(hidden),
                     );
                 }
-                row_div = row_div.child(
-                    summary.child(
-                        div()
-                            .id(format!("history-summary-{ix}"))
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(FS_BASE)
-                            .text_color(summary_color)
-                            .when(is_head, |text| text.font_weight(FontWeight::BOLD))
-                            .tooltip(Tooltip::text(c.summary.clone()))
-                            .child(c.summary.clone()),
-                    ),
-                );
+                row_div = row_div.child(summary.child({
+                    let mut cell = div()
+                        .id(format!("history-summary-{ix}"))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(FS_BASE)
+                        .text_color(summary_color)
+                        .when(is_head, |text| text.font_weight(FontWeight::BOLD))
+                        .tooltip(Tooltip::text(c.summary.clone()));
+                    // Only a matching cell pays for styled runs; the plain
+                    // path keeps the cheap shared string.
+                    cell = if summary_ranges.is_empty() {
+                        cell.child(c.summary.clone())
+                    } else {
+                        let style = TextStyle {
+                            color: summary_color,
+                            font_family: FONT_UI.into(),
+                            font_size: FS_BASE.into(),
+                            font_weight: if is_head {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            },
+                            ..TextStyle::default()
+                        };
+                        cell.child(highlighted_text(
+                            &c.summary,
+                            summary_ranges,
+                            &style,
+                            colors.accent_soft,
+                        ))
+                    };
+                    cell
+                }));
                 if let Some(author) = columns.author {
                     row_div = row_div.child(
                         div()
@@ -1660,13 +1910,26 @@ impl HistoryView {
                                 Avatar::new(c.author_email.clone(), px(16.))
                                     .name(c.author_name.clone()),
                             )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .child(c.author_name.clone()),
-                            ),
+                            .child({
+                                let mut cell = div().flex_1().min_w_0().truncate();
+                                cell = if author_ranges.is_empty() {
+                                    cell.child(c.author_name.clone())
+                                } else {
+                                    let style = TextStyle {
+                                        color: secondary,
+                                        font_family: FONT_UI.into(),
+                                        font_size: FS_SM.into(),
+                                        ..TextStyle::default()
+                                    };
+                                    cell.child(highlighted_text(
+                                        &c.author_name,
+                                        author_ranges,
+                                        &style,
+                                        colors.accent_soft,
+                                    ))
+                                };
+                                cell
+                            }),
                     );
                 }
                 row_div = row_div.child(
@@ -1680,15 +1943,40 @@ impl HistoryView {
                         .child(relative_time(now, c.author_time.max(0) as u64)),
                 );
                 if let Some(hash) = columns.hash {
-                    row_div = row_div.child(
-                        div()
+                    let short = short_hash(&c.id);
+                    // The hash field only matches at the start of the full
+                    // hash, so the highlight covers the visible prefix.
+                    let hash_ranges = fields
+                        .and_then(|fields| fields.hash.as_ref())
+                        .map(|range| 0..range.end.min(short.len()))
+                        .filter(|range| !range.is_empty())
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    row_div = row_div.child({
+                        let mut cell = div()
                             .w(px(hash))
                             .flex_none()
                             .truncate()
                             .font_family(FONT_MONO)
-                            .text_color(secondary)
-                            .child(short_hash(&c.id)),
-                    );
+                            .text_color(secondary);
+                        cell = if hash_ranges.is_empty() {
+                            cell.child(short.clone())
+                        } else {
+                            let style = TextStyle {
+                                color: secondary,
+                                font_family: FONT_MONO.into(),
+                                font_size: FS_SM.into(),
+                                ..TextStyle::default()
+                            };
+                            cell.child(highlighted_text(
+                                &short,
+                                &hash_ranges,
+                                &style,
+                                colors.accent_soft,
+                            ))
+                        };
+                        cell
+                    });
                 }
                 if ring_visible && selected {
                     row_div = row_div.child(focus::focus_ring(RingOffset::Inset2, R_MD, cx));
@@ -2329,6 +2617,50 @@ fn short_hash(id: &Oid) -> String {
     hash
 }
 
+/// One cell's text with every matched run painted `highlight`.
+///
+/// GPUI text runs carry a background colour but no corner radius, so the
+/// design's 3px radius is dropped: the highlight is a plain rectangle.
+fn highlighted_text(
+    text: &str,
+    ranges: &[std::ops::Range<usize>],
+    style: &TextStyle,
+    highlight: gpui::Hsla,
+) -> StyledText {
+    StyledText::new(text.to_owned()).with_runs(text_runs(text, ranges, style, highlight))
+}
+
+/// The runs behind [`highlighted_text`]: plain stretches in `style`, matched
+/// stretches in `style` plus the background. Ranges that are empty, outside
+/// the text or not on a character boundary are ignored.
+fn text_runs(
+    text: &str,
+    ranges: &[std::ops::Range<usize>],
+    style: &TextStyle,
+    highlight: gpui::Hsla,
+) -> Vec<TextRun> {
+    let mut runs = Vec::new();
+    let mut cursor = 0;
+    for range in ranges {
+        let start = range.start.max(cursor);
+        let end = range.end.min(text.len());
+        if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        if cursor < start {
+            runs.push(style.to_run(start - cursor));
+        }
+        let mut matched = style.clone();
+        matched.background_color = Some(highlight);
+        runs.push(matched.to_run(end - start));
+        cursor = end;
+    }
+    if cursor < text.len() {
+        runs.push(style.to_run(text.len() - cursor));
+    }
+    runs
+}
+
 /// The date cell's tooltip: `YYYY-MM-DD HH:MM UTC`.
 fn format_time_tooltip(unix: i64) -> String {
     format!("{} UTC", format_time(unix))
@@ -2671,6 +3003,48 @@ mod tests {
         assert_eq!(body.code.len(), 1);
         let range = body.code[0].clone();
         assert_eq!(&body.text[range], "/usr/bin/git");
+    }
+
+    #[test]
+    fn highlight_runs_cover_the_text_and_paint_only_the_match() {
+        let style = TextStyle {
+            color: gpui::black(),
+            font_family: FONT_UI.into(),
+            font_size: FS_SM.into(),
+            ..TextStyle::default()
+        };
+        let highlight = gpui::blue();
+        let matched = [std::ops::Range { start: 4, end: 7 }];
+        let runs = text_runs("Fix the parser", &matched, &style, highlight);
+        assert_eq!(
+            runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![4, 3, 7]
+        );
+        assert_eq!(runs[0].background_color, None);
+        assert_eq!(runs[1].background_color, Some(highlight));
+        assert_eq!(runs[2].background_color, None);
+        // The unhighlighted runs keep the cell's colour and font.
+        assert!(runs.iter().all(|run| run.color == style.color));
+        assert!(runs
+            .iter()
+            .all(|run| run.font.family == style.font().family));
+
+        // Every occurrence is painted, with the plain gap in between.
+        let runs = text_runs("ab ab", &[0..2, 3..5], &style, highlight);
+        assert_eq!(
+            runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![2, 1, 2]
+        );
+        assert_eq!(runs[0].background_color, Some(highlight));
+        assert_eq!(runs[1].background_color, None);
+        assert_eq!(runs[2].background_color, Some(highlight));
+
+        // A range that does not sit on a character boundary is ignored, and
+        // the cell is still laid out whole.
+        let matched = [std::ops::Range { start: 1, end: 3 }];
+        let runs = text_runs("Ünï", &matched, &style, highlight);
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), 5);
+        assert!(runs.iter().all(|run| run.background_color.is_none()));
     }
 
     #[test]
