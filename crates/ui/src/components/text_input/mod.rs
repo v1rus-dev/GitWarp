@@ -67,6 +67,8 @@ pub struct TextInput {
     font_family: SharedString,
     disabled: bool,
     error: bool,
+    /// Draw the value as bullets (passwords). Editing still sees the text.
+    masked: bool,
     borderless: bool,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
@@ -83,6 +85,7 @@ impl TextInput {
             font_family: FONT_UI.into(),
             disabled: false,
             error: false,
+            masked: false,
             borderless: false,
             last_layout: None,
             last_bounds: None,
@@ -134,6 +137,12 @@ impl TextInput {
 
     pub fn set_error(&mut self, error: bool, cx: &mut Context<Self>) {
         self.error = error;
+        cx.notify();
+    }
+
+    /// Draw the value as bullets, for passwords and other secrets.
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        self.masked = masked;
         cx.notify();
     }
 
@@ -531,8 +540,16 @@ impl Element for TextElement {
             };
             (input.placeholder.clone(), color)
         } else {
+            // One bullet per byte keeps every index (cursor, selection, IME
+            // marked range) valid; a multi-byte character shows as two or
+            // three bullets, which is what a password field may do.
+            let text: SharedString = if input.masked {
+                "*".repeat(content.len()).into()
+            } else {
+                content.clone().into()
+            };
             (
-                content.clone().into(),
+                text,
                 if disabled {
                     colors.disabled
                 } else {

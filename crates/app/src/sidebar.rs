@@ -206,6 +206,20 @@ pub enum SidebarAction {
     AddRemote,
     EditRemote(String),
     RemoveRemote(String),
+    /// Fetches one remote (`origin`, `upstream`, …).
+    FetchRemote(String),
+    /// Fetches every remote with tags and pruning.
+    FetchAll,
+    /// Prunes stale remote-tracking branches while fetching.
+    FetchPrune,
+    /// Makes `origin/<name>` (or the default remote's branch) the upstream.
+    SetUpstream(String),
+    /// Pushes one tag to the default remote.
+    PushTag(String),
+    /// Pushes all tags to the default remote.
+    PushTags,
+    /// Deletes a remote branch, e.g. `origin/feat/x`.
+    DeleteRemoteBranch(String),
 }
 
 /// One item of a sidebar context menu, free of GPUI so the labels, order and
@@ -314,7 +328,8 @@ pub fn sidebar_menu(
             item("Rename…", IconName::Edit)
                 .shortcut("F2")
                 .action(SidebarAction::RenameBranch(name.to_owned())),
-            item("Set upstream…", IconName::Link),
+            item("Set upstream…", IconName::Link)
+                .action(SidebarAction::SetUpstream(name.to_owned())),
             item("Delete branch", IconName::Trash)
                 .danger()
                 .shortcut("Del")
@@ -330,8 +345,9 @@ pub fn sidebar_menu(
                 .action(SidebarAction::CheckoutRemoteBranch(name.to_owned())),
             item(&format!("Merge {name} into {head}"), IconName::Branch),
             SidebarMenuEntry::Separator,
-            // Deleting a remote branch is a push; it arrives with stage 8.
-            item("Delete remote branch…", IconName::Trash).danger(),
+            item("Delete remote branch…", IconName::Trash)
+                .danger()
+                .action(SidebarAction::DeleteRemoteBranch(name.to_owned())),
             item("Copy branch name", IconName::Copy)
                 .action(SidebarAction::CopyText(name.to_owned())),
         ];
@@ -346,7 +362,8 @@ pub fn sidebar_menu(
             item("Checkout", IconName::Check).action(SidebarAction::CheckoutTag(name.to_owned())),
             item("Create branch here…", IconName::Branch)
                 .maybe_action(target.map(SidebarAction::CreateBranchAt)),
-            item("Push tag to origin", IconName::Up),
+            item("Push tag to origin", IconName::Up)
+                .action(SidebarAction::PushTag(name.to_owned())),
             SidebarMenuEntry::Separator,
             item("Rename tag…", IconName::Edit).action(SidebarAction::RenameTag(name.to_owned())),
             item("Delete tag", IconName::Trash)
@@ -370,7 +387,7 @@ pub fn sidebar_menu(
     }
     if let Some(name) = key.strip_prefix("remote:") {
         return vec![
-            item("Fetch", IconName::Fetch),
+            item("Fetch", IconName::Fetch).action(SidebarAction::FetchRemote(name.to_owned())),
             item("Edit remote…", IconName::Edit).action(SidebarAction::EditRemote(name.to_owned())),
             item("Remove remote", IconName::Trash)
                 .danger()
@@ -404,14 +421,16 @@ pub fn sidebar_menu(
         "section:remotes" => vec![
             item("Add remote…", IconName::Plus).action(SidebarAction::AddRemote),
             SidebarMenuEntry::Separator,
-            item("Fetch all remotes", IconName::Fetch).shortcut("Ctrl+Shift+F"),
-            item("Prune stale remote branches", IconName::Trash),
+            item("Fetch all remotes", IconName::Fetch)
+                .shortcut("Ctrl+Shift+F")
+                .action(SidebarAction::FetchAll),
+            item("Prune stale remote branches", IconName::Trash).action(SidebarAction::FetchPrune),
         ],
         "section:tags" => vec![
             item("Create tag…", IconName::Plus).action(SidebarAction::CreateTag),
             SidebarMenuEntry::Separator,
-            item("Fetch tags from origin", IconName::Fetch),
-            item("Push all tags to origin", IconName::Up),
+            item("Fetch tags from origin", IconName::Fetch).action(SidebarAction::FetchAll),
+            item("Push all tags to origin", IconName::Up).action(SidebarAction::PushTags),
         ],
         "section:worktrees" => vec![
             item("Add worktree…", IconName::Plus),
@@ -2062,7 +2081,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_seven_actions_are_enabled_and_network_stays_disabled() {
+    fn stage_seven_and_eight_actions_are_enabled() {
         let head = Head::Branch {
             name: "main".into(),
             target: None,
@@ -2094,17 +2113,36 @@ mod tests {
                 })
                 .collect();
             let expected: &[&str] = match key {
-                "local:feat/idle-lanes" => {
-                    &["Checkout", "Rename…", "Delete branch", "Copy branch name"]
-                }
-                "rbranch:origin/feat/idle-lanes" => {
-                    &["Checkout as local branch", "Copy branch name"]
-                }
-                "tag:v1" => &["Checkout", "Rename tag…", "Delete tag"],
+                "local:feat/idle-lanes" => &[
+                    "Checkout",
+                    "Rename…",
+                    "Set upstream…",
+                    "Delete branch",
+                    "Copy branch name",
+                ],
+                "rbranch:origin/feat/idle-lanes" => &[
+                    "Checkout as local branch",
+                    "Delete remote branch…",
+                    "Copy branch name",
+                ],
+                "tag:v1" => &[
+                    "Checkout",
+                    "Push tag to origin",
+                    "Rename tag…",
+                    "Delete tag",
+                ],
                 "stash:0" => &["Apply stash", "Pop stash", "Drop stash"],
-                "remote:origin" => &["Edit remote…", "Remove remote"],
-                "section:remotes" => &["Add remote…"],
-                "section:tags" => &["Create tag…"],
+                "remote:origin" => &["Fetch", "Edit remote…", "Remove remote"],
+                "section:remotes" => &[
+                    "Add remote…",
+                    "Fetch all remotes",
+                    "Prune stale remote branches",
+                ],
+                "section:tags" => &[
+                    "Create tag…",
+                    "Fetch tags from origin",
+                    "Push all tags to origin",
+                ],
                 "section:worktrees" => &["Refresh list"],
                 _ => &[],
             };
@@ -2157,9 +2195,15 @@ mod tests {
             menu_item(&current, "Delete branch").action,
             SidebarAction::None
         );
-        // Network items keep their place and stay disabled.
-        assert!(!menu_item(&remote_menu, "Delete remote branch…").enabled);
-        assert!(!menu_item(&tag_menu, "Push tag to origin").enabled);
+        // The stage 8 network actions are wired.
+        assert_eq!(
+            menu_item(&remote_menu, "Delete remote branch…").action,
+            SidebarAction::DeleteRemoteBranch("origin/feat/idle-lanes".to_owned())
+        );
+        assert_eq!(
+            menu_item(&tag_menu, "Push tag to origin").action,
+            SidebarAction::PushTag("v1".to_owned())
+        );
         let stash_menu = sidebar_menu("stash:0", Some(&head), Some(&extras), None);
         assert!(!menu_item(&stash_menu, "View changes").enabled);
         // The shortcut hints of the design are kept.

@@ -10,13 +10,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, canvas, div, point, px, App, AppContext, Bounds, Context, CursorStyle, Decorations,
     Div, Entity, HitboxBehavior, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ResizeEdge, SharedString, Styled, Subscription, Tiling,
-    Window,
+    ParentElement, Pixels, Point, Render, ResizeEdge, SharedString, Styled, Subscription, Task,
+    Tiling, Window,
 };
 
 use git_core::{Error, Git, GitChoice};
@@ -24,6 +25,9 @@ use ui::metrics::{BAR, FONT_UI, FS_BASE, R_WINDOW};
 use ui::theme::ActiveTheme;
 use ui::{overlay, WindowControls};
 
+use crate::credential_dialog::CredentialDialog;
+use crate::host_key_dialog::HostKeyDialog;
+use crate::network_service::NetworkService;
 use crate::open_dialog::OpenRepoDialog;
 use crate::repo_view::{
     FocusSearch, OpenBranchSwitcher, OpenRepoSwitcher, RepositoryView, ToggleDetails, ToggleSidebar,
@@ -57,6 +61,12 @@ pub struct Workspace {
     last_resize_edge: Option<ResizeEdge>,
     /// The Open-from-folder dialog, kept so its state survives the frames.
     dialog: Option<Entity<OpenRepoDialog>>,
+    /// A git credential question, while one is open.
+    credential: Option<Entity<CredentialDialog>>,
+    /// An SSH host-key question, while one is open.
+    host_key: Option<Entity<HostKeyDialog>>,
+    /// Polls the network service for git's credential and host-key questions.
+    _network_poll: Option<Task<()>>,
     /// Repaints when the decorations change (windows forced to server-side
     /// decorations, tiling on maximise/snap).
     _decorations: Subscription,
@@ -80,13 +90,68 @@ impl Workspace {
             git_choice,
             last_resize_edge: None,
             dialog: None,
+            credential: None,
+            host_key: None,
+            _network_poll: None,
             _decorations: decorations,
         };
         match path {
             Some(path) => this.open_repository(path, window, cx),
             None => this.show_welcome(window, cx),
         }
+        this.start_prompt_loop(window, cx);
         this
+    }
+
+    /// Git asks for credentials and host-key decisions from a background
+    /// thread; this loop brings those questions to the window.
+    fn start_prompt_loop(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self._network_poll = Some(cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            if this
+                .update_in(cx, |this, window, cx| this.poll_network_prompts(window, cx))
+                .is_err()
+            {
+                break;
+            }
+        }));
+    }
+
+    /// Opens one credential and one host-key modal at a time and drops the
+    /// state once its layer is closed. A question that arrives while another
+    /// dialog is open stays queued in the service.
+    pub(crate) fn poll_network_prompts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dialog) = &self.credential {
+            let gone = dialog.update(cx, |dialog, cx| dialog.layer_gone(window, cx));
+            if gone {
+                self.credential = None;
+            }
+        }
+        if let Some(dialog) = &self.host_key {
+            let gone = dialog.update(cx, |dialog, cx| dialog.layer_gone(window, cx));
+            if gone {
+                self.host_key = None;
+            }
+        }
+
+        if self.credential.is_none() {
+            let prompt = cx
+                .try_global::<NetworkService>()
+                .and_then(NetworkService::try_recv_credential);
+            if let Some(prompt) = prompt {
+                self.credential = Some(crate::credential_dialog::open(prompt, window, cx));
+            }
+        }
+        if self.host_key.is_none() {
+            let request = cx
+                .try_global::<NetworkService>()
+                .and_then(NetworkService::try_recv_host_key);
+            if let Some(request) = request {
+                self.host_key = Some(crate::host_key_dialog::open(request, window, cx));
+            }
+        }
     }
 
     /// Switches to the repository at `path`.
