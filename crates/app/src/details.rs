@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use git_core::{ChangedFile, CommitDetails, FileDiff, Git, Oid, Repo};
 
-use crate::diff_model::{build_rows, build_split_rows, max_columns, DiffRow, SplitRow};
+use crate::diff_model::{build_rows_with, build_split_rows, max_columns, DiffRow, SplitRow};
 use crate::syntax::Highlighted;
 
 /// What the details dock knows about the selected commit.
@@ -87,12 +87,14 @@ pub fn read_diff(
     oid: Oid,
     file: &ChangedFile,
     cached: Option<Arc<Highlighted>>,
+    options: git_core::DiffOptions,
+    word_highlight: bool,
 ) -> Result<DiffData, String> {
     let repo = Repo::open(git, root).map_err(|error| error.to_string())?;
     let diff = repo
-        .file_diff(oid, &file.path, file.old_path.as_deref())
+        .file_diff_with(oid, &file.path, file.old_path.as_deref(), options)
         .map_err(|error| error.to_string())?;
-    let rows = build_rows(&diff.hunks);
+    let rows = build_rows_with(&diff.hunks, word_highlight);
     let split_rows = build_split_rows(&rows);
     let columns = max_columns(&rows);
     let highlight = match cached {

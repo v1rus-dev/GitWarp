@@ -6,12 +6,14 @@
 //! (log, status, diff) can later move to `gix` behind the same API without
 //! touching the UI.
 
+mod config;
+pub mod credential;
 mod diff;
 mod error;
 mod git;
 mod log;
 pub mod network;
-mod oid;
+pub mod oid;
 mod ops;
 mod refs;
 pub mod ssh;
@@ -26,8 +28,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
+pub use config::{
+    global_get, global_identity, set_global_identity, set_global_signing, ConfigScope, Identity,
+};
+pub use credential::Credential;
 pub use diff::{
-    ChangeKind, ChangedFile, CommitDetails, DiffLine, FileDiff, FileTexts, Hunk, LineKind,
+    ChangeKind, ChangedFile, CommitDetails, DiffLine, DiffOptions, DiffWhitespace, FileDiff,
+    FileTexts, Hunk, LineKind,
 };
 pub use error::{Error, ErrorClass, Result};
 pub use git::{Git, GitChoice, GitSource, GitVersion, Resolution};
@@ -362,6 +369,18 @@ impl Repo {
         diff::file_diff(self, oid, path, old_path)
     }
 
+    /// [`Repo::file_diff`] with the context and whitespace options chosen in
+    /// Diff & merge settings.
+    pub fn file_diff_with(
+        &self,
+        oid: Oid,
+        path: &str,
+        old_path: Option<&str>,
+        options: DiffOptions,
+    ) -> Result<FileDiff> {
+        diff::file_diff_with(self, oid, path, old_path, options)
+    }
+
     /// The old and new text of one file, for syntax highlighting.
     pub fn file_texts(&self, oid: Oid, path: &str, old_path: Option<&str>) -> Result<FileTexts> {
         diff::file_texts(self, oid, path, old_path)
@@ -399,9 +418,29 @@ impl Repo {
         status::unstaged_diff(self, path, old_path)
     }
 
+    /// [`Repo::unstaged_diff`] with the Diff & merge options.
+    pub fn unstaged_diff_with(
+        &self,
+        path: &str,
+        old_path: Option<&str>,
+        options: DiffOptions,
+    ) -> Result<FileDiff> {
+        status::unstaged_diff_with(self, path, old_path, options)
+    }
+
     /// One file's index diff (HEAD to index).
     pub fn staged_diff(&self, path: &str, old_path: Option<&str>) -> Result<FileDiff> {
         status::staged_diff(self, path, old_path)
+    }
+
+    /// [`Repo::staged_diff`] with the Diff & merge options.
+    pub fn staged_diff_with(
+        &self,
+        path: &str,
+        old_path: Option<&str>,
+        options: DiffOptions,
+    ) -> Result<FileDiff> {
+        status::staged_diff_with(self, path, old_path, options)
     }
 
     /// An untracked file as an all-additions diff.

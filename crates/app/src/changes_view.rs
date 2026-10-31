@@ -29,7 +29,8 @@ use ui::{
 };
 
 use crate::diff_model::{
-    build_rows, build_split_rows, max_columns, DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow,
+    build_rows_with, build_split_rows, max_columns, DiffRow, RowKind, SplitCell, SplitCellKind,
+    SplitRow,
 };
 use crate::settings::DiffLayout;
 
@@ -142,11 +143,15 @@ impl ChangesView {
             let TextAreaEvent::Changed(_) = event;
             cx.notify();
         });
+        let mono_size = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| px(f32::from(state.settings.mono_font_size)))
+            .unwrap_or(MONO);
         let mono_cell = window
             .text_system()
             .ch_advance(
                 window.text_system().resolve_font(&gpui::font(FONT_MONO)),
-                MONO,
+                mono_size,
             )
             .unwrap_or(px(7.2));
         let layout = cx
@@ -393,10 +398,16 @@ impl ChangesView {
         self.diff = DiffState::Loading;
         let path = self.path.clone();
         let staged = selection.side.staged();
+        let settings = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.clone())
+            .unwrap_or_default();
+        let options = settings.diff_options();
+        let word_highlight = settings.diff_word_highlight;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { read_diff(git, &path, &file, staged) })
+                .spawn(async move { read_diff(git, &path, &file, staged, options, word_highlight) })
                 .await;
             this.update(cx, |view, cx| view.set_diff(generation, result, cx))
                 .ok();
@@ -993,9 +1004,17 @@ impl ChangesView {
                         .tooltip("Discard changes")
                         .disabled(busy)
                         .on_click(move |_, _, cx| {
+                            let confirm = cx
+                                .try_global::<crate::AppSettings>()
+                                .map(|state| state.settings.confirm_discard)
+                                .unwrap_or(true);
                             discard_view.update(cx, |view, cx| {
-                                view.confirming_discard = Some(Selection { side, index });
-                                cx.notify();
+                                if confirm {
+                                    view.confirming_discard = Some(Selection { side, index });
+                                    cx.notify();
+                                } else {
+                                    view.discard(side, index, cx);
+                                }
                             });
                         }),
                 );
@@ -1226,7 +1245,7 @@ impl ChangesView {
             .min_h_0()
             .flex()
             .flex_col()
-            .text_size(MONO)
+            .text_size(cx.theme().mono_font_size)
             .child(toolbar)
             .child(body)
     }
@@ -1241,6 +1260,10 @@ impl ChangesView {
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors;
         let pane_width = px(f32::from(row_width));
+        let show_numbers = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.diff_line_numbers)
+            .unwrap_or(true);
         let selection = self.selection;
         let staged = selection.is_some_and(|selection| selection.side.staged());
         let can_pick = selection.is_some_and(|selection| self.can_pick(selection));
@@ -1347,8 +1370,10 @@ impl ChangesView {
                                     view.toggle_pick(hunk, line, shift, cx);
                                 });
                             })
-                            .child(diff_gutter(row.old_line, old_background, colors))
-                            .child(diff_gutter(row.new_line, new_background, colors));
+                            .when(show_numbers, |this| {
+                                this.child(diff_gutter(row.old_line, old_background, colors))
+                                    .child(diff_gutter(row.new_line, new_background, colors))
+                            });
                         let mut element = div()
                             .id(SharedString::from(format!("changes-row-{index}")))
                             .relative()
@@ -1410,11 +1435,16 @@ impl ChangesView {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors;
-        let half = px(((f32::from(row_width) - 2. * DIFF_GUTTER) / 2.).max(0.));
+        let show_numbers = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.diff_line_numbers)
+            .unwrap_or(true);
+        let gutters = if show_numbers { 2. * DIFF_GUTTER } else { 0. };
+        let half = px(((f32::from(row_width) - gutters) / 2.).max(0.));
         range
             .filter_map(|index| {
                 let row = data.split_rows.get(index)?;
-                Some(split_row(row, index, row_width, half, colors))
+                Some(split_row(row, index, row_width, half, colors, show_numbers))
             })
             .collect()
     }
@@ -1584,8 +1614,14 @@ impl Render for ChangesView {
 impl EventEmitter<ChangesEvent> for ChangesView {}
 
 /// Binds Ctrl+Enter for the commit box. Called once at startup.
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([key_binding(cx, "secondary-enter", CommitChanges, None)]);
+pub fn bind_keys(cx: &mut App, settings: &crate::settings::Settings) {
+    let key = settings
+        .keybindings
+        .get("commit")
+        .filter(|keys| !keys.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "secondary-enter".to_owned());
+    cx.bind_keys([key_binding(cx, &key, CommitChanges, None)]);
 }
 
 actions!(gitwarp, [CommitChanges]);
@@ -1596,19 +1632,21 @@ fn read_diff(
     root: &Path,
     file: &WorkingFile,
     staged: bool,
+    options: git_core::DiffOptions,
+    word_highlight: bool,
 ) -> Result<ChangesDiff, String> {
     let repo = Repo::open(git, root).map_err(|error| error.to_string())?;
     let diff = if staged {
-        repo.staged_diff(&file.path, file.old_path.as_deref())
+        repo.staged_diff_with(&file.path, file.old_path.as_deref(), options)
             .map_err(|error| error.to_string())?
     } else if file.untracked {
         repo.untracked_diff(&file.path)
             .map_err(|error| error.to_string())?
     } else {
-        repo.unstaged_diff(&file.path, file.old_path.as_deref())
+        repo.unstaged_diff_with(&file.path, file.old_path.as_deref(), options)
             .map_err(|error| error.to_string())?
     };
-    let rows = build_rows(&diff.hunks);
+    let rows = build_rows_with(&diff.hunks, word_highlight);
     let split_rows = build_split_rows(&rows);
     let columns = max_columns(&rows);
     Ok(ChangesDiff {
@@ -1671,7 +1709,6 @@ fn diff_gutter(line: Option<u32>, background: Option<Hsla>, colors: ThemeColors)
         .justify_end()
         .pr(px(6.))
         .when_some(background, |this, background| this.bg(background))
-        .text_size(MONO)
         .text_color(colors.muted)
         .child(line.map(|line| line.to_string()).unwrap_or_default())
 }
@@ -1746,6 +1783,7 @@ fn split_row(
     width: Pixels,
     half: Pixels,
     colors: ThemeColors,
+    show_numbers: bool,
 ) -> AnyElement {
     let base = div()
         .id(SharedString::from(format!("changes-split-row-{index}")))
@@ -1769,16 +1807,22 @@ fn split_row(
             .text_color(colors.muted)
             .child(text.clone())
             .into_any_element(),
-        SplitRow::Pair { old, new } => base
-            .child(split_gutter(old.as_ref(), colors))
-            .child(split_content(old.as_ref(), half, colors))
-            .child(
-                split_gutter(new.as_ref(), colors)
-                    .border_l_1()
-                    .border_color(colors.border),
-            )
-            .child(split_content(new.as_ref(), half, colors))
-            .into_any_element(),
+        SplitRow::Pair { old, new } => {
+            let mut base = base;
+            if show_numbers {
+                base = base.child(split_gutter(old.as_ref(), colors));
+            }
+            base = base.child(split_content(old.as_ref(), half, colors));
+            if show_numbers {
+                base = base.child(
+                    split_gutter(new.as_ref(), colors)
+                        .border_l_1()
+                        .border_color(colors.border),
+                );
+            }
+            base.child(split_content(new.as_ref(), half, colors))
+                .into_any_element()
+        }
     }
 }
 
@@ -1797,7 +1841,6 @@ fn split_gutter(cell: Option<&SplitCell>, colors: ThemeColors) -> Div {
         .justify_end()
         .pr(px(6.))
         .when_some(background, |this, background| this.bg(background))
-        .text_size(MONO)
         .text_color(colors.muted)
         .child(cell.map(|cell| cell.line.to_string()).unwrap_or_default())
 }
@@ -1904,7 +1947,7 @@ mod tests {
 
         let git = crate::test_support::git();
         cx.update(ui::init).expect("ui::init");
-        cx.update(bind_keys);
+        cx.update(|cx| bind_keys(cx, &crate::settings::Settings::default()));
         let handle = cx.update(|cx| {
             cx.open_window(
                 WindowOptions {

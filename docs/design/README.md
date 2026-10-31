@@ -50,7 +50,7 @@ Both themes share one geometry and differ only in colour.
 - The history header gets the same 6px side margin as the rows, so the columns line up.
 - A keyboard-focused tree node and a focused segment show an inset 2px focus ring.
 - Disabled checkbox, radio and switch are drawn at 45% opacity.
-- Row density is fixed at 26px until the Appearance settings are implemented.
+- Row density defaults to 26px (Normal); the Appearance settings change it.
 - Light-theme graph lightness is 45% (the token value).
 
 ## Roadmap

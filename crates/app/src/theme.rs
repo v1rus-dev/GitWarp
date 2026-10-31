@@ -3,9 +3,7 @@
 
 use gpui::{px, Pixels};
 
-pub use ui::metrics::{
-    DOT_R as DOT_RADIUS, LANE_W as LANE_WIDTH, LINE_W as LINE_WIDTH, ROW as ROW_HEIGHT,
-};
+pub use ui::metrics::{DOT_R as DOT_RADIUS, LANE_W as LANE_WIDTH};
 
 /// Radius of the ring painted in the row background around a plain dot.
 pub const DOT_HALO_RADIUS: Pixels = px(6.);

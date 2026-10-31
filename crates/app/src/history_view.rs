@@ -113,18 +113,26 @@ actions!(
 
 /// How many rows Page Down / Page Up move: one viewport of rows minus the one
 /// the previous page already showed, at least a single row.
-pub fn page_rows(viewport_height: f32) -> usize {
-    let rows = (viewport_height / f32::from(theme::ROW_HEIGHT)).floor();
+pub fn page_rows(viewport_height: f32, row_height: f32) -> usize {
+    let rows = (viewport_height / row_height.max(1.)).floor();
     (rows as usize).saturating_sub(1).max(1)
 }
 
 /// Binds the list's extra keys in its own `history-list` context, so they
 /// fire only while the list has the keyboard: typing `j` in the search field
 /// still types `j`. Called once at startup.
-pub(crate) fn bind_history_keys(cx: &mut App) {
+pub(crate) fn bind_history_keys(cx: &mut App, settings: &crate::settings::Settings) {
+    let key = |id: &str, default: &str| {
+        settings
+            .keybindings
+            .get(id)
+            .filter(|keys| !keys.is_empty())
+            .cloned()
+            .unwrap_or_else(|| default.to_owned())
+    };
     cx.bind_keys([
-        ui::actions::key_binding(cx, "j", NextCommit, Some("history-list")),
-        ui::actions::key_binding(cx, "k", PrevCommit, Some("history-list")),
+        ui::actions::key_binding(cx, &key("next", "j"), NextCommit, Some("history-list")),
+        ui::actions::key_binding(cx, &key("prev", "k"), PrevCommit, Some("history-list")),
         ui::actions::key_binding(cx, "pagedown", PageDownCommits, Some("history-list")),
         ui::actions::key_binding(cx, "pageup", PageUpCommits, Some("history-list")),
         ui::actions::key_binding(cx, "secondary-c", CopyCommitHash, Some("history-list")),
@@ -1056,7 +1064,7 @@ impl HistoryView {
             self.select_row(current, cx);
             return;
         }
-        let delta = page_rows(self.viewport_height()) as isize;
+        let delta = page_rows(self.viewport_height(), f32::from(cx.theme().row_height)) as isize;
         let delta = if down { delta } else { -delta };
         let last = self.items.len().saturating_sub(1) as isize;
         let next = (current as isize + delta).clamp(0, last) as usize;
@@ -1748,7 +1756,7 @@ impl HistoryView {
         // A 6px gutter around the header, so it lines up with the rows.
         let mut head = div()
             .w_full()
-            .h(theme::ROW_HEIGHT)
+            .h(cx.theme().row_height)
             .pl(px(PAD_LEFT))
             .pr(px(PAD_RIGHT))
             .flex()
@@ -1837,7 +1845,7 @@ impl HistoryView {
             .children((0..SKELETON_ROWS).map(|index| {
                 let mut row = div()
                     .w_full()
-                    .h(theme::ROW_HEIGHT)
+                    .h(cx.theme().row_height)
                     .pl(px(PAD_LEFT))
                     .pr(px(PAD_RIGHT))
                     .flex()
@@ -1885,6 +1893,12 @@ impl HistoryView {
     ) -> Vec<impl IntoElement> {
         let colors = cx.theme().colors;
         let ui_theme = cx.theme().clone();
+        let row_height = cx.theme().row_height;
+        let row_font = cx.theme().ui_font_size - px(1.);
+        let settings = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.clone())
+            .unwrap_or_default();
         let columns = self.columns;
         let geometry = self.geometry.clone();
         let hovered = self.hovered;
@@ -1941,14 +1955,14 @@ impl HistoryView {
                 let mut row_div = div()
                     .id(ix)
                     .relative()
-                    .h(theme::ROW_HEIGHT)
+                    .h(row_height)
                     .w_full()
                     .pl(px(PAD_LEFT))
                     .pr(px(PAD_RIGHT))
                     .flex()
                     .items_center()
                     .gap(px(COL_GAP))
-                    .text_size(FS_SM)
+                    .text_size(row_font)
                     .rounded(R_MD)
                     .debug_selector(move || format!("history-row-{ix}"))
                     .bg(background)
@@ -2000,6 +2014,8 @@ impl HistoryView {
                                         &row_geometry,
                                         is_head,
                                         &row_theme,
+                                        settings.graph_colored,
+                                        px(f32::from(settings.graph_line_width)),
                                         window,
                                     )
                                 })
@@ -2144,7 +2160,14 @@ impl HistoryView {
                         .truncate()
                         .text_color(secondary)
                         .tooltip(Tooltip::text(format_time_tooltip(c.author_time)))
-                        .child(relative_time(now, c.author_time.max(0) as u64)),
+                        .child(match settings.date_format {
+                            crate::settings::DateFormat::Relative => {
+                                relative_time(now, c.author_time.max(0) as u64)
+                            }
+                            crate::settings::DateFormat::Absolute => {
+                                crate::format::absolute_time(c.author_time)
+                            }
+                        }),
                 );
                 if let Some(hash) = columns.hash {
                     let short = short_hash(&c.id);
@@ -3283,13 +3306,13 @@ mod tests {
     fn page_steps_are_one_viewport_minus_a_row() {
         // 26 px rows: a full page leaves one row of overlap, and a viewport
         // shorter than a row still moves by one.
-        assert_eq!(page_rows(0.), 1);
-        assert_eq!(page_rows(26.), 1);
-        assert_eq!(page_rows(51.), 1);
-        assert_eq!(page_rows(52.), 1);
-        assert_eq!(page_rows(260.), 9);
-        assert_eq!(page_rows(259.), 8);
-        assert_eq!(page_rows(620.), 22);
+        assert_eq!(page_rows(0., 26.), 1);
+        assert_eq!(page_rows(26., 26.), 1);
+        assert_eq!(page_rows(51., 26.), 1);
+        assert_eq!(page_rows(52., 26.), 1);
+        assert_eq!(page_rows(260., 26.), 9);
+        assert_eq!(page_rows(259., 26.), 8);
+        assert_eq!(page_rows(620., 26.), 22);
     }
 
     /// The test root: the history view plus the overlay stack, like the
@@ -3437,7 +3460,7 @@ mod tests {
 
         let git = crate::test_support::git();
         cx.update(ui::init).expect("ui::init");
-        cx.update(bind_history_keys);
+        cx.update(|cx| bind_history_keys(cx, &crate::settings::Settings::default()));
         let handle = cx.update(|cx| {
             cx.open_window(
                 WindowOptions {

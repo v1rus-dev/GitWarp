@@ -3,6 +3,7 @@
 //! The file is JSON in the platform config directory. Loading is tolerant: a
 //! bad field falls back to its default instead of losing the whole file.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -10,6 +11,18 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+/// The accent colours offered by Appearance → Accent colour.
+pub const ACCENT_VALUES: [Accent; 4] =
+    [Accent::Blue, Accent::Violet, Accent::Green, Accent::Orange];
+/// The code font sizes offered by Appearance → Code font size, in px.
+pub const MONO_SIZE_MIN: u8 = 9;
+/// See [`MONO_SIZE_MIN`].
+pub const MONO_SIZE_MAX: u8 = 20;
+/// The diff context range offered by Diff & merge.
+pub const DIFF_CONTEXT_MAX: u8 = 20;
+/// The background-fetch intervals, in minutes.
+pub const FETCH_INTERVALS: [u16; 4] = [1, 5, 15, 60];
 
 /// The most recent repositories kept.
 #[allow(dead_code)] // used by the welcome screen (stage 2.3+)
@@ -60,6 +73,68 @@ pub struct Settings {
     pub diff_layout: DiffLayout,
     /// Fetch the remotes in the background while a repository is open.
     pub background_fetch: bool,
+    /// Selection, focus-ring and primary-button colour.
+    pub accent: Accent,
+    /// Height of list and tree rows.
+    pub density: Density,
+    /// Base interface font size, 12–14 px.
+    pub ui_font_size: u8,
+    /// Diff and commit-editor font size, 9–20 px.
+    pub mono_font_size: u8,
+    /// Draw each graph lane in its own colour.
+    pub graph_colored: bool,
+    /// Width of a graph edge, 1–3 px.
+    pub graph_line_width: u8,
+    /// Relative (`2 h ago`) or absolute (`2026-10-31 11:41`) history dates.
+    pub date_format: DateFormat,
+    /// Interface language; the next launch applies it.
+    pub language: Language,
+    /// What opens when the app starts.
+    pub on_launch: OnLaunch,
+    /// Download and offer updates in the background.
+    pub check_updates: bool,
+    /// Stable or beta update channel.
+    pub update_channel: UpdateChannel,
+    /// Minutes between background fetches.
+    pub fetch_interval_minutes: u16,
+    /// Ask before force-pushing.
+    pub confirm_force_push: bool,
+    /// Ask before discarding working-tree changes.
+    pub confirm_discard: bool,
+    /// Ask before deleting a branch.
+    pub confirm_delete_branch: bool,
+    /// Send anonymous usage statistics.
+    pub telemetry: bool,
+    /// Highlight the characters that differ inside a modified diff line.
+    pub diff_word_highlight: bool,
+    /// Wrap long diff lines instead of scrolling horizontally.
+    pub diff_wrap: bool,
+    /// Show the old/new line-number gutters.
+    pub diff_line_numbers: bool,
+    /// Which whitespace-only changes the diff ignores.
+    pub diff_whitespace: WhitespaceMode,
+    /// Unchanged lines shown around each hunk, 0–20.
+    pub diff_context: u8,
+    /// `builtin`, `vscode`, `vimdiff`, `meld` or `custom`.
+    pub merge_tool: MergeTool,
+    /// The command used by [`MergeTool::Custom`].
+    pub merge_command: String,
+    /// Whether the Identity page edits the global or the repository config.
+    pub identity_scope: IdentityScope,
+    /// Sign commits and tags with `signing_key`.
+    pub sign_commits: bool,
+    /// `user.signingkey`, empty when none is configured.
+    pub signing_key: String,
+    /// The connected GitHub account, empty when none.
+    pub account_github: String,
+    /// The connected GitLab account, empty when none.
+    pub account_gitlab: String,
+    /// Which git executable to run.
+    pub git_mode: GitMode,
+    /// The executable used by [`GitMode::Custom`].
+    pub git_path: String,
+    /// Per-action shortcut overrides; an empty value unbinds the action.
+    pub keybindings: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -74,6 +149,37 @@ impl Default for Settings {
             collapse_idle_lanes: false,
             diff_layout: DiffLayout::default(),
             background_fetch: true,
+            accent: Accent::default(),
+            density: Density::default(),
+            ui_font_size: 13,
+            mono_font_size: 12,
+            graph_colored: true,
+            graph_line_width: 2,
+            date_format: DateFormat::default(),
+            language: Language::default(),
+            on_launch: OnLaunch::default(),
+            check_updates: true,
+            update_channel: UpdateChannel::default(),
+            fetch_interval_minutes: 5,
+            confirm_force_push: true,
+            confirm_discard: true,
+            confirm_delete_branch: true,
+            telemetry: false,
+            diff_word_highlight: true,
+            diff_wrap: false,
+            diff_line_numbers: true,
+            diff_whitespace: WhitespaceMode::default(),
+            diff_context: 3,
+            merge_tool: MergeTool::default(),
+            merge_command: String::new(),
+            identity_scope: IdentityScope::default(),
+            sign_commits: false,
+            signing_key: String::new(),
+            account_github: String::new(),
+            account_gitlab: String::new(),
+            git_mode: GitMode::default(),
+            git_path: String::new(),
+            keybindings: BTreeMap::new(),
         }
     }
 }
@@ -102,6 +208,36 @@ impl Settings {
         self.recent.retain(|repo| repo.path != path);
     }
 
+    /// The executable choice the Git page stored.
+    pub fn git_choice(&self) -> git_core::GitChoice {
+        match self.git_mode {
+            GitMode::Auto => git_core::GitChoice::Auto,
+            GitMode::Bundled => git_core::GitChoice::Bundled,
+            GitMode::System => git_core::GitChoice::System,
+            GitMode::Custom => git_core::GitChoice::Custom(PathBuf::from(self.git_path.clone())),
+        }
+    }
+
+    /// The diff context and whitespace options for git and the preview.
+    pub fn diff_options(&self) -> git_core::DiffOptions {
+        git_core::DiffOptions {
+            context: self.diff_context,
+            whitespace: match self.diff_whitespace {
+                WhitespaceMode::None => git_core::DiffWhitespace::None,
+                WhitespaceMode::Eol => git_core::DiffWhitespace::Eol,
+                WhitespaceMode::All => git_core::DiffWhitespace::All,
+            },
+        }
+    }
+
+    /// The command that resolves a conflict, empty for the built-in editor.
+    pub fn merge_command(&self) -> &str {
+        match self.merge_tool {
+            MergeTool::Custom => &self.merge_command,
+            tool => tool.preset(),
+        }
+    }
+
     /// Clamps layout sizes and drops values that cannot be used.
     fn normalize(&mut self) {
         if self.sidebar_width.is_finite() {
@@ -121,7 +257,212 @@ impl Settings {
         } else {
             self.graph_width = GRAPH_WIDTH_DEFAULT;
         }
+        self.ui_font_size = self.ui_font_size.clamp(12, 14);
+        self.mono_font_size = self.mono_font_size.clamp(MONO_SIZE_MIN, MONO_SIZE_MAX);
+        self.graph_line_width = self.graph_line_width.clamp(1, 3);
+        self.diff_context = self.diff_context.min(DIFF_CONTEXT_MAX);
+        if !FETCH_INTERVALS.contains(&self.fetch_interval_minutes) {
+            self.fetch_interval_minutes = 5;
+        }
+        self.git_path = self.git_path.trim().to_owned();
+        self.merge_command = self.merge_command.trim().to_owned();
+        self.signing_key = self.signing_key.trim().to_owned();
+        self.account_github = self.account_github.trim().to_owned();
+        self.account_gitlab = self.account_gitlab.trim().to_owned();
     }
+}
+
+/// Selection, focus-ring and primary-button colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Accent {
+    #[default]
+    Blue,
+    Violet,
+    Green,
+    Orange,
+}
+
+impl From<Accent> for ui::theme::Accent {
+    fn from(accent: Accent) -> Self {
+        match accent {
+            Accent::Blue => ui::theme::Accent::Blue,
+            Accent::Violet => ui::theme::Accent::Violet,
+            Accent::Green => ui::theme::Accent::Green,
+            Accent::Orange => ui::theme::Accent::Orange,
+        }
+    }
+}
+
+/// Height of list and tree rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Density {
+    Compact,
+    #[default]
+    Normal,
+    Roomy,
+}
+
+impl Density {
+    /// The row height in logical pixels.
+    pub fn row_height(self) -> f32 {
+        match self {
+            Density::Compact => 22.,
+            Density::Normal => 26.,
+            Density::Roomy => 30.,
+        }
+    }
+}
+
+impl From<Density> for ui::theme::Density {
+    fn from(density: Density) -> Self {
+        match density {
+            Density::Compact => ui::theme::Density::Compact,
+            Density::Normal => ui::theme::Density::Normal,
+            Density::Roomy => ui::theme::Density::Roomy,
+        }
+    }
+}
+
+/// Relative or absolute dates in history rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DateFormat {
+    #[default]
+    Relative,
+    Absolute,
+}
+
+/// The interface language. Only English is translated so far; the choice is
+/// stored and announced as a restart change, like the design does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    #[default]
+    En,
+    De,
+    Fr,
+    Es,
+    Ru,
+    Ja,
+}
+
+impl Language {
+    pub fn label(self) -> &'static str {
+        match self {
+            Language::En => "English",
+            Language::De => "Deutsch",
+            Language::Fr => "Français",
+            Language::Es => "Español",
+            Language::Ru => "Русский",
+            Language::Ja => "日本語",
+        }
+    }
+}
+
+/// What opens when the app starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnLaunch {
+    /// The most recent repository, or the welcome screen when there is none.
+    #[default]
+    Last,
+    /// Always the welcome screen.
+    Welcome,
+    /// The welcome screen without restoring the last repository.
+    Nothing,
+}
+
+/// Stable or beta update channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Beta,
+}
+
+/// Which whitespace-only changes the diff hides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WhitespaceMode {
+    /// Show every change.
+    #[default]
+    None,
+    /// Ignore whitespace at line end.
+    Eol,
+    /// Ignore all whitespace.
+    All,
+}
+
+/// The tool that opens for conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeTool {
+    /// The three-way editor inside GitWarp.
+    #[default]
+    Builtin,
+    VsCode,
+    Vimdiff,
+    Meld,
+    /// A user command with `$LOCAL`, `$REMOTE`, `$BASE` and `$MERGED`.
+    Custom,
+}
+
+impl MergeTool {
+    /// The preset command, empty for the built-in editor.
+    pub fn preset(self) -> &'static str {
+        match self {
+            MergeTool::Builtin => "",
+            MergeTool::VsCode => "code --wait --merge $LOCAL $REMOTE $BASE $MERGED",
+            MergeTool::Vimdiff => "vimdiff $LOCAL $BASE $REMOTE $MERGED",
+            MergeTool::Meld => "meld $LOCAL $BASE $REMOTE --output $MERGED",
+            MergeTool::Custom => "",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MergeTool::Builtin => "GitWarp (built-in)",
+            MergeTool::VsCode => "VS Code",
+            MergeTool::Vimdiff => "vimdiff",
+            MergeTool::Meld => "Meld",
+            MergeTool::Custom => "Custom command…",
+        }
+    }
+}
+
+/// Global or repository scope for the commit identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentityScope {
+    /// `~/.gitconfig`.
+    #[default]
+    Global,
+    /// `.git/config` of the open repository.
+    Repository,
+}
+
+impl From<IdentityScope> for git_core::ConfigScope {
+    fn from(scope: IdentityScope) -> Self {
+        match scope {
+            IdentityScope::Global => git_core::ConfigScope::Global,
+            IdentityScope::Repository => git_core::ConfigScope::Local,
+        }
+    }
+}
+
+/// Which git executable to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitMode {
+    /// Bundled if working, otherwise the one from PATH.
+    #[default]
+    Auto,
+    Bundled,
+    System,
+    Custom,
 }
 
 /// The theme preference stored in the settings file.
@@ -296,6 +637,53 @@ fn settings_from_value(value: Value) -> Settings {
         ),
         diff_layout: take(&mut object, "diff_layout", defaults.diff_layout),
         background_fetch: take(&mut object, "background_fetch", defaults.background_fetch),
+        accent: take(&mut object, "accent", defaults.accent),
+        density: take(&mut object, "density", defaults.density),
+        ui_font_size: take(&mut object, "ui_font_size", defaults.ui_font_size),
+        mono_font_size: take(&mut object, "mono_font_size", defaults.mono_font_size),
+        graph_colored: take(&mut object, "graph_colored", defaults.graph_colored),
+        graph_line_width: take(&mut object, "graph_line_width", defaults.graph_line_width),
+        date_format: take(&mut object, "date_format", defaults.date_format),
+        language: take(&mut object, "language", defaults.language),
+        on_launch: take(&mut object, "on_launch", defaults.on_launch),
+        check_updates: take(&mut object, "check_updates", defaults.check_updates),
+        update_channel: take(&mut object, "update_channel", defaults.update_channel),
+        fetch_interval_minutes: take(
+            &mut object,
+            "fetch_interval_minutes",
+            defaults.fetch_interval_minutes,
+        ),
+        confirm_force_push: take(
+            &mut object,
+            "confirm_force_push",
+            defaults.confirm_force_push,
+        ),
+        confirm_discard: take(&mut object, "confirm_discard", defaults.confirm_discard),
+        confirm_delete_branch: take(
+            &mut object,
+            "confirm_delete_branch",
+            defaults.confirm_delete_branch,
+        ),
+        telemetry: take(&mut object, "telemetry", defaults.telemetry),
+        diff_word_highlight: take(
+            &mut object,
+            "diff_word_highlight",
+            defaults.diff_word_highlight,
+        ),
+        diff_wrap: take(&mut object, "diff_wrap", defaults.diff_wrap),
+        diff_line_numbers: take(&mut object, "diff_line_numbers", defaults.diff_line_numbers),
+        diff_whitespace: take(&mut object, "diff_whitespace", defaults.diff_whitespace),
+        diff_context: take(&mut object, "diff_context", defaults.diff_context),
+        merge_tool: take(&mut object, "merge_tool", defaults.merge_tool),
+        merge_command: take(&mut object, "merge_command", defaults.merge_command),
+        identity_scope: take(&mut object, "identity_scope", defaults.identity_scope),
+        sign_commits: take(&mut object, "sign_commits", defaults.sign_commits),
+        signing_key: take(&mut object, "signing_key", defaults.signing_key),
+        account_github: take(&mut object, "account_github", defaults.account_github),
+        account_gitlab: take(&mut object, "account_gitlab", defaults.account_gitlab),
+        git_mode: take(&mut object, "git_mode", defaults.git_mode),
+        git_path: take(&mut object, "git_path", defaults.git_path),
+        keybindings: take(&mut object, "keybindings", defaults.keybindings),
     }
 }
 
@@ -399,6 +787,7 @@ mod tests {
             collapse_idle_lanes: true,
             diff_layout: DiffLayout::Split,
             background_fetch: false,
+            ..Settings::default()
         };
         store.save(&settings).unwrap();
         assert_eq!(store.load(), settings);
@@ -604,5 +993,138 @@ mod tests {
         );
 
         assert_eq!(config_dir_from(|_| None), None);
+    }
+    #[test]
+    fn appearance_and_workflow_settings_round_trip() {
+        let dir = TempDir::new("appearance-round-trip");
+        let store = SettingsStore::new(settings_path(dir.path()));
+        let mut settings = Settings {
+            accent: Accent::Violet,
+            density: Density::Compact,
+            ui_font_size: 14,
+            mono_font_size: 16,
+            graph_colored: false,
+            graph_line_width: 3,
+            date_format: DateFormat::Absolute,
+            language: Language::Ru,
+            on_launch: OnLaunch::Welcome,
+            check_updates: false,
+            update_channel: UpdateChannel::Beta,
+            fetch_interval_minutes: 15,
+            confirm_force_push: false,
+            confirm_discard: false,
+            confirm_delete_branch: false,
+            telemetry: true,
+            diff_word_highlight: false,
+            diff_wrap: true,
+            diff_line_numbers: false,
+            diff_whitespace: WhitespaceMode::All,
+            diff_context: 8,
+            merge_tool: MergeTool::Custom,
+            merge_command: "mytool $LOCAL $BASE $REMOTE $MERGED".to_owned(),
+            identity_scope: IdentityScope::Repository,
+            sign_commits: true,
+            signing_key: "SHA256:abc".to_owned(),
+            account_github: "mira-k".to_owned(),
+            account_gitlab: "mira.kovalenko".to_owned(),
+            git_mode: GitMode::Custom,
+            git_path: "/opt/git/bin/git".to_owned(),
+            ..Settings::default()
+        };
+        settings
+            .keybindings
+            .insert("sidebar".to_owned(), "alt-b".to_owned());
+        settings
+            .keybindings
+            .insert("commit".to_owned(), String::new());
+        store.save(&settings).unwrap();
+        assert_eq!(store.load(), settings);
+        assert_eq!(
+            store.load().keybindings.get("commit").map(String::as_str),
+            Some(""),
+            "an explicit unbind survives the round trip"
+        );
+    }
+
+    #[test]
+    fn clamps_the_new_numeric_settings() {
+        let dir = TempDir::new("clamp-appearance");
+        let loaded = load_json(
+            dir.path(),
+            r#"{"ui_font_size":99,"mono_font_size":1,"graph_line_width":9,
+                "diff_context":99,"fetch_interval_minutes":7}"#,
+        );
+        assert_eq!(loaded.ui_font_size, 14);
+        assert_eq!(loaded.mono_font_size, MONO_SIZE_MIN);
+        assert_eq!(loaded.graph_line_width, 3);
+        assert_eq!(loaded.diff_context, DIFF_CONTEXT_MAX);
+        assert_eq!(loaded.fetch_interval_minutes, 5);
+    }
+
+    #[test]
+    fn unknown_appearance_values_fall_back_to_defaults() {
+        let dir = TempDir::new("unknown-appearance");
+        let loaded = load_json(
+            dir.path(),
+            r#"{"accent":"pink","density":"huge","date_format":"stardate",
+                "merge_tool":"emacs","git_mode":"flatpak","keybindings":"j"}"#,
+        );
+        let defaults = Settings::default();
+        assert_eq!(loaded.accent, defaults.accent);
+        assert_eq!(loaded.density, defaults.density);
+        assert_eq!(loaded.date_format, defaults.date_format);
+        assert_eq!(loaded.merge_tool, defaults.merge_tool);
+        assert_eq!(loaded.git_mode, defaults.git_mode);
+        assert!(loaded.keybindings.is_empty());
+    }
+
+    #[test]
+    fn the_git_page_choice_becomes_a_git_choice() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.git_choice(), git_core::GitChoice::Auto);
+        settings.git_mode = GitMode::Bundled;
+        assert_eq!(settings.git_choice(), git_core::GitChoice::Bundled);
+        settings.git_mode = GitMode::System;
+        assert_eq!(settings.git_choice(), git_core::GitChoice::System);
+        settings.git_mode = GitMode::Custom;
+        settings.git_path = "/opt/git/bin/git".to_owned();
+        assert_eq!(
+            settings.git_choice(),
+            git_core::GitChoice::Custom(PathBuf::from("/opt/git/bin/git"))
+        );
+    }
+
+    #[test]
+    fn diff_options_map_to_git_core() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.diff_options().context, 3);
+        assert_eq!(
+            settings.diff_options().whitespace,
+            git_core::DiffWhitespace::None
+        );
+        settings.diff_context = 7;
+        settings.diff_whitespace = WhitespaceMode::All;
+        assert_eq!(settings.diff_options().context, 7);
+        assert_eq!(
+            settings.diff_options().whitespace,
+            git_core::DiffWhitespace::All
+        );
+        settings.diff_whitespace = WhitespaceMode::Eol;
+        assert_eq!(
+            settings.diff_options().whitespace,
+            git_core::DiffWhitespace::Eol
+        );
+    }
+
+    #[test]
+    fn the_merge_command_uses_the_preset_or_the_custom_text() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.merge_tool, MergeTool::Builtin);
+        assert_eq!(settings.merge_command(), "");
+        settings.merge_tool = MergeTool::Meld;
+        assert!(settings.merge_command().contains("meld"));
+        settings.merge_tool = MergeTool::Custom;
+        settings.merge_command = "mytool $LOCAL".to_owned();
+        assert_eq!(settings.merge_command(), "mytool $LOCAL");
     }
 }

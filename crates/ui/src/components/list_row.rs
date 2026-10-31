@@ -7,7 +7,7 @@ use gpui::{
 use gpui::{AnyElement, InteractiveElement, StatefulInteractiveElement};
 
 use crate::focus::{self, RingOffset};
-use crate::metrics::{FONT_UI, FS_BASE, ROW, R_MD};
+use crate::metrics::{FONT_UI, R_MD};
 use crate::theme::{ActiveTheme, ThemeColors};
 
 use super::ClickHandler;
@@ -105,7 +105,7 @@ impl RenderOnce for ListRow {
             .flex()
             .items_center()
             .gap(px(6.))
-            .h(ROW)
+            .h(cx.theme().row_height)
             // A uniform_list lays each item out as a root with a definite
             // width and does not stretch its children, so the row itself must
             // fill its wrapper. The wrapper below owns the 6px side gutters.
@@ -113,7 +113,7 @@ impl RenderOnce for ListRow {
             .debug_selector(move || debug.clone())
             .rounded(R_MD)
             .font_family(FONT_UI)
-            .text_size(FS_BASE)
+            .text_size(cx.theme().ui_font_size)
             .text_color(foreground)
             .bg(background)
             .children(self.children);

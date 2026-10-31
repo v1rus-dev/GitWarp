@@ -17,7 +17,7 @@ use crate::actions::{Confirm, SelectNext, SelectPrev, TreeActivate, TreeCollapse
 use crate::components::counter::CountPill;
 use crate::focus::{self, RingOffset};
 use crate::icon::{Icon, IconName};
-use crate::metrics::{FONT_UI, FS_BASE, FS_XS, ROW, R_SM};
+use crate::metrics::{FONT_UI, FS_XS, R_SM};
 use crate::theme::{ActiveTheme, ThemeColors};
 
 use super::tabular_font;
@@ -553,7 +553,11 @@ impl RenderOnce for Tree {
             } else {
                 node.label.to_string()
             };
-            let label_size = if section { FS_XS } else { FS_BASE };
+            let label_size = if section {
+                FS_XS
+            } else {
+                cx.theme().ui_font_size
+            };
             let label_weight = if section || current {
                 FontWeight::BOLD
             } else {
@@ -591,7 +595,7 @@ impl RenderOnce for Tree {
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .h(ROW)
+                .h(cx.theme().row_height)
                 // The tree is a flex column inside a scroll container: without
                 // this every row shrinks below its fixed height when the
                 // content overflows, instead of the tree scrolling.

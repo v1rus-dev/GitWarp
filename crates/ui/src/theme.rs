@@ -25,6 +25,58 @@ pub enum ThemeMode {
     Light,
 }
 
+/// The accent colour chosen in Appearance settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Accent {
+    #[default]
+    Blue,
+    Violet,
+    Green,
+    Orange,
+}
+
+/// The row density chosen in Appearance settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Density {
+    Compact,
+    #[default]
+    Normal,
+    Roomy,
+}
+
+impl Density {
+    /// The height of a list or tree row, in logical pixels.
+    pub fn row_height(self) -> Pixels {
+        match self {
+            Density::Compact => px(22.),
+            Density::Normal => px(26.),
+            Density::Roomy => px(30.),
+        }
+    }
+}
+
+/// The appearance options that live above a theme's dark/light palette.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThemeStyle {
+    pub accent: Accent,
+    pub density: Density,
+    /// Base interface font size, 12–14 px.
+    pub ui_font_size: f32,
+    /// Diff and editor font size, 9–20 px.
+    pub mono_font_size: f32,
+}
+
+impl Default for ThemeStyle {
+    fn default() -> Self {
+        Self {
+            accent: Accent::default(),
+            density: Density::default(),
+            ui_font_size: 13.,
+            mono_font_size: 12.,
+        }
+    }
+}
+
 /// One drop-shadow layer.
 #[derive(Clone, Copy, Debug)]
 pub struct Shadow {
@@ -189,6 +241,12 @@ pub struct Theme {
     pub primary_shadow: Option<Shadow>,
     /// Lane lightness: 0.62 on dark, 0.45 on light.
     pub graph_lightness: f32,
+    /// Height of one list or tree row.
+    pub row_height: Pixels,
+    /// Base interface font size.
+    pub ui_font_size: Pixels,
+    /// Diff and editor font size.
+    pub mono_font_size: Pixels,
 }
 
 impl Theme {
@@ -212,6 +270,9 @@ impl Theme {
             ],
             primary_shadow: None,
             graph_lightness: 0.62,
+            row_height: px(26.),
+            ui_font_size: px(13.),
+            mono_font_size: px(12.),
         }
     }
 
@@ -240,7 +301,27 @@ impl Theme {
                 color: translucent(0x2a66d6_40),
             }),
             graph_lightness: 0.45,
+            row_height: px(26.),
+            ui_font_size: px(13.),
+            mono_font_size: px(12.),
         }
+    }
+
+    /// Applies the user's accent, density and type sizes to this palette.
+    pub fn apply_style(&mut self, style: ThemeStyle) {
+        let accent = match style.accent {
+            Accent::Blue => self.colors.accent,
+            Accent::Violet => self.colors.st_untracked,
+            Accent::Green => self.colors.st_added,
+            Accent::Orange => self.colors.st_conflict,
+        };
+        self.colors.accent = accent;
+        self.colors.accent_hover = accent;
+        self.colors.accent_soft = accent.opacity(0.16);
+        self.colors.focus = accent;
+        self.row_height = style.density.row_height();
+        self.ui_font_size = px(style.ui_font_size.clamp(12., 14.));
+        self.mono_font_size = px(style.mono_font_size.clamp(9., 20.));
     }
 
     /// The floating-layer shadow: both CSS layers of `shadow-pop`.
@@ -255,6 +336,19 @@ impl Theme {
                 inset: false,
             })
             .collect()
+    }
+
+    /// The colour a given accent choice resolves to in this palette.
+    pub fn accent_color(&self, accent: Accent) -> Hsla {
+        match accent {
+            Accent::Blue => match self.appearance {
+                Appearance::Dark => solid(0x6ea4f7),
+                Appearance::Light => solid(0x2a66d6),
+            },
+            Accent::Violet => self.colors.st_untracked,
+            Accent::Green => self.colors.st_added,
+            Accent::Orange => self.colors.st_conflict,
+        }
     }
 
     /// Lane colour: hues spread by the golden angle, so neighbours never clash.
@@ -277,14 +371,15 @@ fn translucent(hex: u32) -> Hsla {
 /// The active mode and its resolved theme.
 struct ThemeState {
     mode: ThemeMode,
+    style: ThemeStyle,
     theme: Theme,
 }
 
 impl Global for ThemeState {}
 
 impl ThemeState {
-    fn resolve(mode: ThemeMode, appearance: WindowAppearance) -> Self {
-        let theme = match mode {
+    fn resolve(mode: ThemeMode, style: ThemeStyle, appearance: WindowAppearance) -> Self {
+        let mut theme = match mode {
             ThemeMode::Dark => Theme::dark(),
             ThemeMode::Light => Theme::light(),
             ThemeMode::System => match appearance {
@@ -292,19 +387,39 @@ impl ThemeState {
                 WindowAppearance::Dark | WindowAppearance::VibrantDark => Theme::dark(),
             },
         };
-        Self { mode, theme }
+        theme.apply_style(style);
+        Self { mode, style, theme }
     }
 }
 
 /// Installs the theme global, following the system appearance.
 pub fn init(cx: &mut App) {
-    let state = ThemeState::resolve(ThemeMode::System, cx.window_appearance());
+    let state = ThemeState::resolve(
+        ThemeMode::System,
+        ThemeStyle::default(),
+        cx.window_appearance(),
+    );
     cx.set_global(state);
 }
 
 /// Switches the theme mode and repaints every window.
 pub fn set_mode(mode: ThemeMode, cx: &mut App) {
-    let state = ThemeState::resolve(mode, cx.window_appearance());
+    let style = cx
+        .try_global::<ThemeState>()
+        .map(|state| state.style)
+        .unwrap_or_default();
+    let state = ThemeState::resolve(mode, style, cx.window_appearance());
+    cx.set_global(state);
+    cx.refresh_windows();
+}
+
+/// Applies the accent, density and type sizes and repaints every window.
+pub fn set_style(style: ThemeStyle, cx: &mut App) {
+    let mode = cx
+        .try_global::<ThemeState>()
+        .map(|state| state.mode)
+        .unwrap_or_default();
+    let state = ThemeState::resolve(mode, style, cx.window_appearance());
     cx.set_global(state);
     cx.refresh_windows();
 }
@@ -325,7 +440,7 @@ fn sync(appearance: WindowAppearance, cx: &mut App) {
     if state.mode != ThemeMode::System {
         return;
     }
-    let next = ThemeState::resolve(ThemeMode::System, appearance);
+    let next = ThemeState::resolve(ThemeMode::System, state.style, appearance);
     if next.theme.appearance == state.theme.appearance {
         return;
     }
@@ -341,5 +456,41 @@ pub trait ActiveTheme {
 impl ActiveTheme for App {
     fn theme(&self) -> &Theme {
         &self.global::<ThemeState>().theme
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_style_applies_density_accent_and_type_sizes() {
+        let mut theme = Theme::dark();
+        theme.apply_style(ThemeStyle {
+            accent: Accent::Green,
+            density: Density::Roomy,
+            ui_font_size: 14.,
+            mono_font_size: 16.,
+        });
+        assert_eq!(theme.row_height, px(30.));
+        assert_eq!(theme.ui_font_size, px(14.));
+        assert_eq!(theme.mono_font_size, px(16.));
+        assert_eq!(theme.colors.accent, theme.colors.st_added);
+        assert_eq!(theme.colors.focus, theme.colors.st_added);
+        assert_eq!(
+            theme.accent_color(Accent::Violet),
+            theme.colors.st_untracked
+        );
+        assert_eq!(theme.accent_color(Accent::Orange), theme.colors.st_conflict);
+
+        // Out-of-range values are clamped instead of shrinking the UI away.
+        theme.apply_style(ThemeStyle {
+            ui_font_size: 40.,
+            mono_font_size: 1.,
+            ..ThemeStyle::default()
+        });
+        assert_eq!(theme.ui_font_size, px(14.));
+        assert_eq!(theme.mono_font_size, px(9.));
+        assert_eq!(theme.row_height, px(26.));
     }
 }
