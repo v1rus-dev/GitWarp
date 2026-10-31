@@ -17,6 +17,9 @@ pub struct Worktree {
     pub prunable: bool,
     /// This is the worktree the `Repo` was opened in (compare canonicalized paths with `Repo::root`).
     pub current: bool,
+    /// The repository's main worktree: the one a linked worktree points back
+    /// to. It cannot be removed; `git worktree list` prints it first.
+    pub main: bool,
 }
 
 pub(crate) fn list(repo: &Repo) -> Result<Vec<Worktree>> {
@@ -29,6 +32,78 @@ pub(crate) fn list(repo: &Repo) -> Result<Vec<Worktree>> {
     Ok(parse_worktrees(&out.stdout, repo.root()))
 }
 
+/// Checks out `branch` in a new worktree at `path`.
+pub(crate) fn add(repo: &Repo, path: &Path, branch: &str) -> Result<()> {
+    let out = repo
+        .command()
+        .args(["worktree", "add", "--"])
+        .arg(path)
+        .arg(branch)
+        .output()
+        .map_err(Error::Spawn)?;
+    check_output(out, "worktree add").map(drop)
+}
+
+/// Creates `branch` at `start` and checks it out in a new worktree at `path`.
+pub(crate) fn add_new_branch(repo: &Repo, path: &Path, branch: &str, start: Oid) -> Result<()> {
+    let start = start.to_string();
+    let out = repo
+        .command()
+        .args(["worktree", "add", "-b", branch, "--"])
+        .arg(path)
+        .arg(start)
+        .output()
+        .map_err(Error::Spawn)?;
+    check_output(out, "worktree add -b").map(drop)
+}
+
+/// Removes the worktree at `path`. `force` discards staged, unstaged and
+/// untracked files in it; without it git refuses to touch a dirty worktree.
+/// A worktree whose folder is already gone is removed without `force`.
+pub(crate) fn remove(repo: &Repo, path: &Path, force: bool) -> Result<()> {
+    let mut command = repo.command();
+    command.args(["worktree", "remove"]);
+    if force {
+        command.arg("--force");
+    }
+    let out = command.arg("--").arg(path).output().map_err(Error::Spawn)?;
+    check_output(out, "worktree remove").map(drop)
+}
+
+/// Locks the worktree at `path`. `reason` is stored by git and shown to anyone
+/// running `git worktree list`; an empty reason is allowed.
+pub(crate) fn lock(repo: &Repo, path: &Path, reason: Option<&str>) -> Result<()> {
+    let mut command = repo.command();
+    command.args(["worktree", "lock"]);
+    if let Some(reason) = reason.filter(|reason| !reason.is_empty()) {
+        command.args(["--reason", reason]);
+    }
+    let out = command.arg("--").arg(path).output().map_err(Error::Spawn)?;
+    check_output(out, "worktree lock").map(drop)
+}
+
+/// Unlocks the worktree at `path`, so it can be removed again.
+pub(crate) fn unlock(repo: &Repo, path: &Path) -> Result<()> {
+    let out = repo
+        .command()
+        .args(["worktree", "unlock", "--"])
+        .arg(path)
+        .output()
+        .map_err(Error::Spawn)?;
+    check_output(out, "worktree unlock").map(drop)
+}
+
+/// Drops the records of worktrees whose folders no longer exist. Files are
+/// never touched.
+pub(crate) fn prune(repo: &Repo) -> Result<()> {
+    let out = repo
+        .command()
+        .args(["worktree", "prune"])
+        .output()
+        .map_err(Error::Spawn)?;
+    check_output(out, "worktree prune").map(drop)
+}
+
 /// Porcelain `-z` output: NUL-separated attributes, an empty field ending a
 /// record. Unknown attributes are ignored.
 fn parse_worktrees(bytes: &[u8], root: &Path) -> Vec<Worktree> {
@@ -36,7 +111,7 @@ fn parse_worktrees(bytes: &[u8], root: &Path) -> Vec<Worktree> {
     let mut record = Record::default();
     for field in bytes.split(|&b| b == 0) {
         if field.is_empty() {
-            if let Some(worktree) = record.finish(root) {
+            if let Some(worktree) = record.finish(root, out.is_empty()) {
                 out.push(worktree);
             }
             record = Record::default();
@@ -45,7 +120,7 @@ fn parse_worktrees(bytes: &[u8], root: &Path) -> Vec<Worktree> {
         }
     }
     // Be lenient with output that does not end in an empty field.
-    if let Some(worktree) = record.finish(root) {
+    if let Some(worktree) = record.finish(root, out.is_empty()) {
         out.push(worktree);
     }
     out
@@ -97,7 +172,7 @@ impl Record {
         }
     }
 
-    fn finish(self, root: &Path) -> Option<Worktree> {
+    fn finish(self, root: &Path, main: bool) -> Option<Worktree> {
         let path = self.path?;
         let current = crate::same_path(&path, root);
         Some(Worktree {
@@ -109,6 +184,7 @@ impl Record {
             locked: self.locked,
             prunable: self.prunable,
             current,
+            main,
         })
     }
 }
@@ -130,8 +206,10 @@ mod tests {
         assert_eq!(list[0].path, Path::new("/repo"));
         assert_eq!(list[0].branch.as_deref(), Some("main"));
         assert!(list[0].current);
+        assert!(list[0].main);
         assert!(!list[0].detached && !list[0].bare);
         assert_eq!(list[1].branch, None);
+        assert!(!list[1].main);
         assert!(list[1].detached);
         assert_eq!(list[1].locked.as_deref(), Some("testing"));
         assert!(!list[1].current);
@@ -144,6 +222,7 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].locked.as_deref(), Some(""));
         assert!(!list[0].current);
+        assert!(list[0].main);
         assert_eq!(list[0].head.unwrap().to_string(), OID);
     }
 

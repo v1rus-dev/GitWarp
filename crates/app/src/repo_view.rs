@@ -54,6 +54,8 @@ use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
+use crate::worktree_dialog::SelectedCommit;
+use crate::worktrees_view::{WorktreesEvent, WorktreesView};
 
 actions!(
     gitwarp,
@@ -72,11 +74,14 @@ actions!(
     ]
 );
 
-/// The two centre views the toolbar switches between.
+/// The centre views the sidebar and toolbar switch between. `Worktrees` is
+/// opened from the sidebar's Worktrees section, so the toolbar's History /
+/// Changes switch stays on History while it shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewMode {
     History,
     Changes,
+    Worktrees,
 }
 
 /// Binds the search field's own keys in its `history-search` context, so
@@ -306,6 +311,8 @@ pub struct RepositoryView {
     _history_observer: Subscription,
     changes: Entity<ChangesView>,
     _changes_observer: Subscription,
+    worktrees: Entity<WorktreesView>,
+    _worktrees_observer: Subscription,
     view: ViewMode,
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
@@ -446,6 +453,8 @@ impl RepositoryView {
                 if this.root != root {
                     this.root = root.clone();
                     this.repo_name = repo_name(&root);
+                    this.worktrees
+                        .update(cx, |worktrees, cx| worktrees.set_root(root.clone(), cx));
                 }
                 // The sidebar's own lists need the root: load them once, when
                 // the history first reports it.
@@ -459,6 +468,17 @@ impl RepositoryView {
             if *event == ChangesEvent::Committed {
                 this.history.update(cx, |history, cx| history.reload(cx));
             }
+        });
+        let worktrees = cx
+            .new(|cx| WorktreesView::new(path.clone(), git.clone(), workspace.clone(), window, cx));
+        let worktrees_observer = cx.subscribe(&worktrees, |this, _, _: &WorktreesEvent, cx| {
+            // A branch was created or deleted, or a worktree changed: the
+            // sidebar, the history's ref labels and the local changes all
+            // read the same repository.
+            this.history.update(cx, |history, cx| history.reload(cx));
+            this.changes.update(cx, |changes, cx| changes.refresh(cx));
+            this.refresh(cx);
+            cx.notify();
         });
         let search = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
@@ -513,6 +533,8 @@ impl RepositoryView {
             _history_observer: observer,
             changes,
             _changes_observer: changes_observer,
+            worktrees,
+            _worktrees_observer: worktrees_observer,
             view: ViewMode::History,
             workspace,
             focus: focus.clone(),
@@ -598,6 +620,14 @@ impl RepositoryView {
     /// Switches the centre pane and moves the keyboard to the new content.
     fn set_view(&mut self, mode: ViewMode, window: &mut Window, cx: &mut Context<Self>) {
         if self.view == mode {
+            // Re-opening the Worktrees page is also a request for fresh
+            // numbers; the other views keep their loaded state.
+            if mode == ViewMode::Worktrees {
+                self.worktrees
+                    .update(cx, |worktrees, cx| worktrees.refresh(cx));
+                let focus = self.worktrees.read(cx).focus_handle();
+                window.focus(&focus, cx);
+            }
             return;
         }
         self.view = mode;
@@ -605,6 +635,12 @@ impl RepositoryView {
             ViewMode::Changes => {
                 self.changes.update(cx, |changes, cx| changes.refresh(cx));
                 let focus = self.changes.read(cx).focus_handle();
+                window.focus(&focus, cx);
+            }
+            ViewMode::Worktrees => {
+                self.worktrees
+                    .update(cx, |worktrees, cx| worktrees.refresh(cx));
+                let focus = self.worktrees.read(cx).focus_handle();
                 window.focus(&focus, cx);
             }
             ViewMode::History => {
@@ -721,6 +757,11 @@ impl RepositoryView {
             )
         };
         if let Some(oid) = oid {
+            // A sidebar leaf always shows its commit in the history; the
+            // Worktrees page is left when one of its rows is selected.
+            if self.view == ViewMode::Worktrees {
+                self.view = ViewMode::History;
+            }
             self.history
                 .update(cx, |history, cx| history.reveal_commit(oid, cx));
         }
@@ -793,7 +834,11 @@ impl RepositoryView {
             SidebarAction::CopyText(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
-            SidebarAction::Refresh => self.refresh(cx),
+            SidebarAction::Refresh => {
+                self.refresh(cx);
+                self.worktrees
+                    .update(cx, |worktrees, cx| worktrees.refresh(cx));
+            }
             SidebarAction::CheckoutBranch(name) => {
                 self.run_repo_action(window, cx, move |repo| {
                     repo.checkout_branch(&name)?;
@@ -1011,6 +1056,55 @@ impl RepositoryView {
                     Ok((ui::ToastKind::Ok, format!("{branch} now tracks {upstream}")))
                 });
             }
+            SidebarAction::ShowWorktrees => {
+                self.set_view(ViewMode::Worktrees, window, cx);
+            }
+            SidebarAction::AddWorktree => {
+                self.worktrees
+                    .update(cx, |worktrees, cx| worktrees.open_add(window, cx));
+            }
+            SidebarAction::OpenWorktree(path) => {
+                let label = path.clone();
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.open_repository_window(PathBuf::from(path), window, cx);
+                    })
+                    .ok();
+                toast::show(
+                    ui::ToastKind::Ok,
+                    format!("Opened {label} in a new window"),
+                    window,
+                    cx,
+                );
+            }
+            SidebarAction::LockWorktree(path) => {
+                let path = PathBuf::from(path);
+                self.run_repo_action(window, cx, move |repo| {
+                    repo.lock_worktree(&path, Some("locked manually"))?;
+                    Ok((ui::ToastKind::Ok, format!("Locked {}", path.display())))
+                });
+            }
+            SidebarAction::UnlockWorktree(path) => {
+                let path = PathBuf::from(path);
+                self.run_repo_action(window, cx, move |repo| {
+                    repo.unlock_worktree(&path)?;
+                    Ok((ui::ToastKind::Ok, format!("Unlocked {}", path.display())))
+                });
+            }
+            SidebarAction::RemoveWorktree(path) => {
+                self.worktrees.update(cx, |worktrees, cx| {
+                    worktrees.open_remove(Path::new(&path), window, cx);
+                });
+            }
+            SidebarAction::PruneWorktrees => {
+                self.run_repo_action(window, cx, |repo| {
+                    repo.prune_worktrees()?;
+                    Ok((
+                        ui::ToastKind::Ok,
+                        "Pruned stale worktree records".to_owned(),
+                    ))
+                });
+            }
         }
     }
 
@@ -1133,6 +1227,8 @@ impl RepositoryView {
     fn after_ref_change(&mut self, cx: &mut Context<Self>) {
         self.history.update(cx, |history, cx| history.reload(cx));
         self.changes.update(cx, |changes, cx| changes.refresh(cx));
+        self.worktrees
+            .update(cx, |worktrees, cx| worktrees.refresh(cx));
         self.refresh(cx);
         cx.notify();
     }
@@ -1504,6 +1600,17 @@ impl RepositoryView {
     /// Loads the details when the history selection moved to another commit,
     /// and clears them when nothing is selected.
     fn sync_details(&mut self, selected: Option<Arc<CommitInfo>>, cx: &mut Context<Self>) {
+        let worktree_selected = selected.as_ref().map(|commit| {
+            let mut short = commit.id.to_string();
+            short.truncate(7);
+            SelectedCommit {
+                oid: commit.id,
+                short,
+            }
+        });
+        self.worktrees.update(cx, |worktrees, cx| {
+            worktrees.set_selected(worktree_selected, cx)
+        });
         let Some(commit) = selected else {
             if self.details_oid.take().is_some() {
                 self.details_generation = self.details_generation.wrapping_add(1);
@@ -1760,6 +1867,16 @@ impl RepositoryView {
                             workspace.open_repository_dialog(window, cx);
                         })
                         .ok();
+                }),
+        ));
+        let view = cx.entity();
+        entries.push(MenuEntry::Item(
+            MenuItem::new("Worktrees…")
+                .icon(IconName::Worktree)
+                .action(move |window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.set_view(ViewMode::Worktrees, window, cx);
+                    });
                 }),
         ));
         let workspace = self.workspace.clone();
@@ -2022,7 +2139,7 @@ impl RepositoryView {
                 .item(history_item)
                 .item(changes_item.tooltip("Local changes"))
                 .selected(match self.view {
-                    ViewMode::History => 0,
+                    ViewMode::History | ViewMode::Worktrees => 0,
                     ViewMode::Changes => 1,
                 })
                 .on_select(move |index, window, cx| {
@@ -2119,6 +2236,22 @@ impl RepositoryView {
                 });
             }
         };
+        // Double-clicking a worktree leaf opens the Worktrees page; a single
+        // click keeps selecting the worktree and revealing its commit.
+        let open = {
+            let rows = rows.clone();
+            let view = view.clone();
+            move |index: usize, window: &mut Window, cx: &mut App| {
+                let Some((key, _, _)) = rows.get(index).cloned() else {
+                    return;
+                };
+                if key.starts_with("wt:") {
+                    view.update(cx, |view, cx| {
+                        view.set_view(ViewMode::Worktrees, window, cx)
+                    });
+                }
+            }
+        };
 
         div()
             .w(px(width))
@@ -2174,8 +2307,9 @@ impl RepositoryView {
                                     .scroll_handle(self.sidebar_scroll.clone())
                                     .on_toggle(node_toggler(rows.clone(), view.clone()))
                                     .on_expand(node_toggler(rows.clone(), view.clone()))
-                                    .on_collapse(node_toggler(rows, view))
+                                    .on_collapse(node_toggler(rows.clone(), view.clone()))
                                     .on_activate(activate)
+                                    .on_open(open)
                                     .on_context_menu(context_menu),
                             ),
                         )
@@ -3069,7 +3203,7 @@ impl Render for RepositoryView {
             )
         });
         // The local-changes view has its own diff pane; the commit details
-        // dock belongs to history only.
+        // dock belongs to history only. The worktrees page fills the centre.
         let details_open = self.details_open && self.view == ViewMode::History;
         let dock = self.dock;
         let splitter =
@@ -3081,6 +3215,7 @@ impl Render for RepositoryView {
         let content = match self.view {
             ViewMode::History => self.history.clone().into_any_element(),
             ViewMode::Changes => self.changes.clone().into_any_element(),
+            ViewMode::Worktrees => self.worktrees.clone().into_any_element(),
         };
         let history_pane = div()
             .flex_1()
@@ -3918,6 +4053,35 @@ mod tests {
         cx.run_until_parked();
         view.read_with(&cx, |view, _| assert_eq!(view.view, ViewMode::History));
         assert!(cx.debug_bounds("changes-view").is_none());
+    }
+
+    /// The Worktrees page replaces the history pane and lists the repository's
+    /// worktrees; switching back to History removes it.
+    #[gpui::test]
+    fn the_worktrees_page_lists_the_worktrees(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktrees-page");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_view(ViewMode::Worktrees, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert_eq!(view.view, ViewMode::Worktrees));
+        assert!(cx.debug_bounds("worktrees-view").is_some());
+        assert!(
+            cx.debug_bounds("worktree-row-0").is_some(),
+            "the main worktree row was not drawn"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.set_view(ViewMode::History, window, cx));
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("worktrees-view").is_none());
     }
 
     /// A commit made in the changes view reloads the history behind it.

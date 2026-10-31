@@ -307,6 +307,38 @@ impl Repo {
         worktree::list(self)
     }
 
+    /// Checks out `branch` in a new worktree at `path`. The folder is created
+    /// when it does not exist.
+    pub fn add_worktree(&self, path: &Path, branch: &str) -> Result<()> {
+        worktree::add(self, path, branch)
+    }
+
+    /// Creates `branch` at `start` and checks it out in a new worktree at
+    /// `path`.
+    pub fn add_worktree_for_new_branch(&self, path: &Path, branch: &str, start: Oid) -> Result<()> {
+        worktree::add_new_branch(self, path, branch, start)
+    }
+
+    /// Removes the worktree at `path`. `force` discards its local changes.
+    pub fn remove_worktree(&self, path: &Path, force: bool) -> Result<()> {
+        worktree::remove(self, path, force)
+    }
+
+    /// Locks the worktree at `path`; `reason` is kept by git.
+    pub fn lock_worktree(&self, path: &Path, reason: Option<&str>) -> Result<()> {
+        worktree::lock(self, path, reason)
+    }
+
+    /// Unlocks the worktree at `path`.
+    pub fn unlock_worktree(&self, path: &Path) -> Result<()> {
+        worktree::unlock(self, path)
+    }
+
+    /// Drops the records of worktrees whose folders are gone.
+    pub fn prune_worktrees(&self) -> Result<()> {
+        worktree::prune(self)
+    }
+
     /// The submodules recorded in `.gitmodules`.
     pub fn submodules(&self) -> Result<Vec<Submodule>> {
         submodule::list(self)
@@ -339,6 +371,12 @@ impl Repo {
     /// unstaged files with their line counts.
     pub fn working_status(&self) -> Result<WorkingStatus> {
         status::status(self)
+    }
+
+    /// The paths with local changes, staged or not, without line counts. The
+    /// worktree page uses it for each worktree's changed count and file list.
+    pub fn changed_paths(&self) -> Result<Vec<String>> {
+        status::changed_paths(self)
     }
 
     /// Adds `paths` to the index (new files, modifications and deletions).

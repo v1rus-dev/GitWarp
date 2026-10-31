@@ -112,6 +112,42 @@ impl HunkPick {
     }
 }
 
+/// The paths with local changes, staged or not, including untracked and
+/// conflicted files. One entry per path, sorted; line counts are not read.
+///
+/// This is the cheap list the worktree page shows; [`status`] is the full
+/// working-tree view with added/deleted counts.
+pub(crate) fn changed_paths(repo: &Repo) -> Result<Vec<String>> {
+    let out = repo
+        .command()
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "status")?;
+    let mut paths = parse_changed_paths(&out.stdout);
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// `git status --porcelain=v1 -z`: `XY SP PATH NUL`; a rename or copy is
+/// followed by the original path as its own NUL field.
+fn parse_changed_paths(raw: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut fields = raw.split(|&byte| byte == 0);
+    while let Some(record) = fields.next() {
+        if record.len() < 4 {
+            continue;
+        }
+        paths.push(String::from_utf8_lossy(&record[3..]).into_owned());
+        if matches!(record[0], b'R' | b'C') {
+            // The original path of a rename/copy.
+            fields.next();
+        }
+    }
+    paths
+}
+
 /// Reads the whole working-tree status.
 pub(crate) fn status(repo: &Repo) -> Result<WorkingStatus> {
     let porcelain = porcelain(repo)?;
@@ -775,6 +811,13 @@ mod tests {
         assert_eq!(parsed.branch.as_deref(), Some("main"));
         assert_eq!(parsed.untracked, ["new file.txt"]);
         assert_eq!(parsed.conflicted, ["src/conflict.rs"]);
+    }
+
+    #[test]
+    fn the_cheap_status_lists_each_changed_path_once() {
+        let raw = b" M src/a.rs\0?? new file.txt\0R  renamed.rs\0old.rs\0";
+        let paths = parse_changed_paths(raw);
+        assert_eq!(paths, ["src/a.rs", "new file.txt", "renamed.rs"]);
     }
 
     #[test]

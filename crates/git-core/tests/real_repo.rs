@@ -344,6 +344,76 @@ fn lists_worktrees_and_marks_the_current_one() {
 }
 
 #[test]
+fn adds_removes_locks_and_prunes_worktrees() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main_dir = tmp.path().join("main");
+    std::fs::create_dir(&main_dir).unwrap();
+    git(&main_dir, &["init", "-q"]);
+    commit(&main_dir, "A");
+    git(&main_dir, &["branch", "other"]);
+    let repo = open(&main_dir).unwrap();
+    let oid = repo.head_commit().unwrap().unwrap().id;
+
+    // An existing branch in a new folder.
+    let linked = tmp.path().join("linked");
+    repo.add_worktree(&linked, "other").unwrap();
+    let list = repo.worktrees().unwrap();
+    let added = worktree(&list, &linked);
+    assert_eq!(added.branch.as_deref(), Some("other"));
+    assert!(!added.main && !added.current);
+    std::fs::write(linked.join("local.txt"), b"dirty").unwrap();
+
+    // A new branch from a commit.
+    let fresh = tmp.path().join("fresh");
+    repo.add_worktree_for_new_branch(&fresh, "wt-new", oid)
+        .unwrap();
+    let list = repo.worktrees().unwrap();
+    let new = worktree(&list, &fresh);
+    assert_eq!(new.branch.as_deref(), Some("wt-new"));
+    assert_eq!(new.head, Some(oid));
+    assert!(repo
+        .refs()
+        .unwrap()
+        .iter()
+        .any(|r| r.kind == RefKind::LocalBranch && r.name == "wt-new"));
+
+    // Locking keeps a reason; unlocking clears it.
+    repo.lock_worktree(&linked, Some("review in progress"))
+        .unwrap();
+    let list = repo.worktrees().unwrap();
+    assert_eq!(
+        worktree(&list, &linked).locked.as_deref(),
+        Some("review in progress")
+    );
+    repo.unlock_worktree(&linked).unwrap();
+    let list = repo.worktrees().unwrap();
+    assert!(worktree(&list, &linked).locked.is_none());
+
+    // A dirty worktree needs force; the branch stays in the repository.
+    assert!(repo.remove_worktree(&linked, false).is_err());
+    repo.remove_worktree(&linked, true).unwrap();
+    assert!(!linked.exists());
+    let list = repo.worktrees().unwrap();
+    assert!(list.iter().all(|w| w.path != linked));
+    assert!(repo
+        .refs()
+        .unwrap()
+        .iter()
+        .any(|r| r.kind == RefKind::LocalBranch && r.name == "other"));
+
+    // A worktree whose folder is gone is pruned without touching files.
+    std::fs::remove_dir_all(&fresh).unwrap();
+    let list = repo.worktrees().unwrap();
+    assert!(worktree(&list, &fresh).prunable);
+    repo.prune_worktrees().unwrap();
+    assert!(repo.worktrees().unwrap().iter().all(|w| w.path != fresh));
+
+    // The main worktree cannot be removed.
+    assert!(repo.remove_worktree(&main_dir, true).is_err());
+    assert!(main_dir.exists());
+}
+
+#[test]
 fn lists_submodules_and_their_state() {
     let lib = tempfile::tempdir().unwrap();
     git(lib.path(), &["init", "-q"]);

@@ -14,10 +14,11 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, canvas, div, point, px, App, AppContext, Bounds, Context, CursorStyle, Decorations,
-    Div, Entity, HitboxBehavior, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ResizeEdge, SharedString, Styled, Subscription, Task,
-    Tiling, Window,
+    actions, canvas, div, point, px, size, App, AppContext, Bounds, Context, CursorStyle,
+    Decorations, Div, Entity, HitboxBehavior, InteractiveElement, IntoElement, MouseButton,
+    MouseMoveEvent, ParentElement, Pixels, Point, Render, ResizeEdge, SharedString, Styled,
+    Subscription, Task, Tiling, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions,
 };
 
 use git_core::{Error, Git, GitChoice};
@@ -167,6 +168,44 @@ impl Workspace {
         // list gets it in `show_welcome`.
         window.focus(&focus, cx);
         cx.notify();
+    }
+
+    /// Opens `path` in a second window, leaving this one on its repository.
+    /// Used by the worktree page's "Open" and the add dialog's "Open in a new
+    /// window" option.
+    pub fn open_repository_window(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let git = self.git.clone();
+        let git_choice = self.git_choice.clone();
+        let name = repo_name(&path);
+        let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+        let opened = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_decorations: Some(WindowDecorations::Client),
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_min_size: Some(size(px(620.), px(420.))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(format!("{name} — GitWarp").into()),
+                    appears_transparent: true,
+                    ..Default::default()
+                }),
+                app_id: Some("dev.v1rus.gitwarp".into()),
+                ..Default::default()
+            },
+            move |window, cx| {
+                ui::theme::follow_system(window, cx);
+                cx.new(|cx| Workspace::new(Some(path), git, git_choice, window, cx))
+            },
+        );
+        if let Err(error) = opened {
+            log::warn!("could not open a worktree window: {error}");
+            window.refresh();
+        }
     }
 
     /// Switches back to the welcome screen.

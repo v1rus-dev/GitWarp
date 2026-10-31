@@ -220,6 +220,20 @@ pub enum SidebarAction {
     PushTags,
     /// Deletes a remote branch, e.g. `origin/feat/x`.
     DeleteRemoteBranch(String),
+    /// Shows the Worktrees page.
+    ShowWorktrees,
+    /// Opens the add-worktree dialog.
+    AddWorktree,
+    /// Opens a worktree in a second window.
+    OpenWorktree(String),
+    /// Locks a worktree by path.
+    LockWorktree(String),
+    /// Unlocks a worktree by path.
+    UnlockWorktree(String),
+    /// Opens the remove-worktree dialog for a path.
+    RemoveWorktree(String),
+    /// Drops the records of worktrees whose folders are gone.
+    PruneWorktrees,
 }
 
 /// One item of a sidebar context menu, free of GPUI so the labels, order and
@@ -404,11 +418,19 @@ pub fn sidebar_menu(
             })
             .is_some_and(|worktree| worktree.locked.is_some());
         return vec![
-            item("Open in new window", IconName::Folder),
-            item("Add worktree…", IconName::Plus),
+            item("Open in new window", IconName::Folder)
+                .action(SidebarAction::OpenWorktree(path.to_owned())),
+            item("Manage worktrees…", IconName::Worktree).action(SidebarAction::ShowWorktrees),
+            item("Add worktree…", IconName::Plus).action(SidebarAction::AddWorktree),
             SidebarMenuEntry::Separator,
-            item(if locked { "Unlock" } else { "Lock" }, IconName::Lock),
-            item("Remove worktree…", IconName::Trash).danger(),
+            item(if locked { "Unlock" } else { "Lock" }, IconName::Lock).action(if locked {
+                SidebarAction::UnlockWorktree(path.to_owned())
+            } else {
+                SidebarAction::LockWorktree(path.to_owned())
+            }),
+            item("Remove worktree…", IconName::Trash)
+                .danger()
+                .action(SidebarAction::RemoveWorktree(path.to_owned())),
         ];
     }
     if key.starts_with("sub:") {
@@ -433,9 +455,10 @@ pub fn sidebar_menu(
             item("Push all tags to origin", IconName::Up).action(SidebarAction::PushTags),
         ],
         "section:worktrees" => vec![
-            item("Add worktree…", IconName::Plus),
+            item("Manage worktrees…", IconName::Worktree).action(SidebarAction::ShowWorktrees),
+            item("Add worktree…", IconName::Plus).action(SidebarAction::AddWorktree),
             SidebarMenuEntry::Separator,
-            item("Prune missing worktrees", IconName::Trash),
+            item("Prune missing worktrees", IconName::Trash).action(SidebarAction::PruneWorktrees),
             item("Refresh list", IconName::Fetch).action(SidebarAction::Refresh),
         ],
         _ => Vec::new(),
@@ -1387,6 +1410,7 @@ mod tests {
             locked: locked.map(str::to_owned),
             prunable,
             current: index == 0,
+            main: index == 0,
         };
         let extras = SidebarExtras {
             worktrees: vec![
@@ -1646,6 +1670,7 @@ mod tests {
                 locked: None,
                 prunable: false,
                 current: true,
+                main: true,
             }],
             submodules: vec![Submodule {
                 path: "vendor/lib".to_owned(),
@@ -1779,6 +1804,7 @@ mod tests {
             locked: locked.map(str::to_owned),
             prunable: false,
             current: false,
+            main: false,
         }
     }
 
@@ -1961,6 +1987,7 @@ mod tests {
             )),
             vec![
                 "Open in new window",
+                "Manage worktrees…",
                 "Add worktree…",
                 "—",
                 "Lock",
@@ -1976,6 +2003,7 @@ mod tests {
             )),
             vec![
                 "Open in new window",
+                "Manage worktrees…",
                 "Add worktree…",
                 "—",
                 "Unlock",
@@ -2027,6 +2055,7 @@ mod tests {
                 None
             )),
             vec![
+                "Manage worktrees…",
                 "Add worktree…",
                 "—",
                 "Prune missing worktrees",
@@ -2133,6 +2162,13 @@ mod tests {
                 ],
                 "stash:0" => &["Apply stash", "Pop stash", "Drop stash"],
                 "remote:origin" => &["Fetch", "Edit remote…", "Remove remote"],
+                "wt:/tmp/wt" => &[
+                    "Open in new window",
+                    "Manage worktrees…",
+                    "Add worktree…",
+                    "Lock",
+                    "Remove worktree…",
+                ],
                 "section:remotes" => &[
                     "Add remote…",
                     "Fetch all remotes",
@@ -2143,7 +2179,12 @@ mod tests {
                     "Fetch tags from origin",
                     "Push all tags to origin",
                 ],
-                "section:worktrees" => &["Refresh list"],
+                "section:worktrees" => &[
+                    "Manage worktrees…",
+                    "Add worktree…",
+                    "Prune missing worktrees",
+                    "Refresh list",
+                ],
                 _ => &[],
             };
             assert_eq!(enabled, expected, "wrong enabled items for `{key}`");
