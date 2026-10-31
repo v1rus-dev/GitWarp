@@ -25,6 +25,8 @@ mod test_support;
 mod theme;
 mod welcome;
 mod workspace;
+mod worktree_dialog;
+mod worktrees_view;
 
 use gpui::{
     prelude::*, px, size, App, Bounds, Global, KeyBinding, TitlebarOptions,
