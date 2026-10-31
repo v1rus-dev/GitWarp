@@ -95,7 +95,14 @@ impl DiffRow {
 /// A pair is painted removed-then-added, as the design's unified view does;
 /// unpaired lines keep the plain line background. Runs of context lines stay
 /// in order.
+#[cfg(test)]
 pub fn build_rows(hunks: &[Hunk]) -> Vec<DiffRow> {
+    build_rows_with(hunks, true)
+}
+
+/// [`build_rows`] with the user's "Highlight changed words" choice. Without
+/// it the rows still pair removed and added lines but carry no emphasis.
+pub fn build_rows_with(hunks: &[Hunk], word_highlight: bool) -> Vec<DiffRow> {
     let mut rows = Vec::new();
     for (hunk_index, hunk) in hunks.iter().enumerate() {
         let mut header = DiffRow::header(&hunk.header);
@@ -130,7 +137,11 @@ pub fn build_rows(hunks: &[Hunk]) -> Vec<DiffRow> {
                             (Some(old), Some(new)) => {
                                 let old_text = expand_tabs(&old.text);
                                 let new_text = expand_tabs(&new.text);
-                                let (old_emphasis, new_emphasis) = word_diff(&old_text, &new_text);
+                                let (old_emphasis, new_emphasis) = if word_highlight {
+                                    word_diff(&old_text, &new_text)
+                                } else {
+                                    (Vec::new(), Vec::new())
+                                };
                                 let mut old_row = DiffRow::line(old, old_text, old_emphasis);
                                 old_row.hunk = Some(hunk_index);
                                 old_row.line = Some(removed_start + pair);

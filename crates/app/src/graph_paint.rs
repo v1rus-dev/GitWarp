@@ -15,8 +15,8 @@ use gpui::{
 use ui::Theme;
 
 use crate::theme::{
-    DOT_HALO_RADIUS, DOT_RADIUS, GRAPH_FADE_WIDTH, HEAD_RING_RADIUS, HEAD_RING_WIDTH, LINE_WIDTH,
-    MERGE_INNER_RADIUS, ROW_HEIGHT,
+    DOT_HALO_RADIUS, DOT_RADIUS, GRAPH_FADE_WIDTH, HEAD_RING_RADIUS, HEAD_RING_WIDTH,
+    MERGE_INNER_RADIUS,
 };
 
 /// A dot whose centre is further than this past the column edge is not drawn.
@@ -37,6 +37,8 @@ pub fn paint_row(
     geometry: &ColumnGeometry,
     is_head: bool,
     theme: &Theme,
+    colored: bool,
+    line_width: Pixels,
     window: &mut Window,
 ) {
     let cw = f32::from(bounds.size.width);
@@ -46,11 +48,17 @@ pub fn paint_row(
     let origin_x = bounds.origin.x;
     let x_of = |col: usize| geometry.xs.get(col).map(|x| origin_x + px(*x));
     let local_x = |x: Pixels| f32::from(x - origin_x);
-    let lane = |col: usize| theme.lane_color(col as u32);
+    let lane = |col: usize| {
+        if colored {
+            theme.lane_color(col as u32)
+        } else {
+            theme.colors.muted
+        }
+    };
     let folded = |col: usize| geometry.folded.get(col).copied().unwrap_or(false);
     // The dash phase follows the row's absolute content y, so the pattern runs
     // on across row boundaries instead of restarting in every row.
-    let dash_offset = row_index as f32 * f32::from(ROW_HEIGHT);
+    let dash_offset = row_index as f32 * f32::from(bounds.size.height);
 
     // Passing lanes first: one vertical per distinct x, so a folded group draws
     // its dashed gap lane once. `xs` never decreases with the column, so the
@@ -74,13 +82,20 @@ pub fn paint_row(
             for (from, to) in dash_segments(0., f32::from(bounds.size.height), dash_offset) {
                 straight(
                     window,
+                    line_width,
                     point(x, top + px(from)),
                     point(x, top + px(to)),
                     color,
                 );
             }
         } else {
-            straight(window, point(x, top), point(x, bottom), lane(segment.from));
+            straight(
+                window,
+                line_width,
+                point(x, top),
+                point(x, bottom),
+                lane(segment.from),
+            );
         }
     }
 
@@ -96,14 +111,14 @@ pub fn paint_row(
         let color = lane(segment_column(true, segment));
         if segment.from == segment.to {
             if vertical_visible(local_x(x0), cw) {
-                straight(window, point(x0, top), point(x0, mid), color);
+                straight(window, line_width, point(x0, top), point(x0, mid), color);
             }
         } else {
             let Some(x1) = x_of(segment.to) else {
                 continue;
             };
             if curve_visible(local_x(x0), local_x(x1), cw) {
-                curve(window, point(x0, top), point(x1, mid), color);
+                curve(window, line_width, point(x0, top), point(x1, mid), color);
             }
         }
     }
@@ -120,14 +135,14 @@ pub fn paint_row(
         let color = lane(segment_column(false, segment));
         if segment.from == segment.to {
             if vertical_visible(local_x(x0), cw) {
-                straight(window, point(x0, mid), point(x0, bottom), color);
+                straight(window, line_width, point(x0, mid), point(x0, bottom), color);
             }
         } else {
             let Some(x1) = x_of(segment.to) else {
                 continue;
             };
             if curve_visible(local_x(x0), local_x(x1), cw) {
-                curve(window, point(x0, mid), point(x1, bottom), color);
+                curve(window, line_width, point(x0, mid), point(x1, bottom), color);
             }
         }
     }
@@ -257,8 +272,14 @@ fn dash_segments(y0: f32, y1: f32, offset: f32) -> Vec<(f32, f32)> {
     dashes
 }
 
-fn straight(window: &mut Window, from: Point<Pixels>, to: Point<Pixels>, color: Hsla) {
-    let mut path = PathBuilder::stroke(LINE_WIDTH);
+fn straight(
+    window: &mut Window,
+    width: Pixels,
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    color: Hsla,
+) {
+    let mut path = PathBuilder::stroke(width);
     path.move_to(from);
     path.line_to(to);
     if let Ok(path) = path.build() {
@@ -268,8 +289,8 @@ fn straight(window: &mut Window, from: Point<Pixels>, to: Point<Pixels>, color: 
 
 /// A lane change with the design's control points: 7 px along from the start
 /// and 7 px back from the end, so the bend stays inside the row.
-fn curve(window: &mut Window, from: Point<Pixels>, to: Point<Pixels>, color: Hsla) {
-    let mut path = PathBuilder::stroke(LINE_WIDTH);
+fn curve(window: &mut Window, width: Pixels, from: Point<Pixels>, to: Point<Pixels>, color: Hsla) {
+    let mut path = PathBuilder::stroke(width);
     path.move_to(from);
     path.cubic_bezier_to(
         to,

@@ -6,6 +6,48 @@
 
 use crate::{check_output, Error, Oid, Repo, Result};
 
+/// How a diff treats whitespace-only changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffWhitespace {
+    /// Show every change.
+    #[default]
+    None,
+    /// Ignore whitespace at line end (`--ignore-space-at-eol`).
+    Eol,
+    /// Ignore all whitespace (`-w`).
+    All,
+}
+
+/// The context and whitespace options the Diff & merge page persists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffOptions {
+    /// Unchanged lines around a hunk, 0–20.
+    pub context: u8,
+    pub whitespace: DiffWhitespace,
+}
+
+impl Default for DiffOptions {
+    fn default() -> Self {
+        Self {
+            context: 3,
+            whitespace: DiffWhitespace::None,
+        }
+    }
+}
+
+impl DiffOptions {
+    /// The arguments shared by every `git diff` invocation.
+    pub(crate) fn args(&self) -> Vec<String> {
+        let mut args = vec![format!("-U{}", self.context.min(20))];
+        match self.whitespace {
+            DiffWhitespace::None => {}
+            DiffWhitespace::Eol => args.push("--ignore-space-at-eol".to_owned()),
+            DiffWhitespace::All => args.push("-w".to_owned()),
+        }
+        args
+    }
+}
+
 /// Largest patch (or blob) held in memory; a bigger one is reported instead.
 const SIZE_CAP: usize = 2 * 1024 * 1024;
 /// Largest number of patch lines the diff view will accept.
@@ -198,6 +240,17 @@ pub(crate) fn file_diff(
     path: &str,
     old_path: Option<&str>,
 ) -> Result<FileDiff> {
+    file_diff_with(repo, oid, path, old_path, DiffOptions::default())
+}
+
+/// [`file_diff`] with the user's context and whitespace options.
+pub(crate) fn file_diff_with(
+    repo: &Repo,
+    oid: Oid,
+    path: &str,
+    old_path: Option<&str>,
+    options: DiffOptions,
+) -> Result<FileDiff> {
     let parents = parents(repo, oid)?;
     let parent = parents.first().map(Oid::to_string);
 
@@ -206,12 +259,12 @@ pub(crate) fn file_diff(
         "diff-tree",
         "-r",
         "-p",
-        "-U3",
         "--find-renames",
         "--no-color",
         "--no-ext-diff",
         "--no-commit-id",
     ]);
+    command.args(options.args());
     match &parent {
         Some(parent) => {
             command.arg(parent);
@@ -605,6 +658,27 @@ fn bytes_to_text(bytes: Vec<u8>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_options_build_the_context_and_whitespace_arguments() {
+        assert_eq!(DiffOptions::default().args(), vec!["-U3".to_owned()]);
+        assert_eq!(
+            DiffOptions {
+                context: 0,
+                whitespace: DiffWhitespace::Eol,
+            }
+            .args(),
+            vec!["-U0".to_owned(), "--ignore-space-at-eol".to_owned()]
+        );
+        assert_eq!(
+            DiffOptions {
+                context: 99,
+                whitespace: DiffWhitespace::All,
+            }
+            .args(),
+            vec!["-U20".to_owned(), "-w".to_owned()]
+        );
+    }
 
     #[test]
     fn parses_hunk_headers_with_and_without_counts() {

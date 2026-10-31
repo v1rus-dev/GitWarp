@@ -328,7 +328,7 @@ pub(crate) fn commit(repo: &Repo, message: &str, amend: bool) -> Result<Oid> {
 /// or copy; both sides of the rename must match the pathspec or git reports
 /// the new name as a whole new file.
 pub(crate) fn unstaged_diff(repo: &Repo, path: &str, old_path: Option<&str>) -> Result<FileDiff> {
-    file_patch(repo, path, old_path, false)
+    file_patch(repo, path, old_path, false, crate::DiffOptions::default())
 }
 
 /// A patch-shaped view of an untracked file: every line is an addition, so
@@ -387,23 +387,42 @@ pub(crate) fn untracked_diff(repo: &Repo, path: &str) -> Result<FileDiff> {
 
 /// The index side of one file.
 pub(crate) fn staged_diff(repo: &Repo, path: &str, old_path: Option<&str>) -> Result<FileDiff> {
-    file_patch(repo, path, old_path, true)
+    staged_diff_with(repo, path, old_path, crate::DiffOptions::default())
 }
 
-fn file_patch(repo: &Repo, path: &str, old_path: Option<&str>, cached: bool) -> Result<FileDiff> {
+pub(crate) fn staged_diff_with(
+    repo: &Repo,
+    path: &str,
+    old_path: Option<&str>,
+    options: crate::DiffOptions,
+) -> Result<FileDiff> {
+    file_patch(repo, path, old_path, true, options)
+}
+
+pub(crate) fn unstaged_diff_with(
+    repo: &Repo,
+    path: &str,
+    old_path: Option<&str>,
+    options: crate::DiffOptions,
+) -> Result<FileDiff> {
+    file_patch(repo, path, old_path, false, options)
+}
+
+fn file_patch(
+    repo: &Repo,
+    path: &str,
+    old_path: Option<&str>,
+    cached: bool,
+    options: crate::DiffOptions,
+) -> Result<FileDiff> {
     let mut command = repo.command();
     command.arg("diff");
     if cached {
         command.arg("--cached");
     }
-    command.args([
-        "-p",
-        "-U3",
-        "--find-renames",
-        "--no-color",
-        "--no-ext-diff",
-        "--",
-    ]);
+    command.args(["-p", "--find-renames", "--no-color", "--no-ext-diff"]);
+    command.args(options.args());
+    command.arg("--");
     command.arg(path);
     if let Some(old_path) = old_path {
         command.arg(old_path);

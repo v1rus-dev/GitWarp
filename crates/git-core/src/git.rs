@@ -235,6 +235,21 @@ impl Git {
         cmd
     }
 
+    /// The git shipped next to the app, when one is present.
+    pub fn bundled_path() -> Option<PathBuf> {
+        bundled_path()
+    }
+
+    /// The `git` found on `PATH`, as an absolute path when possible.
+    pub fn system_path() -> Option<PathBuf> {
+        find_in_path("git")
+    }
+
+    /// Probes one explicit executable, without the `Auto` fallback.
+    pub fn probe_at(path: PathBuf, source: GitSource) -> Result<Self> {
+        Self::probe(path, source, PROBE_TIMEOUT)
+    }
+
     pub fn version(&self) -> GitVersion {
         self.version
     }
@@ -260,6 +275,21 @@ fn check_floor(found: GitVersion, source: GitSource, path: &Path) -> Result<()> 
     } else {
         Ok(())
     }
+}
+
+/// Finds an executable on `PATH`, trying the platform's extensions on Windows.
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let exts: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    std::env::split_paths(&path).find_map(|dir| {
+        exts.iter()
+            .map(|ext| dir.join(format!("{name}{ext}")))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 /// The git shipped next to the app, if any. Layout per OS:

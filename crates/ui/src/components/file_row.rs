@@ -11,7 +11,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::components::status_glyph::StatusGlyph;
 use crate::focus::{self, RingOffset};
-use crate::metrics::{FONT_UI, FS_BASE, FS_XS, ROW, R_SM};
+use crate::metrics::{FONT_UI, FS_BASE, FS_XS, R_SM};
 use crate::theme::ActiveTheme;
 
 use super::tabular_font;
@@ -153,6 +153,7 @@ impl FileRow {
 impl RenderOnce for FileRow {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors;
+        let row_height = cx.theme().row_height;
         let focus = window
             .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
             .read(cx)
@@ -203,7 +204,7 @@ impl RenderOnce for FileRow {
                     .shape_line(SharedString::from(text), FS_BASE, &runs, None)
             },
             move |bounds, line, window, cx| {
-                let _ = line.paint(bounds.origin, ROW, TextAlign::Left, None, window, cx);
+                let _ = line.paint(bounds.origin, row_height, TextAlign::Left, None, window, cx);
             },
         );
 
@@ -251,7 +252,7 @@ impl RenderOnce for FileRow {
             .flex()
             .items_center()
             .gap(px(8.))
-            .h(ROW)
+            .h(row_height)
             // A row in a scrolling flex column keeps its fixed height.
             .flex_none()
             .ml(px(6.))
@@ -259,7 +260,7 @@ impl RenderOnce for FileRow {
             .px(px(8.))
             .rounded(R_SM)
             .font_family(FONT_UI)
-            .text_size(FS_BASE)
+            .text_size(cx.theme().ui_font_size)
             .text_color(foreground)
             .bg(background)
             .track_focus(&focus)

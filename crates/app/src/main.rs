@@ -18,6 +18,7 @@ mod ref_dialog;
 mod ref_ops;
 mod repo_view;
 mod settings;
+mod settings_ui;
 mod sidebar;
 mod syntax;
 #[cfg(test)]
@@ -169,6 +170,16 @@ fn main() {
             }
         };
 
+    let config_path = settings::config_dir().map(|dir| dir.join("settings.json"));
+    let loaded = match &config_path {
+        Some(path) => SettingsStore::new(path.clone()).load(),
+        None => {
+            log::warn!("no configuration directory found; using default settings");
+            Settings::default()
+        }
+    };
+    // The command line and GITWARP_GIT win over the Git page's choice.
+    let git_choice = git_choice.unwrap_or_else(|| loaded.git_choice());
     // Resolved once, before any window exists, so the probe cannot freeze the UI.
     let git: Result<Arc<Git>, Arc<git_core::Error>> = Git::resolve(git_choice.clone())
         .map(|r| {
@@ -179,13 +190,14 @@ fn main() {
         })
         .map_err(Arc::new);
 
-    let config_path = settings::config_dir().map(|dir| dir.join("settings.json"));
-    let loaded = match &config_path {
-        Some(path) => SettingsStore::new(path.clone()).load(),
-        None => {
-            log::warn!("no configuration directory found; using default settings");
-            Settings::default()
-        }
+    let path = match path {
+        Some(path) => Some(path),
+        None if loaded.on_launch == settings::OnLaunch::Last => loaded
+            .recent
+            .iter()
+            .map(|repo| repo.path.clone())
+            .find(|path| path.is_dir()),
+        None => None,
     };
 
     gpui_platform::application()
@@ -197,25 +209,70 @@ fn main() {
             if loaded.theme != ThemePref::System {
                 ui::theme::set_mode(loaded.theme.into(), cx);
             }
+            ui::theme::set_style(
+                ui::theme::ThemeStyle {
+                    accent: loaded.accent.into(),
+                    density: loaded.density.into(),
+                    ui_font_size: f32::from(loaded.ui_font_size),
+                    mono_font_size: f32::from(loaded.mono_font_size),
+                },
+                cx,
+            );
             // Repository shortcuts. `secondary-` is Ctrl on Linux and Windows
             // and Cmd on macOS. The views handle them, with a window-root
             // fallback for when nothing holds the focus.
+            // A shortcut the user changed on the Keybindings page replaces the
+            // default, including the cross-platform `secondary-` aliases.
+            let keys = |id: &str, default: &str| {
+                loaded
+                    .keybindings
+                    .get(id)
+                    .filter(|keys| !keys.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| default.to_owned())
+            };
             let shortcuts = vec![
-                ui::actions::key_binding(cx, "secondary-b", repo_view::ToggleSidebar, None),
-                ui::actions::key_binding(cx, "secondary-j", repo_view::ToggleDetails, None),
-                ui::actions::key_binding(cx, "secondary-k", repo_view::FocusSearch, None),
+                ui::actions::key_binding(
+                    cx,
+                    &keys("sidebar", "secondary-b"),
+                    repo_view::ToggleSidebar,
+                    None,
+                ),
+                ui::actions::key_binding(
+                    cx,
+                    &keys("dock", "secondary-j"),
+                    repo_view::ToggleDetails,
+                    None,
+                ),
+                ui::actions::key_binding(
+                    cx,
+                    &keys("search", "secondary-k"),
+                    repo_view::FocusSearch,
+                    None,
+                ),
+                ui::actions::key_binding(
+                    cx,
+                    &keys("settings", "secondary-,"),
+                    workspace::OpenSettings,
+                    None,
+                ),
                 // Ctrl O opens the "Open from folder" dialog everywhere: on
                 // the welcome screen and in a repository window alike.
                 ui::actions::key_binding(cx, "secondary-o", workspace::OpenRepositoryDialog, None),
                 ui::actions::key_binding(
                     cx,
-                    "secondary-shift-b",
+                    &keys("branch", "secondary-shift-b"),
                     repo_view::OpenBranchSwitcher,
                     None,
                 ),
                 ui::actions::key_binding(cx, "secondary-shift-s", repo_view::StashChanges, None),
                 // Fetch every remote, as the sidebar's menu advertises.
-                ui::actions::key_binding(cx, "secondary-shift-f", repo_view::FetchAll, None),
+                ui::actions::key_binding(
+                    cx,
+                    &keys("fetch", "secondary-shift-f"),
+                    repo_view::FetchAll,
+                    None,
+                ),
                 // Welcome screen: Ctrl N opens the Initialize dialog and Del
                 // drops a recent entry.
                 ui::actions::key_binding(
@@ -232,8 +289,8 @@ fn main() {
             repo_view::bind_search_keys(cx);
             // The history list's extra keys (j/k, PgUp/PgDn, Ctrl+C) live in
             // the list's own context.
-            history_view::bind_history_keys(cx);
-            changes_view::bind_keys(cx);
+            history_view::bind_history_keys(cx, &loaded);
+            changes_view::bind_keys(cx, &loaded);
             cx.set_global(AppSettings {
                 path: config_path,
                 settings: loaded,
@@ -285,7 +342,8 @@ fn main() {
 enum Cli {
     Run {
         path: Option<PathBuf>,
-        git: GitChoice,
+        /// `None` when neither `--git` nor `GITWARP_GIT` was given.
+        git: Option<GitChoice>,
     },
     Help,
 }
@@ -312,10 +370,7 @@ fn parse_args(
             _ => path = Some(PathBuf::from(arg)),
         }
     }
-    Ok(Cli::Run {
-        path,
-        git: git.unwrap_or_default(),
-    })
+    Ok(Cli::Run { path, git })
 }
 
 #[cfg(test)]
@@ -326,7 +381,7 @@ mod tests {
         parse_args(args.iter().map(OsString::from), env.map(OsString::from))
     }
 
-    fn run(path: Option<&str>, git: GitChoice) -> Result<Cli, String> {
+    fn run(path: Option<&str>, git: Option<GitChoice>) -> Result<Cli, String> {
         Ok(Cli::Run {
             path: path.map(Into::into),
             git,
@@ -335,19 +390,19 @@ mod tests {
 
     #[test]
     fn flag_wins_over_env() {
-        assert_eq!(parse(&[], None), run(None, GitChoice::Auto));
+        assert_eq!(parse(&[], None), run(None, None));
         assert_eq!(
             parse(&["repo"], Some("system")),
-            run(Some("repo"), GitChoice::System)
+            run(Some("repo"), Some(GitChoice::System))
         );
-        assert_eq!(parse(&[], Some("")), run(None, GitChoice::Auto));
+        assert_eq!(parse(&[], Some("")), run(None, Some(GitChoice::Auto)));
         assert_eq!(
             parse(&["--git", "bundled", "repo"], Some("system")),
-            run(Some("repo"), GitChoice::Bundled)
+            run(Some("repo"), Some(GitChoice::Bundled))
         );
         assert_eq!(
             parse(&["repo", "--git=/opt/git"], None),
-            run(Some("repo"), GitChoice::Custom("/opt/git".into()))
+            run(Some("repo"), Some(GitChoice::Custom("/opt/git".into())))
         );
     }
 
@@ -369,7 +424,7 @@ mod tests {
             cli,
             Ok(Cli::Run {
                 path: Some(raw.into()),
-                git: GitChoice::Auto
+                git: None
             })
         );
     }

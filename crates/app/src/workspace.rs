@@ -33,9 +33,10 @@ use crate::open_dialog::OpenRepoDialog;
 use crate::repo_view::{
     FocusSearch, OpenBranchSwitcher, OpenRepoSwitcher, RepositoryView, ToggleDetails, ToggleSidebar,
 };
+use crate::settings_ui::SettingsView;
 use crate::welcome::WelcomeView;
 
-actions!(workspace, [OpenRepositoryDialog]);
+actions!(workspace, [OpenRepositoryDialog, OpenSettings]);
 
 /// The shadow and resize border drawn around the client-side frame.
 const INSET: Pixels = px(10.);
@@ -48,6 +49,8 @@ enum Content {
     Empty,
     Welcome(Entity<WelcomeView>),
     Repository(Entity<RepositoryView>),
+    /// The Settings surface, with the content it came from kept for closing.
+    Settings(Entity<SettingsView>),
 }
 
 /// The window root: frame, decorations and the current content view.
@@ -60,6 +63,8 @@ pub struct Workspace {
     /// The resize edge under the pointer in the frame's inset band, if any.
     /// The band only repaints when this changes, so the cursor follows it.
     last_resize_edge: Option<ResizeEdge>,
+    /// The content Settings was opened from; restored on close.
+    settings_return: Option<Box<Content>>,
     /// The Open-from-folder dialog, kept so its state survives the frames.
     dialog: Option<Entity<OpenRepoDialog>>,
     /// A git credential question, while one is open.
@@ -90,6 +95,7 @@ impl Workspace {
             git,
             git_choice,
             last_resize_edge: None,
+            settings_return: None,
             dialog: None,
             credential: None,
             host_key: None,
@@ -224,6 +230,61 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opens the Settings surface, remembering what it replaced.
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.content, Content::Settings(_)) {
+            return;
+        }
+        let root = self.with_repository(cx, |view, _| view.path().to_path_buf());
+        let git = self.git.clone();
+        let workspace = cx.weak_entity();
+        let view = cx.new(|cx| SettingsView::new(root, git, workspace, window, cx));
+        let previous = std::mem::replace(&mut self.content, Content::Empty);
+        self.settings_return = Some(Box::new(previous));
+        let focus = view.read(cx).focus_handle();
+        self.content = Content::Settings(view);
+        window.set_window_title("Settings — GitWarp");
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Leaves Settings and restores the welcome screen or repository.
+    pub fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.content, Content::Settings(_)) {
+            return;
+        }
+        let previous = self.settings_return.take().map(|content| *content);
+        self.content = previous.unwrap_or(Content::Empty);
+        match &self.content {
+            Content::Repository(view) => {
+                let name = repo_name(view.read(cx).path());
+                let focus = view.read(cx).focus_handle();
+                window.set_window_title(&format!("{name} — GitWarp"));
+                window.focus(&focus, cx);
+            }
+            Content::Welcome(view) => {
+                let focus = view.read(cx).list_focus();
+                window.set_window_title("GitWarp");
+                window.focus(&focus, cx);
+            }
+            Content::Empty => {
+                self.show_welcome(window, cx);
+            }
+            Content::Settings(_) => {}
+        }
+        // The Git page may have chosen a different executable; resolve it now
+        // so the open repository (or the welcome screen) uses it at once.
+        let choice = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.git_choice())
+            .unwrap_or_default();
+        if choice != self.git_choice {
+            self.git_choice = choice;
+            self.retry_git(window, cx);
+        }
+        cx.notify();
+    }
+
     /// Opens the "Open from folder" dialog, or brings it back when the user
     /// closed its layer with Esc or the scrim and asks for it again.
     pub fn open_repository_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -262,8 +323,7 @@ impl Workspace {
         let choice = self.git_choice.clone();
         let path = match &self.content {
             Content::Repository(view) => Some(view.read(cx).path().to_path_buf()),
-            Content::Welcome(_) => None,
-            Content::Empty => None,
+            Content::Welcome(_) | Content::Empty | Content::Settings(_) => None,
         };
         cx.spawn_in(window, async move |this, cx| {
             let resolved = cx
@@ -291,7 +351,7 @@ impl Workspace {
                         Target::Repository(view.read(cx).path().to_path_buf())
                     }
                     Content::Welcome(_) => Target::Welcome,
-                    Content::Empty => Target::None,
+                    Content::Empty | Content::Settings(_) => Target::None,
                 };
                 match target {
                     // Still the repository the user retried for.
@@ -322,7 +382,7 @@ impl Workspace {
     ) -> Option<R> {
         match &self.content {
             Content::Repository(view) => Some(view.update(cx, f)),
-            Content::Welcome(_) | Content::Empty => None,
+            Content::Welcome(_) | Content::Empty | Content::Settings(_) => None,
         }
     }
 }
@@ -401,6 +461,7 @@ impl Render for Workspace {
             Content::Empty => div().size_full().into_any_element(),
             Content::Welcome(view) => view.clone().into_any_element(),
             Content::Repository(view) => view.clone().into_any_element(),
+            Content::Settings(view) => view.clone().into_any_element(),
         };
 
         // The padded backdrop holds the shadow and the resize band. With
@@ -509,6 +570,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenRepositoryDialog, window, cx| {
                 this.open_repository_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_settings(window, cx);
             }));
 
         ui::focus::track_pointer(ui::actions::tab_navigation(root))
@@ -697,6 +761,93 @@ mod tests {
         assert_eq!(
             resize_edge(point(px(99.), px(49.)), INSET, size, left),
             Some(ResizeEdge::BottomRight)
+        );
+    }
+
+    #[gpui::test]
+    fn the_settings_action_opens_the_pages_and_escape_returns(cx: &mut gpui::TestAppContext) {
+        use gpui::{
+            point, size, Bounds, VisualTestContext, WindowBackgroundAppearance, WindowBounds,
+            WindowDecorations, WindowOptions,
+        };
+
+        cx.update(ui::init).expect("ui::init");
+        let handle = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(1200.), px(800.)),
+                    ))),
+                    window_decorations: Some(WindowDecorations::Client),
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    cx.new(|cx| {
+                        Workspace::new(
+                            None,
+                            Err(Arc::new(Error::PathNotFound {
+                                path: PathBuf::from("/nonexistent"),
+                            })),
+                            GitChoice::Auto,
+                            window,
+                            cx,
+                        )
+                    })
+                },
+            )
+            .expect("open window")
+        });
+        let mut cx = VisualTestContext::from_window(handle.into(), cx);
+        cx.run_until_parked();
+        cx.update(|window, _| window.activate_window());
+        assert!(
+            cx.debug_bounds("welcome-view").is_some() || cx.debug_bounds("recent-filter").is_some(),
+            "the welcome screen did not render"
+        );
+
+        cx.update(|window, cx| window.dispatch_action(Box::new(OpenSettings), cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("settings-view").is_some(),
+            "Ctrl , did not open Settings"
+        );
+        assert!(
+            cx.debug_bounds("settings-page-General").is_some(),
+            "the General page is not the first one"
+        );
+        for selector in [
+            "settings-nav-Appearance",
+            "settings-nav-Git",
+            "settings-nav-Ssh",
+            "settings-nav-Keybindings",
+            "settings-nav-Diff",
+            "settings-nav-Identity",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "the {selector} page is missing from the navigation"
+            );
+        }
+
+        let git = cx.debug_bounds("settings-nav-Git").expect("Git nav");
+        cx.simulate_click(git.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("settings-page-Git").is_some(),
+            "clicking Git did not switch the page"
+        );
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("settings-view").is_none(),
+            "Escape did not leave Settings"
+        );
+        assert!(
+            cx.debug_bounds("recent-filter").is_some(),
+            "closing Settings did not bring the welcome screen back"
         );
     }
 

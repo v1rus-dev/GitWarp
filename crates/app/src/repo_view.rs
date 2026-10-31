@@ -24,7 +24,7 @@ use gpui::{
 use git_core::network::{FetchOptions, Progress};
 use git_core::{ChangedFile, CommitDetails, CommitInfo, Error, Git, Head, Oid, RefKind, Repo};
 use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
-use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, MONO, R_SM, STATUS};
+use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
     menu, toast, Avatar, Button, CountPill, Counter, FileRow, Icon, IconName, MenuEntry, MenuItem,
@@ -380,6 +380,8 @@ pub struct RepositoryView {
     network_generation: u64,
     /// Whether the background fetch is on, mirrored in the settings.
     background_fetch: bool,
+    /// Pause between background fetches, from the settings.
+    background_fetch_interval: Duration,
     /// The repeating background-fetch task.
     background_fetch_task: Option<Task<()>>,
     /// A background fetch is in flight; the next tick skips while it runs.
@@ -399,8 +401,6 @@ enum NetworkEvent {
     Done(Result<git_core::network::NetworkOutcome, Error>),
 }
 
-/// How often the background fetch runs after the first try.
-const BACKGROUND_FETCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// The first background fetch waits a little, so opening a repository is not
 /// immediately followed by network traffic.
 const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(30);
@@ -569,7 +569,7 @@ impl RepositoryView {
                 .text_system()
                 .ch_advance(
                     window.text_system().resolve_font(&gpui::font(FONT_MONO)),
-                    MONO,
+                    px(f32::from(settings.mono_font_size)),
                 )
                 .unwrap_or(px(7.2)),
             diff_layout: settings.diff_layout,
@@ -584,6 +584,9 @@ impl RepositoryView {
             network: None,
             network_generation: 0,
             background_fetch: settings.background_fetch,
+            background_fetch_interval: Duration::from_secs(
+                u64::from(settings.fetch_interval_minutes) * 60,
+            ),
             background_fetch_task: None,
             background_fetch_running: false,
         };
@@ -1014,6 +1017,21 @@ impl RepositoryView {
                 let remote = remote.to_owned();
                 let branch = branch.to_owned();
                 let view = cx.entity();
+                let confirm = cx
+                    .try_global::<crate::AppSettings>()
+                    .map(|state| state.settings.confirm_delete_branch)
+                    .unwrap_or(true);
+                if !confirm {
+                    self.start_network_job(
+                        Job::DeleteRemoteBranch {
+                            remote: remote.clone(),
+                            branch: branch.clone(),
+                        },
+                        window,
+                        cx,
+                    );
+                    return;
+                }
                 crate::confirm_dialog::open(
                     format!("Delete {name}?"),
                     format!("This deletes the branch “{branch}” on {remote}. It cannot be undone."),
@@ -1289,13 +1307,14 @@ impl RepositoryView {
 
     /// Starts the repeating, quiet fetch of every remote.
     fn start_background_fetch(&mut self, cx: &mut Context<Self>) {
+        let interval = self.background_fetch_interval;
         self.background_fetch_task = Some(cx.spawn(async move |this, cx| {
             let mut first = true;
             loop {
                 let delay = if first {
                     BACKGROUND_FETCH_FIRST
                 } else {
-                    BACKGROUND_FETCH_INTERVAL
+                    interval
                 };
                 first = false;
                 cx.background_executor().timer(delay).await;
@@ -1735,11 +1754,19 @@ impl RepositoryView {
         };
         let key = (oid, file.path.clone());
         let cached = self.highlight_cache.get(&key).cloned();
+        let settings = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.clone())
+            .unwrap_or_default();
+        let diff_options = settings.diff_options();
+        let word_highlight = settings.diff_word_highlight;
         let root = self.root.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { read_diff(git, &root, oid, &file, cached) })
+                .spawn(async move {
+                    read_diff(git, &root, oid, &file, cached, diff_options, word_highlight)
+                })
                 .await;
             this.update(cx, |view, cx| view.set_diff(generation, result, cx))
                 .ok();
@@ -2183,11 +2210,17 @@ impl RepositoryView {
                 .child(field),
         );
 
+        let settings_click = {
+            let workspace = self.workspace.clone();
+            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                let _ = workspace.update(cx, |workspace, cx| workspace.open_settings(window, cx));
+            }
+        };
         bar = bar.child(no_shrink(
             Button::ghost("settings-button")
                 .icon_only(IconName::Gear)
-                .disabled(true)
-                .tooltip("Settings — arrives in a later version"),
+                .tooltip_kbd("Settings", "Ctrl ,")
+                .on_click(settings_click),
         ));
 
         titlebar_end(bar, client)
@@ -2981,7 +3014,7 @@ impl RepositoryView {
             .flex_col()
             .min_w_0()
             .min_h_0()
-            .text_size(MONO)
+            .text_size(cx.theme().mono_font_size)
             .child(toolbar)
             .child(body)
     }
@@ -2996,6 +3029,10 @@ impl RepositoryView {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors;
+        let show_numbers = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.diff_line_numbers)
+            .unwrap_or(true);
         range
             .filter_map(|index| {
                 rows.get(index).map(|row| {
@@ -3011,7 +3048,15 @@ impl RepositoryView {
                             (spans, &[][..])
                         }
                     };
-                    diff_row(row, index, width, colors, old_spans, new_spans)
+                    diff_row(
+                        row,
+                        index,
+                        width,
+                        colors,
+                        old_spans,
+                        new_spans,
+                        show_numbers,
+                    )
                 })
             })
             .collect()
@@ -3027,11 +3072,16 @@ impl RepositoryView {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors;
-        let half = px(((f32::from(width) - 2. * DIFF_GUTTER) / 2.).max(0.));
+        let show_numbers = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.diff_line_numbers)
+            .unwrap_or(true);
+        let gutters = if show_numbers { 2. * DIFF_GUTTER } else { 0. };
+        let half = px(((f32::from(width) - gutters) / 2.).max(0.));
         range
             .filter_map(|index| {
                 rows.get(index)
-                    .map(|row| split_row(row, index, width, half, colors, highlight))
+                    .map(|row| split_row(row, index, width, half, colors, highlight, show_numbers))
             })
             .collect()
     }
@@ -3417,6 +3467,7 @@ fn diff_row(
     colors: ThemeColors,
     old_spans: &[HighlightSpan],
     new_spans: &[HighlightSpan],
+    show_numbers: bool,
 ) -> AnyElement {
     let base = div()
         .id(SharedString::from(format!("diff-row-{index}")))
@@ -3462,9 +3513,13 @@ fn diff_row(
                 RowKind::Added => new_spans,
                 _ => old_spans,
             };
-            base.child(diff_gutter(row.old_line, old_background, colors))
-                .child(diff_gutter(row.new_line, new_background, colors))
-                .child(diff_marker(row.kind, line_background, colors))
+            let mut base = base;
+            if show_numbers {
+                base = base
+                    .child(diff_gutter(row.old_line, old_background, colors))
+                    .child(diff_gutter(row.new_line, new_background, colors));
+            }
+            base.child(diff_marker(row.kind, line_background, colors))
                 .child(
                     div()
                         .flex_1()
@@ -3501,7 +3556,6 @@ fn diff_gutter(line: Option<u32>, background: Option<Hsla>, colors: ThemeColors)
         .justify_end()
         .pr(px(6.))
         .when_some(background, |this, background| this.bg(background))
-        .text_size(MONO)
         .text_color(colors.muted)
         .child(line.map(|line| line.to_string()).unwrap_or_default())
 }
@@ -3539,6 +3593,7 @@ fn split_row(
     half: Pixels,
     colors: ThemeColors,
     highlight: &Highlighted,
+    show_numbers: bool,
 ) -> AnyElement {
     let base = div()
         .id(SharedString::from(format!("split-row-{index}")))
@@ -3563,26 +3618,32 @@ fn split_row(
             .text_color(colors.muted)
             .child(text.clone())
             .into_any_element(),
-        SplitRow::Pair { old, new } => base
-            .child(split_gutter(old.as_ref(), colors))
-            .child(split_content(
+        SplitRow::Pair { old, new } => {
+            let mut base = base;
+            if show_numbers {
+                base = base.child(split_gutter(old.as_ref(), colors));
+            }
+            base = base.child(split_content(
                 old.as_ref(),
                 half,
                 colors,
                 highlight.spans(true, old.as_ref().map(|cell| cell.line)),
-            ))
-            .child(
-                split_gutter(new.as_ref(), colors)
-                    .border_l_1()
-                    .border_color(colors.border),
-            )
-            .child(split_content(
+            ));
+            if show_numbers {
+                base = base.child(
+                    split_gutter(new.as_ref(), colors)
+                        .border_l_1()
+                        .border_color(colors.border),
+                );
+            }
+            base.child(split_content(
                 new.as_ref(),
                 half,
                 colors,
                 highlight.spans(false, new.as_ref().map(|cell| cell.line)),
             ))
-            .into_any_element(),
+            .into_any_element()
+        }
     }
 }
 
@@ -3602,7 +3663,6 @@ fn split_gutter(cell: Option<&SplitCell>, colors: ThemeColors) -> Div {
         .justify_end()
         .pr(px(6.))
         .when_some(background, |this, background| this.bg(background))
-        .text_size(MONO)
         .text_color(colors.muted)
         .child(cell.map(|cell| cell.line.to_string()).unwrap_or_default())
 }
