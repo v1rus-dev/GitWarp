@@ -1,4 +1,7 @@
 mod changes_view;
+mod clone_dialog;
+mod confirm_dialog;
+mod credential_dialog;
 mod details;
 mod diff_model;
 mod format;
@@ -6,7 +9,10 @@ mod graph_paint;
 mod history_search;
 mod history_state;
 mod history_view;
+mod host_key_dialog;
 mod init_flow;
+mod network_ops;
+mod network_service;
 mod open_dialog;
 mod ref_dialog;
 mod ref_ops;
@@ -141,6 +147,12 @@ Options:
 Without REPO the welcome screen opens.";
 
 fn main() {
+    // git starts this same executable as its askpass helper. That happens
+    // before any window exists, so it must be the first thing `main` checks.
+    if network_service::is_helper() {
+        network_service::run_helper();
+        return;
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let (path, git_choice) =
         match parse_args(std::env::args_os().skip(1), std::env::var_os("GITWARP_GIT")) {
@@ -200,6 +212,8 @@ fn main() {
                     None,
                 ),
                 ui::actions::key_binding(cx, "secondary-shift-s", repo_view::StashChanges, None),
+                // Fetch every remote, as the sidebar's menu advertises.
+                ui::actions::key_binding(cx, "secondary-shift-f", repo_view::FetchAll, None),
                 // Welcome screen: Ctrl N opens the Initialize dialog and Del
                 // drops a recent entry.
                 ui::actions::key_binding(
@@ -224,6 +238,7 @@ fn main() {
                 save_in_flight: false,
                 dirty: false,
             });
+            cx.set_global(network_service::NetworkService::start());
             // A background save may still be in flight when the user quits;
             // closing the last window does reach `on_app_quit` on Linux, so
             // this is the one place that has to write the last change.

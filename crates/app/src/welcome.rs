@@ -26,6 +26,7 @@ use ui::{
     TextInputSubmit, ToastKind, Tooltip,
 };
 
+use crate::clone_dialog::CloneDialog;
 use crate::format::{display_path, expand_home, home_dir, relative_time};
 use crate::history_view::unix_now;
 use crate::init_flow::{banner_body, details, DialogKind, InitFlow, StatusKind};
@@ -86,6 +87,8 @@ pub struct WelcomeView {
     init_focus: FocusHandle,
     /// The open Initialize dialog, if any.
     dialog: Option<Entity<InitDialog>>,
+    /// The open Clone dialog, if any.
+    clone_dialog: Option<Entity<CloneDialog>>,
     _filter_events: Subscription,
 }
 
@@ -125,6 +128,7 @@ impl WelcomeView {
             clone_focus: cx.focus_handle().tab_stop(false),
             init_focus: cx.focus_handle().tab_stop(true),
             dialog: None,
+            clone_dialog: None,
             _filter_events: filter_events,
         }
     }
@@ -357,15 +361,21 @@ impl WelcomeView {
                     id: "welcome-clone",
                     icon: IconName::Clone,
                     label: "Clone repository…",
-                    // No shortcut: clone is not bound yet.
+                    // No shortcut, as in the design.
                     kbd: None,
-                    disabled: true,
-                    tooltip: "Clone arrives in a later version",
+                    disabled: false,
+                    tooltip: "Clone a repository from a URL",
                 },
                 self.clone_focus.clone(),
                 false,
                 cx,
-                None,
+                {
+                    let view = cx.entity().downgrade();
+                    Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+                        view.update(cx, |view, cx| view.open_clone_dialog(window, cx))
+                            .ok();
+                    }))
+                },
             ))
             .child(action_row(
                 ActionSpec {
@@ -501,17 +511,36 @@ impl WelcomeView {
     }
 
     /// Clears a dialog state whose layer was closed with Esc or the scrim.
-    fn prune_dialog(&mut self, window: &Window, cx: &App) {
-        let Some(dialog) = &self.dialog else {
-            return;
-        };
-        let open = dialog
-            .read(cx)
-            .layer
-            .is_some_and(|layer| overlay::layer_view(layer, window, cx).is_some());
-        if !open {
-            self.dialog = None;
+    fn prune_dialog(&mut self, window: &Window, cx: &mut App) {
+        if let Some(dialog) = &self.dialog {
+            let open = dialog
+                .read(cx)
+                .layer
+                .is_some_and(|layer| overlay::layer_view(layer, window, cx).is_some());
+            if !open {
+                self.dialog = None;
+            }
         }
+        if let Some(dialog) = &self.clone_dialog {
+            let open = dialog.update(cx, |dialog, cx| dialog.layer_gone(window, cx));
+            if open {
+                self.clone_dialog = None;
+            }
+        }
+    }
+
+    /// Opens the Clone repository dialog; brings an existing one back if its
+    /// layer was closed with Esc.
+    fn open_clone_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dialog) = &self.clone_dialog {
+            if !dialog.update(cx, |dialog, cx| dialog.layer_gone(window, cx)) {
+                return;
+            }
+        }
+        let workspace = self.workspace.clone();
+        let dialog = crate::clone_dialog::open(self.git.clone(), workspace, window, cx);
+        self.clone_dialog = Some(dialog);
+        cx.notify();
     }
 
     /// Opens the Initialize dialog; reopens it when the old layer is gone.

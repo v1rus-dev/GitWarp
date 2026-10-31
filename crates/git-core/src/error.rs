@@ -52,6 +52,10 @@ pub enum Error {
     TooLarge {
         what: &'static str,
     },
+    /// The user stopped a long-running operation (a clone).
+    Cancelled {
+        command: &'static str,
+    },
 }
 
 /// What kind of failure an [`Error`] is, for the UI to match on instead of
@@ -171,6 +175,7 @@ impl fmt::Display for Error {
             } => write!(f, "git {command} failed: {}", stderr.trim()),
             Error::Parse(what) => write!(f, "could not parse {what}"),
             Error::TooLarge { what } => write!(f, "the {what} is too large to show"),
+            Error::Cancelled { command } => write!(f, "git {command} was cancelled"),
         }
     }
 }

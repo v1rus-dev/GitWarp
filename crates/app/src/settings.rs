@@ -58,6 +58,8 @@ pub struct Settings {
     pub collapse_idle_lanes: bool,
     /// How the commit diff pane lays out a file.
     pub diff_layout: DiffLayout,
+    /// Fetch the remotes in the background while a repository is open.
+    pub background_fetch: bool,
 }
 
 impl Default for Settings {
@@ -71,6 +73,7 @@ impl Default for Settings {
             graph_width: GRAPH_WIDTH_DEFAULT,
             collapse_idle_lanes: false,
             diff_layout: DiffLayout::default(),
+            background_fetch: true,
         }
     }
 }
@@ -292,6 +295,7 @@ fn settings_from_value(value: Value) -> Settings {
             defaults.collapse_idle_lanes,
         ),
         diff_layout: take(&mut object, "diff_layout", defaults.diff_layout),
+        background_fetch: take(&mut object, "background_fetch", defaults.background_fetch),
     }
 }
 
@@ -394,6 +398,7 @@ mod tests {
             graph_width: 176.0,
             collapse_idle_lanes: true,
             diff_layout: DiffLayout::Split,
+            background_fetch: false,
         };
         store.save(&settings).unwrap();
         assert_eq!(store.load(), settings);

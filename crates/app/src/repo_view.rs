@@ -8,7 +8,9 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -16,10 +18,11 @@ use gpui::{
     ClickEvent, ClipboardItem, Context, Decorations, Div, Entity, FocusHandle, FontWeight, Hsla,
     InteractiveElement, IntoElement, ListHorizontalSizingBehavior, MouseButton, ParentElement,
     Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    StyledText, Subscription, TextRun, UniformListScrollHandle, WeakEntity, Window,
+    StyledText, Subscription, Task, TextRun, UniformListScrollHandle, WeakEntity, Window,
 };
 
-use git_core::{ChangedFile, CommitDetails, CommitInfo, Error, Git, Head, Oid, RefKind};
+use git_core::network::{FetchOptions, Progress};
+use git_core::{ChangedFile, CommitDetails, CommitInfo, Error, Git, Head, Oid, RefKind, Repo};
 use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
 use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, MONO, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
@@ -35,6 +38,8 @@ use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
 use crate::format::{absolute_time, format_count, relative_time};
 use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
+use crate::network_ops::{self, Job};
+use crate::network_service::NetworkService;
 use crate::ref_dialog::{self, RefDialog, RefDialogContext, RefDialogKind, RemoteEdit};
 use crate::ref_ops::{CommitCard, RefAction};
 use crate::settings::{
@@ -62,7 +67,8 @@ actions!(
         SearchFocusList,
         OpenRepoSwitcher,
         OpenBranchSwitcher,
-        StashChanges
+        StashChanges,
+        FetchAll
     ]
 );
 
@@ -361,7 +367,38 @@ pub struct RepositoryView {
     ref_dialog: Option<Entity<RefDialog>>,
     /// A ref operation without a dialog (checkout, stash apply, …) is running.
     ref_action_running: bool,
+    /// The network action that is running, if any.
+    network: Option<NetworkActivity>,
+    /// Bumped per network job; an older poll loop stops.
+    network_generation: u64,
+    /// Whether the background fetch is on, mirrored in the settings.
+    background_fetch: bool,
+    /// The repeating background-fetch task.
+    background_fetch_task: Option<Task<()>>,
+    /// A background fetch is in flight; the next tick skips while it runs.
+    background_fetch_running: bool,
 }
+
+/// What the status bar and the toolbar show while git is talking to a remote.
+struct NetworkActivity {
+    verb: &'static str,
+    detail: SharedString,
+    progress: Option<f32>,
+}
+
+/// One event from the worker to the UI.
+enum NetworkEvent {
+    Progress(Progress),
+    Done(Result<git_core::network::NetworkOutcome, Error>),
+}
+
+/// How often the background fetch runs after the first try.
+const BACKGROUND_FETCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// The first background fetch waits a little, so opening a repository is not
+/// immediately followed by network traffic.
+const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(30);
+/// How often the UI drains the job's progress channel.
+const NETWORK_POLL: Duration = Duration::from_millis(80);
 
 impl RepositoryView {
     pub fn new(
@@ -466,7 +503,7 @@ impl RepositoryView {
             .unwrap_or_else(|| dock_default(dock));
         let focus = cx.focus_handle().tab_stop(false);
 
-        Self {
+        let mut view = Self {
             path,
             root,
             repo_name: name,
@@ -522,7 +559,14 @@ impl RepositoryView {
             branch_bounds: Rc::new(Cell::new(None)),
             ref_dialog: None,
             ref_action_running: false,
-        }
+            network: None,
+            network_generation: 0,
+            background_fetch: settings.background_fetch,
+            background_fetch_task: None,
+            background_fetch_running: false,
+        };
+        view.start_background_fetch(cx);
+        view
     }
 
     /// The focus handle of the repository root; the workspace focuses it after
@@ -881,7 +925,112 @@ impl RepositoryView {
             SidebarAction::RemoveRemote(name) => {
                 self.open_ref_dialog(RefDialogKind::RemoveRemote { name }, window, cx);
             }
+            SidebarAction::FetchRemote(name) => {
+                self.start_network_job(
+                    Job::Fetch(FetchOptions {
+                        remote: Some(name),
+                        tags: true,
+                        prune: false,
+                    }),
+                    window,
+                    cx,
+                );
+            }
+            SidebarAction::FetchAll => self.fetch_remotes(window, cx),
+            SidebarAction::FetchPrune => {
+                self.start_network_job(
+                    Job::Fetch(FetchOptions {
+                        remote: None,
+                        tags: true,
+                        prune: true,
+                    }),
+                    window,
+                    cx,
+                );
+            }
+            SidebarAction::PushTag(tag) => {
+                let remote = self.default_remote_name();
+                self.start_network_job(Job::PushTag { remote, tag }, window, cx);
+            }
+            SidebarAction::PushTags => {
+                let remote = self.default_remote_name();
+                self.start_network_job(Job::PushTags { remote }, window, cx);
+            }
+            SidebarAction::DeleteRemoteBranch(name) => {
+                let Some((remote, branch)) = name.split_once('/') else {
+                    toast::show(
+                        ui::ToastKind::Warn,
+                        format!("Cannot tell which remote {name} belongs to"),
+                        window,
+                        cx,
+                    );
+                    return;
+                };
+                let remote = remote.to_owned();
+                let branch = branch.to_owned();
+                let view = cx.entity();
+                crate::confirm_dialog::open(
+                    format!("Delete {name}?"),
+                    format!("This deletes the branch “{branch}” on {remote}. It cannot be undone."),
+                    "Delete branch",
+                    move |window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.start_network_job(
+                                Job::DeleteRemoteBranch {
+                                    remote: remote.clone(),
+                                    branch: branch.clone(),
+                                },
+                                window,
+                                cx,
+                            );
+                        });
+                    },
+                    window,
+                    cx,
+                );
+            }
+            SidebarAction::SetUpstream(branch) => {
+                let fallback = self.default_remote_name();
+                self.run_repo_action(window, cx, move |repo| {
+                    let remote = git_core::network::default_remote(repo)?
+                        .unwrap_or_else(|| fallback.clone());
+                    let upstream = format!("{remote}/{branch}");
+                    let exists = repo.refs()?.iter().any(|reference| {
+                        reference.kind == RefKind::RemoteBranch && reference.name == upstream
+                    });
+                    if !exists {
+                        return Err(Error::Git {
+                            command: "branch --set-upstream-to",
+                            code: None,
+                            stderr: format!(
+                                "There is no {upstream} yet. Push {branch} first to create it."
+                            ),
+                        });
+                    }
+                    git_core::network::set_upstream(repo, &branch, &remote, &branch)?;
+                    Ok((ui::ToastKind::Ok, format!("{branch} now tracks {upstream}")))
+                });
+            }
         }
+    }
+
+    /// `origin` when configured, otherwise the first remote, otherwise
+    /// `origin` (the operation then reports the missing remote).
+    fn default_remote_name(&self) -> String {
+        let remotes = self
+            .sidebar_extras
+            .as_ref()
+            .map(|extras| &extras.remote_urls)
+            .filter(|urls| !urls.is_empty());
+        let Some(remotes) = remotes else {
+            return "origin".to_owned();
+        };
+        remotes
+            .iter()
+            .find(|(name, _)| name == "origin")
+            .or_else(|| remotes.first())
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| "origin".to_owned())
     }
 
     /// Runs one history-row action.
@@ -1040,6 +1189,242 @@ impl RepositoryView {
                 Ok((ui::ToastKind::Info, "No local changes to stash".to_owned()))
             }
         });
+    }
+
+    /// Starts the repeating, quiet fetch of every remote.
+    fn start_background_fetch(&mut self, cx: &mut Context<Self>) {
+        self.background_fetch_task = Some(cx.spawn(async move |this, cx| {
+            let mut first = true;
+            loop {
+                let delay = if first {
+                    BACKGROUND_FETCH_FIRST
+                } else {
+                    BACKGROUND_FETCH_INTERVAL
+                };
+                first = false;
+                cx.background_executor().timer(delay).await;
+                if this
+                    .update(cx, |view, cx| view.background_fetch_tick(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// One background fetch, skipped while another network action runs.
+    fn background_fetch_tick(&mut self, cx: &mut Context<Self>) {
+        if !self.background_fetch || self.network.is_some() || self.background_fetch_running {
+            return;
+        }
+        let Some(root) = self
+            .history
+            .read(cx)
+            .root()
+            .map(std::path::Path::to_path_buf)
+        else {
+            return;
+        };
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(_) => return,
+        };
+        let context = cx
+            .try_global::<NetworkService>()
+            .map(|service| service.context(false))
+            .unwrap_or_default();
+        self.background_fetch_running = true;
+        cx.spawn(async move |this, cx| {
+            let changed = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = match Repo::open(git, &root) {
+                        Ok(repo) => repo,
+                        Err(error) => {
+                            log::debug!("background fetch could not open the repository: {error}");
+                            return false;
+                        }
+                    };
+                    let before = ref_snapshot(&repo);
+                    let outcome = git_core::network::fetch(
+                        &repo,
+                        &FetchOptions {
+                            remote: None,
+                            tags: true,
+                            prune: true,
+                        },
+                        &context,
+                        &git_core::network::CancelToken::new(),
+                        |_| {},
+                    );
+                    match outcome {
+                        Ok(_) => before != ref_snapshot(&repo),
+                        Err(error) => {
+                            log::debug!("background fetch failed: {error}");
+                            false
+                        }
+                    }
+                })
+                .await;
+            this.update(cx, |view, cx| {
+                view.background_fetch_running = false;
+                if changed {
+                    view.reload_after_network(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Turns the background fetch on or off and remembers it in the settings.
+    fn set_background_fetch(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.background_fetch = enabled;
+        crate::update_settings(cx, |settings| settings.background_fetch = enabled);
+        cx.notify();
+    }
+
+    /// Runs a network job in the background and paints its progress in the
+    /// status bar. Only one runs at a time.
+    fn start_network_job(&mut self, job: Job, window: &mut Window, cx: &mut Context<Self>) {
+        if self.network.is_some() {
+            return;
+        }
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+                return;
+            }
+        };
+        let (context, asker) = match cx.try_global::<NetworkService>() {
+            Some(service) => (service.context(true), service.host_keys()),
+            None => (
+                git_core::network::NetworkContext::default(),
+                crate::network_service::HostKeyAsker::unavailable(),
+            ),
+        };
+        let root = self.root.clone();
+        self.network_generation = self.network_generation.wrapping_add(1);
+        let generation = self.network_generation;
+        self.network = Some(NetworkActivity {
+            verb: job.verb(),
+            detail: "Connecting…".into(),
+            progress: None,
+        });
+        cx.notify();
+
+        let (tx, rx) = mpsc::channel();
+        let worker_job = job.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let result = Repo::open(git, &root).and_then(|repo| {
+                    worker_job.run(
+                        &repo,
+                        &context,
+                        &asker,
+                        &git_core::network::CancelToken::new(),
+                        |progress| {
+                            let _ = tx.send(NetworkEvent::Progress(progress));
+                        },
+                    )
+                });
+                let _ = tx.send(NetworkEvent::Done(result));
+            })
+            .detach();
+
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(NETWORK_POLL).await;
+            let done = this
+                .update_in(cx, |view, window, cx| {
+                    view.poll_network(&rx, generation, &job, window, cx)
+                })
+                .unwrap_or(true);
+            if done {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Returns whether the job finished.
+    fn poll_network(
+        &mut self,
+        rx: &Receiver<NetworkEvent>,
+        generation: u64,
+        job: &Job,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if generation != self.network_generation {
+            return true;
+        }
+        let mut finished = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                NetworkEvent::Progress(progress) => {
+                    if let Some(activity) = self.network.as_mut() {
+                        if let Some(fraction) = progress.fraction() {
+                            activity.progress = Some(fraction);
+                        }
+                        let text = progress.text.trim();
+                        if !text.is_empty() {
+                            activity.detail = text.to_owned().into();
+                        }
+                    }
+                }
+                NetworkEvent::Done(result) => finished = Some(result),
+            }
+        }
+        if let Some(result) = finished {
+            self.network = None;
+            match result {
+                Ok(outcome) => {
+                    toast::show(ui::ToastKind::Ok, job.done_message(&outcome), window, cx);
+                    self.reload_after_network(cx);
+                }
+                Err(error) => {
+                    toast::show(
+                        ui::ToastKind::Error,
+                        network_ops::friendly_error(&error),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            return true;
+        }
+        cx.notify();
+        false
+    }
+
+    /// Reloads everything a remote change can affect.
+    fn reload_after_network(&mut self, cx: &mut Context<Self>) {
+        self.history.update(cx, |history, cx| history.reload(cx));
+        self.changes.update(cx, |changes, cx| changes.refresh(cx));
+        self.refresh(cx);
+        cx.notify();
+    }
+
+    fn fetch_remotes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_network_job(
+            Job::Fetch(FetchOptions {
+                remote: None,
+                tags: true,
+                prune: true,
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn pull_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_network_job(Job::Pull, window, cx);
+    }
+
+    fn push_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_network_job(Job::Push, window, cx);
     }
 
     /// Starts the sidebar's background load when the history first reports a
@@ -1387,6 +1772,24 @@ impl RepositoryView {
                         .ok();
                 }),
         ));
+        entries.push(MenuEntry::Separator);
+        let enabled = self.background_fetch;
+        let view = cx.entity();
+        entries.push(MenuEntry::Item(
+            MenuItem::new(if enabled {
+                "Fetch in the background"
+            } else {
+                "Background fetch is off"
+            })
+            .icon(if enabled {
+                IconName::Check
+            } else {
+                IconName::Fetch
+            })
+            .action(move |_, cx| {
+                view.update(cx, |view, cx| view.set_background_fetch(!enabled, cx));
+            }),
+        ));
         entries
     }
 
@@ -1541,6 +1944,53 @@ impl RepositoryView {
             stash_button = stash_button.counter(Counter::new(stash_count.to_string()));
         }
 
+        let busy = self.network.is_some();
+        let fetch = {
+            let view = cx.entity();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                view.update(cx, |view, cx| view.fetch_remotes(window, cx));
+            }
+        };
+        let pull = {
+            let view = cx.entity();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                view.update(cx, |view, cx| view.pull_branch(window, cx));
+            }
+        };
+        let push = {
+            let view = cx.entity();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                view.update(cx, |view, cx| view.push_branch(window, cx));
+            }
+        };
+        let fetch_button = network_tool(
+            "toolbar-fetch",
+            IconName::Fetch,
+            "Fetch",
+            "Fetch all remotes, tags and pruned branches",
+            layout.labels,
+            busy,
+            fetch,
+        );
+        let pull_button = network_tool(
+            "toolbar-pull",
+            IconName::Down,
+            "Pull",
+            "Pull the current branch (fast-forward only)",
+            layout.labels,
+            busy,
+            pull,
+        );
+        let push_button = network_tool(
+            "toolbar-push",
+            IconName::Up,
+            "Push",
+            "Push the current branch",
+            layout.labels,
+            busy,
+            push,
+        );
+
         let mut bar = titlebar(cx)
             .gap(px(layout.gap))
             .px(px(layout.padding))
@@ -1550,27 +2000,9 @@ impl RepositoryView {
             .child(no_shrink(
                 div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(colors.border),
             ))
-            .child(no_shrink(tool_button(
-                "toolbar-fetch",
-                IconName::Fetch,
-                "Fetch",
-                "Fetch — arrives in a later version",
-                layout.labels,
-            )))
-            .child(no_shrink(tool_button(
-                "toolbar-pull",
-                IconName::Down,
-                "Pull",
-                "Pull — arrives in a later version",
-                layout.labels,
-            )))
-            .child(no_shrink(tool_button(
-                "toolbar-push",
-                IconName::Up,
-                "Push",
-                "Push — arrives in a later version",
-                layout.labels,
-            )))
+            .child(no_shrink(fetch_button))
+            .child(no_shrink(pull_button))
+            .child(no_shrink(push_button))
             .child(no_shrink(stash_button))
             .child(titlebar_fill());
 
@@ -2484,6 +2916,23 @@ impl RepositoryView {
             .text_size(FS_SM)
             .text_color(colors.muted);
 
+        if let Some(network) = &self.network {
+            let detail = network.detail.clone();
+            bar = bar.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(Spinner::new("network-status-spinner", px(12.)))
+                    .child(network.verb)
+                    .child(div().max_w(px(260.)).truncate().child(detail)),
+            );
+            bar = bar.child(match network.progress {
+                Some(value) => ui::Progress::new("network-status-progress", value),
+                None => ui::Progress::new("network-status-progress", 0.).indeterminate(),
+            });
+        }
+
         if self.view == ViewMode::Changes {
             let changes = self.changes.read(cx);
             if changes.is_loading() {
@@ -2697,6 +3146,9 @@ impl Render for RepositoryView {
             .on_action(cx.listener(|view, _: &StashChanges, window, cx| {
                 view.stash_changes(window, cx);
             }))
+            .on_action(cx.listener(|view, _: &FetchAll, window, cx| {
+                view.fetch_remotes(window, cx);
+            }))
             .child(toolbar)
             .child(body)
             .child(status)
@@ -2764,21 +3216,37 @@ fn no_shrink(child: impl IntoElement) -> Div {
     div().flex_none().child(child)
 }
 
-/// One disabled tool button; the label is dropped on narrow windows and the
-/// tooltip keeps the name and says the action is not available yet.
-fn tool_button(
+/// A working toolbar tool button: the label is dropped on narrow windows.
+fn network_tool(
     id: &'static str,
     icon: IconName,
     label: &'static str,
     tooltip: &'static str,
     labels: bool,
+    busy: bool,
+    action: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Button {
-    let button = Button::tool(id).icon(icon).disabled(true).tooltip(tooltip);
+    let button = Button::tool(id)
+        .icon(icon)
+        .disabled(busy)
+        .tooltip(tooltip)
+        .on_click(action);
     if labels {
         button.label(label)
     } else {
         button
     }
+}
+
+/// The name and target of every ref, for "did the fetch change anything?".
+fn ref_snapshot(repo: &Repo) -> Vec<(String, Oid)> {
+    repo.refs()
+        .map(|refs| {
+            refs.into_iter()
+                .map(|reference| (reference.name, reference.target))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One diff row and its cells, in pixels.
