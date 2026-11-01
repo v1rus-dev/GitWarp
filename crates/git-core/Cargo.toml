@@ -1,12 +1,13 @@
 [package]
 name = "git-core"
-description = "Repository access: streaming log, refs. Reads via the git CLI for now"
+description = "Repository access: streaming log, refs. Discovery via gix; mutations still use the git CLI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+gix.workspace = true
 
 [dev-dependencies]
 git-graph.workspace = true
