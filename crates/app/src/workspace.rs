@@ -49,8 +49,6 @@ enum Content {
     Empty,
     Welcome(Entity<WelcomeView>),
     Repository(Entity<RepositoryView>),
-    /// The Settings surface, with the content it came from kept for closing.
-    Settings(Entity<SettingsView>),
 }
 
 /// The window root: frame, decorations and the current content view.
@@ -63,8 +61,8 @@ pub struct Workspace {
     /// The resize edge under the pointer in the frame's inset band, if any.
     /// The band only repaints when this changes, so the cursor follows it.
     last_resize_edge: Option<ResizeEdge>,
-    /// The content Settings was opened from; restored on close.
-    settings_return: Option<Box<Content>>,
+    /// The settings window, drawn over the current content. `None` once closed.
+    settings: Option<Entity<SettingsView>>,
     /// The Open-from-folder dialog, kept so its state survives the frames.
     dialog: Option<Entity<OpenRepoDialog>>,
     /// A git credential question, while one is open.
@@ -95,7 +93,7 @@ impl Workspace {
             git,
             git_choice,
             last_resize_edge: None,
-            settings_return: None,
+            settings: None,
             dialog: None,
             credential: None,
             host_key: None,
@@ -230,47 +228,39 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Opens the Settings surface, remembering what it replaced.
+    /// Opens Settings as a window over the current content. The repository or
+    /// welcome screen stays underneath and keeps its title.
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.content, Content::Settings(_)) {
+        if self.settings.is_some() {
             return;
         }
         let root = self.with_repository(cx, |view, _| view.path().to_path_buf());
         let git = self.git.clone();
         let workspace = cx.weak_entity();
         let view = cx.new(|cx| SettingsView::new(root, git, workspace, window, cx));
-        let previous = std::mem::replace(&mut self.content, Content::Empty);
-        self.settings_return = Some(Box::new(previous));
         let focus = view.read(cx).focus_handle();
-        self.content = Content::Settings(view);
-        window.set_window_title("Settings — GitWarp");
+        self.settings = Some(view);
         window.focus(&focus, cx);
         cx.notify();
     }
 
-    /// Leaves Settings and restores the welcome screen or repository.
+    /// Closes the settings window, leaving the content it covered as it was.
     pub fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.content, Content::Settings(_)) {
+        if self.settings.take().is_none() {
             return;
         }
-        let previous = self.settings_return.take().map(|content| *content);
-        self.content = previous.unwrap_or(Content::Empty);
         match &self.content {
             Content::Repository(view) => {
-                let name = repo_name(view.read(cx).path());
                 let focus = view.read(cx).focus_handle();
-                window.set_window_title(&format!("{name} — GitWarp"));
                 window.focus(&focus, cx);
             }
             Content::Welcome(view) => {
                 let focus = view.read(cx).list_focus();
-                window.set_window_title("GitWarp");
                 window.focus(&focus, cx);
             }
             Content::Empty => {
                 self.show_welcome(window, cx);
             }
-            Content::Settings(_) => {}
         }
         // The Git page may have chosen a different executable; resolve it now
         // so the open repository (or the welcome screen) uses it at once.
@@ -323,7 +313,7 @@ impl Workspace {
         let choice = self.git_choice.clone();
         let path = match &self.content {
             Content::Repository(view) => Some(view.read(cx).path().to_path_buf()),
-            Content::Welcome(_) | Content::Empty | Content::Settings(_) => None,
+            Content::Welcome(_) | Content::Empty => None,
         };
         cx.spawn_in(window, async move |this, cx| {
             let resolved = cx
@@ -351,7 +341,7 @@ impl Workspace {
                         Target::Repository(view.read(cx).path().to_path_buf())
                     }
                     Content::Welcome(_) => Target::Welcome,
-                    Content::Empty | Content::Settings(_) => Target::None,
+                    Content::Empty => Target::None,
                 };
                 match target {
                     // Still the repository the user retried for.
@@ -382,7 +372,7 @@ impl Workspace {
     ) -> Option<R> {
         match &self.content {
             Content::Repository(view) => Some(view.update(cx, f)),
-            Content::Welcome(_) | Content::Empty | Content::Settings(_) => None,
+            Content::Welcome(_) | Content::Empty => None,
         }
     }
 }
@@ -461,8 +451,8 @@ impl Render for Workspace {
             Content::Empty => div().size_full().into_any_element(),
             Content::Welcome(view) => view.clone().into_any_element(),
             Content::Repository(view) => view.clone().into_any_element(),
-            Content::Settings(view) => view.clone().into_any_element(),
         };
+        let settings = self.settings.clone();
 
         // The padded backdrop holds the shadow and the resize band. With
         // server-side decorations the system draws the frame instead, so it
@@ -531,15 +521,46 @@ impl Render for Workspace {
                 .when(!tiling.is_tiled(), |d| d.shadow(cx.theme().pop_shadow()));
         }
 
-        let frame = frame
-            .child(
+        let content = div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_hidden()
+            .child(body);
+        let content = if let Some(settings) = settings {
+            let colors = colors;
+            content.child(
                 div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .overflow_hidden()
-                    .child(body),
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(px(32.))
+                    .bg(colors.overlay)
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        this.close_settings(window, cx);
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(1080.))
+                            .h_full()
+                            .max_h(px(760.))
+                            .rounded(R_WINDOW)
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(colors.border)
+                            .shadow(cx.theme().pop_shadow())
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(settings),
+                    ),
             )
+        } else {
+            content
+        };
+        let frame = frame.child(content)
             // Menus, dialogs and toasts live inside the frame, above the
             // content, so they cannot spill over the window's shadow band.
             .child(ui::overlay::render_overlays(window, cx));

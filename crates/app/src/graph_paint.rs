@@ -9,7 +9,7 @@
 use git_core::Oid;
 use git_graph::{ColumnGeometry, Row, Segment};
 use gpui::{
-    fill, linear_color_stop, linear_gradient, point, px, size, Bounds, Hsla, PathBuilder, Pixels,
+    fill, linear_color_stop, linear_gradient, point, px, Bounds, Hsla, PathBuilder, Pixels,
     Point, Window,
 };
 use ui::Theme;
@@ -303,11 +303,24 @@ fn curve(window: &mut Window, width: Pixels, from: Point<Pixels>, to: Point<Pixe
 }
 
 fn circle(window: &mut Window, center: Point<Pixels>, radius: Pixels, color: Hsla) {
-    let bounds = Bounds::new(
-        point(center.x - radius, center.y - radius),
-        size(radius * 2., radius * 2.),
-    );
-    window.paint_quad(fill(bounds, color).corner_radii(radius));
+    // A rounded quad is tessellated as a box, so a small one lands between
+    // pixels and looks faceted. A filled cubic circle, snapped to the pixel
+    // grid, stays round at the graph's 4–6 px sizes.
+    let r = f32::from(radius);
+    let k = r * 0.552_284_8;
+    let cx = f32::from(center.x).round();
+    let cy = f32::from(center.y).round();
+    let at = |x: f32, y: f32| point(px(cx + x), px(cy + y));
+    let mut path = PathBuilder::fill();
+    path.move_to(at(r, 0.));
+    path.cubic_bezier_to(at(0., r), at(r, k), at(k, r));
+    path.cubic_bezier_to(at(-r, 0.), at(-k, r), at(-r, k));
+    path.cubic_bezier_to(at(0., -r), at(-r, -k), at(-k, -r));
+    path.cubic_bezier_to(at(r, 0.), at(k, -r), at(r, -k));
+    path.close();
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color);
+    }
 }
 
 /// A stroked circle, like the design's `<circle fill="none" stroke=…>`: the
@@ -315,7 +328,8 @@ fn circle(window: &mut Window, center: Point<Pixels>, radius: Pixels, color: Hsl
 fn ring(window: &mut Window, center: Point<Pixels>, radius: Pixels, width: Pixels, color: Hsla) {
     let r = f32::from(radius);
     let k = r * 0.552_284_8;
-    let (cx, cy) = (f32::from(center.x), f32::from(center.y));
+    let cx = f32::from(center.x).round();
+    let cy = f32::from(center.y).round();
     let at = |x: f32, y: f32| point(px(cx + x), px(cy + y));
     let mut path = PathBuilder::stroke(width);
     path.move_to(at(r, 0.));

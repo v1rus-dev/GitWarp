@@ -7,7 +7,7 @@
 //! panel from them. Operations run the real git in the background; on success
 //! the dialog closes, a toast reports it and `on_done` reloads the shell.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -100,6 +100,10 @@ pub(crate) enum RefDialogKind {
     Revert {
         card: CommitCard,
     },
+    /// Moves a worktree's folder. `from` is its current path.
+    RenameWorktree {
+        from: PathBuf,
+    },
 }
 
 type DialogAction = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -153,6 +157,10 @@ impl RefDialog {
         cx: &mut Context<Self>,
     ) -> Self {
         let initial_name = match &kind {
+            RefDialogKind::RenameWorktree { from } => from
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             RefDialogKind::RenameBranch { old } | RefDialogKind::RenameTag { old } => old.clone(),
             RefDialogKind::Remote {
                 editing: Some(edit),
@@ -199,6 +207,7 @@ impl RefDialog {
                 RefDialogKind::CreateBranch { .. } => "feat/my-change",
                 RefDialogKind::CreateTag { .. } => "v0.3.1",
                 RefDialogKind::Remote { .. } => "upstream",
+                RefDialogKind::RenameWorktree { .. } => "new-folder-name",
                 _ => "",
             };
             let entity = cx.new(|cx| {
@@ -326,6 +335,7 @@ impl RefDialog {
         let name = self.name_text(cx);
         match &self.kind {
             RefDialogKind::Remote { .. } => remote_name_error(&name, &self.taken),
+            RefDialogKind::RenameWorktree { .. } => worktree_folder_error(&name),
             _ => ref_name_error(&name, &self.taken),
         }
     }
@@ -335,6 +345,9 @@ impl RefDialog {
         let name = self.name_text(cx);
         match &self.kind {
             RefDialogKind::RenameBranch { old } | RefDialogKind::RenameTag { old } => name == *old,
+            RefDialogKind::RenameWorktree { from } => {
+                from.file_name().is_some_and(|current| current == name.as_str())
+            }
             _ => false,
         }
     }
@@ -349,10 +362,16 @@ impl RefDialog {
         let rename_unchanged = self.rename_is_unchanged(cx);
 
         let (enabled, hint) = match &self.kind {
-            RefDialogKind::CreateBranch { .. } | RefDialogKind::RenameBranch { .. } => (
+            RefDialogKind::CreateBranch { .. }
+            | RefDialogKind::RenameBranch { .. }
+            | RefDialogKind::RenameWorktree { .. } => (
                 !name.is_empty() && name_error.is_none() && !rename_unchanged,
                 if name.is_empty() {
-                    Some("Enter a branch name")
+                    Some(if matches!(self.kind, RefDialogKind::RenameWorktree { .. }) {
+                        "Enter a folder name"
+                    } else {
+                        "Enter a branch name"
+                    })
                 } else if name_error.is_some() {
                     Some("Fix the name to continue")
                 } else if rename_unchanged {
@@ -504,6 +523,11 @@ impl RefDialog {
                 repo.rename_branch(&old, &name)?;
                 Ok(format!("Renamed {old} to {name}"))
             }),
+            RefDialogKind::RenameWorktree { from } => Box::new(move |repo: &Repo| {
+                let to = worktree_destination(&from, &name);
+                repo.move_worktree(&from, &to)?;
+                Ok(format!("Moved worktree to {}", to.display()))
+            }),
             RefDialogKind::RenameTag { old } => Box::new(move |repo: &Repo| {
                 repo.rename_tag(&old, &name)?;
                 Ok(format!("Renamed tag {old} to {name}"))
@@ -600,6 +624,7 @@ fn needs_name(kind: &RefDialogKind) -> bool {
             | RefDialogKind::CreateTag { .. }
             | RefDialogKind::RenameBranch { .. }
             | RefDialogKind::RenameTag { .. }
+            | RefDialogKind::RenameWorktree { .. }
             | RefDialogKind::Remote { .. }
     )
 }
@@ -644,6 +669,7 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
         RefDialogKind::CreateBranch { .. } => ("Create branch here", IconName::Branch, 480.),
         RefDialogKind::CreateTag { .. } => ("Create tag here", IconName::Tag, 500.),
         RefDialogKind::RenameBranch { .. } => ("Rename branch", IconName::Edit, 480.),
+        RefDialogKind::RenameWorktree { .. } => ("Rename worktree", IconName::Edit, 480.),
         RefDialogKind::RenameTag { .. } => ("Rename tag", IconName::Edit, 480.),
         RefDialogKind::Remote { editing: None } => ("Add remote", IconName::Cloud, 500.),
         RefDialogKind::Remote { editing: Some(_) } => ("Edit remote", IconName::Cloud, 500.),
@@ -744,6 +770,16 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
             );
             body
         }
+        RefDialogKind::RenameWorktree { from } => body.child(name_field(
+            "New folder name",
+            dialog.name.clone(),
+            valid.name_error.as_deref().filter(|_| dialog.touched),
+            Some(&format!(
+                "Moves {} next to its current folder. Git refuses a locked or main worktree.",
+                from.display()
+            )),
+            colors,
+        )),
         RefDialogKind::RenameBranch { old } | RefDialogKind::RenameTag { old } => body
             .child(name_field(
                 if matches!(dialog.kind, RefDialogKind::RenameBranch { .. }) {
@@ -864,7 +900,9 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
             }
         }
         RefDialogKind::CreateTag { .. } => "Create tag",
-        RefDialogKind::RenameBranch { .. } | RefDialogKind::RenameTag { .. } => "Rename",
+        RefDialogKind::RenameBranch { .. }
+        | RefDialogKind::RenameTag { .. }
+        | RefDialogKind::RenameWorktree { .. } => "Rename",
         RefDialogKind::Remote { editing: None, .. } => "Add remote",
         RefDialogKind::Remote {
             editing: Some(_), ..
@@ -1131,6 +1169,28 @@ fn field_shell(
         );
     }
     field
+}
+
+/// Why a worktree folder name cannot be used, or `None` when it can.
+///
+/// The name is one path segment: no separators, and not `.` or `..`.
+fn worktree_folder_error(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    if name == "." || name == ".." || name.contains(['/', '\\']) || name.contains('\0') {
+        Some("Use a single folder name, without / or \\".to_owned())
+    } else {
+        None
+    }
+}
+
+/// The destination of a renamed worktree: the same parent, a new folder name.
+fn worktree_destination(from: &Path, name: &str) -> PathBuf {
+    match from.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
 }
 
 fn branch_note(card: &CommitCard, dialog: &RefDialog) -> AnyElement {

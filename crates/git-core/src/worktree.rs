@@ -93,6 +93,19 @@ pub(crate) fn unlock(repo: &Repo, path: &Path) -> Result<()> {
     check_output(out, "worktree unlock").map(drop)
 }
 
+/// Moves the worktree at `from` to `to`. Git refuses when `to` already
+/// exists, when the worktree is locked, or when it is the main worktree.
+pub(crate) fn relocate(repo: &Repo, from: &Path, to: &Path) -> Result<()> {
+    let out = repo
+        .command()
+        .args(["worktree", "move", "--"])
+        .arg(from)
+        .arg(to)
+        .output()
+        .map_err(Error::Spawn)?;
+    check_output(out, "worktree move").map(drop)
+}
+
 /// Drops the records of worktrees whose folders no longer exist. Files are
 /// never touched.
 pub(crate) fn prune(repo: &Repo) -> Result<()> {

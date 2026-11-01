@@ -8,7 +8,7 @@ Windows and macOS too. Rust + [GPUI](https://www.gpui.rs) (the UI framework of Z
 ```
 crates/
   git-graph/   commit-graph lane layout: incremental, UI-agnostic, no dependencies
-  git-core/    repository access: streaming `git log`, refs, HEAD, commit-graph upkeep
+  git-core/    repository access: gix opens the repo; git still runs mutations, log, refs
   app/         the GPUI desktop app (binary: `gitwarp`)
 patches/       temporary fix for a GPUI transitive dependency (see Cargo.toml)
 ```
@@ -26,10 +26,19 @@ cargo run --release -p app -- /path/to/repo  # the app
 
 ### Which git
 
-The app runs a `git` executable (minimum version 2.31). Pick it with
-`--git <auto|system|bundled|PATH>` or the `GITWARP_GIT` environment variable
-(the flag wins); the default `auto` uses the bundled git if present, else the
-one on `PATH`. The header shows what is in use, e.g. `git 2.56.0 (system)`.
+Opening a repository does not spawn `git`. [`GitRunner`](crates/git-core/src/runner.rs)
+discovers it with in-process [`gix`](https://github.com/GitoxideLabs/gitoxide)
+([`GitEngine::Native`](crates/git-core/src/git.rs), the default). Mutations,
+the log, status and anything that must keep hooks, credentials, LFS or
+signing still run a `git` executable (minimum version 2.31). `GitEngine::Cli`
+is the old `git rev-parse` discovery, kept so the two can be compared.
+
+The workspace MSRV is 1.88 because `gix` 0.90 requires it.
+
+Pick the executable with `--git <auto|system|bundled|PATH>` or the
+`GITWARP_GIT` environment variable (the flag wins); the default `auto` uses
+the bundled git if present, else the one on `PATH`. The header shows what is
+in use, e.g. `git 2.56.0 (system)`.
 
 The bundled git is looked up next to the app binary:
 

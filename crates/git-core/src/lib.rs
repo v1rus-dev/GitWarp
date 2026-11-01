@@ -1,10 +1,11 @@
 //! Repository access for the client.
 //!
-//! Everything here runs the `git` executable. That is deliberate for the
-//! first version: hooks, credential helpers, LFS, `includeIf` configs and
-//! signing all keep working exactly as in the terminal. Hot read paths
-//! (log, status, diff) can later move to `gix` behind the same API without
-//! touching the UI.
+//! Opening a repository goes through [`GitRunner`]. The default engine is
+//! in-process `gix` ([`GitEngine::Native`]); [`GitEngine::Cli`] still shells
+//! out to `git rev-parse`. Mutations stay on the `git` executable so hooks,
+//! credential helpers, LFS, `includeIf` configs and signing keep working
+//! exactly as in the terminal. Further hot read paths (log, status, diff)
+//! move onto the same runner without touching the UI.
 
 mod config;
 pub mod credential;
@@ -16,6 +17,7 @@ pub mod network;
 pub mod oid;
 mod ops;
 mod refs;
+mod runner;
 pub mod ssh;
 mod stash;
 mod status;
@@ -37,11 +39,12 @@ pub use diff::{
     FileTexts, Hunk, LineKind,
 };
 pub use error::{Error, ErrorClass, Result};
-pub use git::{Git, GitChoice, GitSource, GitVersion, Resolution};
+pub use git::{Git, GitChoice, GitEngine, GitSource, GitVersion, Resolution};
 pub use log::{CommitCount, CommitInfo, LogKiller, LogOptions, LogStream};
 pub use oid::Oid;
 pub use ops::ResetMode;
 pub use refs::{Head, Ref, RefKind};
+pub use runner::{DiscoveredRepo, GitRunner};
 pub use stash::Stash;
 pub use status::{HeadCommit, HunkPick, WorkingFile, WorkingStatus};
 pub use submodule::{Submodule, SubmoduleState};
@@ -64,75 +67,19 @@ impl Repo {
     pub fn open(git: Arc<Git>, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         // Checked here so a missing folder is not reported as "not a git
-        // repository" by git itself.
+        // repository" by the discovery engine.
         if !path.is_dir() {
             return Err(Error::PathNotFound {
                 path: path.to_path_buf(),
             });
         }
-        let out = git
-            .command()
-            .arg("-C")
-            .arg(path)
-            .args([
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-dir",
-                "--git-path",
-                "objects/info",
-                "--is-bare-repository",
-                "--show-toplevel",
-            ])
-            .output()
-            .map_err(Error::Spawn)?;
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let lines: Vec<&str> = stdout.lines().collect();
-        let bare = lines.get(2) == Some(&"true");
-        // In a bare repository `--show-toplevel` fails (exit 128) after the
-        // other answers were already printed; anywhere else a failure is real
-        // and git's own message ("not a git repository", unknown extension,
-        // dubious ownership, ...) is what the user needs to see.
-        if !bare {
-            match check_output(out, "rev-parse") {
-                Ok(_) => {}
-                // The one failure the UI treats separately: a folder that is
-                // simply not inside a working tree.
-                Err(Error::Git {
-                    command,
-                    code,
-                    stderr,
-                }) => {
-                    if stderr.contains("not a git repository") {
-                        return Err(Error::NotARepository {
-                            path: path.to_path_buf(),
-                        });
-                    }
-                    return Err(Error::Git {
-                        command,
-                        code,
-                        stderr,
-                    });
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        let line = |i: usize| {
-            lines
-                .get(i)
-                .map(PathBuf::from)
-                .ok_or(Error::Parse("rev-parse output"))
-        };
-        let git_dir = line(0)?;
-        // Asked from git so GIT_OBJECT_DIRECTORY and linked worktrees (whose
-        // objects live in the common dir) are respected.
-        let objects_info = line(1)?;
-        let root = if bare { git_dir.clone() } else { line(3)? };
+        let found = git.discover(path)?;
         Ok(Self {
             git,
-            root,
-            git_dir,
-            objects_info,
-            bare,
+            root: found.root,
+            git_dir: found.git_dir,
+            objects_info: found.objects_info,
+            bare: found.bare,
         })
     }
 
@@ -341,6 +288,11 @@ impl Repo {
         worktree::unlock(self, path)
     }
 
+    /// Moves the worktree at `from` to `to`. The main worktree cannot move.
+    pub fn move_worktree(&self, from: &Path, to: &Path) -> Result<()> {
+        worktree::relocate(self, from, to)
+    }
+
     /// Drops the records of worktrees whose folders are gone.
     pub fn prune_worktrees(&self) -> Result<()> {
         worktree::prune(self)
@@ -411,6 +363,11 @@ impl Repo {
     /// Restores `tracked` files from the index and deletes `untracked` ones.
     pub fn discard(&self, tracked: &[String], untracked: &[String]) -> Result<()> {
         status::discard(self, tracked, untracked)
+    }
+
+    /// Throws away the index, tracked edits and untracked files.
+    pub fn discard_all(&self) -> Result<()> {
+        status::discard_all(self)
     }
 
     /// One file's work-tree diff (index to work tree).
@@ -704,7 +661,35 @@ pub(crate) fn check_output(out: Output, command: &'static str) -> Result<Output>
         Err(Error::Git {
             command,
             code: out.status.code(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr: decode_bytes(out.stderr),
         })
+    }
+}
+
+/// Decode bytes git wrote. Valid UTF-8 is moved into the `String`; only
+/// invalid bytes pay for a lossy copy, and those become U+FFFD.
+pub(crate) fn decode_bytes(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::decode_bytes;
+
+    #[test]
+    fn valid_utf8_is_returned_unchanged() {
+        assert_eq!(
+            decode_bytes(b"refs/heads/main\n".to_vec()),
+            "refs/heads/main\n"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_is_replaced() {
+        let text = decode_bytes(vec![b'a', 0xff, b'b']);
+        assert_eq!(text, "a\u{FFFD}b");
     }
 }

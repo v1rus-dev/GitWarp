@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use gpui::prelude::*;
 use gpui::{
     actions, canvas, container_query, div, px, uniform_list, AnyElement, App, AsyncApp,
-    ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, FocusHandle, FontWeight,
+    ClickEvent, ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, FocusHandle,
+    FontWeight,
     IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, ScrollStrategy,
     SharedString, StyledText, Task, TextRun, TextStyle, UniformListScrollHandle, WeakEntity,
     Window,
@@ -37,7 +38,7 @@ use crate::history_state::{
     percent_text, progress_fraction, skeleton_percent, source_label, Failure, LoadState,
     SkeletonColumn,
 };
-use crate::ref_ops::{CommitCard, RefAction};
+use crate::ref_ops::{CardRefKind, CommitCard, RefAction};
 
 /// What the history row menu asks the shell to do.
 pub(crate) type RefActionHandler = Rc<dyn Fn(RefAction, &mut Window, &mut App)>;
@@ -525,6 +526,9 @@ pub struct HistoryView {
     /// The repository root, once `Repo::open` succeeded.
     root: Option<PathBuf>,
     items: Vec<Item>,
+    /// A reload is in flight and the rows still belong to the previous walk.
+    /// The first page of the new walk replaces them.
+    pending_rows: bool,
     max_lanes: usize,
     selected: Option<usize>,
     state: LoadState,
@@ -675,6 +679,7 @@ impl HistoryView {
             on_action,
             root: None,
             items: Vec::new(),
+            pending_rows: false,
             max_lanes: 1,
             selected: None,
             state: LoadState::Loading { total: None },
@@ -919,6 +924,14 @@ impl HistoryView {
     }
 
     fn append(&mut self, page: Vec<(CommitInfo, Row<Oid>)>, cx: &mut Context<Self>) {
+        // A reload keeps the previous rows until the first page of the new
+        // walk arrives, so the list does not flash empty.
+        if self.pending_rows {
+            self.items.clear();
+            self.max_lanes = 1;
+            self.idle_lanes = IdleLanes::new();
+            self.pending_rows = false;
+        }
         let start = self.items.len();
         for (commit, row) in page {
             self.max_lanes = self.max_lanes.max(row.width);
@@ -1094,6 +1107,36 @@ impl HistoryView {
         }
     }
 
+    /// Double-click: switch to the row's first local branch that is not HEAD,
+    /// or check the commit out detached when the row has no such branch.
+    fn checkout_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.items.get(index) else {
+            return;
+        };
+        let card = CommitCard::from_commit(&item.commit, self.refs().unwrap_or(&[]), self.head());
+        let head_branch = match self.head() {
+            Some(Head::Branch { name, .. }) => Some(name.as_str()),
+            _ => None,
+        };
+        let branch = card.refs.iter().find(|reference| {
+            reference.kind == CardRefKind::Local && Some(reference.name.as_str()) != head_branch
+        });
+        let action = match branch {
+            Some(reference) => RefAction::CheckoutBranch(reference.name.clone()),
+            None if head_branch.is_some()
+                && card
+                    .refs
+                    .iter()
+                    .any(|reference| reference.kind == CardRefKind::Local) =>
+            {
+                // The row's only local branch is the one already checked out.
+                return;
+            }
+            None => RefAction::CheckoutCommit(card),
+        };
+        (self.on_action)(action, window, cx);
+    }
+
     /// Right-clicking a row selects it and opens the row menu at the pointer.
     fn open_row_menu(
         &mut self,
@@ -1123,6 +1166,43 @@ impl HistoryView {
         )];
         if let Some(card) = card {
             let on_action = self.on_action.clone();
+            let head_branch = match self.head() {
+                Some(Head::Branch { name, .. }) => Some(name.clone()),
+                _ => None,
+            };
+            let locals: Vec<String> = card
+                .refs
+                .iter()
+                .filter(|reference| reference.kind == CardRefKind::Local)
+                .map(|reference| reference.name.clone())
+                .filter(|name| Some(name) != head_branch.as_ref())
+                .collect();
+            if locals.is_empty() {
+                let checkout = on_action.clone();
+                let checkout_card = card.clone();
+                entries.push(MenuEntry::Item(
+                    MenuItem::new("Checkout this commit")
+                        .icon(IconName::Check)
+                        .action(move |window, cx| {
+                            checkout(
+                                RefAction::CheckoutCommit(checkout_card.clone()),
+                                window,
+                                cx,
+                            );
+                        }),
+                ));
+            }
+            for name in locals {
+                let checkout = on_action.clone();
+                let branch = name.clone();
+                entries.push(MenuEntry::Item(
+                    MenuItem::new(format!("Switch to {name}"))
+                        .icon(IconName::Check)
+                        .action(move |window, cx| {
+                            checkout(RefAction::CheckoutBranch(branch.clone()), window, cx);
+                        }),
+                ));
+            }
             push_row_action(
                 &mut entries,
                 &card,
@@ -1541,10 +1621,9 @@ impl HistoryView {
         self.retry(cx);
     }
 
-    /// Start over: drop the rows and the graph, then load again.
+    /// Start over: load again, keeping the rows until the first new page lands.
     fn retry(&mut self, cx: &mut Context<Self>) {
-        self.items.clear();
-        self.max_lanes = 1;
+        self.pending_rows = !self.items.is_empty();
         self.selected = None;
         self.user_selected = false;
         self.hovered = None;
@@ -1981,12 +2060,17 @@ impl HistoryView {
                             cx.notify();
                         }
                     }))
-                    .on_click(cx.listener(move |view, _, window, cx| {
+                    .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
                         // Clicking focuses the list and selects the row; the
                         // ring stays hidden because the modality is the mouse.
                         let focus = view.focus.clone();
                         window.focus(&focus, cx);
                         view.select_row(ix, cx);
+                        // A double click checks the row's branch out, or the
+                        // commit itself when the row has no local branch.
+                        if event.click_count() >= 2 {
+                            view.checkout_row(ix, window, cx);
+                        }
                     }))
                     .on_mouse_down(
                         MouseButton::Right,

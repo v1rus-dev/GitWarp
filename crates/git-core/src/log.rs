@@ -153,7 +153,7 @@ impl LogStream {
             std::thread::spawn(move || {
                 let mut bytes = Vec::new();
                 let _ = e.read_to_end(&mut bytes);
-                String::from_utf8_lossy(&bytes).into_owned()
+                crate::decode_bytes(bytes)
             })
         });
         Ok(Self {
@@ -285,7 +285,7 @@ impl CommitCount {
             std::thread::spawn(move || {
                 let mut bytes = Vec::new();
                 let _ = e.read_to_end(&mut bytes);
-                String::from_utf8_lossy(&bytes).into_owned()
+                crate::decode_bytes(bytes)
             })
         });
         Ok(Self {
@@ -338,7 +338,7 @@ impl CommitCount {
                 stderr,
             });
         }
-        String::from_utf8_lossy(&bytes)
+        crate::decode_bytes(bytes)
             .trim()
             .parse()
             .map_err(|_| Error::Parse("rev-list --count output"))

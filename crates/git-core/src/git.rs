@@ -16,6 +16,20 @@ pub enum GitSource {
     Custom,
 }
 
+/// Which implementation reads repository metadata.
+///
+/// Mutations (commit, push, hooks, credentials, LFS, signing) still go
+/// through the `git` executable. Discovery is the first path that can run
+/// in-process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GitEngine {
+    /// In-process [`gix`]. No `git` process is spawned to open a repository.
+    #[default]
+    Native,
+    /// `git rev-parse` via the resolved executable.
+    Cli,
+}
+
 impl fmt::Display for GitSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -104,6 +118,7 @@ pub struct Git {
     exe: PathBuf,
     version: GitVersion,
     source: GitSource,
+    engine: GitEngine,
 }
 
 /// The outcome of [`Git::resolve`].
@@ -173,6 +188,7 @@ impl Git {
             exe,
             version: GitVersion::default(),
             source,
+            engine: GitEngine::Native,
         };
         let mut child = git
             .command()
@@ -204,7 +220,7 @@ impl Git {
             std::thread::sleep(Duration::from_millis(10));
         }
         let out = check_output(child.wait_with_output()?, "--version")?;
-        let text = String::from_utf8_lossy(&out.stdout);
+        let text = crate::decode_bytes(out.stdout);
         git.version = GitVersion::parse(&text).ok_or(Error::Parse("git --version output"))?;
         check_floor(git.version, source, &git.exe)?;
         Ok(git)
@@ -261,6 +277,19 @@ impl Git {
     /// The executable this handle runs.
     pub fn path(&self) -> &Path {
         &self.exe
+    }
+
+    /// How this handle opens repositories. Freshly resolved handles use
+    /// [`GitEngine::Native`].
+    pub fn engine(&self) -> GitEngine {
+        self.engine
+    }
+
+    /// Return a handle that opens repositories with `engine`. The executable
+    /// used for every command that is not migrated yet stays the same.
+    pub fn with_engine(mut self, engine: GitEngine) -> Self {
+        self.engine = engine;
+        self
     }
 }
 
