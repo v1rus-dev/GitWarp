@@ -146,13 +146,19 @@ fn reject_unsupported_format(repo: &gix::Repository) -> Result<()> {
     let version = match config.try_integer("core.repositoryformatversion") {
         Ok(Some(version)) => version,
         Ok(None) => 0,
-        Err(err) => {
-            return Err(Error::Git {
-                command: "discover",
-                code: None,
-                stderr: err.to_string(),
-            });
-        }
+        // A bad integer can fail the typed read while the raw value is still
+        // there. Format versions git itself rejects usually never get this
+        // far: `gix::discover` errors while loading config.
+        Err(err) => match config.string("core.repositoryformatversion") {
+            Some(raw) => raw.to_string().trim().parse().unwrap_or(0),
+            None => {
+                return Err(Error::Git {
+                    command: "discover",
+                    code: None,
+                    stderr: err.to_string(),
+                });
+            }
+        },
     };
     if version > 1 {
         return Err(Error::Git {
@@ -327,6 +333,28 @@ mod tests {
             }
             other => panic!("unexpected result {other:?}"),
         }
+    }
+
+    #[test]
+    fn native_refuses_a_repository_format_newer_than_git_supports() {
+        let tmp = tempfile::tempdir().unwrap();
+        init(tmp.path());
+        let config = tmp.path().join(".git/config");
+        let text = std::fs::read_to_string(&config)
+            .unwrap()
+            .replace("repositoryformatversion = 0", "repositoryformatversion = 2");
+        std::fs::write(&config, text).unwrap();
+        // The fixture really is one git refuses, and the native engine must
+        // refuse it too. gix fails while loading config, before it will hand
+        // back the version number, so the wording is not git's.
+        match git(GitEngine::Cli).discover(tmp.path()) {
+            Err(Error::Git { stderr, .. }) => assert!(stderr.contains("found 2"), "{stderr}"),
+            other => panic!("cli should refuse format 2, got {other:?}"),
+        }
+        assert!(
+            git(GitEngine::Native).discover(tmp.path()).is_err(),
+            "native engine opened a repository git refuses"
+        );
     }
 
     #[test]
