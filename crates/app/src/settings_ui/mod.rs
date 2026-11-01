@@ -1,9 +1,9 @@
 //! The Settings surface: seven pages in the design's order, with a persistent
 //! left navigation and an automatically saved settings file.
 //!
-//! The page is a content view of the workspace rather than a separate window:
-//! closing it brings back the welcome screen or the repository it was opened
-//! from, and the Identity page can edit the open repository's config.
+//! The page is a centred window drawn over the workspace, not a replacement for
+//! it: closing it leaves the welcome screen or the repository underneath, and
+//! the Identity page can edit the open repository's config.
 //!
 //! Every control writes through [`crate::update_settings`], which also saves
 //! on the background executor. Appearance changes additionally rebuild the
@@ -454,7 +454,10 @@ impl Render for SettingsView {
             .px(px(28.))
             .pt(px(20.))
             .pb(px(28.))
-            .child(page);
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(div().w_full().max_w(px(760.)).child(page));
         let body = div()
             .flex_1()
             .min_h_0()
@@ -547,6 +550,7 @@ pub(crate) fn group(title: &'static str, rows: Vec<AnyElement>) -> Div {
         .flex_col()
         .gap(px(6.))
         .mb(px(20.))
+        .w_full()
         .max_w(px(760.))
         .child(
             div()

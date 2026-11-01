@@ -254,6 +254,32 @@ pub(crate) fn unstage(repo: &Repo, paths: &[String]) -> Result<()> {
     check_output(out, name).map(drop)
 }
 
+/// Throws away every local change: the index, tracked edits and untracked
+/// files. Used when a checkout is told to start from a clean work tree.
+pub(crate) fn discard_all(repo: &Repo) -> Result<()> {
+    let has_head = repo
+        .command()
+        .args(["rev-parse", "-q", "--verify", "HEAD"])
+        .output()
+        .map_err(Error::Spawn)?
+        .status
+        .success();
+    if has_head {
+        let out = repo
+            .command()
+            .args(["reset", "--hard", "HEAD"])
+            .output()
+            .map_err(Error::Spawn)?;
+        check_output(out, "reset --hard")?;
+    }
+    let out = repo
+        .command()
+        .args(["clean", "-fd", "-q"])
+        .output()
+        .map_err(Error::Spawn)?;
+    check_output(out, "clean").map(drop)
+}
+
 /// Restores tracked files from the index and removes untracked ones.
 pub(crate) fn discard(repo: &Repo, tracked: &[String], untracked: &[String]) -> Result<()> {
     if !tracked.is_empty() {

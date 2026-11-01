@@ -288,6 +288,11 @@ impl Repo {
         worktree::unlock(self, path)
     }
 
+    /// Moves the worktree at `from` to `to`. The main worktree cannot move.
+    pub fn move_worktree(&self, from: &Path, to: &Path) -> Result<()> {
+        worktree::relocate(self, from, to)
+    }
+
     /// Drops the records of worktrees whose folders are gone.
     pub fn prune_worktrees(&self) -> Result<()> {
         worktree::prune(self)
@@ -358,6 +363,11 @@ impl Repo {
     /// Restores `tracked` files from the index and deletes `untracked` ones.
     pub fn discard(&self, tracked: &[String], untracked: &[String]) -> Result<()> {
         status::discard(self, tracked, untracked)
+    }
+
+    /// Throws away the index, tracked edits and untracked files.
+    pub fn discard_all(&self) -> Result<()> {
+        status::discard_all(self)
     }
 
     /// One file's work-tree diff (index to work tree).

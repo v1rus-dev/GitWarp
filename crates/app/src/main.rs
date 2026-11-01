@@ -1,4 +1,5 @@
 mod changes_view;
+mod checkout_dialog;
 mod clone_dialog;
 mod confirm_dialog;
 mod credential_dialog;

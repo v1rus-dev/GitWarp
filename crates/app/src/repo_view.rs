@@ -4,7 +4,7 @@
 //! and swaps it for the welcome screen. Everything that belongs to a later
 //! stage is a placeholder or a disabled control, never a dead click.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -770,6 +770,28 @@ impl RepositoryView {
         }
     }
 
+    /// Double-click: a worktree opens the Worktrees page; a local branch,
+    /// remote branch or tag checks out through the same path as its menu.
+    fn open_sidebar_node(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = key.strip_prefix("wt:") {
+            let _ = path;
+            self.set_view(ViewMode::Worktrees, window, cx);
+            return;
+        }
+        let action = if let Some(name) = key.strip_prefix("local:") {
+            Some(SidebarAction::CheckoutBranch(name.to_owned()))
+        } else if let Some(name) = key.strip_prefix("rbranch:") {
+            Some(SidebarAction::CheckoutRemoteBranch(name.to_owned()))
+        } else if let Some(name) = key.strip_prefix("tag:") {
+            Some(SidebarAction::CheckoutTag(name.to_owned()))
+        } else {
+            None
+        };
+        if let Some(action) = action {
+            self.run_sidebar_action(action, window, cx);
+        }
+    }
+
     /// Right-click on a sidebar row: selects it (without the jump) and opens
     /// its kind's menu at the pointer. A kind without a menu does nothing.
     fn open_sidebar_menu(
@@ -843,16 +865,19 @@ impl RepositoryView {
                     .update(cx, |worktrees, cx| worktrees.refresh(cx));
             }
             SidebarAction::CheckoutBranch(name) => {
-                self.run_repo_action(window, cx, move |repo| {
-                    repo.checkout_branch(&name)?;
-                    Ok((ui::ToastKind::Ok, format!("Switched to {name}")))
-                });
+                self.checkout_branch(name, window, cx);
             }
             SidebarAction::CheckoutRemoteBranch(remote) => {
-                self.run_repo_action(window, cx, move |repo| {
-                    repo.checkout_remote(&remote)?;
-                    Ok((ui::ToastKind::Ok, format!("Checked out {remote}")))
-                });
+                let label = remote.clone();
+                self.checkout_guarded(
+                    format!("Check out {label}?"),
+                    move |repo| {
+                        repo.checkout_remote(&remote)?;
+                        Ok((ui::ToastKind::Ok, format!("Checked out {label}")))
+                    },
+                    window,
+                    cx,
+                );
             }
             SidebarAction::CheckoutTag(name) => {
                 let target = {
@@ -872,13 +897,19 @@ impl RepositoryView {
                     );
                     return;
                 };
-                self.run_repo_action(window, cx, move |repo| {
-                    repo.checkout_detached(target)?;
-                    Ok((
-                        ui::ToastKind::Ok,
-                        format!("Checked out tag {name} (detached HEAD)"),
-                    ))
-                });
+                let label = name.clone();
+                self.checkout_guarded(
+                    format!("Check out tag {label}?"),
+                    move |repo| {
+                        repo.checkout_detached(target)?;
+                        Ok((
+                            ui::ToastKind::Ok,
+                            format!("Checked out tag {label} (detached HEAD)"),
+                        ))
+                    },
+                    window,
+                    cx,
+                );
             }
             SidebarAction::CreateBranchAt(oid) => {
                 let card = self.card_for(oid, cx);
@@ -1109,6 +1140,15 @@ impl RepositoryView {
                     Ok((ui::ToastKind::Ok, format!("Unlocked {}", path.display())))
                 });
             }
+            SidebarAction::RenameWorktree(path) => {
+                self.open_ref_dialog(
+                    RefDialogKind::RenameWorktree {
+                        from: PathBuf::from(path),
+                    },
+                    window,
+                    cx,
+                );
+            }
             SidebarAction::RemoveWorktree(path) => {
                 self.worktrees.update(cx, |worktrees, cx| {
                     worktrees.open_remove(Path::new(&path), window, cx);
@@ -1152,14 +1192,37 @@ impl RepositoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let kind = match action {
-            RefAction::CreateBranch(card) => RefDialogKind::CreateBranch { card },
-            RefAction::CreateTag(card) => RefDialogKind::CreateTag { card },
-            RefAction::CherryPick(card) => RefDialogKind::CherryPick { card },
-            RefAction::Revert(card) => RefDialogKind::Revert { card },
-            RefAction::Reset(card) => RefDialogKind::Reset { card },
-        };
-        self.open_ref_dialog(kind, window, cx);
+        match action {
+            RefAction::CheckoutBranch(name) => {
+                self.checkout_branch(name, window, cx);
+            }
+            RefAction::CheckoutCommit(card) => {
+                let short = card.short.clone();
+                self.checkout_guarded(
+                    format!("Check out {short}?"),
+                    move |repo| {
+                        repo.checkout_detached(card.oid)?;
+                        Ok((
+                            ui::ToastKind::Ok,
+                            format!("Checked out {short} (detached HEAD)"),
+                        ))
+                    },
+                    window,
+                    cx,
+                );
+            }
+            other => {
+                let kind = match other {
+                    RefAction::CheckoutBranch(_) | RefAction::CheckoutCommit(_) => return,
+                    RefAction::CreateBranch(card) => RefDialogKind::CreateBranch { card },
+                    RefAction::CreateTag(card) => RefDialogKind::CreateTag { card },
+                    RefAction::CherryPick(card) => RefDialogKind::CherryPick { card },
+                    RefAction::Revert(card) => RefDialogKind::Revert { card },
+                    RefAction::Reset(card) => RefDialogKind::Reset { card },
+                };
+                self.open_ref_dialog(kind, window, cx);
+            }
+        }
     }
 
     /// HEAD's commit, or `None` while the branch is unborn.
@@ -1238,6 +1301,101 @@ impl RepositoryView {
         });
         let dialog = ref_dialog::open(kind, context, on_done, window, cx);
         self.ref_dialog = Some(dialog);
+    }
+
+    /// Checks out a local branch, asking first when the work tree is dirty.
+    fn checkout_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let label = name.clone();
+        self.checkout_guarded(
+            format!("Switch to {label}?"),
+            move |repo| {
+                repo.checkout_branch(&name)?;
+                Ok((ui::ToastKind::Ok, format!("Switched to {label}")))
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Runs a checkout at once when the work tree is clean. Otherwise asks
+    /// whether to stash the changes, carry them along, or discard them.
+    fn checkout_guarded<F>(
+        &mut self,
+        title: String,
+        checkout: F,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)>
+            + Send
+            + Clone
+            + 'static,
+    {
+        if self.ref_action_running {
+            return;
+        }
+        let dirty = {
+            let changes = self.changes.read(cx);
+            changes.staged_count() + changes.unstaged_count()
+        };
+        if dirty == 0 {
+            self.run_repo_action(window, cx, checkout);
+            return;
+        }
+        let files = if dirty == 1 {
+            "1 uncommitted change".to_owned()
+        } else {
+            format!("{dirty} uncommitted changes")
+        };
+        let view = cx.entity();
+        // Each button may fire, but only one does. `Rc` lets every closure
+        // hold the checkout and the chosen one take it.
+        let checkout = Rc::new(RefCell::new(Some(checkout)));
+        let take = |checkout: &Rc<RefCell<Option<F>>>| {
+            checkout.borrow_mut().take().expect("checkout runs once")
+        };
+        crate::checkout_dialog::open(
+            title,
+            format!("{files} in the working tree. What should happen to them?"),
+            {
+                let view = view.clone();
+                let checkout = checkout.clone();
+                move |window, cx| {
+                    let checkout = take(&checkout);
+                    view.update(cx, |view, cx| {
+                        view.run_repo_action(window, cx, move |repo| {
+                            // An empty stash (nothing left to save) is fine:
+                            // the switch still happens.
+                            repo.stash_save(Some("GitWarp: stashed before switching"))?;
+                            checkout(repo)
+                        });
+                    });
+                }
+            },
+            {
+                let view = view.clone();
+                let checkout = checkout.clone();
+                move |window, cx| {
+                    let checkout = take(&checkout);
+                    view.update(cx, |view, cx| view.run_repo_action(window, cx, checkout));
+                }
+            },
+            {
+                let view = view.clone();
+                let checkout = checkout.clone();
+                move |window, cx| {
+                    let checkout = take(&checkout);
+                    view.update(cx, |view, cx| {
+                        view.run_repo_action(window, cx, move |repo| {
+                            repo.discard_all()?;
+                            checkout(repo)
+                        });
+                    });
+                }
+            },
+            window,
+            cx,
+        );
     }
 
     /// Reloads everything a ref operation can have changed: the history and
@@ -1579,7 +1737,8 @@ impl RepositoryView {
         self.sidebar_root = Some(root.clone());
         self.sidebar_generation = self.sidebar_generation.wrapping_add(1);
         let generation = self.sidebar_generation;
-        self.sidebar_extras = None;
+        // Keep the lists that are already on screen. Clearing them here makes
+        // the tree blink empty until the background read returns.
         let git = match &self.git {
             Ok(git) => git.clone(),
             Err(error) => {
@@ -2229,6 +2388,11 @@ impl RepositoryView {
     fn render_sidebar(&mut self, width: f32, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
         let nodes = self.tree_nodes(cx);
+        if let Some(index) = nodes.iter().position(|node| node.current) {
+            // ScrollHandle applies this during prepaint, so asking during
+            // render lands on the rows that are about to be laid out.
+            self.sidebar_scroll.scroll_to_item(index);
+        }
         let filtering = !self.filter.trim().is_empty();
         let no_matches = filtering && nodes.is_empty();
         // Every row's identity and expansion, so a click, Enter/Space or
@@ -2269,8 +2433,9 @@ impl RepositoryView {
                 });
             }
         };
-        // Double-clicking a worktree leaf opens the Worktrees page; a single
-        // click keeps selecting the worktree and revealing its commit.
+        // Double-clicking a worktree leaf opens the Worktrees page. A branch,
+        // remote branch or tag checks out, asking first when the work tree is
+        // dirty. A single click keeps selecting the row.
         let open = {
             let rows = rows.clone();
             let view = view.clone();
@@ -2278,11 +2443,7 @@ impl RepositoryView {
                 let Some((key, _, _)) = rows.get(index).cloned() else {
                     return;
                 };
-                if key.starts_with("wt:") {
-                    view.update(cx, |view, cx| {
-                        view.set_view(ViewMode::Worktrees, window, cx)
-                    });
-                }
+                view.update(cx, |view, cx| view.open_sidebar_node(&key, window, cx));
             }
         };
 

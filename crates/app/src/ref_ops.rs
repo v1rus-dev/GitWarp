@@ -95,6 +95,10 @@ impl CommitCard {
 /// What a history row's menu asks the shell to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefAction {
+    /// Checks out a local branch, asking what to do with uncommitted changes.
+    CheckoutBranch(String),
+    /// Checks out the commit with a detached HEAD.
+    CheckoutCommit(CommitCard),
     CreateBranch(CommitCard),
     CreateTag(CommitCard),
     CherryPick(CommitCard),

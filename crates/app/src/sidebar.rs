@@ -226,6 +226,8 @@ pub enum SidebarAction {
     AddWorktree,
     /// Opens a worktree in a second window.
     OpenWorktree(String),
+    /// Moves a worktree's folder. The path is the current location.
+    RenameWorktree(String),
     /// Locks a worktree by path.
     LockWorktree(String),
     /// Unlocks a worktree by path.
@@ -420,6 +422,8 @@ pub fn sidebar_menu(
         return vec![
             item("Open in new window", IconName::Folder)
                 .action(SidebarAction::OpenWorktree(path.to_owned())),
+            item("Rename worktree…", IconName::Edit)
+                .action(SidebarAction::RenameWorktree(path.to_owned())),
             item("Manage worktrees…", IconName::Worktree).action(SidebarAction::ShowWorktrees),
             item("Add worktree…", IconName::Plus).action(SidebarAction::AddWorktree),
             SidebarMenuEntry::Separator,
@@ -1987,6 +1991,7 @@ mod tests {
             )),
             vec![
                 "Open in new window",
+                "Rename worktree…",
                 "Manage worktrees…",
                 "Add worktree…",
                 "—",
@@ -2003,6 +2008,7 @@ mod tests {
             )),
             vec![
                 "Open in new window",
+                "Rename worktree…",
                 "Manage worktrees…",
                 "Add worktree…",
                 "—",
@@ -2164,6 +2170,7 @@ mod tests {
                 "remote:origin" => &["Fetch", "Edit remote…", "Remove remote"],
                 "wt:/tmp/wt" => &[
                     "Open in new window",
+                    "Rename worktree…",
                     "Manage worktrees…",
                     "Add worktree…",
                     "Lock",
