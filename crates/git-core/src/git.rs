@@ -220,7 +220,7 @@ impl Git {
             std::thread::sleep(Duration::from_millis(10));
         }
         let out = check_output(child.wait_with_output()?, "--version")?;
-        let text = String::from_utf8_lossy(&out.stdout);
+        let text = crate::decode_bytes(out.stdout);
         git.version = GitVersion::parse(&text).ok_or(Error::Parse("git --version output"))?;
         check_floor(git.version, source, &git.exe)?;
         Ok(git)

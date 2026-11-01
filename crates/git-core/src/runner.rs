@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{check_output, Error, Git, GitEngine, Result};
+use crate::{Error, Git, GitEngine, Result};
 
 /// Paths [`crate::Repo`] needs after a repository has been found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,33 +89,26 @@ fn discover_cli(git: &Git, path: &Path) -> Result<DiscoveredRepo> {
         ])
         .output()
         .map_err(Error::Spawn)?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let code = out.status.code();
+    let success = out.status.success();
+    let stdout = crate::decode_bytes(out.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let bare = lines.get(2) == Some(&"true");
     // In a bare repository `--show-toplevel` fails (exit 128) after the
     // other answers were already printed; anywhere else a failure is real
     // and git's own message is what the user needs to see.
-    if !bare {
-        match check_output(out, "rev-parse") {
-            Ok(_) => {}
-            Err(Error::Git {
-                command,
-                code,
-                stderr,
-            }) => {
-                if stderr.contains("not a git repository") {
-                    return Err(Error::NotARepository {
-                        path: path.to_path_buf(),
-                    });
-                }
-                return Err(Error::Git {
-                    command,
-                    code,
-                    stderr,
-                });
-            }
-            Err(e) => return Err(e),
+    if !bare && !success {
+        let stderr = crate::decode_bytes(out.stderr);
+        if stderr.contains("not a git repository") {
+            return Err(Error::NotARepository {
+                path: path.to_path_buf(),
+            });
         }
+        return Err(Error::Git {
+            command: "rev-parse",
+            code,
+            stderr,
+        });
     }
     let line = |i: usize| {
         lines

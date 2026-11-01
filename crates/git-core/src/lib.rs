@@ -651,7 +651,35 @@ pub(crate) fn check_output(out: Output, command: &'static str) -> Result<Output>
         Err(Error::Git {
             command,
             code: out.status.code(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr: decode_bytes(out.stderr),
         })
+    }
+}
+
+/// Decode bytes git wrote. Valid UTF-8 is moved into the `String`; only
+/// invalid bytes pay for a lossy copy, and those become U+FFFD.
+pub(crate) fn decode_bytes(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::decode_bytes;
+
+    #[test]
+    fn valid_utf8_is_returned_unchanged() {
+        assert_eq!(
+            decode_bytes(b"refs/heads/main\n".to_vec()),
+            "refs/heads/main\n"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_is_replaced() {
+        let text = decode_bytes(vec![b'a', 0xff, b'b']);
+        assert_eq!(text, "a\u{FFFD}b");
     }
 }
