@@ -3,6 +3,11 @@
 //! [`GitRunner`] is the seam between the `git` executable and in-process
 //! [`gix`]. [`Repo::open`](crate::Repo::open) is the first caller; commands
 //! that must keep hooks, credentials and signing still spawn `git`.
+//!
+//! The runner is [`Send`] + [`Sync`]. The GPUI app already moves repository
+//! work onto its background executor, and each git command is its own
+//! process, so this crate stays synchronous: an async wrapper would only
+//! hide the same threads.
 
 use std::path::{Path, PathBuf};
 
@@ -342,6 +347,29 @@ mod tests {
         );
         std::fs::write(&config, text).unwrap();
         assert!(git(GitEngine::Native).discover(tmp.path()).is_ok());
+    }
+
+    fn assert_shareable<T: Send + Sync>() {}
+
+    #[test]
+    fn the_runner_can_be_shared_across_threads() {
+        assert_shareable::<Git>();
+        assert_shareable::<crate::Repo>();
+        assert_shareable::<Arc<dyn GitRunner>>();
+
+        let tmp = tempfile::tempdir().unwrap();
+        init(tmp.path());
+        let git = Arc::new(git(GitEngine::Native));
+        let path = tmp.path().to_path_buf();
+        let found = std::thread::scope(|scope| {
+            let git = Arc::clone(&git);
+            scope
+                .spawn(move || git.discover(&path))
+                .join()
+                .expect("discovery thread")
+        })
+        .expect("discover");
+        assert_eq!(found.root, tmp.path().canonicalize().unwrap());
     }
 
     #[test]
