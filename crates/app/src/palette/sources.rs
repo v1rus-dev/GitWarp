@@ -386,7 +386,7 @@ pub fn search(query: &str, sources: &Sources, recent: &Recent) -> Vec<Hit> {
         &[]
     };
     for scored in top(commit_sources.iter().enumerate().filter_map(|(order, c)| {
-        let by_hash = matcher::hash_prefix(query, &c.hex);
+        let by_hash = matcher::hash_prefix(query, &c.hex, scope == Scope::Commits);
         let by_summary = matcher::fuzzy(query, &c.info.summary);
         // Positions index the displayed `hash  summary`, not the summary.
         let shift = SHORT_HASH + HASH_GAP.len();
@@ -763,6 +763,26 @@ mod tests {
         // The highlight sits on the abbreviated hash.
         assert_eq!(found[0].positions, vec![0, 1, 2, 3]);
         assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn three_hex_digits_are_a_hash_only_after_the_hash_scope() {
+        let commits = [
+            commit(0xb2, "a1a is mentioned here"),
+            commit(0xa1, "Something else"),
+        ];
+        let scoped = search("#a1a", &sources(&commits), &Recent::default());
+        let found: Vec<&Hit> = scoped
+            .iter()
+            .filter(|h| h.group == Group::Commits)
+            .collect();
+        assert_eq!(found[0].target, Target::Commit(oid(0xa1)));
+        assert_eq!(found[0].positions, vec![0, 1, 2]);
+
+        // Without the scope three digits stay a fuzzy summary query.
+        let plain = search("a1a", &sources(&commits), &Recent::default());
+        let found: Vec<&Hit> = plain.iter().filter(|h| h.group == Group::Commits).collect();
+        assert_eq!(found[0].target, Target::Commit(oid(0xb2)));
     }
 
     #[test]

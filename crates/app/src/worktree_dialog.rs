@@ -127,6 +127,10 @@ pub(crate) struct WorktreeDialog {
     name_focus: FocusHandle,
     browse_focus: FocusHandle,
     open_focus: FocusHandle,
+    mode_existing_focus: FocusHandle,
+    mode_new_focus: FocusHandle,
+    branch_focus: FocusHandle,
+    base_focus: FocusHandle,
     unlock_focus: FocusHandle,
     force_focus: FocusHandle,
     delete_focus: FocusHandle,
@@ -151,8 +155,11 @@ impl WorktreeDialog {
             input.set_placeholder("~/develop/gitwarp-hotfix", cx);
             input
         });
-        subscriptions.push(cx.subscribe(&path, |this, _, _: &TextInputEvent, cx| {
+        subscriptions.push(cx.subscribe(&path, |this, input, _: &TextInputEvent, cx| {
             this.path_touched = true;
+            // Design: an invalid field gets the error border, not only the message.
+            let invalid = this.path_error(cx).is_some();
+            input.update(cx, |input, cx| input.set_error(invalid, cx));
             this.notify_host(cx);
             cx.notify();
         }));
@@ -162,11 +169,15 @@ impl WorktreeDialog {
             input.set_placeholder("fix/my-change", cx);
             input
         });
-        subscriptions.push(cx.subscribe(&new_name, |this, _, _: &TextInputEvent, cx| {
-            this.name_touched = true;
-            this.notify_host(cx);
-            cx.notify();
-        }));
+        subscriptions.push(
+            cx.subscribe(&new_name, |this, input, _: &TextInputEvent, cx| {
+                this.name_touched = true;
+                let invalid = this.name_error(cx).is_some();
+                input.update(cx, |input, cx| input.set_error(invalid, cx));
+                this.notify_host(cx);
+                cx.notify();
+            }),
+        );
         let branch = context
             .branches
             .iter()
@@ -218,6 +229,10 @@ impl WorktreeDialog {
             name_focus,
             browse_focus: cx.focus_handle().tab_stop(true),
             open_focus: cx.focus_handle().tab_stop(true),
+            mode_existing_focus: cx.focus_handle().tab_stop(true),
+            mode_new_focus: cx.focus_handle().tab_stop(true),
+            branch_focus: cx.focus_handle().tab_stop(true),
+            base_focus: cx.focus_handle().tab_stop(true),
             unlock_focus: cx.focus_handle().tab_stop(true),
             force_focus: cx.focus_handle().tab_stop(true),
             delete_focus: cx.focus_handle().tab_stop(true),
@@ -269,6 +284,10 @@ impl WorktreeDialog {
             name_focus: cx.focus_handle(),
             browse_focus: cx.focus_handle(),
             open_focus: cx.focus_handle(),
+            mode_existing_focus: cx.focus_handle(),
+            mode_new_focus: cx.focus_handle(),
+            branch_focus: cx.focus_handle(),
+            base_focus: cx.focus_handle(),
             unlock_focus: cx.focus_handle().tab_stop(true),
             force_focus: cx.focus_handle().tab_stop(true),
             delete_focus: cx.focus_handle().tab_stop(true),
@@ -750,7 +769,12 @@ pub(crate) fn open_remove<T: 'static>(
     window: &mut Window,
     cx: &mut Context<T>,
 ) -> Entity<WorktreeDialog> {
+    let has_branch = target.branch.is_some() && !target.main;
     let dialog = cx.new(|cx| WorktreeDialog::new_remove(target, context, on_done, cx));
+    if has_branch {
+        // The checkbox label says `(fully merged)` only when git confirmed it.
+        dialog.update(cx, |dialog, cx| dialog.check_branch_merged(cx));
+    }
     finish_open(dialog, window, cx)
 }
 
@@ -847,12 +871,26 @@ fn build(state: &Entity<WorktreeDialog>, cx: &App) -> Dialog {
 
     let mut focus_order = Vec::new();
     match dialog.mode {
+        // Visual order. Only the selected segment is listed: Left/Right move
+        // between the segments.
         Mode::Add => {
             focus_order.push(DialogFocus::input(dialog.path_focus.clone()));
+            focus_order.push(DialogFocus::control(dialog.browse_focus.clone()));
+            focus_order.push(DialogFocus::control(
+                if dialog.branch_mode == BranchMode::New {
+                    dialog.mode_new_focus.clone()
+                } else {
+                    dialog.mode_existing_focus.clone()
+                },
+            ));
             if dialog.branch_mode == BranchMode::New {
                 focus_order.push(DialogFocus::input(dialog.name_focus.clone()));
+                if !dialog.base_options().is_empty() {
+                    focus_order.push(DialogFocus::control(dialog.base_focus.clone()));
+                }
+            } else if !dialog.branches.is_empty() {
+                focus_order.push(DialogFocus::control(dialog.branch_focus.clone()));
             }
-            focus_order.push(DialogFocus::control(dialog.browse_focus.clone()));
             focus_order.push(DialogFocus::control(dialog.open_focus.clone()));
         }
         Mode::Remove => {
@@ -877,7 +915,10 @@ fn build(state: &Entity<WorktreeDialog>, cx: &App) -> Dialog {
         }
     }
     focus_order.push(DialogFocus::control(dialog.cancel_focus.clone()));
-    focus_order.push(DialogFocus::control(dialog.primary_focus.clone()));
+    // A disabled button takes no focus: Tab onto it would leave focus on nothing.
+    if valid.enabled {
+        focus_order.push(DialogFocus::control(dialog.primary_focus.clone()));
+    }
 
     let mut panel = Dialog::new(title)
         .icon(icon)
@@ -1054,8 +1095,16 @@ fn add_body(
                 )
                 .child(
                     Segmented::new("worktree-mode")
-                        .item(SegmentItem::new("Existing branch"))
-                        .item(SegmentItem::new("New branch"))
+                        .item(
+                            SegmentItem::new("Existing branch")
+                                .id("existing")
+                                .focus_handle(dialog.mode_existing_focus.clone()),
+                        )
+                        .item(
+                            SegmentItem::new("New branch")
+                                .id("new")
+                                .focus_handle(dialog.mode_new_focus.clone()),
+                        )
                         .selected(if dialog.branch_mode == BranchMode::New {
                             1
                         } else {
@@ -1072,6 +1121,7 @@ fn add_body(
                     Select::new("worktree-branch")
                         .options(branch_options)
                         .selected(dialog.branch)
+                        .focus_handle(dialog.branch_focus.clone())
                         .disabled(dialog.branches.is_empty())
                         .on_change(branch_listener),
                 )
@@ -1108,6 +1158,7 @@ fn add_body(
                                 Select::new("worktree-base")
                                     .options(base_options)
                                     .selected(dialog.base)
+                                    .focus_handle(dialog.base_focus.clone())
                                     .disabled(dialog.base_options().is_empty())
                                     .on_change(base_listener),
                             )
@@ -1189,12 +1240,15 @@ fn remove_body(
                 )),
             )
             .child(
-                Button::new("worktree-unlock")
-                    .label("Unlock")
-                    .icon(IconName::Lock)
-                    .focus_handle(dialog.unlock_focus.clone())
-                    .disabled(dialog.unlocking)
-                    .on_click(unlock),
+                // Content-width button, not stretched to the column.
+                div().flex().child(
+                    Button::new("worktree-unlock")
+                        .label("Unlock")
+                        .icon(IconName::Lock)
+                        .focus_handle(dialog.unlock_focus.clone())
+                        .disabled(dialog.unlocking)
+                        .on_click(unlock),
+                ),
             );
     }
     if !target.changes.is_empty() {
@@ -1210,16 +1264,10 @@ fn remove_body(
         };
         body = body
             .child(
-                Banner::new(
-                    BannerKind::Warn,
-                    format!(
-                        "{} file{} have uncommitted changes",
-                        target.changes.len(),
-                        if target.changes.len() == 1 { "" } else { "s" }
-                    ),
-                )
-                .body("Removing the worktree discards them for good.")
-                .list(target.changes.clone()),
+                Banner::new(BannerKind::Warn, uncommitted_title(target.changes.len()))
+                    .body("Removing the worktree discards them for good.")
+                    .plain_list()
+                    .list(target.changes.clone()),
             )
             .child(
                 Checkbox::new("worktree-force")
@@ -1257,7 +1305,18 @@ fn remove_body(
         };
         body = body.child(
             Checkbox::new("worktree-delete-branch")
-                .label(format!("Also delete branch {branch}"))
+                .label_element(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .child("Also delete branch")
+                        .child(div().font_family(FONT_MONO).child(branch.clone()))
+                        // Only claimed once git confirmed it; see `open_remove`.
+                        .when(dialog.unmerged == Some(false), |this| {
+                            this.child("(fully merged)")
+                        }),
+                )
                 .checked(dialog.delete_branch)
                 .focus_handle(dialog.delete_focus.clone())
                 .on_toggle(delete_toggle),
@@ -1288,6 +1347,14 @@ fn remove_body(
         }
     }
     body.into_any_element()
+}
+
+/// The dirty-files banner title: `1 file has …` / `N files have …`.
+fn uncommitted_title(count: usize) -> String {
+    format!(
+        "{count} {} uncommitted changes",
+        if count == 1 { "file has" } else { "files have" }
+    )
 }
 
 fn kv(label: &'static str, value: String, colors: ThemeColors) -> impl IntoElement {
@@ -1411,6 +1478,13 @@ mod tests {
 
     fn home() -> PathBuf {
         PathBuf::from("/home/mira")
+    }
+
+    #[test]
+    fn uncommitted_title_agrees_with_the_count() {
+        assert_eq!(uncommitted_title(1), "1 file has uncommitted changes");
+        assert_eq!(uncommitted_title(2), "2 files have uncommitted changes");
+        assert_eq!(uncommitted_title(12), "12 files have uncommitted changes");
     }
 
     #[test]

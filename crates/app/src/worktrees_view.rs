@@ -359,9 +359,14 @@ impl Render for WorktreesView {
 
         if let Some(error) = error {
             return content
-                .child(Banner::new(BannerKind::Error, "Could not read the worktrees").body(error))
                 .child(
-                    div().child(
+                    Banner::new(BannerKind::Error, "Could not read the worktrees")
+                        .body(error)
+                        .mono_body(),
+                )
+                .child(
+                    // Content-width button, not stretched to the column.
+                    div().flex().child(
                         Button::new("worktrees-retry")
                             .label("Try again")
                             .icon(IconName::Fetch)
@@ -995,8 +1000,9 @@ fn key_hints(colors: ThemeColors) -> AnyElement {
         .gap(px(16.))
         .text_size(FS_SM)
         .text_color(colors.muted)
-        .child(group(&["Ctrl", "Alt", "W"], "switcher"))
-        .child(group(&["Alt", "1–9"], "jump in the switcher"))
+        // One cap with "+" between the keys, as everywhere else in the app.
+        .child(group(&["Ctrl+Alt+W"], "switcher"))
+        .child(group(&["Alt+1–9"], "jump in the switcher"))
         .child(group(&["Enter"], "switch in the sidebar"))
         .child(group(&["Del"], "remove"))
         .into_any_element()

@@ -458,6 +458,11 @@ pub fn layer_count(window: &Window, cx: &App) -> usize {
     try_entity(window, cx).map_or(0, |overlays| overlays.read(cx).layers.entries.len())
 }
 
+/// Whether layer `id` is the topmost layer of `window`.
+pub(crate) fn is_top_layer(id: LayerId, window: &Window, cx: &App) -> bool {
+    try_entity(window, cx).is_some_and(|overlays| overlays.read(cx).layers.is_top(id))
+}
+
 /// The view of layer `id`, if it is open in `window`.
 pub fn layer_view(id: LayerId, window: &Window, cx: &App) -> Option<AnyView> {
     let overlays = try_entity(window, cx)?;

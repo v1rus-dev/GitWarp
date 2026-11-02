@@ -6294,6 +6294,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(linked);
     }
 
+    /// The worktree panel is a Tab stop, reachable like the branch tree.
+    #[gpui::test]
+    fn the_worktree_panel_is_reachable_with_tab(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktree-panel-tab");
+        let (mut cx, _workspace, view, linked) = open_with_linked_worktree(&repo, cx);
+        let focus = view.read_with(&cx, |view, _| view.worktree_panel_focus.clone());
+        let mut reached = false;
+        for _ in 0..40 {
+            cx.simulate_keystrokes("tab");
+            if cx.update(|window, _| focus.is_focused(window)) {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "Tab never reached the worktree panel");
+        let _ = std::fs::remove_dir_all(linked);
+    }
+
+    /// The Remove dialog of a dirty worktree has a disabled primary button;
+    /// it must still own the keyboard: Esc closes it.
+    #[gpui::test]
+    fn escape_closes_the_remove_dialog_of_a_dirty_worktree(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktree-remove-esc");
+        let (mut cx, _workspace, view, linked) = open_with_linked_worktree(&repo, cx);
+        std::fs::write(linked.join("dirty.txt"), "uncommitted").expect("dirty the worktree");
+        let model = view.read_with(&cx, |view, _| view.worktrees_model());
+        cx.update(|_, cx| model.update(cx, |model, cx| model.reload(cx)));
+        cx.run_until_parked();
+        let layers = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| ui::overlay::layer_count(window, cx))
+        };
+        let focus = view.read_with(&cx, |view, _| view.worktree_panel_focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+
+        cx.simulate_keystrokes("down delete");
+        cx.run_until_parked();
+        assert_eq!(
+            layers(&mut cx),
+            1,
+            "Remove should open for a linked worktree"
+        );
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(layers(&mut cx), 0, "Esc did not close the Remove dialog");
+        let _ = std::fs::remove_dir_all(linked);
+    }
+
     /// Del opens the Remove dialog for a linked worktree and does nothing on
     /// the main one.
     #[gpui::test]

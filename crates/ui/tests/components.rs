@@ -229,6 +229,23 @@ fn clicking_a_segment_selects_it(cx: &mut TestAppContext) {
     assert_eq!(cx.read(|app| view.read(app).selected.get()), Some(2));
 }
 
+#[gpui::test]
+fn arrow_keys_move_the_selection_between_segments(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx, |_| SegmentedRoot {
+        selected: Rc::new(Cell::new(None)),
+    });
+
+    // The control is a Tab stop: the first segment takes focus.
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes("right");
+    assert_eq!(cx.read(|app| view.read(app).selected.get()), Some(1));
+    cx.simulate_keystrokes("right");
+    assert_eq!(cx.read(|app| view.read(app).selected.get()), Some(2));
+    // Focus followed the selection, so the next arrow continues from there.
+    cx.simulate_keystrokes("left");
+    assert_eq!(cx.read(|app| view.read(app).selected.get()), Some(1));
+}
+
 struct TabsRoot {
     labels: Vec<&'static str>,
     selected: Rc<Cell<Option<usize>>>,

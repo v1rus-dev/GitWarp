@@ -31,6 +31,9 @@ const LEADING_GAP_CAP: i32 = 8;
 const HASH_PREFIX: i32 = 10_000;
 /// Shorter hash queries match too many commits to mean "a hash".
 pub const MIN_HASH_QUERY: usize = 4;
+/// With the explicit `#` scope the user means a commit, so three digits do.
+/// (The design states no minimum.)
+pub const MIN_HASH_QUERY_SCOPED: usize = 3;
 
 const UNREACHABLE: i32 = i32::MIN / 2;
 
@@ -153,11 +156,17 @@ pub fn fuzzy(query: &str, text: &str) -> Option<Match> {
 }
 
 /// Matches a commit hash typed as a prefix (`e4f2a`). `None` unless the
-/// query is at least [`MIN_HASH_QUERY`] hex digits and `hash` starts with it.
+/// query is at least [`MIN_HASH_QUERY`] hex digits ([`MIN_HASH_QUERY_SCOPED`]
+/// when `scoped`, i.e. typed after `#`) and `hash` starts with it.
 /// The score beats any fuzzy score, so a hash hit leads the Commits group.
-pub fn hash_prefix(query: &str, hash: &str) -> Option<Match> {
+pub fn hash_prefix(query: &str, hash: &str, scoped: bool) -> Option<Match> {
     let query = query.trim();
-    if query.len() < MIN_HASH_QUERY || !query.chars().all(|c| c.is_ascii_hexdigit()) {
+    let min = if scoped {
+        MIN_HASH_QUERY_SCOPED
+    } else {
+        MIN_HASH_QUERY
+    };
+    if query.len() < min || !query.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     let starts = hash.len() >= query.len()
@@ -281,7 +290,7 @@ mod tests {
     #[test]
     fn a_hash_prefix_matches_and_beats_any_fuzzy_score() {
         let hash = "e4f2a91c0d3b5a6978e1f2d3c4b5a69788776655";
-        let m = hash_prefix("E4F2a", hash).expect("prefix");
+        let m = hash_prefix("E4F2a", hash, false).expect("prefix");
         assert_eq!(m.positions, vec![0, 1, 2, 3, 4]);
         assert!(m.score > score("e4f2a", "e4f2a91  Merge branch"));
     }
@@ -289,10 +298,14 @@ mod tests {
     #[test]
     fn only_a_long_enough_hex_prefix_counts_as_a_hash() {
         let hash = "e4f2a91c0d3b5a6978e1f2d3c4b5a69788776655";
-        assert_eq!(hash_prefix("e4f", hash), None);
-        assert_eq!(hash_prefix("f2a9", hash), None);
-        assert_eq!(hash_prefix("e4g2", hash), None);
-        assert_eq!(hash_prefix("", hash), None);
+        assert_eq!(hash_prefix("e4f", hash, false), None);
+        assert_eq!(hash_prefix("f2a9", hash, false), None);
+        assert_eq!(hash_prefix("e4g2", hash, false), None);
+        assert_eq!(hash_prefix("", hash, false), None);
+        // After `#` three digits are enough, two are not.
+        assert!(hash_prefix("e4f", hash, true).is_some());
+        assert_eq!(hash_prefix("e4", hash, true), None);
+        assert_eq!(hash_prefix("e4g", hash, true), None);
     }
 
     #[test]

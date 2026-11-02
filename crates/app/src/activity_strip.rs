@@ -40,6 +40,10 @@ const YEARS_SHOWN: usize = 5;
 /// The strip's header height, the same as the details dock's.
 const HEADER: f32 = 34.;
 
+/// The side column never shrinks below the no-wrap key hint
+/// (`↑ ↓ day · ← → week · Enter filter`); the grid gives way instead.
+const SIDE_MIN_WIDTH: f32 = 280.;
+
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -106,6 +110,15 @@ pub struct ActivityStrip {
     task: Option<Task<()>>,
 }
 
+/// The UTC day number of the system clock: where the loading skeleton's grid
+/// ends before git has said which local day it is (the first count replaces it).
+fn provisional_today() -> i32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    i32::try_from(secs / 86_400).unwrap_or(0)
+}
+
 impl ActivityStrip {
     pub fn new(
         path: PathBuf,
@@ -128,7 +141,7 @@ impl ActivityStrip {
             who: Who::Me,
             year: None,
             status: Status::Loading,
-            today: 0,
+            today: provisional_today(),
             me: None,
             mine: Rc::default(),
             all: Rc::default(),
@@ -494,10 +507,15 @@ impl ActivityStrip {
             }
         };
 
+        // Design: the legend stays while loading; it goes with an error or an
+        // empty repository.
         let show_legend = !collapsed
-            && matches!(self.status, Status::Ready | Status::Partial { .. })
-            && !self.all.is_empty();
-        let me_disabled = self.me.is_none();
+            && !matches!(self.status, Status::Failed(_))
+            && !(matches!(self.status, Status::Ready) && self.all.is_empty());
+        // The identity is unknown until the first count (and after an error),
+        // so `Me` is only disabled once git said there is no user.email.
+        let me_disabled =
+            self.me.is_none() && matches!(self.status, Status::Ready | Status::Partial { .. });
         let me_tip = match &self.me {
             Some(email) => format!("Commits where author email = {email}"),
             None => "Set user.email to see your own commits".to_owned(),
@@ -586,8 +604,8 @@ impl ActivityStrip {
                     .text_color(colors.muted)
                     .child(Icon::new(IconName::Err).size(px(16.)).color(colors.error))
                     .child(
+                        // Content-width: Retry sits right after the message.
                         div()
-                            .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_col()
@@ -650,7 +668,7 @@ impl ActivityStrip {
 
         let side = div()
             .flex_1()
-            .min_w_0()
+            .min_w(px(SIDE_MIN_WIDTH))
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -662,8 +680,8 @@ impl ActivityStrip {
         body.child(
             div()
                 .id("activity-scroll")
-                .flex_none()
-                .max_w_full()
+                // Design `.heat-scroll { flex: 0 1 auto; overflow-x: auto }`:
+                // the grid shrinks and scrolls so the side column keeps its width.
                 .min_w_0()
                 .overflow_x_scroll()
                 .child(heatmap),
@@ -702,17 +720,18 @@ impl ActivityStrip {
         }
         if self.me.is_none() {
             let view = cx.entity();
-            return side.child(
-                line()
-                    .child("Showing everyone:")
-                    .child(mono("user.email".to_owned()))
-                    .child("is not set for this repository.")
-                    .child(link("activity-set-identity", "Set identity…").on_click(
-                        move |_, window, cx| {
-                            view.update(cx, |this, cx| this.open_identity(window, cx));
-                        },
-                    )),
-            );
+            return side
+                .child(
+                    line()
+                        .child("Showing everyone:")
+                        .child(mono("user.email".to_owned()))
+                        .child("is not set for this repository."),
+                )
+                .child(link("activity-set-identity", "Set identity…").on_click(
+                    move |_, window, cx| {
+                        view.update(cx, |this, cx| this.open_identity(window, cx));
+                    },
+                ));
         }
         if self.all.is_empty() {
             return side.child("Make the first commit to start the graph.");
@@ -721,9 +740,13 @@ impl ActivityStrip {
             let view = cx.entity();
             return side
                 .child(
-                    line()
-                        .child("No commits by")
-                        .child(mono(self.me.clone().unwrap_or_default())),
+                    line().child("No commits by").child(
+                        // The design ends the line with a full stop right after the address.
+                        div()
+                            .flex()
+                            .child(mono(self.me.clone().unwrap_or_default()))
+                            .child("."),
+                    ),
                 )
                 .child(
                     link("activity-show-everyone", "Show everyone’s commits").on_click(

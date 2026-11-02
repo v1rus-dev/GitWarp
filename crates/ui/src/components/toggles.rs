@@ -19,6 +19,7 @@ use crate::theme::ActiveTheme;
 pub struct Checkbox {
     id: ElementId,
     label: Option<SharedString>,
+    label_element: Option<AnyElement>,
     checked: bool,
     mixed: bool,
     disabled: bool,
@@ -31,6 +32,7 @@ impl Checkbox {
         Self {
             id: id.into(),
             label: None,
+            label_element: None,
             checked: false,
             mixed: false,
             disabled: false,
@@ -41,6 +43,13 @@ impl Checkbox {
 
     pub fn label(mut self, label: impl Into<SharedString>) -> Self {
         self.label = Some(label.into());
+        self
+    }
+
+    /// A label made of several parts (e.g. text with a mono name); wins over
+    /// [`label`](Self::label).
+    pub fn label_element(mut self, label: impl IntoElement) -> Self {
+        self.label_element = Some(label.into_any_element());
         self
     }
 
@@ -129,6 +138,14 @@ impl RenderOnce for Checkbox {
             .min_h(px(26.))
             .key_context("ui-checkbox")
             .child(box_)
+            .when_some(self.label_element, |this, label| {
+                this.child(
+                    div()
+                        .text_size(FS_BASE)
+                        .text_color(colors.text)
+                        .child(label),
+                )
+            })
             .when_some(self.label, |this, label| {
                 this.child(
                     div()

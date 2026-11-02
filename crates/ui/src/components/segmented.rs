@@ -5,10 +5,12 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, App, ElementId, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window,
+    div, px, App, ElementId, FocusHandle, IntoElement, ParentElement, RenderOnce, SharedString,
+    Styled, Window,
 };
 use gpui::{InteractiveElement, StatefulInteractiveElement};
 
+use crate::actions::{SegmentNext, SegmentPrev};
 use crate::components::Tooltip;
 use crate::focus::{self, RingOffset};
 use crate::icon::{Icon, IconName};
@@ -24,6 +26,7 @@ pub struct SegmentItem {
     tooltip: Option<SharedString>,
     /// A key cap shown after the tooltip text.
     tooltip_kbd: Option<SharedString>,
+    focus_handle: Option<FocusHandle>,
 }
 
 impl SegmentItem {
@@ -35,6 +38,7 @@ impl SegmentItem {
             disabled: false,
             tooltip: None,
             tooltip_kbd: None,
+            focus_handle: None,
         }
     }
 
@@ -46,6 +50,7 @@ impl SegmentItem {
             disabled: false,
             tooltip: None,
             tooltip_kbd: None,
+            focus_handle: None,
         }
     }
 
@@ -76,6 +81,13 @@ impl SegmentItem {
     /// focus stays on the same segment when items are added or removed.
     pub fn id(mut self, id: impl Into<ElementId>) -> Self {
         self.id = Some(id.into());
+        self
+    }
+
+    /// Uses the caller's focus handle, e.g. to list the segment in a
+    /// [`Dialog::focus_order`](crate::Dialog::focus_order).
+    pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
+        self.focus_handle = Some(handle);
         self
     }
 
@@ -158,9 +170,11 @@ impl RenderOnce for Segmented {
             .border_color(colors.border_strong)
             .bg(colors.bg);
 
+        // Resolve every segment's focus handle first: Left/Right move focus to
+        // a sibling.
         let mut label_occurrences: HashMap<String, usize> = HashMap::new();
-        for (index, item) in self.items.into_iter().enumerate() {
-            let selected = index == self.selected;
+        let mut stops: Vec<(ElementId, FocusHandle, bool)> = Vec::with_capacity(count);
+        for item in &self.items {
             let item_disabled = self.disabled || item.disabled;
             // Key by identity, not position; duplicate labels/icons get
             // `label#n` so each item keeps its own focus handle.
@@ -179,11 +193,28 @@ impl RenderOnce for Segmented {
             };
             let child_id =
                 ElementId::NamedChild(std::sync::Arc::new(bar_id.clone()), SharedString::from(key));
-            let focus = window
-                .use_keyed_state(child_id.clone(), cx, |_, cx| cx.focus_handle())
-                .read(cx)
+            let focus = item
+                .focus_handle
                 .clone()
+                .unwrap_or_else(|| {
+                    window
+                        .use_keyed_state(child_id.clone(), cx, |_, cx| cx.focus_handle())
+                        .read(cx)
+                        .clone()
+                })
                 .tab_stop(!item_disabled);
+            stops.push((child_id, focus, item_disabled));
+        }
+        let handles: Rc<Vec<(FocusHandle, bool)>> = Rc::new(
+            stops
+                .iter()
+                .map(|(_, focus, disabled)| (focus.clone(), *disabled))
+                .collect(),
+        );
+
+        for (index, item) in self.items.into_iter().enumerate() {
+            let selected = index == self.selected;
+            let (child_id, focus, item_disabled) = stops[index].clone();
             let ring = !item_disabled && focus::focus_visible(&focus, window, cx);
             let foreground = if item_disabled {
                 colors.disabled
@@ -226,7 +257,20 @@ impl RenderOnce for Segmented {
                     segment = segment.hover(|style| style.bg(colors.hover).text_color(colors.text));
                 }
                 if let Some(listener) = self.on_select.clone() {
-                    segment = segment.on_click(move |_, window, cx| listener(index, window, cx));
+                    let click_listener = listener.clone();
+                    segment =
+                        segment.on_click(move |_, window, cx| click_listener(index, window, cx));
+                    // Left/Right select and focus the neighbouring enabled
+                    // segment; they stop at the ends.
+                    let prev = (handles.clone(), listener.clone());
+                    let next = (handles.clone(), listener);
+                    segment = segment
+                        .on_action(move |_: &SegmentPrev, window, cx| {
+                            step_segment(&prev.0, &prev.1, index, false, window, cx);
+                        })
+                        .on_action(move |_: &SegmentNext, window, cx| {
+                            step_segment(&next.0, &next.1, index, true, window, cx);
+                        });
                 }
             }
 
@@ -248,5 +292,25 @@ impl RenderOnce for Segmented {
         } else {
             container
         }
+    }
+}
+
+/// Selects and focuses the nearest enabled segment before/after `from`.
+fn step_segment(
+    handles: &[(FocusHandle, bool)],
+    listener: &crate::components::SelectHandler,
+    from: usize,
+    forward: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let target = if forward {
+        (from + 1..handles.len()).find(|index| !handles[*index].1)
+    } else {
+        (0..from).rev().find(|index| !handles[*index].1)
+    };
+    if let Some(target) = target {
+        window.focus(&handles[target].0, cx);
+        listener(target, window, cx);
     }
 }

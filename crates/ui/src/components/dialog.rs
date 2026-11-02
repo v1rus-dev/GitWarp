@@ -204,6 +204,9 @@ pub struct DialogHost {
     /// Imperative override set by [`set_busy`]; when `None` the builder's
     /// `Dialog::busy` is authoritative on every render.
     busy_override: Option<bool>,
+    /// Frames rendered so far; the focus check needs the dispatch tree of an
+    /// earlier frame that already contains the dialog.
+    frames: u32,
 }
 
 /// Opens a dialog and returns its layer.
@@ -231,6 +234,7 @@ pub fn open_with_view(
         focus: cx.focus_handle().tab_stop(false),
         layer: None,
         busy_override: None,
+        frames: 0,
     });
     let layer = overlay::open_modal(host.clone().into(), window, cx);
     host.update(cx, |host, _| host.layer = Some(layer));
@@ -258,6 +262,29 @@ pub fn set_busy(id: LayerId, busy: bool, window: &mut Window, cx: &mut App) {
     window.refresh();
 }
 
+impl DialogHost {
+    /// Makes sure the dialog owns keyboard focus.
+    ///
+    /// The initial focus target may not be focusable: a disabled button does
+    /// not track its handle, so focusing it leaves the focus on nothing and
+    /// Esc, Tab and Enter never reach the dialog. A control that disables
+    /// itself while it has focus does the same. Whenever the dialog is the top
+    /// layer and focus is not inside it, focus moves to the dialog container;
+    /// Tab then enters the focus order at its first stop.
+    fn keep_focus_inside(&mut self, layer: Option<LayerId>, window: &mut Window, cx: &mut App) {
+        self.frames = self.frames.saturating_add(1);
+        if self.frames == 1 {
+            // Check on the next frame, once the dialog is in the dispatch tree.
+            window.refresh();
+            return;
+        }
+        let on_top = layer.is_some_and(|layer| overlay::is_top_layer(layer, window, cx));
+        if on_top && !self.focus.contains_focused(window, cx) {
+            window.focus(&self.focus, cx);
+        }
+    }
+}
+
 impl Render for DialogHost {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dialog = (self.build)(window, cx);
@@ -270,6 +297,7 @@ impl Render for DialogHost {
         if let Some(layer) = layer {
             overlay::set_dismiss_on_outside_click(layer, !busy, window, cx);
         }
+        self.keep_focus_inside(layer, window, cx);
         let handles: Vec<FocusHandle> = dialog
             .focus
             .iter()

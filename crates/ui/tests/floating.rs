@@ -871,3 +871,85 @@ fn tab_inside_a_menu_does_not_move_focus_behind_it(cx: &mut TestAppContext) {
     assert_eq!(focused(cx), before, "tab moved focus behind the menu");
     assert_eq!(layer_count(cx), 1, "tab closed the menu");
 }
+
+#[gpui::test]
+fn escape_closes_a_dialog_whose_only_default_is_disabled(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx);
+    let outside = cx.read(|app| view.read(app).outside.clone());
+    cx.update(|window, cx| window.focus(&outside, cx));
+
+    // Like the Remove-worktree dialog for a dirty worktree: the initial focus
+    // target is a disabled button, which never tracks its focus handle.
+    let primary = cx.update(|_, app| app.focus_handle());
+    let cancel = cx.update(|_, app| app.focus_handle());
+    let layer = {
+        let (primary, cancel) = (primary.clone(), cancel.clone());
+        cx.update(|window, app| {
+            dialog::open(window, app, move |_, _| {
+                Dialog::new("Remove")
+                    .footer(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                Button::new("cancel")
+                                    .label("Cancel")
+                                    .focus_handle(cancel.clone()),
+                            )
+                            .child(
+                                Button::danger("primary")
+                                    .label("Remove")
+                                    .disabled(true)
+                                    .focus_handle(primary.clone()),
+                            ),
+                    )
+                    .focus_order([
+                        DialogFocus::control(cancel.clone()),
+                        DialogFocus::control(primary.clone()),
+                    ])
+                    .default_button(primary.clone())
+                    .default_danger(true)
+            })
+        })
+    };
+    let _ = layer;
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 1);
+
+    // Tab enters the dialog's own focus order, not the page behind it.
+    cx.simulate_keystrokes("tab");
+    assert_focused(cx, &cancel);
+
+    // Tabbing onto the disabled button loses focus; the dialog takes it back.
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    assert_eq!(layer_count(cx), 0, "escape did not close the dialog");
+    assert_focused(cx, &outside);
+}
+
+#[gpui::test]
+fn select_opens_with_space_and_down_and_picks_with_the_keyboard(cx: &mut TestAppContext) {
+    init(cx);
+    let chosen = Rc::new(Cell::new(None));
+    let (_, cx) = cx.add_window_view(|_, _| SelectRoot {
+        chosen: chosen.clone(),
+    });
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("tab");
+    press(cx, "space");
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 1, "space did not open the select menu");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 0, "escape did not close the select menu");
+
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 1, "down did not open the select menu");
+    cx.simulate_keystrokes("down down enter");
+    assert_eq!(chosen.get(), Some(1));
+    assert_eq!(layer_count(cx), 0);
+}

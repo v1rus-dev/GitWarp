@@ -1506,7 +1506,11 @@ impl RenderOnce for WorktreePanel {
         if self.state == PanelState::Ready {
             header = header.child(CountPill::new(self.total.to_string()));
         }
-        root = root.child(header);
+        // Design: while loading or failed only the skeleton / message shows,
+        // no WORKTREES header and no "New worktree…" button.
+        if self.state == PanelState::Ready {
+            root = root.child(header);
+        }
 
         let message = |text: SharedString| {
             div()
@@ -1586,6 +1590,9 @@ impl RenderOnce for WorktreePanel {
         root = root.child(body);
 
         // "New worktree…" focuses the quick-create input of the centre pane.
+        if self.state != PanelState::Ready {
+            return root;
+        }
         let on_event = self.on_event.clone();
         root.child(
             div().flex_none().px(px(8.)).pt(px(6.)).pb(px(8.)).child(
@@ -1593,7 +1600,6 @@ impl RenderOnce for WorktreePanel {
                     Button::new("worktree-panel-new")
                         .icon(IconName::Plus)
                         .label("New worktree…")
-                        .disabled(self.state != PanelState::Ready)
                         .on_click(move |_, window, cx| {
                             on_event(PanelEvent::NewWorktree, window, cx)
                         }),
