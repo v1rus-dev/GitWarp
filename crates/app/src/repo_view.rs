@@ -8554,8 +8554,16 @@ mod tests {
         cx.run_until_parked();
         assert!(view.read_with(&cx, |view, cx| view.worktrees.read(cx).has_dialog()));
         let dirty = |cx: &gpui::VisualTestContext| {
+            // Compared canonically: on macOS git reports the temp folder as /private/var/...
+            let linked = linked
+                .canonicalize()
+                .expect("canonicalize the worktree path");
             model.read_with(cx, |model, _| {
-                model.entry(&linked).map(|entry| entry.changes.len())
+                model
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.path().canonicalize().ok().as_deref() == Some(&*linked))
+                    .map(|entry| entry.changes.len())
             })
         };
         assert_eq!(dirty(&cx), Some(0), "the worktree starts clean");

@@ -93,6 +93,8 @@ fn clone_into(remote: &Path) -> (tempfile::TempDir, Repo) {
         |_| {},
     )
     .unwrap();
+    // Git for Windows enables `core.autocrlf` system-wide; files pulled later must keep LF.
+    git(&dest, &["config", "core.autocrlf", "false"]);
     let repo = open(&dest);
     (parent, repo)
 }

@@ -5510,7 +5510,12 @@ mod tests {
         // Ctrl+C copies the full 40-char hash of the selected commit.
         cx.simulate_keystrokes("home");
         cx.simulate_keystrokes("down");
-        cx.simulate_keystrokes("ctrl-c");
+        // `secondary-c` is Cmd+C on macOS and Ctrl+C elsewhere.
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        });
         let copied = cx
             .read_from_clipboard()
             .and_then(|item| item.text())
