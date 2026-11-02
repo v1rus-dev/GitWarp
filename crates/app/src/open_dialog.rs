@@ -57,10 +57,28 @@ pub(crate) struct OpenRepoDialog {
 }
 
 /// What a folder picker answer means for the dialog.
-enum Browse {
+pub(crate) enum Browse {
     Picked(Option<PathBuf>),
     Cancelled,
     Failed(String),
+}
+
+/// Opens the native folder picker; shared with the Clone dialog's Browse button.
+pub(crate) fn pick_folder(cx: &mut App) -> impl std::future::Future<Output = Browse> {
+    let receiver = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: Some(ui::t!("welcome.init.open")),
+    });
+    async move {
+        match receiver.await {
+            Ok(Ok(Some(paths))) => Browse::Picked(paths.into_iter().next()),
+            Ok(Ok(None)) => Browse::Cancelled,
+            Ok(Err(error)) => Browse::Failed(error.to_string()),
+            Err(error) => Browse::Failed(error.to_string()),
+        }
+    }
 }
 
 impl OpenRepoDialog {
@@ -247,19 +265,9 @@ impl OpenRepoDialog {
 
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let home = self.home.clone();
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some(ui::t!("welcome.init.open")),
-        });
+        let picked = pick_folder(cx);
         cx.spawn_in(window, async move |this, cx| {
-            let outcome = match receiver.await {
-                Ok(Ok(Some(paths))) => Browse::Picked(paths.into_iter().next()),
-                Ok(Ok(None)) => Browse::Cancelled,
-                Ok(Err(error)) => Browse::Failed(error.to_string()),
-                Err(error) => Browse::Failed(error.to_string()),
-            };
+            let outcome = picked.await;
             this.update_in(cx, |dialog, window, cx| {
                 dialog.finish_browse(outcome, home, window, cx)
             })

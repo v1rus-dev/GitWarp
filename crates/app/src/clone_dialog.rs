@@ -24,6 +24,7 @@ use ui::{
 use crate::format::{display_path, expand_home, home_dir};
 use crate::network_ops::{self, friendly_error};
 use crate::network_service::{HostKeyAsker, NetworkService};
+use crate::open_dialog::{pick_folder, Browse};
 use crate::workspace::{repo_name, Workspace};
 
 const CLONE_TIMEOUT: Duration = Duration::from_millis(80);
@@ -92,6 +93,7 @@ pub(crate) struct CloneDialog {
 
     url_focus: gpui::FocusHandle,
     dest_focus: gpui::FocusHandle,
+    browse_focus: gpui::FocusHandle,
     name_focus: gpui::FocusHandle,
     branch_focus: gpui::FocusHandle,
     depth_focus: gpui::FocusHandle,
@@ -220,6 +222,7 @@ impl CloneDialog {
             generation: 0,
             url_focus,
             dest_focus,
+            browse_focus: cx.focus_handle().tab_stop(true),
             name_focus,
             branch_focus,
             depth_focus,
@@ -228,6 +231,51 @@ impl CloneDialog {
             cancel_focus: cx.focus_handle().tab_stop(true),
             primary_focus: cx.focus_handle().tab_stop(true),
             secondary_focus: cx.focus_handle().tab_stop(true),
+        }
+    }
+
+    fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let home = self.home.clone();
+        let picked = pick_folder(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = picked.await;
+            this.update_in(cx, |dialog, window, cx| {
+                dialog.finish_browse(outcome, home, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_browse(
+        &mut self,
+        outcome: Browse,
+        home: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A picker that was already open when the clone started must not
+        // change the folder the clone is running for.
+        if matches!(self.phase, Phase::Cloning | Phase::Done(_)) {
+            return;
+        }
+        match outcome {
+            // `set_text` emits `Changed`, which the `dest_events` subscription
+            // turns into `dest_text` and a re-render.
+            Browse::Picked(Some(path)) => {
+                let label = display_path(&path, home.as_deref());
+                self.dest.update(cx, |input, cx| input.set_text(label, cx));
+            }
+            Browse::Picked(None) | Browse::Cancelled => {}
+            Browse::Failed(message) => {
+                // No xdg portal, no picker: the field stays the way in.
+                toast::show(
+                    ToastKind::Error,
+                    ui::t!("welcome.open.picker_failed", message = message),
+                    window,
+                    cx,
+                );
+            }
         }
     }
 
@@ -778,6 +826,12 @@ fn build_form(
     cx: &App,
 ) -> Dialog {
     let dialog = state.read(cx);
+    let browse = {
+        let state = state.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            state.update(cx, |dialog, cx| dialog.browse(window, cx));
+        }
+    };
     let target = dialog.target();
     let url_error = dialog.url_error().filter(|_| dialog.url_touched);
     let name_error = dialog.name_error();
@@ -836,7 +890,20 @@ fn build_form(
                     .flex_col()
                     .gap(px(4.))
                     .child(label(ui::t!("welcome.open.folder")))
-                    .child(dialog.dest.clone()),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().flex_1().min_w_0().child(dialog.dest.clone()))
+                            .child(
+                                Button::new("clone-browse")
+                                    .label(ui::t!("welcome.open.browse"))
+                                    .icon(IconName::Folder)
+                                    .focus_handle(dialog.browse_focus.clone())
+                                    .on_click(browse),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -966,6 +1033,7 @@ fn build_form(
     let focus_order = vec![
         DialogFocus::input(dialog.url_focus.clone()),
         DialogFocus::input(dialog.dest_focus.clone()),
+        DialogFocus::control(dialog.browse_focus.clone()),
         DialogFocus::input(dialog.name_focus.clone()),
         DialogFocus::input(dialog.branch_focus.clone()),
         DialogFocus::input(dialog.depth_focus.clone()),
