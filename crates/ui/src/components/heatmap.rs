@@ -39,10 +39,31 @@ const TIP_BOX_W: f32 = 280.;
 /// The room a tooltip needs above a cell: its height plus the 6 px gap.
 const TIP_FLIP_ROOM: f32 = 34.;
 
+/// Catalog keys of the short month names, January first.
 const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    "kit.heatmap.month.jan",
+    "kit.heatmap.month.feb",
+    "kit.heatmap.month.mar",
+    "kit.heatmap.month.apr",
+    "kit.heatmap.month.may",
+    "kit.heatmap.month.jun",
+    "kit.heatmap.month.jul",
+    "kit.heatmap.month.aug",
+    "kit.heatmap.month.sep",
+    "kit.heatmap.month.oct",
+    "kit.heatmap.month.nov",
+    "kit.heatmap.month.dec",
 ];
-const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+/// Catalog keys of the short weekday names, Monday first.
+const WEEKDAYS: [&str; 7] = [
+    "kit.heatmap.weekday.mon",
+    "kit.heatmap.weekday.tue",
+    "kit.heatmap.weekday.wed",
+    "kit.heatmap.weekday.thu",
+    "kit.heatmap.weekday.fri",
+    "kit.heatmap.weekday.sat",
+    "kit.heatmap.weekday.sun",
+];
 
 type DayHandler = Rc<dyn Fn(i32, &mut Window, &mut App) + 'static>;
 type ClearHandler = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
@@ -165,7 +186,7 @@ impl RenderOnce for HeatLegend {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors;
         let cell = px(if self.compact { CELL_COMPACT } else { CELL });
-        let label = |text: &'static str| {
+        let label = |text: SharedString| {
             div()
                 .text_size(FS_XS)
                 .text_color(colors.muted)
@@ -177,13 +198,13 @@ impl RenderOnce for HeatLegend {
             .items_center()
             .gap(px(GAP))
             .font_family(FONT_UI)
-            .child(label("Less").mr(SP_2))
+            .child(label(crate::i18n::t("kit.heatmap.less")).mr(SP_2))
             .children(
                 colors
                     .heat
                     .map(|color| div().size(cell).flex_none().rounded(px(RADIUS)).bg(color)),
             )
-            .child(label("More").ml(SP_2))
+            .child(label(crate::i18n::t("kit.heatmap.more")).ml(SP_2))
     }
 }
 
@@ -251,22 +272,27 @@ fn civil_from_days(day: i32) -> (i32, u32, u32) {
 /// `Wed, 14 Oct 2026`.
 fn long_date(day: i32) -> String {
     let (year, month, date) = civil_from_days(day);
-    format!(
-        "{}, {date} {} {year}",
-        WEEKDAYS[weekday_row(day) as usize],
-        MONTHS[month as usize - 1]
+    let weekday = crate::i18n::t(WEEKDAYS[weekday_row(day) as usize]);
+    let month = crate::i18n::t(MONTHS[month as usize - 1]);
+    crate::i18n::t_args(
+        "kit.heatmap.long_date",
+        &[
+            ("weekday", &weekday),
+            ("day", &date),
+            ("month", &month),
+            ("year", &year),
+        ],
     )
+    .to_string()
 }
 
 /// `5 commits on Wed, 14 Oct 2026`, `1 commit on …`, `No commits on …`.
 fn default_tooltip(day: i32, count: u32) -> SharedString {
     let date = long_date(day);
-    match count {
-        0 => format!("No commits on {date}"),
-        1 => format!("1 commit on {date}"),
-        n => format!("{n} commits on {date}"),
+    if count == 0 {
+        return crate::i18n::t_args("kit.heatmap.no_commits", &[("date", &date)]);
     }
-    .into()
+    crate::i18n::t_count("kit.heatmap.commits", u64::from(count), &[("date", &date)])
 }
 
 /// The month labels as `(column, name)`: the month name sits over the column
@@ -526,7 +552,7 @@ impl RenderOnce for Heatmap {
             let max_left = (grid_w - TIP_BOX_W).max(0.);
             let left = (centre - half).clamp(0., max_left);
             let label: SharedString = if span.is_pending(day) {
-                format!("Counting commits on {}", long_date(day)).into()
+                crate::i18n::t_args("kit.heatmap.counting", &[("date", &long_date(day))])
             } else {
                 tooltip_text(day)
             };
@@ -589,9 +615,9 @@ impl RenderOnce for Heatmap {
                     .flex()
                     .items_center()
                     .child(if row % 2 == 0 && row < 6 {
-                        WEEKDAYS[row]
+                        crate::i18n::t(WEEKDAYS[row])
                     } else {
-                        ""
+                        SharedString::default()
                     })
             }));
 
@@ -612,7 +638,7 @@ impl RenderOnce for Heatmap {
                             .top(px(0.))
                             .left(px(col as f32 * pitch))
                             .whitespace_nowrap()
-                            .child(name)
+                            .child(crate::i18n::t(name))
                     }),
             );
 
@@ -689,7 +715,10 @@ mod tests {
         let (start, end) = Span::bounds(OCT_14_2026, 53);
         let labels = month_labels(start, end, 53);
         assert!(labels.windows(2).all(|pair| pair[1].0 - pair[0].0 >= 3));
-        assert_eq!(labels.last().map(|label| label.1), Some("Oct"));
+        assert_eq!(
+            labels.last().map(|label| label.1),
+            Some("kit.heatmap.month.oct")
+        );
         // About one label per month over a year.
         assert!((12..=13).contains(&labels.len()), "{labels:?}");
     }

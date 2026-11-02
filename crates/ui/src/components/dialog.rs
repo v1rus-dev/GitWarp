@@ -340,7 +340,7 @@ impl Render for DialogHost {
             Button::ghost(ElementId::Name(format!("dialog-close-{layer:?}").into()))
                 .icon_only(IconName::X)
                 .size(ButtonSize::Xs)
-                .tooltip("Close")
+                .tooltip(crate::i18n::t("kit.dialog.close"))
                 .disabled(busy);
         if !busy {
             close_button = close_button.on_click(move |_, window, cx| {

@@ -19,11 +19,12 @@ const LANGUAGES: [Language; 6] = [
     Language::Ja,
 ];
 
+/// Fetch interval in minutes with the catalog key of its label.
 const INTERVALS: [(u16, &str); 4] = [
-    (1, "Every minute"),
-    (5, "Every 5 minutes"),
-    (15, "Every 15 minutes"),
-    (60, "Every hour"),
+    (1, "settings.general.interval.1"),
+    (5, "settings.general.interval.5"),
+    (15, "settings.general.interval.15"),
+    (60, "settings.general.interval.60"),
 ];
 
 fn language_index(language: Language) -> usize {
@@ -57,14 +58,14 @@ pub(super) fn render(
     let mut page = div().flex().flex_col();
 
     page = page.child(heading(
-        "General",
-        "Startup, updates and safety prompts. Applies to every repository.",
+        ui::t!("settings.page.general"),
+        ui::t!("settings.general.subtitle"),
     ));
     if view.language_changed {
         page = page.child(
             div().max_w(px(760.)).mb(px(12.)).child(
-                Banner::new(BannerKind::Info, "Restart required")
-                    .body("The interface language changes the next time GitWarp starts."),
+                Banner::new(BannerKind::Info, ui::t!("settings.general.restart_title"))
+                    .body(ui::t!("settings.general.restart_body")),
             ),
         );
     }
@@ -89,7 +90,11 @@ pub(super) fn render(
         let entity = cx.entity();
         form::segmented(
             "settings-launch".into(),
-            ["Last repository", "Welcome", "Nothing"],
+            [
+                ui::t!("settings.general.launch.last"),
+                ui::t!("settings.general.launch.welcome"),
+                ui::t!("settings.general.launch.nothing"),
+            ],
             launch_index(settings.on_launch),
             false,
             move |index, _, cx| {
@@ -122,7 +127,10 @@ pub(super) fn render(
         let entity = cx.entity();
         form::segmented(
             "settings-channel".into(),
-            ["Stable", "Beta"],
+            [
+                ui::t!("settings.general.channel.stable"),
+                ui::t!("settings.general.channel.beta"),
+            ],
             usize::from(settings.update_channel == UpdateChannel::Beta),
             !settings.check_updates,
             move |index, _, cx| {
@@ -155,7 +163,7 @@ pub(super) fn render(
         let entity = cx.entity();
         form::select(
             "settings-fetch-interval".into(),
-            INTERVALS.iter().map(|(_, label)| *label),
+            INTERVALS.iter().map(|(_, key)| ui::i18n::t(key)),
             interval_index(settings.fetch_interval_minutes),
             !settings.background_fetch,
             move |index, _, cx| {
@@ -168,41 +176,41 @@ pub(super) fn render(
     };
 
     page = page.child(group(
-        "Startup",
+        ui::t!("settings.general.group.startup"),
         vec![
             form::row(
                 "settings-language-row",
-                "Language",
-                "Interface language.",
+                ui::t!("settings.general.language.title"),
+                ui::t!("settings.general.language.desc"),
                 language,
                 false,
             ),
             form::row(
                 "settings-launch-row",
-                "On launch",
-                "What opens when GitWarp starts.",
+                ui::t!("settings.general.launch.title"),
+                ui::t!("settings.general.launch.desc"),
                 launch,
                 false,
             ),
         ],
     ));
     page = page.child(group(
-        "Updates",
+        ui::t!("settings.general.group.updates"),
         vec![
             form::row(
                 "settings-updates-row",
-                "Check for updates automatically",
-                "GitWarp downloads updates in the background and asks before installing.",
+                ui::t!("settings.general.updates.title"),
+                ui::t!("settings.general.updates.desc"),
                 update_switch,
                 false,
             ),
             form::row(
                 "settings-channel-row",
-                "Update channel",
+                ui::t!("settings.general.channel.title"),
                 if settings.check_updates {
-                    "Beta builds ship weekly and may contain regressions."
+                    ui::t!("settings.general.channel.desc_on")
                 } else {
-                    "Turn on automatic updates to pick a channel."
+                    ui::t!("settings.general.channel.desc_off")
                 },
                 channel,
                 !settings.check_updates,
@@ -210,22 +218,22 @@ pub(super) fn render(
         ],
     ));
     page = page.child(group(
-        "Background fetch",
+        ui::t!("settings.general.group.fetch"),
         vec![
             form::row(
                 "settings-fetch-row",
-                "Fetch remotes automatically",
-                "Keeps ahead/behind counts and the graph current without touching your working tree.",
+                ui::t!("settings.general.fetch.title"),
+                ui::t!("settings.general.fetch.desc"),
                 fetch_switch,
                 false,
             ),
             form::row(
                 "settings-interval-row",
-                "Interval",
+                ui::t!("settings.general.interval.title"),
                 if settings.background_fetch {
-                    "Fetch pauses while the window is in the background."
+                    ui::t!("settings.general.interval.desc_on")
                 } else {
-                    "Automatic fetch is off."
+                    ui::t!("settings.general.interval.desc_off")
                 },
                 interval,
                 !settings.background_fetch,
@@ -237,27 +245,27 @@ pub(super) fn render(
     for (id, title, description, value) in [
         (
             "settings-confirm-force",
-            "Force push",
-            "Rewrites remote history; always shows which commits will be lost.",
+            ui::t!("settings.general.confirm.force.title"),
+            ui::t!("settings.general.confirm.force.desc"),
             settings.confirm_force_push,
         ),
         (
             "settings-confirm-discard",
-            "Discarding changes",
-            "Discarded edits cannot be recovered.",
+            ui::t!("settings.general.confirm.discard.title"),
+            ui::t!("settings.general.confirm.discard.desc"),
             settings.confirm_discard,
         ),
         (
             "settings-confirm-branch",
-            "Deleting a branch",
-            "Unmerged commits stay reachable from the reflog for 30 days.",
+            ui::t!("settings.general.confirm.branch.title"),
+            ui::t!("settings.general.confirm.branch.desc"),
             settings.confirm_delete_branch,
         ),
     ] {
         let entity = cx.entity();
         let control = form::checkbox(
             format!("{id}-check").into(),
-            "Confirm",
+            ui::t!("settings.general.confirm.label"),
             value,
             false,
             move |checked, _, cx| {
@@ -278,7 +286,10 @@ pub(super) fn render(
             false,
         ));
     }
-    page = page.child(group("Ask before…", confirmations));
+    page = page.child(group(
+        ui::t!("settings.general.group.confirm"),
+        confirmations,
+    ));
 
     let telemetry = {
         let entity = cx.entity();
@@ -294,11 +305,11 @@ pub(super) fn render(
         )
     };
     page = page.child(group(
-        "Privacy",
+        ui::t!("settings.general.group.privacy"),
         vec![form::row(
             "settings-telemetry-row",
-            "Send anonymous usage statistics",
-            "Counts of features used and crash reports. Never repository names, paths, commit messages or diffs.",
+            ui::t!("settings.general.telemetry.title"),
+            ui::t!("settings.general.telemetry.desc"),
             telemetry,
             false,
         )],
@@ -316,7 +327,7 @@ pub(super) fn render(
             .gap(px(4.))
             .text_size(ui::metrics::FS_SM)
             .child(ui::Icon::new(ui::IconName::Info).size(px(12.)))
-            .child("Settings file: ")
+            .child(ui::t!("settings.general.file_label"))
             .child(div().font_family(ui::metrics::FONT_MONO).child(path)),
     )
     .into_any_element()

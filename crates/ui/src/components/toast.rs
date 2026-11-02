@@ -284,7 +284,7 @@ fn render_toast(toast: &Toast, colors: ThemeColors, shadows: Vec<gpui::BoxShadow
             ))
             .icon_only(IconName::X)
             .size(ButtonSize::Xs)
-            .tooltip("Dismiss")
+            .tooltip(crate::i18n::t("kit.toast.dismiss"))
             .on_click(move |_, window, cx| {
                 dismiss(id, window, cx);
             }),

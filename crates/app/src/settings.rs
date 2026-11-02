@@ -408,8 +408,10 @@ pub enum DateFormat {
     Absolute,
 }
 
-/// The interface language. Only English is translated so far; the choice is
-/// stored and announced as a restart change, like the design does.
+/// The interface language. The saved choice is handed to `ui::i18n::set_language`
+/// once at startup (see `main.rs`), so a change takes effect after a restart, like
+/// the design announces. Languages whose catalog is still empty fall back to English
+/// text key by key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Language {
@@ -423,6 +425,18 @@ pub enum Language {
 }
 
 impl Language {
+    /// The catalog code understood by `ui::i18n::set_language`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Language::En => "en",
+            Language::De => "de",
+            Language::Fr => "fr",
+            Language::Es => "es",
+            Language::Ru => "ru",
+            Language::Ja => "ja",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Language::En => "English",
@@ -496,13 +510,13 @@ impl MergeTool {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> gpui::SharedString {
         match self {
-            MergeTool::Builtin => "GitWarp (built-in)",
-            MergeTool::VsCode => "VS Code",
-            MergeTool::Vimdiff => "vimdiff",
-            MergeTool::Meld => "Meld",
-            MergeTool::Custom => "Custom command…",
+            MergeTool::Builtin => ui::t!("settings.merge_tool.builtin"),
+            MergeTool::VsCode => "VS Code".into(),
+            MergeTool::Vimdiff => "vimdiff".into(),
+            MergeTool::Meld => "Meld".into(),
+            MergeTool::Custom => ui::t!("settings.merge_tool.custom"),
         }
     }
 }

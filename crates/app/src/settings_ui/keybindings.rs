@@ -20,104 +20,124 @@ use super::{heading, SettingsView};
 pub struct Action {
     pub id: &'static str,
     pub group: &'static str,
+    /// Catalog key of the action's display name; see [`Action::title`].
     pub name: &'static str,
     pub default: &'static str,
+}
+
+impl Action {
+    /// The translated display name.
+    pub fn title(&self) -> gpui::SharedString {
+        ui::i18n::t(self.name)
+    }
 }
 
 pub const ACTIONS: [Action; 15] = [
     Action {
         id: "palette",
         group: "General",
-        name: "Command palette",
+        name: "settings.keybindings.action.palette",
         default: "ctrl-p",
     },
     Action {
         id: "search",
         group: "General",
-        name: "Search commits",
+        name: "settings.keybindings.action.search",
         default: "ctrl-k",
     },
     Action {
         id: "settings",
         group: "General",
-        name: "Open settings",
+        name: "settings.keybindings.action.settings",
         default: "ctrl-,",
     },
     Action {
         id: "sidebar",
         group: "View",
-        name: "Toggle sidebar",
+        name: "settings.keybindings.action.sidebar",
         default: "ctrl-b",
     },
     Action {
         id: "dock",
         group: "View",
-        name: "Toggle details dock",
+        name: "settings.keybindings.action.dock",
         default: "ctrl-j",
     },
     Action {
         id: "branch",
         group: "Repository",
-        name: "Switch branch",
+        name: "settings.keybindings.action.branch",
         default: "ctrl-shift-b",
     },
     Action {
         id: "worktree_switcher",
         group: "Repository",
-        name: "Switch worktree",
+        name: "settings.keybindings.action.worktree_switcher",
         default: "ctrl-alt-w",
     },
     Action {
         id: "fetch",
         group: "Repository",
-        name: "Fetch",
+        name: "settings.keybindings.action.fetch",
         default: "ctrl-shift-f",
     },
     Action {
         id: "pull",
         group: "Repository",
-        name: "Pull",
+        name: "settings.keybindings.action.pull",
         default: "ctrl-shift-l",
     },
     Action {
         id: "push",
         group: "Repository",
-        name: "Push",
+        name: "settings.keybindings.action.push",
         default: "ctrl-shift-p",
     },
     Action {
         id: "next",
         group: "History",
-        name: "Next commit",
+        name: "settings.keybindings.action.next",
         default: "j",
     },
     Action {
         id: "prev",
         group: "History",
-        name: "Previous commit",
+        name: "settings.keybindings.action.prev",
         default: "k",
     },
     Action {
         id: "stage",
         group: "Changes",
-        name: "Stage / unstage file",
+        name: "settings.keybindings.action.stage",
         default: "space",
     },
     Action {
         id: "commit",
         group: "Changes",
-        name: "Commit",
+        name: "settings.keybindings.action.commit",
         default: "ctrl-enter",
     },
     Action {
         id: "discard",
         group: "Changes",
-        name: "Discard changes",
+        name: "settings.keybindings.action.discard",
         default: "ctrl-shift-z",
     },
 ];
 
+/// Group ids; `Action::group` and the filter compare these, never the label.
 const GROUPS: [&str; 6] = ["All", "General", "View", "Repository", "History", "Changes"];
+
+fn group_label(id: &str) -> gpui::SharedString {
+    match id {
+        "All" => ui::t!("settings.keybindings.group.all"),
+        "General" => ui::t!("settings.keybindings.group.general"),
+        "View" => ui::t!("settings.keybindings.group.view"),
+        "Repository" => ui::t!("settings.keybindings.group.repository"),
+        "History" => ui::t!("settings.keybindings.group.history"),
+        _ => ui::t!("settings.keybindings.group.changes"),
+    }
+}
 
 /// A captured shortcut that another action already uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,7 +177,7 @@ pub fn key_cap(cx: &gpui::App, id: &str) -> Option<String> {
 /// Formats the stored GPUI syntax as the design's `Ctrl + Shift + B` caps.
 pub fn display(keys: &str) -> String {
     if keys.is_empty() {
-        return "Unbound".to_owned();
+        return ui::t!("settings.keybindings.unbound").to_string();
     }
     keys.split('-')
         .map(|part| match part {
@@ -192,7 +212,10 @@ pub fn display(keys: &str) -> String {
 
 fn kbd_caps(keys: &str) -> AnyElement {
     if keys.is_empty() {
-        return div().text_size(FS_SM).child("Unbound").into_any_element();
+        return div()
+            .text_size(FS_SM)
+            .child(ui::t!("settings.keybindings.unbound"))
+            .into_any_element();
     }
     let mut row = div().flex().items_center().gap(px(4.));
     for (index, part) in keys.split('-').enumerate() {
@@ -281,7 +304,7 @@ impl SettingsView {
             self.kb_conflict = Some(Conflict {
                 id,
                 keys,
-                other: other.name,
+                other: other.name, // catalog key, translated where shown
                 other_id: other.id,
             });
             cx.notify();
@@ -323,7 +346,7 @@ impl SettingsView {
 
     fn reset_all(&mut self, cx: &mut Context<Self>) {
         self.change(cx, |settings| settings.keybindings.clear());
-        self.kb_flash = Some("All shortcuts reset to defaults".into());
+        self.kb_flash = Some(ui::t!("settings.keybindings.reset_done"));
         self.kb_recording = None;
         self.kb_conflict = None;
     }
@@ -331,12 +354,16 @@ impl SettingsView {
     fn export(&mut self, cx: &mut Context<Self>) {
         let settings = self.settings(cx);
         let Some(dir) = crate::settings::config_dir() else {
-            self.kb_flash = Some("No configuration directory to export to".into());
+            self.kb_flash = Some(ui::t!("settings.keybindings.no_config_dir"));
             cx.notify();
             return;
         };
         if let Err(error) = std::fs::create_dir_all(&dir) {
-            self.kb_flash = Some(format!("Could not create {}: {error}", dir.display()).into());
+            self.kb_flash = Some(ui::t!(
+                "settings.keybindings.create_failed",
+                path = dir.display(),
+                error = error
+            ));
             cx.notify();
             return;
         }
@@ -352,13 +379,14 @@ impl SettingsView {
         }
         let result =
             std::fs::File::create(&path).and_then(|mut file| file.write_all(out.as_bytes()));
-        self.kb_flash = Some(
-            match result {
-                Ok(()) => format!("Saved to {}", path.display()),
-                Err(error) => format!("Could not write {}: {error}", path.display()),
-            }
-            .into(),
-        );
+        self.kb_flash = Some(match result {
+            Ok(()) => ui::t!("settings.keybindings.saved", path = path.display()),
+            Err(error) => ui::t!(
+                "settings.keybindings.write_failed",
+                path = path.display(),
+                error = error
+            ),
+        });
         cx.notify();
     }
 }
@@ -378,7 +406,7 @@ pub(super) fn render(
         .filter(|action| group == "All" || action.group == group)
         .filter(|action| {
             query.is_empty()
-                || action.name.to_lowercase().contains(&query)
+                || action.title().to_lowercase().contains(&query)
                 || current(&settings, action).to_lowercase().contains(&query)
         })
         .collect();
@@ -386,8 +414,8 @@ pub(super) fn render(
 
     let mut page = div().flex().flex_col();
     page = page.child(heading(
-        "Keybindings",
-        "Click the pencil, then press the shortcut you want. Esc cancels, Backspace unbinds.",
+        ui::t!("settings.page.keybindings"),
+        ui::t!("settings.keybindings.subtitle"),
     ));
 
     let search = div()
@@ -399,7 +427,7 @@ pub(super) fn render(
         let entity = cx.entity();
         form::select(
             "settings-kb-group".into(),
-            GROUPS,
+            GROUPS.iter().map(|id| group_label(id)),
             view.kb_group,
             false,
             move |index, _, cx| {
@@ -413,7 +441,7 @@ pub(super) fn render(
     let reset_all = {
         let entity = cx.entity();
         Button::new("settings-kb-reset-all")
-            .label("Reset all")
+            .label(ui::t!("settings.keybindings.reset_all"))
             .disabled(changed == 0)
             .on_click(move |_, _, cx| {
                 entity.update(cx, |view, cx| view.reset_all(cx));
@@ -423,7 +451,7 @@ pub(super) fn render(
         let entity = cx.entity();
         Button::new("settings-kb-export")
             .icon(IconName::Copy)
-            .label("Export")
+            .label(ui::t!("settings.keybindings.export"))
             .on_click(move |_, _, cx| {
                 entity.update(cx, |view, cx| view.export(cx));
             })
@@ -455,16 +483,20 @@ pub(super) fn render(
             .mb(px(6.))
             .text_size(FS_SM)
             .text_color(colors.muted)
-            .child(format!(
-                "{} of {} actions{}",
-                rows.len(),
-                ACTIONS.len(),
-                if changed > 0 {
-                    format!(" · {changed} modified")
-                } else {
-                    String::new()
-                }
-            )),
+            .child(if changed > 0 {
+                ui::t!(
+                    "settings.keybindings.count_modified",
+                    shown = rows.len(),
+                    total = ACTIONS.len(),
+                    changed = changed
+                )
+            } else {
+                ui::t!(
+                    "settings.keybindings.count",
+                    shown = rows.len(),
+                    total = ACTIONS.len()
+                )
+            }),
     );
 
     let mut list = div()
@@ -483,7 +515,7 @@ pub(super) fn render(
                 .text_center()
                 .text_size(FS_SM)
                 .text_color(colors.muted)
-                .child(format!("No actions match “{query}”.")),
+                .child(ui::t!("settings.keybindings.no_match", query = query)),
         );
     }
     for action in &rows {
@@ -513,13 +545,13 @@ pub(super) fn render(
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .child(div().text_size(FS_BASE).child(action.name))
+                    .child(div().text_size(FS_BASE).child(action.title()))
                     .when(modified, |this| {
                         this.child(
                             div()
                                 .text_size(px(11.))
                                 .text_color(colors.muted)
-                                .child("· modified"),
+                                .child(ui::t!("settings.keybindings.modified")),
                         )
                     }),
             )
@@ -534,7 +566,7 @@ pub(super) fn render(
                             div()
                                 .text_size(FS_SM)
                                 .text_color(colors.muted)
-                                .child("Press the new shortcut…"),
+                                .child(ui::t!("settings.keybindings.press_new")),
                         )
                     })
                     .when(!recording, |this| this.child(kbd_caps(&keys))),
@@ -552,7 +584,7 @@ pub(super) fn render(
                             Button::ghost(format!("settings-kb-edit-{}", action.id))
                                 .icon_only(IconName::Edit)
                                 .size(ButtonSize::Small)
-                                .tooltip("Change shortcut")
+                                .tooltip(ui::t!("settings.keybindings.change"))
                                 .on_click(move |_, _, cx| {
                                     entity.update(cx, |view, cx| view.start_recording(id, cx));
                                 }),
@@ -564,7 +596,7 @@ pub(super) fn render(
                                 Button::ghost(format!("settings-kb-reset-{}", action.id))
                                     .icon_only(IconName::Undo)
                                     .size(ButtonSize::Small)
-                                    .tooltip("Reset to default")
+                                    .tooltip(ui::t!("settings.keybindings.reset_one"))
                                     .on_click(move |_, _, cx| {
                                         entity.update(cx, |view, cx| {
                                             view.change(cx, |settings| {
@@ -580,7 +612,7 @@ pub(super) fn render(
                         this.child(
                             Button::new(format!("settings-kb-cancel-{}", action.id))
                                 .size(ButtonSize::Small)
-                                .label("Cancel")
+                                .label(ui::t!("settings.keybindings.cancel"))
                                 .on_click(move |_, _, cx| {
                                     entity.update(cx, |view, cx| {
                                         view.kb_recording = None;
@@ -603,15 +635,15 @@ pub(super) fn render(
                 .text_size(FS_SM)
                 .text_color(colors.error)
                 .child(Icon::new(IconName::Err).size(px(12.)).color(colors.error))
-                .child(format!(
-                    "{} is already used by “{}”.",
-                    display(&conflict.keys),
-                    conflict.other
+                .child(ui::t!(
+                    "settings.keybindings.conflict",
+                    keys = display(&conflict.keys),
+                    other = ui::i18n::t(conflict.other)
                 ))
                 .child(
                     Button::new("settings-kb-conflict-reassign")
                         .size(ButtonSize::Small)
-                        .label("Reassign here")
+                        .label(ui::t!("settings.keybindings.reassign"))
                         .on_click({
                             let conflict = conflict.clone();
                             move |_, _, cx| {
@@ -624,7 +656,7 @@ pub(super) fn render(
                 .child(
                     Button::new("settings-kb-conflict-cancel")
                         .size(ButtonSize::Small)
-                        .label("Cancel")
+                        .label(ui::t!("settings.keybindings.cancel"))
                         .on_click({
                             let entity = cx.entity();
                             move |_, _, cx| {

@@ -10,6 +10,7 @@ pub mod assets;
 pub mod components;
 pub mod focus;
 pub mod fonts;
+pub mod i18n;
 pub mod icon;
 pub mod metrics;
 pub mod overlay;
