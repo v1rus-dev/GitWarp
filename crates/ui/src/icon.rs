@@ -1,4 +1,6 @@
-//! The icon set: one 16px stroke family, embedded as SVG assets.
+//! The icon set, embedded as SVG assets: Primer Octicons 16px (MIT, see
+//! `assets/icons/OCTICONS-LICENSE`), plus our own git, keyboard, command and
+//! window-control glyphs, which Octicons does not have.
 
 use gpui::{px, svg, App, Hsla, IntoElement, Pixels, RenderOnce, Styled, Window};
 
