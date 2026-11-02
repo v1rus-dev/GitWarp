@@ -9,11 +9,27 @@ use crate::{known_kind_for_host, Instance, RepoCoords, ServiceKind};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 use ureq::config::Config;
 use ureq::http::Response;
 use ureq::tls::{RootCerts, TlsConfig};
 use ureq::{Agent, Body};
+
+mod checks;
+mod net;
+mod pulls;
+mod repos_write;
+
+pub use checks::{commit_checks, Check, CiState, CommitChecks};
+pub use net::{Auth, ETagCache};
+pub use pulls::{
+    list_pull_requests, pull_request_review, pull_requests_for_branches, PrFilter, PrState,
+    PrStateFilter, PullPage, PullRequest, ReviewState,
+};
+pub use repos_write::{
+    create_pull_request, pull_request_head_ref, CreatedPullRequest, NewPullRequest,
+};
 
 /// Profile endpoint of Azure DevOps (a single global service, not per organization).
 const AZURE_PROFILE_URL: &str =
@@ -43,6 +59,15 @@ pub enum ApiError {
     Status(u16),
     /// The response body was not what the service documents.
     Decode(String),
+    /// The service (Bitbucket, Azure DevOps) has no implementation of this call.
+    Unsupported,
+    /// A pull / merge request for this head and base already exists.
+    AlreadyExists {
+        number: u64,
+        web_url: String,
+    },
+    /// The service refused the request (HTTP 400 / 422) and said why.
+    Rejected(String),
 }
 
 impl fmt::Display for ApiError {
@@ -63,6 +88,14 @@ impl fmt::Display for ApiError {
                 write!(f, "Unexpected response from the service (HTTP {code})")
             }
             ApiError::Decode(why) => write!(f, "Unexpected answer from the service: {why}"),
+            ApiError::Unsupported => f.write_str("Not supported for this service yet"),
+            ApiError::AlreadyExists { number, .. } => {
+                write!(
+                    f,
+                    "A pull request already exists for this branch (#{number})"
+                )
+            }
+            ApiError::Rejected(why) => write!(f, "The service rejected the request: {why}"),
         }
     }
 }
@@ -107,6 +140,8 @@ pub struct TokenCheck {
 #[derive(Clone)]
 pub struct Client {
     agent: Agent,
+    /// Shared by clones: conditional-request cache of the PR / CI reads.
+    etags: Arc<ETagCache>,
 }
 
 impl fmt::Debug for Client {
@@ -137,6 +172,7 @@ impl Client {
             .build();
         Client {
             agent: config.into(),
+            etags: Arc::default(),
         }
     }
 
@@ -195,12 +231,24 @@ fn header_str<'a>(response: &'a Response<Body>, name: &str) -> Option<&'a str> {
 
 fn check_status(response: Response<Body>) -> Result<Response<Body>, ApiError> {
     let status = response.status().as_u16();
-    let reset_at =
-        || header_str(&response, "x-ratelimit-reset").and_then(|v| v.trim().parse().ok());
+    // GitHub / Gitea `X-RateLimit-Reset`, GitLab `RateLimit-Reset` (Unix time),
+    // else `Retry-After` seconds (GitHub secondary limits).
+    let reset_at = || {
+        header_str(&response, "x-ratelimit-reset")
+            .or_else(|| header_str(&response, "ratelimit-reset"))
+            .and_then(|v| v.trim().parse().ok())
+            .or_else(|| {
+                header_str(&response, "retry-after")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(|secs| net::now_unix() + secs)
+            })
+    };
     match status {
         200..=299 => Ok(response),
         401 => Err(ApiError::Unauthorized),
-        403 if header_str(&response, "x-ratelimit-remaining").map(str::trim) == Some("0") => {
+        403 if header_str(&response, "x-ratelimit-remaining").map(str::trim) == Some("0")
+            || header_str(&response, "retry-after").is_some() =>
+        {
             Err(ApiError::RateLimited {
                 reset_at: reset_at(),
             })
@@ -541,3 +589,5 @@ pub(crate) fn base64(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_hapi;
