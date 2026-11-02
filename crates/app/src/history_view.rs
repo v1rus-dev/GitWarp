@@ -31,7 +31,7 @@ use ui::{
 };
 
 use crate::format::{format_count, relative_time};
-use crate::graph_paint::paint_row;
+use crate::graph_paint::{content_width, lane_centre, overdraw_mask_bounds, paint_row};
 use crate::history_search::{self, Query};
 use crate::history_state::{
     percent_text, progress_fraction, skeleton_percent, source_label, Failure, LoadState,
@@ -415,7 +415,11 @@ pub fn fit_width(graph_width: f32) -> f32 {
 /// the `N` of the header's "+N" pill. `column_width` is the effective column
 /// width, not the raw user setting (the pane's share may have narrowed it).
 pub fn clipped_lanes(geometry: &ColumnGeometry, column_width: f32) -> usize {
-    geometry.xs.iter().filter(|&&x| x > column_width).count()
+    geometry
+        .xs
+        .iter()
+        .filter(|&&x| lane_centre(x) > column_width)
+        .count()
 }
 
 struct Item {
@@ -1311,7 +1315,7 @@ impl HistoryView {
     /// Fits the graph column to the current geometry and persists the width.
     /// Used by the grip's double-click, the "+N" pill and the context menu.
     fn fit_graph(&mut self, cx: &mut Context<Self>) {
-        let width = fit_width(self.geometry.width);
+        let width = fit_width(content_width(&self.geometry));
         self.graph_width = width;
         crate::update_settings(cx, move |settings| settings.graph_width = width);
         cx.notify();
@@ -2114,7 +2118,12 @@ impl HistoryView {
                             move |bounds, _, window, _| {
                                 // Clip to the graph column so lanes past its
                                 // edge are cut instead of drawn over Summary.
-                                window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                // The mask is 1 px taller at top and bottom so
+                                // the lanes' vertical overdraw survives.
+                                let mask = ContentMask {
+                                    bounds: overdraw_mask_bounds(bounds),
+                                };
+                                window.with_content_mask(Some(mask), |window| {
                                     paint_row(
                                         &row,
                                         ix,
@@ -3341,10 +3350,12 @@ mod tests {
             folded_count: 0,
         };
         // A centre exactly on the edge is not clipped.
+        // (the painted centres are 9, 23, 37, 51 with the 2 px inset).
         assert_eq!(clipped_lanes(&geometry, 56.), 0);
+        assert_eq!(clipped_lanes(&geometry, 51.), 0);
         assert_eq!(clipped_lanes(&geometry, 28.), 2);
-        assert_eq!(clipped_lanes(&geometry, 21.), 2);
-        assert_eq!(clipped_lanes(&geometry, 7.), 3);
+        assert_eq!(clipped_lanes(&geometry, 23.), 2);
+        assert_eq!(clipped_lanes(&geometry, 9.), 3);
     }
 
     #[test]

@@ -15,8 +15,8 @@ use gpui::{
 use ui::Theme;
 
 use crate::theme::{
-    DOT_HALO_RADIUS, DOT_RADIUS, GRAPH_FADE_WIDTH, HEAD_RING_RADIUS, HEAD_RING_WIDTH,
-    MERGE_INNER_RADIUS,
+    DOT_HALO_RADIUS, DOT_RADIUS, GRAPH_FADE_WIDTH, GRAPH_INSET, HEAD_RING_RADIUS, HEAD_RING_WIDTH,
+    LANE_OVERDRAW, MERGE_INNER_RADIUS,
 };
 
 /// A dot whose centre is further than this past the column edge is not drawn.
@@ -24,6 +24,30 @@ const DOT_CLIP_MARGIN: f32 = 6.;
 /// Dash pattern of a folded lane: 2 px on, 3 px off.
 const DASH_ON: f32 = 2.;
 const DASH_PERIOD: f32 = 5.;
+
+/// Pixel x of a column's centre inside the graph column: the geometry's x plus
+/// the left inset.
+pub fn lane_centre(x: f32) -> f32 {
+    x + GRAPH_INSET
+}
+
+/// Content width of the graph: the geometry's width plus the left inset.
+pub fn content_width(geometry: &ColumnGeometry) -> f32 {
+    geometry.width + GRAPH_INSET
+}
+
+/// The graph cell's paint mask: the cell's bounds extended vertically by the
+/// lane overdraw, so the 1 px a straight lane runs past its row is not clipped.
+/// Horizontally the mask stays at the cell's edges (the right-edge clip/fade).
+pub fn overdraw_mask_bounds(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    Bounds::new(
+        point(bounds.origin.x, bounds.origin.y - px(LANE_OVERDRAW)),
+        gpui::size(
+            bounds.size.width,
+            bounds.size.height + px(2. * LANE_OVERDRAW),
+        ),
+    )
+}
 
 /// Paints one row. `background` is the row's current fill (`bg`, `hover` or
 /// `selection`): it colours the dot halo and the merge ring's interior, and it
@@ -45,8 +69,10 @@ pub fn paint_row(
     let top = bounds.origin.y;
     let mid = top + bounds.size.height / 2.;
     let bottom = top + bounds.size.height;
+    // Straight lane segments overdraw their row by 1 px at both ends.
+    let overdraw = px(LANE_OVERDRAW);
     let origin_x = bounds.origin.x;
-    let x_of = |col: usize| geometry.xs.get(col).map(|x| origin_x + px(*x));
+    let x_of = |col: usize| geometry.xs.get(col).map(|x| origin_x + px(lane_centre(*x)));
     let local_x = |x: Pixels| f32::from(x - origin_x);
     let lane = |col: usize| {
         if colored {
@@ -92,8 +118,8 @@ pub fn paint_row(
             straight(
                 window,
                 line_width,
-                point(x, top),
-                point(x, bottom),
+                point(x, top - overdraw),
+                point(x, bottom + overdraw),
                 lane(segment.from),
             );
         }
@@ -111,7 +137,13 @@ pub fn paint_row(
         let color = lane(segment_column(true, segment));
         if segment.from == segment.to {
             if vertical_visible(local_x(x0), cw) {
-                straight(window, line_width, point(x0, top), point(x0, mid), color);
+                straight(
+                    window,
+                    line_width,
+                    point(x0, top - overdraw),
+                    point(x0, mid),
+                    color,
+                );
             }
         } else {
             let Some(x1) = x_of(segment.to) else {
@@ -135,7 +167,13 @@ pub fn paint_row(
         let color = lane(segment_column(false, segment));
         if segment.from == segment.to {
             if vertical_visible(local_x(x0), cw) {
-                straight(window, line_width, point(x0, mid), point(x0, bottom), color);
+                straight(
+                    window,
+                    line_width,
+                    point(x0, mid),
+                    point(x0, bottom + overdraw),
+                    color,
+                );
             }
         } else {
             let Some(x1) = x_of(segment.to) else {
@@ -175,7 +213,7 @@ pub fn paint_row(
     }
 
     // A graph wider than the column fades out over its last 20 px.
-    if geometry.width > cw {
+    if content_width(geometry) > cw {
         let fade = f32::from(GRAPH_FADE_WIDTH).min(cw);
         let fade_bounds = Bounds::from_corners(
             point(origin_x + px(cw - fade), top),
@@ -349,6 +387,49 @@ mod tests {
 
     fn segment(from: usize, to: usize) -> Segment {
         Segment { from, to, color: 0 }
+    }
+
+    fn geometry(xs: Vec<f32>, width: f32) -> ColumnGeometry {
+        let lanes = xs.len();
+        ColumnGeometry {
+            xs,
+            folded: vec![false; lanes],
+            width,
+            folded_count: 0,
+        }
+    }
+
+    #[test]
+    fn lane_zero_centre_is_nine() {
+        // git-graph puts lane 0 at 7; the 2 px inset makes it 9.
+        assert_eq!(lane_centre(7.), 9.);
+        assert_eq!(lane_centre(21.), 23.);
+    }
+
+    #[test]
+    fn content_width_is_lanes_times_14_plus_inset() {
+        for n in [1_usize, 3, 10] {
+            let g = geometry(
+                (0..n).map(|i| 14. * i as f32 + 7.).collect(),
+                n as f32 * 14.,
+            );
+            assert_eq!(content_width(&g), n as f32 * 14. + 2.);
+        }
+    }
+
+    #[test]
+    fn fit_width_includes_the_inset() {
+        // Three lanes: 42 + 2 inset + 8 pad.
+        let g = geometry(vec![7., 21., 35.], 42.);
+        assert_eq!(crate::history_view::fit_width(content_width(&g)), 52.);
+    }
+
+    #[test]
+    fn mask_extends_one_px_vertically_only() {
+        let b = Bounds::new(point(px(10.), px(20.)), gpui::size(px(100.), px(26.)));
+        let m = overdraw_mask_bounds(b);
+        assert_eq!(m.origin, point(px(10.), px(19.)));
+        assert_eq!(m.size, gpui::size(px(100.), px(28.)));
     }
 
     #[test]
