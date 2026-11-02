@@ -470,7 +470,7 @@ pub struct RepositoryView {
 
 /// What the status bar and the toolbar show while git is talking to a remote.
 struct NetworkActivity {
-    verb: &'static str,
+    verb: SharedString,
     detail: SharedString,
     progress: Option<f32>,
 }
@@ -4040,7 +4040,7 @@ impl RepositoryView {
                     .items_center()
                     .gap(px(8.))
                     .child(Spinner::new("network-status-spinner", px(12.)))
-                    .child(network.verb)
+                    .child(network.verb.clone())
                     .child(div().max_w(px(260.)).truncate().child(detail)),
             );
             bar = bar.child(match network.progress {

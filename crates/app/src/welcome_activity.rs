@@ -317,9 +317,9 @@ impl WelcomeActivity {
         // The menu opens at the pointer: the heatmap reports the day, not the
         // cell's bounds.
         let mut menu_entries = vec![MenuEntry::Item(
-            MenuItem::new(format!(
-                "{} — open with History filtered to this day",
-                long_date(day)
+            MenuItem::new(ui::t!(
+                "welcome.activity.day_menu_header",
+                date = long_date(day)
             ))
             .disabled(true),
         )];
@@ -433,7 +433,7 @@ fn count_repo(
     cached: Option<&CacheEntry>,
 ) -> Result<CacheEntry, String> {
     if !path.is_dir() {
-        return Err("the folder does not exist".to_owned());
+        return Err(ui::t!("welcome.activity.folder_missing").to_string());
     }
     let stamp = head_stamp(path);
     if let Some(cached) = cached {
@@ -529,33 +529,37 @@ impl Render for WelcomeActivity {
         let head = if me.is_none() && !me_loading {
             None
         } else if unreachable.is_some() {
-            Some(line().child("Unavailable").into_any_element())
+            Some(
+                line()
+                    .child(ui::t!("welcome.activity.unavailable"))
+                    .into_any_element(),
+            )
         } else if skeleton {
             Some(Skeleton::new("welcome-activity-total", px(180.)).into_any_element())
         } else if pending {
             Some(
                 line()
                     .child(Icon::new(IconName::Fetch).size(px(12.)).color(colors.muted))
-                    .child("Counting…")
+                    .child(ui::t!("welcome.activity.counting"))
                     .child(strong(format_count(total)))
-                    .child("commits so far")
+                    .child(ui::t!("welcome.activity.so_far"))
                     .into_any_element(),
             )
         } else if total == 0 {
             Some(
                 line()
-                    .child("No commits by you in the last year")
+                    .child(ui::t!("welcome.activity.none_last_year"))
                     .into_any_element(),
             )
         } else {
             Some(
                 line()
                     .child(strong(format_count(total)))
-                    .child(if total == 1 {
-                        "commit by you in the last year"
-                    } else {
-                        "commits by you in the last year"
-                    })
+                    .child(ui::i18n::t_count(
+                        "welcome.activity.commits_last_year",
+                        total as u64,
+                        &[],
+                    ))
                     .into_any_element(),
             )
         };
@@ -568,22 +572,24 @@ impl Render for WelcomeActivity {
             .count();
         let selected_name: SharedString = match &self.selected {
             Some(path) => recent_name(path).into(),
-            None => "Selected".into(),
+            None => ui::t!("welcome.activity.selected"),
         };
         let scope_switch = Segmented::new("welcome-activity-scope")
             .small()
             .item(
-                SegmentItem::new("All recent")
+                SegmentItem::new(ui::t!("welcome.activity.all_recent"))
                     .id("welcome-activity-all")
-                    .tooltip(format!(
-                        "Your commits in the {reachable} reachable recent repositories"
+                    .tooltip(ui::i18n::t_count(
+                        "welcome.activity.all_tooltip",
+                        reachable as u64,
+                        &[],
                     )),
             )
             .item(
                 SegmentItem::new(selected_name)
                     .id("welcome-activity-selected")
                     .disabled(self.selected.is_none())
-                    .tooltip("Follows the selected row"),
+                    .tooltip(ui::t!("welcome.activity.selected_tooltip")),
             )
             .selected(usize::from(scope == Scope::Selected))
             .on_select({
@@ -609,7 +615,7 @@ impl Render for WelcomeActivity {
                 div()
                     .text_size(FS_LG)
                     .font_weight(FontWeight::BOLD)
-                    .child("Your activity"),
+                    .child(ui::t!("welcome.activity.title")),
             )
             .children(head)
             .child(div().flex_1())
@@ -640,13 +646,13 @@ impl Render for WelcomeActivity {
                 line()
                     .whitespace_normal()
                     .flex_wrap()
-                    .child("Set a global")
+                    .child(ui::t!("welcome.activity.identity_before"))
                     .child(mono("user.email".to_owned()))
-                    .child("to see your activity across repositories.")
+                    .child(ui::t!("welcome.activity.identity_after"))
                     .child(
                         Button::new("welcome-activity-identity")
                             .size(ButtonSize::Small)
-                            .label("Set identity…")
+                            .label(ui::t!("welcome.activity.set_identity"))
                             .on_click(move |_, window, cx| {
                                 view.update(cx, |this, cx| this.open_identity(window, cx));
                             }),
@@ -661,7 +667,7 @@ impl Render for WelcomeActivity {
                     .whitespace_normal()
                     .flex_wrap()
                     .child(mono(display_path(path, home.as_deref())))
-                    .child("is not reachable, so its activity can’t be counted.")
+                    .child(ui::t!("welcome.activity.unreachable"))
                     .into_any_element(),
             )
             .into_any_element()
@@ -688,32 +694,37 @@ impl Render for WelcomeActivity {
         // The footer: who, how many repositories, the legend.
         let footer_left =
             if let Some(me) = me.as_ref().filter(|_| !skeleton && unreachable.is_none()) {
-                let mut left = line().child("By").child(mono(me.clone()));
+                let mut left = line()
+                    .child(ui::t!("welcome.activity.by"))
+                    .child(mono(me.clone()));
                 if scope == Scope::All && !pending {
                     let skipped = skipped(&self.paths, &self.repos);
                     let counted = self.paths.len() - skipped.len();
                     if skipped.is_empty() {
-                        left = left.child(format!(
-                            "· {} repositor{}",
-                            self.paths.len(),
-                            if self.paths.len() == 1 { "y" } else { "ies" }
+                        left = left.child(ui::i18n::t_count(
+                            "welcome.activity.repo_count",
+                            self.paths.len() as u64,
+                            &[],
                         ));
                     } else {
-                        let tip = format!(
-                            "{} repositor{} skipped:\n{}",
-                            skipped.len(),
-                            if skipped.len() == 1 { "y" } else { "ies" },
-                            skipped
-                                .iter()
-                                .map(|(path, reason)| format!(
-                                    "{} — {reason}",
-                                    display_path(path, home.as_deref())
-                                ))
-                                .collect::<Vec<_>>()
-                                .join("\n")
+                        let list = skipped
+                            .iter()
+                            .map(|(path, reason)| {
+                                format!("{} — {reason}", display_path(path, home.as_deref()))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let tip = ui::i18n::t_count(
+                            "welcome.activity.skipped_tip",
+                            skipped.len() as u64,
+                            &[("list", &list)],
                         );
                         left = left
-                            .child(format!("· {counted} of {} repositories", self.paths.len()))
+                            .child(ui::i18n::t_count(
+                                "welcome.activity.counted_of",
+                                self.paths.len() as u64,
+                                &[("counted", &counted)],
+                            ))
                             .child(
                                 div()
                                     .id("welcome-activity-skipped")
@@ -729,7 +740,9 @@ impl Render for WelcomeActivity {
                     }
                 }
                 if !pending && total == 0 && unreachable.is_none() {
-                    left = line().child("No commits by").child(mono(me.clone()));
+                    left = line()
+                        .child(ui::t!("welcome.activity.no_commits_by"))
+                        .child(mono(me.clone()));
                 }
                 Some(left.into_any_element())
             } else {

@@ -2,10 +2,11 @@
 //! the action a history row's menu asks the shell to run, and the pure
 //! validation the dialogs use.
 //!
-//! Everything here is free of GPUI, so the names, errors and menu decisions
+//! Everything here is free of windows and views, so the names, errors and menu decisions
 //! are unit-testable without a window.
 
 use git_core::{CommitInfo, Head, Oid, Ref, RefKind};
+use gpui::SharedString;
 
 /// One ref chip on a [`CommitCard`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,14 +116,12 @@ pub fn ref_name_error(name: &str, taken: &[String]) -> Option<String> {
         return None;
     }
     if name.chars().any(char::is_whitespace) {
-        return Some("Name cannot contain spaces. Use - or / instead.".to_owned());
+        return Some(ui::t!("dialogs.ref_name.spaces").to_string());
     }
     let forbidden =
         name.contains("..") || name.contains("@{") || name.chars().any(|c| "~^:?*[\\".contains(c));
     if forbidden {
-        return Some(
-            "Name contains characters Git does not allow: .. ~ ^ : ? * [ \\ @{".to_owned(),
-        );
+        return Some(ui::t!("dialogs.ref_name.forbidden_chars").to_string());
     }
     if name.starts_with('-')
         || name.starts_with('/')
@@ -130,10 +129,10 @@ pub fn ref_name_error(name: &str, taken: &[String]) -> Option<String> {
         || name.ends_with('.')
         || name.ends_with(".lock")
     {
-        return Some("Name cannot start with - or /, or end with /, . or .lock".to_owned());
+        return Some(ui::t!("dialogs.ref_name.bad_edges").to_string());
     }
     if taken.iter().any(|existing| existing == name) {
-        return Some(format!("“{name}” already exists. Pick another name."));
+        return Some(ui::t!("dialogs.ref_name.exists", name = name).to_string());
     }
     None
 }
@@ -144,10 +143,10 @@ pub fn remote_name_error(name: &str, taken: &[String]) -> Option<String> {
         return None;
     }
     if name.chars().any(char::is_whitespace) {
-        return Some("Name cannot contain spaces.".to_owned());
+        return Some(ui::t!("dialogs.remote_name.spaces").to_string());
     }
     if taken.iter().any(|existing| existing == name) {
-        return Some(format!("Remote “{name}” already exists."));
+        return Some(ui::t!("dialogs.remote_name.exists", name = name).to_string());
     }
     None
 }
@@ -162,13 +161,11 @@ pub enum RemoteUrlKind {
 
 impl RemoteUrlKind {
     /// The phrase the protocol note uses; the dialog also colours it.
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> SharedString {
         match self {
-            RemoteUrlKind::Https => "HTTPS · uses your saved account",
-            RemoteUrlKind::Ssh => "SSH · uses your SSH keys",
-            RemoteUrlKind::Bad => {
-                "Not a Git address. Use https://host/user/repo.git or git@host:user/repo.git"
-            }
+            RemoteUrlKind::Https => ui::t!("dialogs.remote_url.https"),
+            RemoteUrlKind::Ssh => ui::t!("dialogs.remote_url.ssh"),
+            RemoteUrlKind::Bad => ui::t!("dialogs.remote_url.bad"),
         }
     }
 }

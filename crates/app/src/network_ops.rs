@@ -11,6 +11,7 @@ use git_core::network::{
 };
 use git_core::ssh::{self, HostKeyStatus};
 use git_core::{Error, Git, Repo, Result};
+use gpui::SharedString;
 
 use crate::network_service::HostKeyAsker;
 
@@ -42,36 +43,40 @@ pub enum Job {
 
 impl Job {
     /// The word shown in the status bar and in toasts.
-    pub fn verb(&self) -> &'static str {
+    pub fn verb(&self) -> SharedString {
         match self {
-            Job::Fetch(_) => "Fetching",
-            Job::Pull => "Pulling",
-            Job::Push => "Pushing",
-            Job::PushTag { .. } | Job::PushTags { .. } => "Pushing tags",
-            Job::DeleteRemoteBranch { .. } => "Deleting remote branch",
-            Job::UpdateSubmodule { .. } => "Updating submodule",
+            Job::Fetch(_) => ui::t!("network.verb.fetching"),
+            Job::Pull => ui::t!("network.verb.pulling"),
+            Job::Push => ui::t!("network.verb.pushing"),
+            Job::PushTag { .. } | Job::PushTags { .. } => ui::t!("network.verb.pushing_tags"),
+            Job::DeleteRemoteBranch { .. } => ui::t!("network.verb.deleting_remote_branch"),
+            Job::UpdateSubmodule { .. } => ui::t!("network.verb.updating_submodule"),
         }
     }
 
     /// The success line for the toast, once the job is done.
     pub fn done_message(&self, outcome: &NetworkOutcome) -> String {
         match self {
-            Job::Fetch(_) if !outcome.changed => "Already up to date".to_owned(),
-            Job::Fetch(_) => "Fetch complete".to_owned(),
+            Job::Fetch(_) if !outcome.changed => ui::t!("network.done.up_to_date").to_string(),
+            Job::Fetch(_) => ui::t!("network.done.fetch").to_string(),
             Job::Pull
                 if outcome
                     .lines
                     .iter()
                     .any(|line| line.contains("Already up to date")) =>
             {
-                "Already up to date".to_owned()
+                ui::t!("network.done.up_to_date").to_string()
             }
-            Job::Pull => "Pull complete".to_owned(),
-            Job::Push => "Pushed the current branch".to_owned(),
-            Job::PushTag { tag, .. } => format!("Pushed tag {tag}"),
-            Job::PushTags { .. } => "Pushed all tags".to_owned(),
-            Job::DeleteRemoteBranch { branch, .. } => format!("Deleted remote branch {branch}"),
-            Job::UpdateSubmodule { path } => format!("Updated submodule {path}"),
+            Job::Pull => ui::t!("network.done.pull").to_string(),
+            Job::Push => ui::t!("network.done.push").to_string(),
+            Job::PushTag { tag, .. } => ui::t!("network.done.push_tag", tag = tag).to_string(),
+            Job::PushTags { .. } => ui::t!("network.done.push_tags").to_string(),
+            Job::DeleteRemoteBranch { branch, .. } => {
+                ui::t!("network.done.delete_remote_branch", branch = branch).to_string()
+            }
+            Job::UpdateSubmodule { path } => {
+                ui::t!("network.done.update_submodule", path = path).to_string()
+            }
         }
     }
 
@@ -92,9 +97,8 @@ impl Job {
                     return Err(Error::Git {
                         command: "pull",
                         code: None,
-                        stderr: format!(
-                            "Branch {branch} has no upstream. Push it once or set an upstream."
-                        ),
+                        stderr: ui::t!("network.error.pull_no_upstream", branch = branch)
+                            .to_string(),
                     });
                 };
                 pull(
@@ -117,7 +121,7 @@ impl Job {
                             return Err(Error::Git {
                                 command: "push",
                                 code: None,
-                                stderr: "No remote is configured for this repository.".to_owned(),
+                                stderr: ui::t!("network.error.no_remote").to_string(),
                             });
                         };
                         (remote, branch, true)
@@ -159,7 +163,7 @@ pub fn current_branch(repo: &Repo) -> Result<String> {
         git_core::Head::Detached(_) => Err(Error::Git {
             command: "branch",
             code: None,
-            stderr: "HEAD is detached; check out a branch first.".to_owned(),
+            stderr: ui::t!("network.error.detached_head").to_string(),
         }),
     }
 }
@@ -214,7 +218,8 @@ pub fn preflight(urls: &[String], asker: &HostKeyAsker, cancel: &CancelToken) ->
                     return Err(Error::Git {
                         command: "ssh",
                         code: None,
-                        stderr: format!("the host key of {} was not trusted", target.host),
+                        stderr: ui::t!("network.error.host_key_not_trusted", host = target.host)
+                            .to_string(),
                     });
                 }
                 ssh::trust_host_key(&target)?;
@@ -230,7 +235,8 @@ pub fn preflight(urls: &[String], asker: &HostKeyAsker, cancel: &CancelToken) ->
                     return Err(Error::Git {
                         command: "ssh",
                         code: None,
-                        stderr: format!("the host key of {} was not replaced", target.host),
+                        stderr: ui::t!("network.error.host_key_not_replaced", host = target.host)
+                            .to_string(),
                     });
                 }
                 ssh::replace_host_key(&target)?;
@@ -389,44 +395,35 @@ pub fn friendly_error(error: &Error) -> String {
     let text = error.to_string();
     let lower = text.to_lowercase();
     if matches!(error, Error::Cancelled { .. }) {
-        return "Operation cancelled.".to_owned();
+        return ui::t!("network.friendly.cancelled").to_string();
     }
     if lower.contains("permission denied (publickey") {
-        return "The SSH key was rejected. Check that your key is loaded in ssh-agent \
-                and added to the account on the Git host."
-            .to_owned();
+        return ui::t!("network.friendly.ssh_key_rejected").to_string();
     }
     if lower.contains("host key verification failed") {
-        return "The SSH host key was not trusted, so the connection was stopped.".to_owned();
+        return ui::t!("network.friendly.host_key_untrusted").to_string();
     }
     if lower.contains("authentication failed")
         || lower.contains("could not read username")
         || lower.contains("terminal prompts disabled")
         || lower.contains("invalid username or password")
     {
-        return "Authentication failed. Check your credentials or configure a git credential \
-                helper."
-            .to_owned();
+        return ui::t!("network.friendly.auth_failed").to_string();
     }
     if lower.contains("could not resolve host") {
-        return format!(
-            "Could not resolve the host. Check the address and your connection.\n{text}"
-        );
+        return ui::t!("network.friendly.resolve_host", detail = text).to_string();
     }
     if lower.contains("connection refused")
         || lower.contains("connection timed out")
         || lower.contains("operation timed out")
     {
-        return format!("The Git host did not answer. Check your connection.\n{text}");
+        return ui::t!("network.friendly.host_unreachable", detail = text).to_string();
     }
     if lower.contains("not possible to fast-forward") || lower.contains("diverging branches") {
-        return "The branch has diverged from its upstream. Pull is fast-forward only for now; \
-                merge or rebase the branch in a terminal first."
-            .to_owned();
+        return ui::t!("network.friendly.diverged").to_string();
     }
     if lower.contains("no upstream") || lower.contains("no tracking information") {
-        return "The branch has no upstream. Push it once to create one, or set an upstream."
-            .to_owned();
+        return ui::t!("network.friendly.no_upstream").to_string();
     }
     text
 }

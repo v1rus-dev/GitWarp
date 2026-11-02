@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use gpui::{
     div, px, AnyElement, App, AppContext, ClickEvent, Context, Entity, FocusHandle, IntoElement,
-    ParentElement, Styled, Subscription, Window,
+    ParentElement, SharedString, Styled, Subscription, Window,
 };
 
 use git_core::network::FetchOptions;
@@ -248,7 +248,7 @@ impl RefDialog {
         let message = matches!(kind, RefDialogKind::CreateTag { .. }).then(|| {
             let entity = cx.new(|cx| {
                 let mut area = TextArea::new(window, cx);
-                area.set_placeholder("Release notes or a short description", cx);
+                area.set_placeholder(ui::t!("dialogs.ref.tag_message_placeholder"), cx);
                 area
             });
             subscriptions.push(cx.subscribe(&entity, |this, _, _: &TextAreaEvent, cx| {
@@ -400,15 +400,15 @@ impl RefDialog {
                 if name.is_empty() {
                     Some(
                         if matches!(self.kind, RefDialogKind::RenameWorktree { .. }) {
-                            "Enter a folder name"
+                            ui::t!("dialogs.ref.hint.folder_name")
                         } else {
-                            "Enter a branch name"
+                            ui::t!("dialogs.ref.hint.branch_name")
                         },
                     )
                 } else if name_error.is_some() {
-                    Some("Fix the name to continue")
+                    Some(ui::t!("dialogs.ref.hint.fix_name"))
                 } else if rename_unchanged {
-                    Some("Enter a new name")
+                    Some(ui::t!("dialogs.ref.hint.new_name"))
                 } else {
                     None
                 },
@@ -419,13 +419,13 @@ impl RefDialog {
                     && !rename_unchanged
                     && !(self.annotated && message.is_empty()),
                 if name.is_empty() {
-                    Some("Enter a tag name")
+                    Some(ui::t!("dialogs.ref.hint.tag_name"))
                 } else if name_error.is_some() {
-                    Some("Fix the name to continue")
+                    Some(ui::t!("dialogs.ref.hint.fix_name"))
                 } else if rename_unchanged {
-                    Some("Enter a new name")
+                    Some(ui::t!("dialogs.ref.hint.new_name"))
                 } else if self.annotated && message.is_empty() {
-                    Some("Add a message to continue")
+                    Some(ui::t!("dialogs.ref.hint.add_message"))
                 } else {
                     None
                 },
@@ -433,13 +433,13 @@ impl RefDialog {
             RefDialogKind::Remote { .. } => (
                 self.remote_valid(&name, name_error.as_ref(), url_kind),
                 if name.is_empty() {
-                    Some("Enter a remote name")
+                    Some(ui::t!("dialogs.ref.hint.remote_name"))
                 } else if name_error.is_some() {
-                    Some("Choose another name")
+                    Some(ui::t!("dialogs.ref.hint.other_name"))
                 } else if url.is_empty() {
-                    Some("Enter the remote address")
+                    Some(ui::t!("dialogs.ref.hint.remote_address"))
                 } else if url_kind == RemoteUrlKind::Bad {
-                    Some("Fix the address")
+                    Some(ui::t!("dialogs.ref.hint.fix_address"))
                 } else {
                     None
                 },
@@ -542,33 +542,33 @@ impl RefDialog {
             RefDialogKind::CreateBranch { card } => Box::new(move |repo: &Repo| {
                 repo.create_branch(&name, card.oid, checkout)?;
                 Ok(if checkout {
-                    format!("Created {name} and switched to it")
+                    ui::t!("dialogs.ref.done.created_and_switched", name = name).to_string()
                 } else {
-                    format!("Created {name}")
+                    ui::t!("dialogs.ref.done.created", name = name).to_string()
                 })
             }),
             RefDialogKind::CreateTag { card } => Box::new(move |repo: &Repo| {
                 let message = annotated.then_some(message.as_str());
                 repo.create_tag(&name, card.oid, message, sign)?;
-                Ok(format!("Created tag {name}"))
+                Ok(ui::t!("dialogs.ref.done.created_tag", name = name).to_string())
             }),
             RefDialogKind::RenameBranch { old } => Box::new(move |repo: &Repo| {
                 repo.rename_branch(&old, &name)?;
-                Ok(format!("Renamed {old} to {name}"))
+                Ok(ui::t!("dialogs.ref.done.renamed", old = old, name = name).to_string())
             }),
             RefDialogKind::RenameWorktree { from } => Box::new(move |repo: &Repo| {
                 let to = worktree_destination(&from, &name);
                 repo.move_worktree(&from, &to)?;
-                Ok(format!("Moved worktree to {}", to.display()))
+                Ok(ui::t!("dialogs.ref.done.moved_worktree", path = to.display()).to_string())
             }),
             RefDialogKind::RenameTag { old } => Box::new(move |repo: &Repo| {
                 repo.rename_tag(&old, &name)?;
-                Ok(format!("Renamed tag {old} to {name}"))
+                Ok(ui::t!("dialogs.ref.done.renamed_tag", old = old, name = name).to_string())
             }),
             RefDialogKind::Remote { editing } => Box::new(move |repo: &Repo| match editing {
                 None => {
                     repo.add_remote(&name, &url)?;
-                    Ok(format!("Added remote {name}"))
+                    Ok(ui::t!("dialogs.ref.done.added_remote", name = name).to_string())
                 }
                 Some(edit) => {
                     if edit.name != name {
@@ -577,36 +577,41 @@ impl RefDialog {
                     if edit.url != url {
                         repo.set_remote_url(&name, &url)?;
                     }
-                    Ok(format!("Updated remote {name}"))
+                    Ok(ui::t!("dialogs.ref.done.updated_remote", name = name).to_string())
                 }
             }),
             RefDialogKind::Reset { card } => Box::new(move |repo: &Repo| {
                 repo.reset(card.oid, mode)?;
-                Ok(format!("Reset {branch} to {}", card.short))
+                Ok(ui::t!(
+                    "dialogs.ref.done.reset",
+                    branch = branch,
+                    commit = card.short
+                )
+                .to_string())
             }),
             RefDialogKind::DeleteBranch { name, force } => Box::new(move |repo: &Repo| {
                 repo.delete_branch(&name, force)?;
-                Ok(format!("Deleted branch {name}"))
+                Ok(ui::t!("dialogs.ref.done.deleted_branch", name = name).to_string())
             }),
             RefDialogKind::DeleteTag { name } => Box::new(move |repo: &Repo| {
                 repo.delete_tag(&name)?;
-                Ok(format!("Deleted tag {name}"))
+                Ok(ui::t!("dialogs.ref.done.deleted_tag", name = name).to_string())
             }),
             RefDialogKind::RemoveRemote { name } => Box::new(move |repo: &Repo| {
                 repo.remove_remote(&name)?;
-                Ok(format!("Removed remote {name}"))
+                Ok(ui::t!("dialogs.ref.done.removed_remote", name = name).to_string())
             }),
             RefDialogKind::DropStash { index, .. } => Box::new(move |repo: &Repo| {
                 repo.stash_drop(index)?;
-                Ok(format!("Dropped stash@{{{index}}}"))
+                Ok(ui::t!("dialogs.ref.done.dropped_stash", index = index).to_string())
             }),
             RefDialogKind::CherryPick { card } => Box::new(move |repo: &Repo| {
                 repo.cherry_pick(card.oid)?;
-                Ok(format!("Cherry-picked {}", card.short))
+                Ok(ui::t!("dialogs.ref.done.cherry_picked", commit = card.short).to_string())
             }),
             RefDialogKind::Revert { card } => Box::new(move |repo: &Repo| {
                 repo.revert(card.oid)?;
-                Ok(format!("Reverted {}", card.short))
+                Ok(ui::t!("dialogs.ref.done.reverted", commit = card.short).to_string())
             }),
         })
     }
@@ -693,7 +698,7 @@ struct Validity {
     url_kind: RemoteUrlKind,
     message: String,
     enabled: bool,
-    hint: Option<&'static str>,
+    hint: Option<SharedString>,
 }
 
 /// Opens a dialog and keeps its state in the shell.
@@ -708,7 +713,7 @@ pub(crate) fn open(
     let state = dialog.downgrade();
     let (layer, host) = dialog::open_with_view(window, cx, move |_, cx| match state.upgrade() {
         Some(state) => build(&state, cx),
-        None => Dialog::new("Repository operation").icon(IconName::Git),
+        None => Dialog::new(ui::t!("dialogs.ref.title_fallback")).icon(IconName::Git),
     });
     dialog.update(cx, |dialog, cx| {
         dialog.layer = Some(layer);
@@ -723,32 +728,80 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
     let colors = cx.theme().colors;
     let valid = dialog.validity(cx);
     let (title, icon, width) = match &dialog.kind {
-        RefDialogKind::CreateBranch { .. } => ("Create branch here", IconName::Branch, 480.),
-        RefDialogKind::CreateTag { .. } => ("Create tag here", IconName::Tag, 500.),
-        RefDialogKind::RenameBranch { .. } => ("Rename branch", IconName::Edit, 480.),
-        RefDialogKind::RenameWorktree { .. } => ("Rename worktree", IconName::Edit, 480.),
-        RefDialogKind::RenameTag { .. } => ("Rename tag", IconName::Edit, 480.),
-        RefDialogKind::Remote { editing: None } => ("Add remote", IconName::Cloud, 500.),
-        RefDialogKind::Remote { editing: Some(_) } => ("Edit remote", IconName::Cloud, 500.),
-        RefDialogKind::Reset { .. } => ("Reset branch to here", IconName::Undo, 500.),
-        RefDialogKind::DeleteBranch { .. } => ("Delete branch", IconName::Trash, CONFIRM_WIDTH),
-        RefDialogKind::DeleteTag { .. } => ("Delete tag", IconName::Trash, CONFIRM_WIDTH),
-        RefDialogKind::RemoveRemote { .. } => ("Remove remote", IconName::Trash, CONFIRM_WIDTH),
-        RefDialogKind::DropStash { .. } => ("Drop stash", IconName::Trash, CONFIRM_WIDTH),
-        RefDialogKind::CherryPick { .. } => ("Cherry-pick commit", IconName::Undo, CONFIRM_WIDTH),
-        RefDialogKind::Revert { .. } => ("Revert commit", IconName::Undo, CONFIRM_WIDTH),
+        RefDialogKind::CreateBranch { .. } => (
+            ui::t!("dialogs.ref.title.create_branch"),
+            IconName::Branch,
+            480.,
+        ),
+        RefDialogKind::CreateTag { .. } => {
+            (ui::t!("dialogs.ref.title.create_tag"), IconName::Tag, 500.)
+        }
+        RefDialogKind::RenameBranch { .. } => (
+            ui::t!("dialogs.ref.title.rename_branch"),
+            IconName::Edit,
+            480.,
+        ),
+        RefDialogKind::RenameWorktree { .. } => (
+            ui::t!("dialogs.ref.title.rename_worktree"),
+            IconName::Edit,
+            480.,
+        ),
+        RefDialogKind::RenameTag { .. } => {
+            (ui::t!("dialogs.ref.title.rename_tag"), IconName::Edit, 480.)
+        }
+        RefDialogKind::Remote { editing: None } => (
+            ui::t!("dialogs.ref.title.add_remote"),
+            IconName::Cloud,
+            500.,
+        ),
+        RefDialogKind::Remote { editing: Some(_) } => (
+            ui::t!("dialogs.ref.title.edit_remote"),
+            IconName::Cloud,
+            500.,
+        ),
+        RefDialogKind::Reset { .. } => (ui::t!("dialogs.ref.title.reset"), IconName::Undo, 500.),
+        RefDialogKind::DeleteBranch { .. } => (
+            ui::t!("dialogs.ref.title.delete_branch"),
+            IconName::Trash,
+            CONFIRM_WIDTH,
+        ),
+        RefDialogKind::DeleteTag { .. } => (
+            ui::t!("dialogs.ref.title.delete_tag"),
+            IconName::Trash,
+            CONFIRM_WIDTH,
+        ),
+        RefDialogKind::RemoveRemote { .. } => (
+            ui::t!("dialogs.ref.title.remove_remote"),
+            IconName::Trash,
+            CONFIRM_WIDTH,
+        ),
+        RefDialogKind::DropStash { .. } => (
+            ui::t!("dialogs.ref.title.drop_stash"),
+            IconName::Trash,
+            CONFIRM_WIDTH,
+        ),
+        RefDialogKind::CherryPick { .. } => (
+            ui::t!("dialogs.ref.title.cherry_pick"),
+            IconName::Undo,
+            CONFIRM_WIDTH,
+        ),
+        RefDialogKind::Revert { .. } => (
+            ui::t!("dialogs.ref.title.revert"),
+            IconName::Undo,
+            CONFIRM_WIDTH,
+        ),
     };
 
     let mut body = div().flex().flex_col().gap(px(14.));
     body = match &dialog.kind {
         RefDialogKind::CreateBranch { card } => {
             let mut body = body.child(commit_card(card, colors)).child(name_field(
-                "Branch name",
+                ui::t!("dialogs.ref.field.branch_name"),
                 dialog.name.clone(),
                 valid.name_error.as_deref().filter(|_| dialog.touched),
-                Some(&format!(
-                    "Starts at {}. Use / to group branches, e.g. feat/…",
-                    card.short
+                Some(&*ui::t!(
+                    "dialogs.ref.help.branch_start",
+                    commit = card.short
                 )),
                 colors,
             ));
@@ -764,7 +817,7 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
             };
             body = body.child(
                 Checkbox::new("ref-branch-checkout")
-                    .label("Switch to the new branch after creating it")
+                    .label(ui::t!("dialogs.ref.switch_after_create"))
                     .checked(dialog.checkout)
                     .focus_handle(dialog.checkout_focus.clone())
                     .on_toggle(toggle),
@@ -778,13 +831,13 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
             let mut body = body
                 .child(commit_card(card, colors))
                 .child(name_field(
-                    "Tag name",
+                    ui::t!("dialogs.ref.field.tag_name"),
                     dialog.name.clone(),
                     valid.name_error.as_deref().filter(|_| dialog.touched),
                     dialog
                         .latest_tag
                         .as_ref()
-                        .map(|tag| format!("Latest tag: {tag}"))
+                        .map(|tag| ui::t!("dialogs.ref.help.latest_tag", tag = tag).to_string())
                         .as_deref(),
                     colors,
                 ))
@@ -796,7 +849,8 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
                         .touched
                         .then_some(valid.message.is_empty())
                         .filter(|empty| *empty)
-                        .map(|_| "An annotated tag needs a message."),
+                        .map(|_| ui::t!("dialogs.ref.error.tag_message"))
+                        .as_deref(),
                     colors,
                 ));
                 if let Some(key) = &dialog.signing_key {
@@ -812,7 +866,7 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
                     };
                     body = body.child(
                         Checkbox::new("ref-tag-sign")
-                            .label(format!("Sign with GPG key {key}"))
+                            .label(ui::t!("dialogs.ref.sign_tag", key = key))
                             .checked(dialog.sign)
                             .focus_handle(dialog.sign_focus.clone())
                             .on_toggle(toggle),
@@ -832,53 +886,56 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
                 };
                 body = body.child(
                     Checkbox::new("ref-tag-push")
-                        .label(format!("Push the tag to {remote} after creating"))
+                        .label(ui::t!("dialogs.ref.push_tag", remote = remote))
                         .checked(dialog.push_tag_after_create)
                         .focus_handle(dialog.push_focus.clone())
                         .on_toggle(toggle),
                 );
                 if dialog.push_tag_after_create {
                     body = body.child(
-                        Banner::new(BannerKind::Warn, "Pushed tags are public").body(
-                            "Others can fetch it right away. Deleting it later needs a separate \
-                             remote delete.",
-                        ),
+                        Banner::new(BannerKind::Warn, ui::t!("dialogs.ref.pushed_tags_public"))
+                            .body(ui::t!("dialogs.ref.pushed_tags_public_body")),
                     );
                 }
             }
             body
         }
         RefDialogKind::RenameWorktree { from } => body.child(name_field(
-            "New folder name",
+            ui::t!("dialogs.ref.field.new_folder_name"),
             dialog.name.clone(),
             valid.name_error.as_deref().filter(|_| dialog.touched),
-            Some(&format!(
-                "Moves {} next to its current folder. Git refuses a locked or main worktree.",
-                from.display()
+            Some(&*ui::t!(
+                "dialogs.ref.help.move_worktree",
+                path = from.display()
             )),
             colors,
         )),
-        RefDialogKind::RenameBranch { old } | RefDialogKind::RenameTag { old } => body
-            .child(name_field(
+        RefDialogKind::RenameBranch { old } | RefDialogKind::RenameTag { old } => {
+            body.child(name_field(
                 if matches!(dialog.kind, RefDialogKind::RenameBranch { .. }) {
-                    "New branch name"
+                    ui::t!("dialogs.ref.field.new_branch_name")
                 } else {
-                    "New tag name"
+                    ui::t!("dialogs.ref.field.new_tag_name")
                 },
                 dialog.name.clone(),
                 valid.name_error.as_deref().filter(|_| dialog.touched),
-                Some(&format!("Renames {old} in this repository.")),
+                Some(&*ui::t!("dialogs.ref.help.renames", old = old)),
                 colors,
-            )),
+            ))
+        }
         RefDialogKind::Remote { editing } => {
             let existing = if dialog.remote_names.is_empty() {
-                "No remotes yet.".to_owned()
+                ui::t!("dialogs.ref.help.no_remotes").to_string()
             } else {
-                format!("Existing remotes: {}", dialog.remote_names.join(", "))
+                ui::t!(
+                    "dialogs.ref.help.existing_remotes",
+                    remotes = dialog.remote_names.join(", ")
+                )
+                .to_string()
             };
             let mut body = body
                 .child(name_field(
-                    "Name",
+                    ui::t!("dialogs.ref.field.name"),
                     dialog.name.clone(),
                     valid.name_error.as_deref().filter(|_| dialog.touched),
                     Some(&existing),
@@ -890,7 +947,7 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
                     div()
                         .text_size(FS_SM)
                         .text_color(colors.muted)
-                        .child("Renaming the remote also renames its remote-tracking branches."),
+                        .child(ui::t!("dialogs.ref.help.rename_remote")),
                 );
             } else {
                 let toggle = {
@@ -905,7 +962,7 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
                 };
                 body = body.child(
                     Checkbox::new("ref-remote-fetch")
-                        .label("Fetch branches and tags right after adding")
+                        .label(ui::t!("dialogs.ref.fetch_after_add"))
                         .checked(dialog.fetch_after_add)
                         .focus_handle(dialog.fetch_focus.clone())
                         .on_toggle(toggle),
@@ -919,46 +976,52 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
             .child(reset_note(dialog, card, colors)),
         RefDialogKind::DeleteBranch { name, force } => body.child(confirm_note(
             if *force {
-                format!("The branch “{name}” has commits that are not merged anywhere else. Deleting it loses them.")
+                ui::t!("dialogs.ref.confirm.branch_unmerged", name = name)
             } else {
-                format!("Deletes the local branch “{name}”. This cannot be undone.")
+                ui::t!("dialogs.ref.confirm.branch", name = name)
             },
             if *force {
-                "Deleting an unmerged branch is permanent."
+                ui::t!("dialogs.ref.confirm.branch_unmerged_note")
             } else {
-                "The commits stay in the repository until they are unreachable."
+                ui::t!("dialogs.ref.confirm.branch_note")
             },
         )),
         RefDialogKind::DeleteTag { name } => body.child(confirm_note(
-            format!("Deletes the tag “{name}”. This cannot be undone."),
-            "Other clones keep their copy until it is deleted there too.",
+            ui::t!("dialogs.ref.confirm.tag", name = name),
+            ui::t!("dialogs.ref.confirm.tag_note"),
         )),
         RefDialogKind::RemoveRemote { name } => body.child(confirm_note(
-            format!("Removes the remote “{name}” and its remote-tracking branches from this repository."),
-            "The repository on the server is not touched.",
+            ui::t!("dialogs.ref.confirm.remote", name = name),
+            ui::t!("dialogs.ref.confirm.remote_note"),
         )),
         RefDialogKind::DropStash { index, label } => body.child(confirm_note(
-            format!("Drops stash@{{{index}}}: {label}"),
-            "The changes are gone; this cannot be undone.",
+            ui::t!("dialogs.ref.confirm.stash", index = index, label = label),
+            ui::t!("dialogs.ref.confirm.stash_note"),
         )),
-        RefDialogKind::CherryPick { card } => body
-            .child(commit_card(card, colors))
-            .child(Banner::new(
+        RefDialogKind::CherryPick { card } => body.child(commit_card(card, colors)).child(
+            Banner::new(
                 BannerKind::Info,
-                format!("Applies {} on top of {}.", card.short, dialog.branch),
+                ui::t!(
+                    "dialogs.ref.confirm.cherry_pick",
+                    commit = card.short,
+                    branch = dialog.branch
+                ),
             )
-            .body("A conflict aborts the cherry-pick and leaves the repository as it was.")),
-        RefDialogKind::Revert { card } => body
-            .child(commit_card(card, colors))
-            .child(Banner::new(
+            .body(ui::t!("dialogs.ref.confirm.cherry_pick_note")),
+        ),
+        RefDialogKind::Revert { card } => body.child(commit_card(card, colors)).child(
+            Banner::new(
                 BannerKind::Info,
-                format!("Creates a new commit that undoes {}.", card.short),
+                ui::t!("dialogs.ref.confirm.revert", commit = card.short),
             )
-            .body("A conflict aborts the revert and leaves the repository as it was.")),
+            .body(ui::t!("dialogs.ref.confirm.revert_note")),
+        ),
     };
     if let Some(error) = &dialog.error {
-        body =
-            body.child(Banner::new(BannerKind::Error, "The operation failed").body(error.clone()));
+        body = body.child(
+            Banner::new(BannerKind::Error, ui::t!("dialogs.ref.operation_failed"))
+                .body(error.clone()),
+        );
     }
 
     let cancel = {
@@ -983,28 +1046,32 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
     let primary_label = match &dialog.kind {
         RefDialogKind::CreateBranch { .. } => {
             if dialog.checkout {
-                "Create and switch"
+                ui::t!("dialogs.ref.primary.create_and_switch")
             } else {
-                "Create branch"
+                ui::t!("dialogs.ref.primary.create_branch")
             }
         }
-        RefDialogKind::CreateTag { .. } if dialog.push_tag_after_create => "Create and push",
-        RefDialogKind::CreateTag { .. } => "Create tag",
+        RefDialogKind::CreateTag { .. } if dialog.push_tag_after_create => {
+            ui::t!("dialogs.ref.primary.create_and_push")
+        }
+        RefDialogKind::CreateTag { .. } => ui::t!("dialogs.ref.primary.create_tag"),
         RefDialogKind::RenameBranch { .. }
         | RefDialogKind::RenameTag { .. }
-        | RefDialogKind::RenameWorktree { .. } => "Rename",
-        RefDialogKind::Remote { editing: None, .. } => "Add remote",
+        | RefDialogKind::RenameWorktree { .. } => ui::t!("dialogs.ref.primary.rename"),
+        RefDialogKind::Remote { editing: None, .. } => ui::t!("dialogs.ref.primary.add_remote"),
         RefDialogKind::Remote {
             editing: Some(_), ..
-        } => "Save",
-        RefDialogKind::Reset { .. } => "Reset",
-        RefDialogKind::DeleteBranch { force: true, .. } => "Delete anyway",
-        RefDialogKind::DeleteBranch { .. } => "Delete branch",
-        RefDialogKind::DeleteTag { .. } => "Delete tag",
-        RefDialogKind::RemoveRemote { .. } => "Remove remote",
-        RefDialogKind::DropStash { .. } => "Drop stash",
-        RefDialogKind::CherryPick { .. } => "Cherry-pick",
-        RefDialogKind::Revert { .. } => "Revert",
+        } => ui::t!("dialogs.ref.primary.save"),
+        RefDialogKind::Reset { .. } => ui::t!("dialogs.ref.primary.reset"),
+        RefDialogKind::DeleteBranch { force: true, .. } => {
+            ui::t!("dialogs.ref.primary.delete_anyway")
+        }
+        RefDialogKind::DeleteBranch { .. } => ui::t!("dialogs.ref.primary.delete_branch"),
+        RefDialogKind::DeleteTag { .. } => ui::t!("dialogs.ref.primary.delete_tag"),
+        RefDialogKind::RemoveRemote { .. } => ui::t!("dialogs.ref.primary.remove_remote"),
+        RefDialogKind::DropStash { .. } => ui::t!("dialogs.ref.primary.drop_stash"),
+        RefDialogKind::CherryPick { .. } => ui::t!("dialogs.ref.primary.cherry_pick"),
+        RefDialogKind::Revert { .. } => ui::t!("dialogs.ref.primary.revert"),
     };
     let dangerous = matches!(
         dialog.kind,
@@ -1031,7 +1098,7 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
         .gap(px(8.))
         .child(
             Button::new("ref-cancel")
-                .label("Cancel")
+                .label(ui::t!("dialogs.common.cancel"))
                 .min_width(px(72.))
                 .disabled(dialog.running)
                 .focus_handle(dialog.cancel_focus.clone())
@@ -1065,11 +1132,11 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
     focus_order.push(DialogFocus::control(dialog.primary_focus.clone()));
 
     let hint = if dialog.running {
-        Some("Working…".to_owned())
+        Some(ui::t!("dialogs.ref.working"))
     } else if matches!(dialog.kind, RefDialogKind::DeleteBranch { force: true, .. }) {
-        Some("This cannot be undone".to_owned())
+        Some(ui::t!("dialogs.ref.cannot_undo"))
     } else {
-        valid.hint.map(str::to_owned)
+        valid.hint
     };
 
     let mut panel = Dialog::new(title)
@@ -1124,7 +1191,7 @@ fn commit_card(card: &CommitCard, colors: ThemeColors) -> impl IntoElement {
                         .truncate()
                         .text_size(FS_BASE)
                         .child(if card.summary.is_empty() {
-                            "Commit".to_owned()
+                            ui::t!("dialogs.ref.card.commit").to_string()
                         } else {
                             card.summary.clone()
                         }),
@@ -1159,7 +1226,7 @@ fn commit_card(card: &CommitCard, colors: ThemeColors) -> impl IntoElement {
 }
 
 fn name_field(
-    label: &'static str,
+    label: SharedString,
     input: Option<Entity<TextInput>>,
     error: Option<&str>,
     help: Option<&str>,
@@ -1180,7 +1247,7 @@ fn message_field(
     colors: ThemeColors,
 ) -> impl IntoElement {
     field_shell(
-        "Message",
+        ui::t!("dialogs.ref.field.message"),
         area.map(IntoElement::into_any_element),
         error,
         None,
@@ -1191,7 +1258,7 @@ fn message_field(
 fn url_field(dialog: &RefDialog, valid: &Validity, colors: ThemeColors) -> impl IntoElement {
     let url_error =
         (dialog.touched && !valid.url.is_empty() && valid.url_kind == RemoteUrlKind::Bad)
-            .then_some(valid.url_kind.label());
+            .then(|| valid.url_kind.label());
     let note = match valid.url_kind {
         RemoteUrlKind::Https | RemoteUrlKind::Ssh => {
             let (icon, color) = if valid.url_kind == RemoteUrlKind::Ssh {
@@ -1213,9 +1280,9 @@ fn url_field(dialog: &RefDialog, valid: &Validity, colors: ThemeColors) -> impl 
         RemoteUrlKind::Bad => None,
     };
     let mut field = field_shell(
-        "Address",
+        ui::t!("dialogs.ref.field.address"),
         dialog.url.clone().map(IntoElement::into_any_element),
-        url_error,
+        url_error.as_deref(),
         None,
         colors,
     );
@@ -1226,7 +1293,7 @@ fn url_field(dialog: &RefDialog, valid: &Validity, colors: ThemeColors) -> impl 
 }
 
 fn field_shell(
-    label: &'static str,
+    label: SharedString,
     control: Option<AnyElement>,
     error: Option<&str>,
     help: Option<&str>,
@@ -1275,7 +1342,7 @@ fn worktree_folder_error(name: &str) -> Option<String> {
         return None;
     }
     if name == "." || name == ".." || name.contains(['/', '\\']) || name.contains('\0') {
-        Some("Use a single folder name, without / or \\".to_owned())
+        Some(ui::t!("dialogs.ref.error.folder_name").to_string())
     } else {
         None
     }
@@ -1320,12 +1387,12 @@ fn tag_type(
             div()
                 .text_size(FS_SM)
                 .text_color(colors.muted)
-                .child("Type"),
+                .child(ui::t!("dialogs.ref.tag_type")),
         )
         .child(
             Segmented::new("ref-tag-type")
-                .item(SegmentItem::new("Annotated"))
-                .item(SegmentItem::new("Lightweight"))
+                .item(SegmentItem::new(ui::t!("dialogs.ref.tag_type.annotated")))
+                .item(SegmentItem::new(ui::t!("dialogs.ref.tag_type.lightweight")))
                 .selected(if dialog.annotated { 0 } else { 1 })
                 .on_select(listener),
         )
@@ -1334,9 +1401,9 @@ fn tag_type(
                 .text_size(FS_SM)
                 .text_color(colors.muted)
                 .child(if dialog.annotated {
-                    "Stores author, date and a message. Recommended for releases."
+                    ui::t!("dialogs.ref.tag_type.annotated_note")
                 } else {
-                    "Just a name pointing at the commit."
+                    ui::t!("dialogs.ref.tag_type.lightweight_note")
                 }),
         )
 }
@@ -1373,13 +1440,13 @@ fn reset_mode_control(
             div()
                 .text_size(FS_SM)
                 .text_color(colors.muted)
-                .child("Mode"),
+                .child(ui::t!("dialogs.ref.reset_mode")),
         )
         .child(
             Segmented::new("ref-reset-mode")
-                .item(SegmentItem::new("Soft"))
-                .item(SegmentItem::new("Mixed"))
-                .item(SegmentItem::new("Hard"))
+                .item(SegmentItem::new(ui::t!("dialogs.ref.reset_mode.soft")))
+                .item(SegmentItem::new(ui::t!("dialogs.ref.reset_mode.mixed")))
+                .item(SegmentItem::new(ui::t!("dialogs.ref.reset_mode.hard")))
                 .selected(selected)
                 .on_select(listener),
         )
@@ -1388,13 +1455,9 @@ fn reset_mode_control(
                 .text_size(FS_SM)
                 .text_color(colors.muted)
                 .child(match dialog.reset_mode {
-                    ResetMode::Soft => {
-                        "Moves HEAD only. The index and work tree keep their changes."
-                    }
-                    ResetMode::Mixed => {
-                        "Moves HEAD and clears the index. The work tree keeps its files."
-                    }
-                    ResetMode::Hard => "Moves HEAD and discards index and work tree changes.",
+                    ResetMode::Soft => ui::t!("dialogs.ref.reset_mode.soft_note"),
+                    ResetMode::Mixed => ui::t!("dialogs.ref.reset_mode.mixed_note"),
+                    ResetMode::Hard => ui::t!("dialogs.ref.reset_mode.hard_note"),
                 }),
         )
 }
@@ -1404,19 +1467,23 @@ fn reset_note(dialog: &RefDialog, card: &CommitCard, colors: ThemeColors) -> imp
     if dialog.reset_mode == ResetMode::Hard {
         Banner::new(
             BannerKind::Warn,
-            format!("Hard reset to {} discards every local change", card.short),
+            ui::t!("dialogs.ref.reset.hard_title", commit = card.short),
         )
-        .body("Staged and unstaged changes in the work tree are lost. This cannot be undone.")
+        .body(ui::t!("dialogs.ref.reset.hard_body"))
     } else {
         Banner::new(
             BannerKind::Info,
-            format!("Moves {} to {}", dialog.branch, card.short),
+            ui::t!(
+                "dialogs.ref.reset.title",
+                branch = dialog.branch,
+                commit = card.short
+            ),
         )
-        .body("Local commits after this point become unreachable from the branch.")
+        .body(ui::t!("dialogs.ref.reset.body"))
     }
 }
 
-fn confirm_note(title: String, body: &'static str) -> impl IntoElement {
+fn confirm_note(title: SharedString, body: SharedString) -> impl IntoElement {
     Banner::new(BannerKind::Warn, title).body(body)
 }
 
@@ -1427,21 +1494,31 @@ fn confirm_note(title: String, body: &'static str) -> impl IntoElement {
 fn branch_changes_note(
     context_dirty: usize,
     is_head: bool,
-) -> Option<(BannerKind, String, &'static str)> {
+) -> Option<(BannerKind, String, SharedString)> {
     if context_dirty == 0 {
         return None;
     }
     if is_head {
         Some((
             BannerKind::Info,
-            format!("{context_dirty} local changes will come with you"),
-            "The new branch starts at the current commit, so nothing conflicts.",
+            ui::i18n::t_count(
+                "dialogs.ref.dirty.carry",
+                u64::try_from(context_dirty).unwrap_or(u64::MAX),
+                &[],
+            )
+            .to_string(),
+            ui::t!("dialogs.ref.dirty.carry_note"),
         ))
     } else {
         Some((
             BannerKind::Warn,
-            format!("{context_dirty} local changes may conflict"),
-            "Switching to another commit rewrites files that differ from your working tree. GitWarp stops and keeps your changes if a file conflicts.",
+            ui::i18n::t_count(
+                "dialogs.ref.dirty.conflict",
+                u64::try_from(context_dirty).unwrap_or(u64::MAX),
+                &[],
+            )
+            .to_string(),
+            ui::t!("dialogs.ref.dirty.conflict_note"),
         ))
     }
 }

@@ -23,7 +23,7 @@ pub(crate) struct CredentialDialog {
     layer: Option<overlay::LayerId>,
     host: Option<Entity<DialogHost>>,
     prompt: SharedString,
-    label: &'static str,
+    label: SharedString,
     input: Entity<TextInput>,
     _input_events: Subscription,
     reply: Sender<Option<String>>,
@@ -39,7 +39,7 @@ impl CredentialDialog {
         let label = prompt.label();
         let input = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder(if secret { "Password" } else { "User name" }, cx);
+            input.set_placeholder(label.clone(), cx);
             input.set_masked(secret, cx);
             input
         });
@@ -113,7 +113,7 @@ pub(crate) fn open(
     let state = dialog.downgrade();
     let (layer, host) = dialog::open_with_view(window, cx, move |_, cx| match state.upgrade() {
         Some(state) => build(&state, cx),
-        None => Dialog::new("Authentication required"),
+        None => Dialog::new(ui::t!("dialogs.credential.title")),
     });
     dialog.update(cx, |dialog, _| {
         dialog.layer = Some(layer);
@@ -151,7 +151,7 @@ fn build(state: &Entity<CredentialDialog>, cx: &App) -> Dialog {
         .flex_col()
         .gap(px(12.))
         .child(
-            Banner::new(BannerKind::Info, "The Git server asked for credentials")
+            Banner::new(BannerKind::Info, ui::t!("dialogs.credential.banner"))
                 .body(dialog.prompt.clone()),
         )
         .child(
@@ -163,7 +163,7 @@ fn build(state: &Entity<CredentialDialog>, cx: &App) -> Dialog {
                     div()
                         .text_size(FS_SM)
                         .text_color(colors.muted)
-                        .child(dialog.label),
+                        .child(dialog.label.clone()),
                 )
                 .child(dialog.input.clone()),
         )
@@ -171,7 +171,7 @@ fn build(state: &Entity<CredentialDialog>, cx: &App) -> Dialog {
             div()
                 .text_size(FS_SM)
                 .text_color(colors.muted)
-                .child("The answer is passed to git and is not saved by GitWarp."),
+                .child(ui::t!("dialogs.credential.not_saved")),
         );
 
     let footer = div()
@@ -180,21 +180,21 @@ fn build(state: &Entity<CredentialDialog>, cx: &App) -> Dialog {
         .gap(px(8.))
         .child(
             Button::new("credential-cancel")
-                .label("Cancel")
+                .label(ui::t!("dialogs.common.cancel"))
                 .min_width(px(72.))
                 .focus_handle(dialog.cancel_focus.clone())
                 .on_click(cancel),
         )
         .child(
             Button::primary("credential-submit")
-                .label("Continue")
+                .label(ui::t!("dialogs.credential.continue"))
                 .min_width(px(72.))
                 .disabled(!can_submit)
                 .focus_handle(dialog.primary_focus.clone())
                 .on_click(submit),
         );
 
-    Dialog::new("Authentication required")
+    Dialog::new(ui::t!("dialogs.credential.title"))
         .icon(ui::IconName::Key)
         .width(px(460.))
         .compact_body()
