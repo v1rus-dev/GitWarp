@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/git-graph",
     "crates/git-core",
+    "crates/forge",
     "crates/app",
     "crates/ui",
 ]
@@ -11,6 +12,7 @@ members = [
 default-members = [
     "crates/git-graph",
     "crates/git-core",
+    "crates/forge",
 ]
 
 [workspace.package]
@@ -22,6 +24,7 @@ rust-version = "1.88"
 [workspace.dependencies]
 git-graph = { path = "crates/git-graph" }
 git-core = { path = "crates/git-core" }
+forge = { path = "crates/forge" }
 ui = { path = "crates/ui" }
 
 # In-process git. `gix` 0.90 needs Rust 1.88, which is why the workspace

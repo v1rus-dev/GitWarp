@@ -1,0 +1,9 @@
+[package]
+name = "forge"
+description = "Hosting-service model and remote URL resolution (GitHub, GitLab, ...), UI-agnostic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
