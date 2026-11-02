@@ -56,6 +56,28 @@ pub fn my_email(repo: &Repo) -> Result<Option<String>> {
     }
 }
 
+/// The absolute common git dir: the same for a repository and all its linked
+/// worktrees, because they share one object store and `git log --all` sees
+/// the same commits from each.
+pub fn common_dir(repo: &Repo) -> Result<std::path::PathBuf> {
+    let out = repo
+        .command()
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(Error::Spawn)?;
+    if !out.status.success() {
+        return Err(Error::Git {
+            command: "rev-parse --git-common-dir",
+            code: out.status.code(),
+            stderr: decode_bytes(out.stderr),
+        });
+    }
+    let dir = String::from_utf8_lossy(&out.stdout).trim_end().to_owned();
+    // Canonical, so a symlinked path to the same store groups with it.
+    Ok(std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.into()))
+}
+
 /// The current local calendar day, as days since the Unix epoch.
 ///
 /// There is no timezone code in this crate, so the local offset comes from
@@ -427,5 +449,36 @@ mod tests {
             }]
         );
         assert_eq!(act.me, None);
+    }
+
+    #[test]
+    fn a_linked_worktree_shares_the_common_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"], None, "a@x.io");
+        git(
+            &main,
+            &["commit", "-q", "--allow-empty", "-m", "a"],
+            None,
+            "a@x.io",
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                other.to_str().unwrap(),
+                "-b",
+                "side",
+            ],
+            None,
+            "a@x.io",
+        );
+        let (a, b) = (open(&main), open(&other));
+        assert_eq!(common_dir(&a).unwrap(), common_dir(&b).unwrap());
+        assert!(common_dir(&a).unwrap().ends_with(".git"));
     }
 }

@@ -175,7 +175,11 @@ impl WelcomeView {
 
     /// Tells the activity card the recent list and the selected row.
     fn sync_activity(&self, cx: &mut Context<Self>) {
-        let paths = self.recent.iter().map(|repo| repo.path.clone()).collect();
+        // Most recently opened first: worktrees of one repository are listed
+        // under the newest entry.
+        let mut by_recency: Vec<&RecentRepo> = self.recent.iter().collect();
+        by_recency.sort_by_key(|repo| std::cmp::Reverse(repo.last_opened));
+        let paths = by_recency.iter().map(|repo| repo.path.clone()).collect();
         let selected = self
             .recent
             .iter()

@@ -47,7 +47,9 @@ enum Scope {
 enum RepoState {
     Loading,
     /// Commits by me per day over the last 12 months.
-    Ready(Arc<HashMap<i32, u32>>),
+    /// The counts and the repository's common git dir: linked worktrees of
+    /// one repository share it and are counted once.
+    Ready(Arc<HashMap<i32, u32>>, PathBuf),
     /// Why it could not be counted.
     Skipped(String),
 }
@@ -64,6 +66,7 @@ struct CacheEntry {
     /// mtime of `.git` (and its `HEAD`); `None` never matches.
     stamp: Option<SystemTime>,
     me: String,
+    group: PathBuf,
     today: i32,
     counts: Arc<HashMap<i32, u32>>,
 }
@@ -226,8 +229,10 @@ impl WelcomeActivity {
                     match result {
                         Ok(entry) => {
                             view.today = view.today.max(entry.today);
-                            view.repos
-                                .insert(path.clone(), RepoState::Ready(entry.counts.clone()));
+                            view.repos.insert(
+                                path.clone(),
+                                RepoState::Ready(entry.counts.clone(), entry.group.clone()),
+                            );
                             cx.default_global::<ActivityCache>().0.insert(path, entry);
                         }
                         Err(reason) => {
@@ -263,14 +268,14 @@ impl WelcomeActivity {
     fn shown_counts(&self) -> HashMap<i32, u32> {
         match (self.effective_scope(), &self.selected) {
             (Scope::Selected, Some(path)) => match self.repos.get(path) {
-                Some(RepoState::Ready(counts)) => counts.as_ref().clone(),
+                Some(RepoState::Ready(counts, _)) => counts.as_ref().clone(),
                 _ => HashMap::new(),
             },
             _ => sum_counts(
-                self.paths
-                    .iter()
+                representatives(&self.paths, &self.repos)
+                    .into_iter()
                     .filter_map(|path| match self.repos.get(path) {
-                        Some(RepoState::Ready(counts)) => Some(counts.as_ref()),
+                        Some(RepoState::Ready(counts, _)) => Some(counts.as_ref()),
                         _ => None,
                     }),
             ),
@@ -354,12 +359,30 @@ fn sum_counts<'a>(repos: impl Iterator<Item = &'a HashMap<i32, u32>>) -> HashMap
     total
 }
 
+/// The counted entries with linked worktrees of one repository collapsed to
+/// the first of them: `paths` is most recently opened first, so a repository
+/// shared by several recent entries is counted once and listed under the
+/// newest one.
+fn representatives<'a>(
+    paths: &'a [PathBuf],
+    repos: &HashMap<PathBuf, RepoState>,
+) -> Vec<&'a PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .iter()
+        .filter(|path| match repos.get(*path) {
+            Some(RepoState::Ready(_, group)) => seen.insert(group.clone()),
+            _ => false,
+        })
+        .collect()
+}
+
 /// The repositories with commits on `day`, most commits first (then by name).
 fn day_entries(paths: &[PathBuf], repos: &HashMap<PathBuf, RepoState>, day: i32) -> Vec<DayEntry> {
-    let mut entries: Vec<DayEntry> = paths
-        .iter()
+    let mut entries: Vec<DayEntry> = representatives(paths, repos)
+        .into_iter()
         .filter_map(|path| match repos.get(path) {
-            Some(RepoState::Ready(counts)) => {
+            Some(RepoState::Ready(counts, _)) => {
                 let count = counts.get(&day).copied().filter(|&count| count > 0)?;
                 Some(DayEntry {
                     path: path.clone(),
@@ -419,6 +442,7 @@ fn count_repo(
         }
     }
     let repo = Repo::open(git, path).map_err(|e| e.to_string())?;
+    let group = git_core::common_dir(&repo).map_err(|e| e.to_string())?;
     let today = git_core::today(&repo).map_err(|e| e.to_string())?;
     // Padded by a day on each side so no timezone can cut a day.
     let since = (i64::from(today - LAST_YEAR_DAYS) - 1) * 86_400;
@@ -433,6 +457,7 @@ fn count_repo(
     Ok(CacheEntry {
         stamp,
         me: me.to_owned(),
+        group,
         today,
         counts: Arc::new(counts),
     })
@@ -453,7 +478,7 @@ impl Render for WelcomeActivity {
         };
         let ready = relevant
             .iter()
-            .filter(|path| matches!(self.repos.get(**path), Some(RepoState::Ready(_))))
+            .filter(|path| matches!(self.repos.get(**path), Some(RepoState::Ready(..))))
             .count();
         let pending = me_loading
             || relevant
@@ -755,6 +780,14 @@ mod tests {
         Arc::new(pairs.iter().copied().collect())
     }
 
+    /// A counted repository of its own (every call gets a fresh common dir).
+    fn ready(pairs: &[(i32, u32)]) -> RepoState {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let group = PathBuf::from(format!("/g/{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+        RepoState::Ready(counts(pairs), group)
+    }
+
     fn states(items: &[(&str, RepoState)]) -> (Vec<PathBuf>, HashMap<PathBuf, RepoState>) {
         let paths = items.iter().map(|(p, _)| PathBuf::from(p)).collect();
         let repos = items
@@ -776,7 +809,7 @@ mod tests {
     #[test]
     fn skipped_repositories_are_listed_in_recent_order() {
         let (paths, repos) = states(&[
-            ("/r/one", RepoState::Ready(counts(&[(1, 1)]))),
+            ("/r/one", ready(&[(1, 1)])),
             (
                 "/r/gone",
                 RepoState::Skipped("the folder does not exist".into()),
@@ -793,10 +826,10 @@ mod tests {
     #[test]
     fn the_menu_lists_repositories_with_commits_that_day() {
         let (paths, repos) = states(&[
-            ("/r/zed", RepoState::Ready(counts(&[(5, 2), (6, 1)]))),
-            ("/r/alpha", RepoState::Ready(counts(&[(5, 2)]))),
-            ("/r/big", RepoState::Ready(counts(&[(5, 7)]))),
-            ("/r/other-day", RepoState::Ready(counts(&[(6, 3)]))),
+            ("/r/zed", ready(&[(5, 2), (6, 1)])),
+            ("/r/alpha", ready(&[(5, 2)])),
+            ("/r/big", ready(&[(5, 7)])),
+            ("/r/other-day", ready(&[(6, 3)])),
             ("/r/gone", RepoState::Skipped("x".into())),
             ("/r/busy", RepoState::Loading),
         ]);
@@ -852,5 +885,63 @@ mod tests {
 
         let gone = repo.path().join("does-not-exist");
         assert!(count_repo(git, &gone, "me@x.io", None).is_err());
+    }
+
+    #[test]
+    fn worktrees_of_one_repository_are_counted_once() {
+        let shared = counts(&[(5, 3), (6, 1)]);
+        let group = PathBuf::from("/g/shared");
+        let (paths, repos) = states(&[
+            // Most recently opened first: the group is listed under `newer`.
+            ("/w/newer", RepoState::Ready(shared.clone(), group.clone())),
+            ("/w/older", RepoState::Ready(shared, group)),
+            ("/w/solo", ready(&[(5, 2)])),
+        ]);
+        let total =
+            sum_counts(representatives(&paths, &repos).into_iter().filter_map(
+                |p| match repos.get(p) {
+                    Some(RepoState::Ready(c, _)) => Some(c.as_ref()),
+                    _ => None,
+                },
+            ));
+        assert_eq!(total, HashMap::from([(5, 5), (6, 1)]));
+        let entries = day_entries(&paths, &repos, 5);
+        let shown: Vec<(&str, u32)> = entries.iter().map(|e| (e.name.as_str(), e.count)).collect();
+        assert_eq!(shown, [("newer", 3), ("solo", 2)]);
+        assert_eq!(entries[0].path, PathBuf::from("/w/newer"));
+    }
+
+    #[test]
+    fn a_real_worktree_falls_into_its_repositorys_group() {
+        let repo = crate::test_support::TempRepo::new("welcome-activity-wt");
+        commit(repo.path(), "me@x.io");
+        let linked = repo.path().with_extension("linked");
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["worktree", "add", "-q", "-b", "side"])
+            .arg(&linked)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git is installed");
+        assert!(status.success());
+
+        let git = crate::test_support::git();
+        let a = count_repo(git.clone(), repo.path(), "me@x.io", None).unwrap();
+        let b = count_repo(git, &linked, "me@x.io", None).unwrap();
+        assert_eq!(a.group, b.group);
+        assert_eq!(a.counts, b.counts);
+
+        let paths = vec![linked.clone(), repo.path().to_path_buf()];
+        let repos = HashMap::from([
+            (linked.clone(), RepoState::Ready(b.counts.clone(), b.group)),
+            (
+                repo.path().to_path_buf(),
+                RepoState::Ready(a.counts.clone(), a.group),
+            ),
+        ]);
+        assert_eq!(representatives(&paths, &repos), vec![&linked]);
+        let _ = std::fs::remove_dir_all(&linked);
     }
 }

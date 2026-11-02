@@ -32,7 +32,8 @@ use std::process::{Command, Output};
 use std::sync::Arc;
 
 pub use activity::{
-    activity, civil_from_days, days_from_civil, level, levels, my_email, today, Activity, DayCount,
+    activity, civil_from_days, common_dir, days_from_civil, level, levels, my_email, today,
+    Activity, DayCount,
 };
 pub use config::{
     global_get, global_identity, set_global_identity, set_global_signing, ConfigScope, Identity,
