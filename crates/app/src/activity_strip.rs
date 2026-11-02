@@ -147,7 +147,6 @@ impl ActivityStrip {
         self.load(cx);
     }
 
-    #[cfg(test)]
     pub(crate) fn is_collapsed(&self) -> bool {
         self.collapsed
     }

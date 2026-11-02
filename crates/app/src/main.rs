@@ -17,6 +17,7 @@ mod init_flow;
 mod network_ops;
 mod network_service;
 mod open_dialog;
+mod palette;
 mod ref_dialog;
 mod ref_ops;
 mod repo_view;
@@ -238,6 +239,12 @@ fn main() {
             let shortcuts = vec![
                 ui::actions::key_binding(
                     cx,
+                    &keys("palette", "secondary-p"),
+                    palette::OpenPalette,
+                    None,
+                ),
+                ui::actions::key_binding(
+                    cx,
                     &keys("sidebar", "secondary-b"),
                     repo_view::ToggleSidebar,
                     None,
@@ -306,6 +313,8 @@ fn main() {
             // The search field's own keys (Shift+Enter, F3, Esc, ↓) live in
             // its key context.
             repo_view::bind_search_keys(cx);
+            // The palette's own keys (PgUp/PgDn, Tab) live in its key context.
+            palette::bind_keys(cx);
             // The history list's extra keys (j/k, PgUp/PgDn, Ctrl+C) live in
             // the list's own context.
             history_view::bind_history_keys(cx, &loaded);

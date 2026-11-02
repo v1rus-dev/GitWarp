@@ -41,6 +41,7 @@ use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
 use crate::network_ops::{self, Job};
 use crate::network_service::NetworkService;
+use crate::palette::{self, Command};
 use crate::ref_dialog::{self, RefDialog, RefDialogContext, RefDialogKind, RemoteEdit};
 use crate::ref_ops::{CommitCard, RefAction};
 use crate::settings::{
@@ -2116,6 +2117,183 @@ impl RepositoryView {
             .get()
             .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), size(px(200.), px(28.))));
         menu::open_dropdown(anchor, entries, window, cx);
+    }
+
+    /// Opens the command palette (Ctrl P) over this repository.
+    pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let history = self.history.read(cx);
+        let state = palette::ViewState {
+            idle_lanes_collapsed: history.idle_lanes_collapsed(),
+            activity_collapsed: self.activity.read(cx).is_collapsed(),
+        };
+        let sources = palette::Sources::new(
+            state,
+            history.head(),
+            history.refs().unwrap_or(&[]),
+            &history.loaded_commits(),
+        );
+        let init = palette::Init {
+            repo: cx.weak_entity(),
+            workspace: self.workspace.clone(),
+            sources,
+            git: self.git.clone(),
+            root: self.root.clone(),
+        };
+        palette::open(init, window, cx);
+    }
+
+    /// Runs a palette command that belongs to the repository view. The ones
+    /// the workspace owns (settings, open, clone, close) never get here.
+    pub(crate) fn run_palette_command(
+        &mut self,
+        command: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            Command::FetchAll => self.fetch_remotes(window, cx),
+            Command::Pull => self.pull_branch(window, cx),
+            Command::Push => self.push_branch(window, cx),
+            Command::StashChanges => self.stash_changes(window, cx),
+            Command::SwitchBranch => self.open_branch_menu(window, cx),
+            Command::CreateBranchHere => {
+                // "Here" is the selected commit, with HEAD as the fallback,
+                // as for "Create tag here".
+                let oid = self
+                    .history
+                    .read(cx)
+                    .selected_commit()
+                    .map(|commit| commit.id)
+                    .or_else(|| self.head_oid(cx));
+                match oid {
+                    Some(oid) => {
+                        self.run_sidebar_action(SidebarAction::CreateBranchAt(oid), window, cx);
+                    }
+                    None => {
+                        toast::show(
+                            ui::ToastKind::Warn,
+                            "Create a commit before branching",
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
+            Command::CreateTagHere => self.run_sidebar_action(SidebarAction::CreateTag, window, cx),
+            Command::AddRemote => self.run_sidebar_action(SidebarAction::AddRemote, window, cx),
+            Command::AddWorktree => self.run_sidebar_action(SidebarAction::AddWorktree, window, cx),
+            Command::Refresh => self.run_sidebar_action(SidebarAction::Refresh, window, cx),
+            Command::ToggleSidebar => self.toggle_sidebar(cx),
+            Command::ToggleDetails => self.toggle_details(cx),
+            Command::ToggleActivity => {
+                let collapsed = self.activity.read(cx).is_collapsed();
+                self.activity
+                    .update(cx, |activity, cx| activity.set_collapsed(!collapsed, cx));
+            }
+            Command::FocusSearch => {
+                let focus = self.search_focus();
+                window.focus(&focus, cx);
+            }
+            Command::ShowHistory => self.set_view(ViewMode::History, window, cx),
+            Command::ShowChanges => self.set_view(ViewMode::Changes, window, cx),
+            Command::ShowWorktrees => self.set_view(ViewMode::Worktrees, window, cx),
+            Command::CollapseIdleLanes => self.history.update(cx, |history, cx| {
+                let collapsed = history.idle_lanes_collapsed();
+                history.set_collapse(!collapsed, cx);
+            }),
+            Command::FitGraph => self.history.update(cx, |history, cx| history.fit_graph(cx)),
+            Command::OpenSettings(_)
+            | Command::OpenRepository
+            | Command::Clone
+            | Command::CloseRepository => {
+                debug_assert!(false, "{command:?} is run by the workspace");
+            }
+        }
+    }
+
+    /// A palette branch pick: the sidebar's checkout, with its dialog for
+    /// uncommitted changes.
+    pub(crate) fn palette_checkout(
+        &mut self,
+        name: String,
+        remote: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let action = if remote {
+            SidebarAction::CheckoutRemoteBranch(name)
+        } else {
+            SidebarAction::CheckoutBranch(name)
+        };
+        self.run_sidebar_action(action, window, cx);
+    }
+
+    /// A palette commit pick: shows the History and selects the commit.
+    pub(crate) fn palette_reveal_commit(
+        &mut self,
+        oid: Oid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_view(ViewMode::History, window, cx);
+        self.history
+            .update(cx, |history, cx| history.reveal_commit(oid, cx));
+        let focus = self.history.read(cx).list_focus();
+        window.focus(&focus, cx);
+    }
+
+    /// A palette file pick. A file with local changes opens Local changes;
+    /// any other file selects the latest commit that touched it in History.
+    pub(crate) fn palette_reveal_file(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+                return;
+            }
+        };
+        let root = self.root.clone();
+        let file = path.clone();
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &root)?;
+                    if repo.changed_paths()?.contains(&file) {
+                        return Ok(None);
+                    }
+                    let options = git_core::LogOptions {
+                        paths: vec![file],
+                        max_count: Some(1),
+                        ..git_core::LogOptions::default()
+                    };
+                    let latest = repo.log(&options)?.next_chunk(1)?.into_iter().next();
+                    Ok::<_, Error>(Some(latest.map(|commit| commit.id)))
+                })
+                .await;
+            this.update_in(cx, |view, window, cx| match found {
+                Ok(None) => view.set_view(ViewMode::Changes, window, cx),
+                Ok(Some(Some(oid))) => view.palette_reveal_commit(oid, window, cx),
+                Ok(Some(None)) => {
+                    toast::show(
+                        ui::ToastKind::Info,
+                        format!("{path} has no commits yet"),
+                        window,
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn repo_menu_entries(&self, cx: &Context<Self>) -> Vec<MenuEntry> {

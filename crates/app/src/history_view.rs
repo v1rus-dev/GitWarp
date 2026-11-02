@@ -1487,8 +1487,19 @@ impl HistoryView {
             .unwrap_or_else(|| CommitCard::bare(oid))
     }
 
+    /// Whether idle lanes fold into gap lanes.
+    pub(crate) fn idle_lanes_collapsed(&self) -> bool {
+        self.collapse
+    }
+
+    /// Every loaded commit, newest first, for the palette's Commits group.
+    /// The whole history, whatever the day filter shows.
+    pub(crate) fn loaded_commits(&self) -> Vec<Arc<CommitInfo>> {
+        self.items.iter().map(|item| item.commit.clone()).collect()
+    }
+
     /// Sets the idle-lane collapse, recomputes the geometry and persists it.
-    fn set_collapse(&mut self, collapse: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_collapse(&mut self, collapse: bool, cx: &mut Context<Self>) {
         if self.collapse == collapse {
             return;
         }
@@ -1502,7 +1513,7 @@ impl HistoryView {
 
     /// Fits the graph column to the current geometry and persists the width.
     /// Used by the grip's double-click, the "+N" pill and the context menu.
-    fn fit_graph(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn fit_graph(&mut self, cx: &mut Context<Self>) {
         let width = fit_width(content_width(self.geometry()));
         self.graph_width = width;
         crate::update_settings(cx, move |settings| settings.graph_width = width);

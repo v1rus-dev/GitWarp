@@ -156,7 +156,9 @@ impl TextInput {
         cx.notify();
     }
 
-    pub(crate) fn set_borderless(&mut self, borderless: bool) {
+    /// Drops the field's own border, padding and background, for an input that
+    /// sits in a container which draws them (the command palette's top row).
+    pub fn set_borderless(&mut self, borderless: bool) {
         self.borderless = borderless;
     }
 

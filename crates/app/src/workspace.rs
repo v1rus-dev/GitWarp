@@ -31,6 +31,7 @@ use crate::credential_dialog::CredentialDialog;
 use crate::host_key_dialog::HostKeyDialog;
 use crate::network_service::NetworkService;
 use crate::open_dialog::OpenRepoDialog;
+use crate::palette::OpenPalette;
 use crate::repo_view::{
     FocusSearch, OpenBranchSwitcher, OpenRepoSwitcher, PullBranch, PushBranch, RepositoryView,
     ToggleDetails, ToggleSidebar,
@@ -437,6 +438,15 @@ impl Workspace {
         .detach();
     }
 
+    /// The open repository's view, for the palette's tests.
+    #[cfg(test)]
+    pub(crate) fn repository_for_test(&self) -> Option<Entity<RepositoryView>> {
+        match &self.content {
+            Content::Repository(view) => Some(view.clone()),
+            Content::Welcome(_) | Content::Empty => None,
+        }
+    }
+
     /// Runs `f` on the open repository, if there is one.
     fn with_repository<R>(
         &self,
@@ -676,6 +686,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenCloneDialog, window, cx| {
                 this.open_clone_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
+                // The palette searches the open repository; settings cover it.
+                if this.settings.is_none() {
+                    this.with_repository(cx, |view, cx| view.open_palette(window, cx));
+                }
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(window, cx);
