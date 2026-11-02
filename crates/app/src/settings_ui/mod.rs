@@ -35,7 +35,7 @@ use ui::theme::{ActiveTheme, Density as UiDensity, ThemeStyle};
 use ui::{Button, Icon, IconName};
 
 use crate::settings::{Density, Settings};
-use crate::workspace::{git_label, git_tooltip, titlebar, titlebar_end, titlebar_fill, Workspace};
+use crate::workspace::{git_label, git_tooltip, titlebar, Workspace};
 
 /// One page of the Settings surface, in navigation order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -426,10 +426,6 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let client = matches!(
-            window.window_decorations(),
-            gpui::Decorations::Client { .. }
-        );
         let colors = cx.theme().colors;
         let close = {
             let view = cx.entity();
@@ -437,7 +433,9 @@ impl Render for SettingsView {
                 view.update(cx, |view, cx| view.close(window, cx));
             }
         };
-        let mut bar = titlebar(cx)
+        // Settings is a modal card inside the window, so its header has no
+        // window buttons and its empty stretch does not move the window.
+        let bar = titlebar(cx)
             .child(
                 div()
                     .flex()
@@ -448,14 +446,13 @@ impl Render for SettingsView {
                     .child(Icon::new(IconName::Gear).size(px(14.)).color(colors.muted))
                     .child(ui::t!("settings.title")),
             )
-            .child(titlebar_fill())
+            .child(div().flex_1())
             .child(
                 Button::ghost("settings-close")
                     .icon_only(IconName::X)
                     .tooltip(ui::t!("settings.close_tooltip"))
                     .on_click(close),
             );
-        bar = titlebar_end(bar, client);
 
         let nav = self.render_nav(cx);
         let page = self.render_page(window, cx);
