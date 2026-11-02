@@ -807,9 +807,11 @@ impl ActivityStrip {
         let keys = |text: &'static str| Kbd::new(text);
         side.child("Click a day to show its commits in History.")
             .child(
-                // One line, as in the design: the hint never wraps `filter`.
+                // Wraps only when the side column is too narrow, as in the
+                // design; items wrap whole, never mid-word.
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(4.))
                     .whitespace_nowrap()
