@@ -8,6 +8,7 @@
 //! move onto the same runner without touching the UI.
 
 pub mod activity;
+mod branch_log;
 mod config;
 pub mod credential;
 mod diff;
@@ -35,6 +36,7 @@ pub use activity::{
     activity, civil_from_days, common_dir, days_from_civil, level, levels, my_email, today,
     Activity, DayCount,
 };
+pub use branch_log::BranchLog;
 pub use config::{
     global_get, global_identity, set_global_identity, set_global_signing, ConfigScope, Identity,
 };
@@ -51,7 +53,7 @@ pub use ops::ResetMode;
 pub use refs::{Head, Ref, RefKind};
 pub use runner::{DiscoveredRepo, GitRunner};
 pub use stash::Stash;
-pub use status::{HeadCommit, HunkPick, WorkingFile, WorkingStatus};
+pub use status::{ChangedEntry, HeadCommit, HunkPick, WorkingFile, WorkingStatus};
 pub use submodule::{Submodule, SubmoduleState};
 pub use worktree::Worktree;
 
@@ -278,6 +280,17 @@ impl Repo {
         worktree::add_new_branch(self, path, branch, start)
     }
 
+    /// Creates the local branch `local_branch` tracking `remote_branch` (e.g.
+    /// `origin/feature`) and checks it out in a new worktree at `path`.
+    pub fn add_worktree_tracking(
+        &self,
+        path: &Path,
+        local_branch: &str,
+        remote_branch: &str,
+    ) -> Result<()> {
+        worktree::add_tracking(self, path, local_branch, remote_branch)
+    }
+
     /// Removes the worktree at `path`. `force` discards its local changes.
     pub fn remove_worktree(&self, path: &Path, force: bool) -> Result<()> {
         worktree::remove(self, path, force)
@@ -353,6 +366,33 @@ impl Repo {
     /// worktree page uses it for each worktree's changed count and file list.
     pub fn changed_paths(&self) -> Result<Vec<String>> {
         status::changed_paths(self)
+    }
+
+    /// Like [`Repo::changed_paths`], with a status letter per path
+    /// (`M A D U R ?`; a rename lists the new path).
+    pub fn changed_entries(&self) -> Result<Vec<ChangedEntry>> {
+        status::changed_entries(self)
+    }
+
+    /// The first line of the commit message of each of `ids`, in one git
+    /// process. Ids git does not know are left out.
+    pub fn head_summaries(&self, ids: &[Oid]) -> Result<std::collections::HashMap<Oid, String>> {
+        branch_log::head_summaries(self, ids)
+    }
+
+    /// The branch the worktree page treats as the main line (see the
+    /// settings: origin/HEAD's local branch, else `main`, `master`, the
+    /// current branch); `None` when nothing qualifies.
+    pub fn main_line(&self) -> Result<Option<String>> {
+        refs::main_line(self)
+    }
+
+    /// The first-parent history of `branch` (local or `<remote>/<name>`) down
+    /// to and including the point where it left `main`, plus merge info.
+    /// `main` is a local branch name; for a remote branch the same branch of
+    /// its remote is used when it exists. At most `limit` commits.
+    pub fn branch_log(&self, branch: &str, main: Option<&str>, limit: usize) -> Result<BranchLog> {
+        branch_log::branch_log(self, branch, main, limit)
     }
 
     /// Adds `paths` to the index (new files, modifications and deletions).

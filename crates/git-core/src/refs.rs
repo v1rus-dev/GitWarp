@@ -104,6 +104,54 @@ pub(crate) fn remotes(repo: &Repo) -> Result<Vec<String>> {
     Ok(parse_remotes(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// The local branch the worktree page treats as the main line: the one
+/// `refs/remotes/<remote>/HEAD` points to (when it exists locally), else
+/// `main`, else `master`, else the current branch; `None` when detached.
+pub(crate) fn main_line(repo: &Repo) -> Result<Option<String>> {
+    let remotes = remotes(repo)?;
+    // The default remote is `origin`, or the only/first one otherwise.
+    let remote = remotes
+        .iter()
+        .find(|r| *r == "origin")
+        .or_else(|| remotes.first());
+    if let Some(remote) = remote {
+        let prefix = format!("refs/remotes/{remote}/");
+        let out = repo
+            .command()
+            .args(["symbolic-ref", "-q"])
+            .arg(format!("{prefix}HEAD"))
+            .output()
+            .map_err(Error::Spawn)?;
+        if out.status.success() {
+            let target = String::from_utf8_lossy(&out.stdout);
+            if let Some(name) = target.trim().strip_prefix(&prefix) {
+                if local_branch_exists(repo, name)? {
+                    return Ok(Some(name.to_owned()));
+                }
+            }
+        }
+    }
+    for name in ["main", "master"] {
+        if local_branch_exists(repo, name)? {
+            return Ok(Some(name.to_owned()));
+        }
+    }
+    Ok(match head(repo)? {
+        Head::Branch { name, .. } => Some(name),
+        Head::Detached(_) => None,
+    })
+}
+
+fn local_branch_exists(repo: &Repo, name: &str) -> Result<bool> {
+    let out = repo
+        .command()
+        .args(["rev-parse", "-q", "--verify"])
+        .arg(format!("refs/heads/{name}"))
+        .output()
+        .map_err(Error::Spawn)?;
+    Ok(out.status.success())
+}
+
 fn parse_remotes(stdout: &str) -> Vec<String> {
     stdout
         .lines()

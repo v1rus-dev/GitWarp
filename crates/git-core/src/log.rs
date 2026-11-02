@@ -5,10 +5,10 @@ use std::thread::JoinHandle;
 
 use crate::{Error, Oid, Repo, Result};
 
-const FIELD: u8 = 0x1f;
-const RECORD: u8 = 0x1e;
+pub(crate) const FIELD: u8 = 0x1f;
+pub(crate) const RECORD: u8 = 0x1e;
 //                 id   parents  author   email    time     subject
-const FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1e";
+pub(crate) const FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1e";
 
 /// One commit as shown in the history list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,7 +437,7 @@ pub(crate) fn commits_on_day_in(
     Ok(found)
 }
 
-fn trim_record(raw: &[u8]) -> &[u8] {
+pub(crate) fn trim_record(raw: &[u8]) -> &[u8] {
     let raw = raw.strip_suffix(&[RECORD]).unwrap_or(raw);
     let start = raw
         .iter()
@@ -446,7 +446,7 @@ fn trim_record(raw: &[u8]) -> &[u8] {
     &raw[start..]
 }
 
-fn parse_record(record: &[u8]) -> Result<CommitInfo> {
+pub(crate) fn parse_record(record: &[u8]) -> Result<CommitInfo> {
     let mut fields = record.splitn(6, |&b| b == FIELD);
     let mut next = |what| fields.next().ok_or(Error::Parse(what));
 

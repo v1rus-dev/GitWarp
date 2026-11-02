@@ -112,40 +112,82 @@ impl HunkPick {
     }
 }
 
+/// One path with local changes and a one-letter status for the worktree page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedEntry {
+    pub path: String,
+    /// `M` modified, `A` added, `D` deleted, `R` renamed (`path` is the new
+    /// name), `U` conflicted, `?` untracked.
+    pub status: char,
+}
+
 /// The paths with local changes, staged or not, including untracked and
 /// conflicted files. One entry per path, sorted; line counts are not read.
 ///
 /// This is the cheap list the worktree page shows; [`status`] is the full
 /// working-tree view with added/deleted counts.
 pub(crate) fn changed_paths(repo: &Repo) -> Result<Vec<String>> {
+    Ok(changed_entries(repo)?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect())
+}
+
+/// Like [`changed_paths`], with a status letter per path.
+pub(crate) fn changed_entries(repo: &Repo) -> Result<Vec<ChangedEntry>> {
     let out = repo
         .command()
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()
         .map_err(Error::Spawn)?;
     let out = check_output(out, "status")?;
-    let mut paths = parse_changed_paths(&out.stdout);
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+    let mut entries = parse_changed_entries(&out.stdout);
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries.dedup_by(|a, b| a.path == b.path);
+    Ok(entries)
 }
 
 /// `git status --porcelain=v1 -z`: `XY SP PATH NUL`; a rename or copy is
 /// followed by the original path as its own NUL field.
-fn parse_changed_paths(raw: &[u8]) -> Vec<String> {
-    let mut paths = Vec::new();
+fn parse_changed_entries(raw: &[u8]) -> Vec<ChangedEntry> {
+    let mut entries = Vec::new();
     let mut fields = raw.split(|&byte| byte == 0);
     while let Some(record) = fields.next() {
         if record.len() < 4 {
             continue;
         }
-        paths.push(String::from_utf8_lossy(&record[3..]).into_owned());
+        entries.push(ChangedEntry {
+            path: String::from_utf8_lossy(&record[3..]).into_owned(),
+            status: status_letter(record[0], record[1]),
+        });
         if matches!(record[0], b'R' | b'C') {
             // The original path of a rename/copy.
             fields.next();
         }
     }
-    paths
+    entries
+}
+
+/// Collapses the two-column `XY` code into one letter. Conflicts win, then
+/// renames, additions (a copy counts as an addition), deletions; everything
+/// else (modified, type change) is `M`.
+fn status_letter(x: u8, y: u8) -> char {
+    match (x, y) {
+        (b'?', b'?') => '?',
+        (b'U', _) | (_, b'U') | (b'A', b'A') | (b'D', b'D') => 'U',
+        _ if x == b'R' || y == b'R' => 'R',
+        _ if x == b'A' || x == b'C' || y == b'C' => 'A',
+        _ if x == b'D' || y == b'D' => 'D',
+        _ => 'M',
+    }
+}
+
+#[cfg(test)]
+fn parse_changed_paths(raw: &[u8]) -> Vec<String> {
+    parse_changed_entries(raw)
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect()
 }
 
 /// Reads the whole working-tree status.
