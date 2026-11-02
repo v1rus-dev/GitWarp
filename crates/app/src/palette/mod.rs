@@ -17,8 +17,8 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, div, px, size, App, AppContext, Context, Decorations, Entity, FontWeight,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render, ScrollHandle,
-    Size, StatefulInteractiveElement, Styled, StyledText, Subscription, Task, TextRun, TextStyle,
-    WeakEntity, Window,
+    SharedString, Size, StatefulInteractiveElement, Styled, StyledText, Subscription, Task,
+    TextRun, TextStyle, WeakEntity, Window,
 };
 
 use git_core::{Error, Git};
@@ -40,7 +40,6 @@ actions!(palette, [OpenPalette, PagePrev, PageNext, Ignore]);
 
 /// Rows a PgUp / PgDn press moves.
 const PAGE: usize = 10;
-const PLACEHOLDER: &str = "Type a command, branch, commit hash or file…";
 
 /// Binds the palette's own keys in its key context. Called once at startup;
 /// the key that opens it is bound with the other repository shortcuts.
@@ -72,7 +71,7 @@ pub(crate) fn open(init: Init, window: &mut Window, cx: &mut App) {
         let mut input = TextInput::new(window, cx);
         // The row around it draws the palette's chrome, not the input.
         input.set_borderless(true);
-        input.set_placeholder(PLACEHOLDER, cx);
+        input.set_placeholder(ui::t!("palette.placeholder"), cx);
         input
     });
     let view = cx.new(|cx| PaletteView::new(init, input.clone(), window, cx));
@@ -303,9 +302,12 @@ impl PaletteView {
         let selected = index == self.selected;
         let trailing = if hit.current {
             Some(
-                RefBadge::new(format!("palette-current-{index}"), "current")
-                    .kind(RefKind::Head)
-                    .into_any_element(),
+                RefBadge::new(
+                    format!("palette-current-{index}"),
+                    ui::t!("palette.row.current"),
+                )
+                .kind(RefKind::Head)
+                .into_any_element(),
             )
         } else if let Target::Command(command) = &hit.target {
             command
@@ -346,7 +348,7 @@ impl PaletteView {
     }
 
     fn render_footer(&self, colors: ui::ThemeColors) -> impl IntoElement {
-        let hint = |keys: Vec<&'static str>, label: &'static str| {
+        let hint = |keys: Vec<&'static str>, label: SharedString| {
             div()
                 .flex()
                 .items_center()
@@ -365,16 +367,17 @@ impl PaletteView {
             .border_color(colors.border)
             .text_size(FS_SM)
             .text_color(colors.muted)
-            .child(hint(vec!["↑", "↓"], "navigate"))
-            .child(hint(vec!["Enter"], "run"))
-            .child(hint(vec![">"], "commands"))
-            .child(hint(vec!["@"], "branches"))
-            .child(hint(vec!["#"], "commits"))
+            .child(hint(vec!["↑", "↓"], ui::t!("palette.footer.navigate")))
+            .child(hint(vec!["Enter"], ui::t!("palette.footer.run")))
+            .child(hint(vec![">"], ui::t!("palette.footer.commands")))
+            .child(hint(vec!["@"], ui::t!("palette.footer.branches")))
+            .child(hint(vec!["#"], ui::t!("palette.footer.commits")))
             .child(div().flex_1())
-            .child(match self.hits.len() {
-                1 => "1 result".to_owned(),
-                n => format!("{n} results"),
-            })
+            .child(ui::i18n::t_count(
+                "palette.footer.results",
+                self.hits.len() as u64,
+                &[],
+            ))
     }
 }
 
@@ -488,7 +491,7 @@ impl Render for PaletteView {
                 .justify_center()
                 .min_h(px(120.))
                 .text_color(colors.muted)
-                .child(format!("No results for “{}”", self.query.trim()))
+                .child(ui::t!("palette.empty", query = self.query.trim()))
                 .into_any_element()
         } else {
             div()

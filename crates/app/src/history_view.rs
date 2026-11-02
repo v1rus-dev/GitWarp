@@ -749,7 +749,7 @@ fn push_row_action(
     entries: &mut Vec<MenuEntry>,
     card: &CommitCard,
     on_action: &RefActionHandler,
-    label: String,
+    label: SharedString,
     icon: IconName,
     shortcut: Option<&str>,
     build: fn(CommitCard) -> RefAction,
@@ -948,7 +948,7 @@ impl RowMenu {
     fn entries(&self) -> Vec<MenuEntry> {
         let hash = self.hash.clone();
         let mut entries = vec![MenuEntry::Item(
-            MenuItem::new("Copy commit hash")
+            MenuItem::new(ui::t!("history.menu.copy_hash"))
                 .icon(IconName::Copy)
                 .shortcut("Ctrl+C")
                 .action(move |_, cx| {
@@ -967,7 +967,7 @@ impl RowMenu {
             &mut entries,
             card,
             on_action,
-            "Create branch here…".to_owned(),
+            ui::t!("history.menu.create_branch_here"),
             IconName::Branch,
             Some("B"),
             RefAction::CreateBranch,
@@ -977,7 +977,7 @@ impl RowMenu {
             &mut entries,
             card,
             on_action,
-            "Create tag here…".to_owned(),
+            ui::t!("history.menu.create_tag_here"),
             IconName::Tag,
             None,
             RefAction::CreateTag,
@@ -988,7 +988,7 @@ impl RowMenu {
             &mut entries,
             card,
             on_action,
-            "Cherry-pick".to_owned(),
+            ui::t!("history.menu.cherry_pick"),
             IconName::Undo,
             None,
             RefAction::CherryPick,
@@ -998,7 +998,7 @@ impl RowMenu {
             &mut entries,
             card,
             on_action,
-            "Revert commit".to_owned(),
+            ui::t!("history.menu.revert_commit"),
             IconName::Undo,
             None,
             RefAction::Revert,
@@ -1008,7 +1008,7 @@ impl RowMenu {
             &mut entries,
             card,
             on_action,
-            format!("Reset {} to here…", self.reset_branch),
+            ui::t!("history.menu.reset_to_here", branch = self.reset_branch),
             IconName::Undo,
             None,
             RefAction::Reset,
@@ -1024,7 +1024,7 @@ impl RowMenu {
             [] => {
                 let (on_action, card) = (self.on_action.clone(), self.card.clone());
                 entries.push(MenuEntry::Item(
-                    MenuItem::new("Checkout this commit")
+                    MenuItem::new(ui::t!("history.menu.checkout_commit"))
                         .icon(IconName::Check)
                         .action(move |window, cx| {
                             on_action(RefAction::CheckoutCommit(card.clone()), window, cx);
@@ -1041,7 +1041,7 @@ impl RowMenu {
                     })
                     .collect();
                 entries.push(MenuEntry::Item(self.picker_item(
-                    "Switch to…",
+                    ui::t!("history.menu.switch_to_picker"),
                     IconName::Check,
                     list,
                     Pick::Switch,
@@ -1054,7 +1054,7 @@ impl RowMenu {
         if self.filter.is_some() {
             let on_filter = self.on_filter.clone();
             entries.push(MenuEntry::Item(
-                MenuItem::new("Show all commits")
+                MenuItem::new(ui::t!("history.menu.show_all_commits"))
                     .icon(IconName::X)
                     .action(move |_, cx| on_filter(None, cx)),
             ));
@@ -1065,7 +1065,7 @@ impl RowMenu {
                 self.filter_item(&branch.name, IconName::Branch),
             )),
             _ => entries.push(MenuEntry::Item(self.picker_item(
-                "Show all commits of…",
+                ui::t!("history.menu.show_all_commits_of_picker"),
                 IconName::Branch,
                 self.branches.clone(),
                 Pick::Filter,
@@ -1080,14 +1080,14 @@ impl RowMenu {
                 let this = self.clone();
                 let branch = branch.clone();
                 entries.push(MenuEntry::Item(
-                    MenuItem::new(format!("Branch {}", branch.name))
+                    MenuItem::new(ui::t!("history.menu.branch", name = branch.name))
                         .icon(branch_icon(&branch))
                         .shortcut("›")
                         .submenu(move || this.branch_view(&branch)),
                 ));
             }
             _ => entries.push(MenuEntry::Item(self.picker_item(
-                "Branch…",
+                ui::t!("history.menu.branch_picker"),
                 IconName::Branch,
                 self.branches.clone(),
                 Pick::Menu,
@@ -1097,7 +1097,7 @@ impl RowMenu {
 
     fn switch_item(&self, name: &str) -> MenuItem {
         let (on_action, branch) = (self.on_action.clone(), name.to_owned());
-        MenuItem::new(format!("Switch to {name}"))
+        MenuItem::new(ui::t!("history.menu.switch_to", name = name))
             .icon(IconName::Check)
             .action(move |window, cx| {
                 on_action(RefAction::CheckoutBranch(branch.clone()), window, cx);
@@ -1109,7 +1109,7 @@ impl RowMenu {
     fn filter_item(&self, name: &str, icon: IconName) -> MenuItem {
         let active = self.filter.as_deref() == Some(name);
         let (on_filter, branch) = (self.on_filter.clone(), name.to_owned());
-        MenuItem::new(format!("Show all commits of {name}"))
+        MenuItem::new(ui::t!("history.menu.show_all_commits_of", name = name))
             .icon(if active { IconName::Check } else { icon })
             .disabled(active)
             .action(move |_, cx| on_filter(Some(branch.clone()), cx))
@@ -1118,7 +1118,7 @@ impl RowMenu {
     /// An item that swaps the menu for a picker over `list`.
     fn picker_item(
         &self,
-        label: &'static str,
+        label: SharedString,
         icon: IconName,
         list: Vec<RowBranch>,
         pick: Pick,
@@ -1138,7 +1138,7 @@ impl RowMenu {
             let mut item = MenuItem::new(branch.name.clone()).icon(branch_icon(&branch));
             match branch.kind {
                 RowBranchKind::Head => item = item.shortcut("HEAD"),
-                RowBranchKind::Remote => item = item.shortcut("remote"),
+                RowBranchKind::Remote => item = item.shortcut(ui::t!("history.menu.remote_tag")),
                 RowBranchKind::Local => {}
             }
             let last_picked = self.last_picked.clone();
@@ -1185,7 +1185,7 @@ impl RowMenu {
     fn back_item(&self) -> MenuEntry {
         let this = self.clone();
         MenuEntry::Item(
-            MenuItem::new("Back")
+            MenuItem::new(ui::t!("history.menu.back"))
                 .icon(IconName::Undo)
                 .shortcut("‹")
                 .submenu(move || this.entries()),
@@ -2149,7 +2149,7 @@ impl HistoryView {
         let checked = self.collapse;
         let entries = vec![
             MenuEntry::Item(
-                MenuItem::new("Collapse idle lanes")
+                MenuItem::new(ui::t!("history.graph_menu.collapse_idle"))
                     // The kit menu has no checked state: the icon says it.
                     .icon(if checked {
                         IconName::Check
@@ -2163,7 +2163,7 @@ impl HistoryView {
                     }),
             ),
             MenuEntry::Item(
-                MenuItem::new("Fit graph to content")
+                MenuItem::new(ui::t!("history.graph_menu.fit"))
                     .icon(IconName::Split)
                     .action(move |_, cx| {
                         fit.update(cx, |view, cx| view.fit_graph(cx)).ok();
@@ -2284,7 +2284,7 @@ impl HistoryView {
             return Some(if pending {
                 "– / 0+".into()
             } else {
-                "No matches".into()
+                ui::t!("history.search.no_matches")
             });
         }
         let total = self.search_matches.len();
@@ -2599,7 +2599,7 @@ impl HistoryView {
                     view.open_graph_menu(event.position, window, cx);
                 }),
             )
-            .child("Graph");
+            .child(ui::t!("history.header.graph"));
         if clipped > 0 {
             cell = cell.child(
                 div()
@@ -2612,8 +2612,10 @@ impl HistoryView {
                     .font_weight(FontWeight::BOLD)
                     .text_color(accent)
                     .cursor_pointer()
-                    .tooltip(Tooltip::text(format!(
-                        "{clipped} lanes are clipped. Click to widen the column."
+                    .tooltip(Tooltip::text(ui::i18n::t_count(
+                        "history.header.lanes_clipped",
+                        clipped as u64,
+                        &[],
                     )))
                     .on_click(cx.listener(|view, _, _, cx| view.fit_graph(cx)))
                     .child(format!("+{clipped}")),
@@ -2631,9 +2633,19 @@ impl HistoryView {
             .cursor_col_resize()
             .hover(move |style| style.bg(accent.opacity(0.7)))
             .when(dragging, |this| this.bg(accent.opacity(0.7)))
-            .tooltip(Tooltip::text(
-                "Drag to resize the graph column · double-click to fit",
-            ))
+            // A resting 1px divider, so the grip is visible before hover.
+            .when(!dragging, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(3.))
+                        .w(px(1.))
+                        .bg(colors.border_strong),
+                )
+            })
+            .tooltip(Tooltip::text(ui::t!("history.header.grip_tooltip")))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, event: &MouseDownEvent, _, cx| {
@@ -2693,13 +2705,34 @@ impl HistoryView {
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(colors.muted)
             .child(self.render_graph_header(columns, cx))
-            .child(div().flex_1().min_w_0().truncate().child("Summary"));
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(ui::t!("history.header.summary")),
+            );
         if let Some(author) = columns.author {
-            head = head.child(div().w(px(author)).flex_none().child("Author"));
+            head = head.child(
+                div()
+                    .w(px(author))
+                    .flex_none()
+                    .child(ui::t!("history.header.author")),
+            );
         }
-        head = head.child(div().w(px(columns.date)).flex_none().child("Date"));
+        head = head.child(
+            div()
+                .w(px(columns.date))
+                .flex_none()
+                .child(ui::t!("history.header.date")),
+        );
         if let Some(hash) = columns.hash {
-            head = head.child(div().w(px(hash)).flex_none().child("Hash"));
+            head = head.child(
+                div()
+                    .w(px(hash))
+                    .flex_none()
+                    .child(ui::t!("history.header.hash")),
+            );
         }
         div().w_full().px(px(SIDE_MARGIN)).child(head)
     }
@@ -2711,24 +2744,29 @@ impl HistoryView {
         let ready = matches!(rows.state, DayState::Ready);
         let commits = rows.items.len();
         let merges = rows.merged_from.len();
-        let mut counts = if ready {
-            format!("{commits} commit{}", if commits == 1 { "" } else { "s" })
-        } else {
+        let counts = if !ready {
             "…".to_owned()
+        } else if merges > 0 {
+            ui::t!(
+                "history.branch_bar.with_merges",
+                commits = ui::i18n::t_count("history.branch_bar.commits", commits as u64, &[]),
+                merges = ui::i18n::t_count("history.branch_bar.merges", merges as u64, &[])
+            )
+            .to_string()
+        } else {
+            ui::i18n::t_count("history.branch_bar.commits", commits as u64, &[]).to_string()
         };
-        if ready && merges > 0 {
-            counts.push_str(&format!(
-                " · {merges} merge{}",
-                if merges == 1 { "" } else { "s" }
-            ));
-        }
         let into = rows.merged_into.as_ref().map(|(oid, main)| {
             let hash = short_hash(oid);
             let oid = *oid;
             Button::new("branch-filter-into")
                 .size(ButtonSize::Small)
-                .label(format!("Merged into {main} · {hash}"))
-                .tooltip(format!("Select the merge commit {hash}"))
+                .label(ui::t!(
+                    "history.branch_bar.merged_into",
+                    main = main,
+                    hash = hash
+                ))
+                .tooltip(ui::t!("history.branch_bar.select_merge", hash = hash))
                 .on_click(cx.listener(move |view, _, _, cx| {
                     // Back to the whole history, on that merge.
                     view.set_branch_filter(None, cx);
@@ -2764,9 +2802,14 @@ impl HistoryView {
                                 .size(px(13.))
                                 .color(colors.muted),
                         )
-                        .child("Commits of")
-                        .child(
-                            div()
+                        .child(div().min_w_0().flex().items_center().children(
+                            ui::i18n::pieces_children(
+                                ui::i18n::t_pieces(
+                                    "history.branch_bar.commits_of",
+                                    &[],
+                                    &["branch"],
+                                ),
+                                vec![div()
                                 .id("history-branch-filter-name")
                                 .min_w_0()
                                 // The design caps the name at 40ch.
@@ -2775,8 +2818,10 @@ impl HistoryView {
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(colors.text)
                                 .tooltip(Tooltip::text(rows.branch.clone()))
-                                .child(rows.branch.clone()),
-                        ),
+                                .child(rows.branch.clone())
+                                .into_any_element()],
+                            ),
+                        )),
                 )
                 .child(div().flex_none().text_color(colors.muted).child(counts))
                 .children(into)
@@ -2785,7 +2830,7 @@ impl HistoryView {
                     Button::new("branch-filter-clear")
                         .size(ButtonSize::Small)
                         .icon(IconName::X)
-                        .label("Show all commits")
+                        .label(ui::t!("history.branch_bar.show_all"))
                         .on_click(cx.listener(|view, _, _, cx| view.set_branch_filter(None, cx))),
                 ),
         )
@@ -2800,10 +2845,23 @@ impl HistoryView {
         };
         // The folded lanes are part of the history's own progress line: say
         // how many the graph is hiding while the rows stream in.
-        let folded = if self.collapse && self.geometry().folded_count > 0 {
-            format!(" · {} idle lanes folded", self.geometry.folded_count)
+        let loading_text = ui::i18n::t_count(
+            "history.load.loading",
+            loaded,
+            &[("n", &format_count(loaded as usize))],
+        );
+        let loading_text = if self.collapse && self.geometry().folded_count > 0 {
+            ui::t!(
+                "history.load.with_folded",
+                loading = loading_text,
+                folded = ui::i18n::t_count(
+                    "history.load.lanes_folded",
+                    self.geometry.folded_count as u64,
+                    &[]
+                )
+            )
         } else {
-            String::new()
+            loading_text
         };
         div()
             .w_full()
@@ -2822,10 +2880,7 @@ impl HistoryView {
                     .flex_none()
                     .font_weight(FontWeight::BOLD)
                     .text_color(colors.text)
-                    .child(format!(
-                        "Loading… {} commits{folded}",
-                        format_count(loaded as usize)
-                    )),
+                    .child(loading_text),
             )
             .child(
                 div()
@@ -2840,7 +2895,7 @@ impl HistoryView {
             })
             .child(
                 Button::new("history-cancel")
-                    .label("Cancel")
+                    .label(ui::t!("history.load.cancel"))
                     .size(ButtonSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
             )
@@ -3088,7 +3143,7 @@ impl HistoryView {
                     // The "from {x}" chip is not a ref of the row but takes
                     // room beside the badges.
                     let chip_width = merged_from.map_or(0., |name| {
-                        let label = SharedString::from(format!("from {name}"));
+                        let label = ui::t!("history.badge.from", name = name);
                         f32::from(measure_badge(window, &label, RefKind::Local, badge_widths))
                             + BADGE_GAP
                     });
@@ -3155,16 +3210,19 @@ impl HistoryView {
                 if let Some(name) = merged_from {
                     let target = name.clone();
                     summary = summary.child(
-                        RefBadge::new(format!("history-from-{ix}"), format!("from {name}"))
-                            .dashed()
-                            .max_label_width(px(BADGE_LABEL_MAX))
-                            .tooltip(format!("Merged from {name} · click to show its commits"))
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                // The row's own click must not also select a
-                                // row of the list that is about to change.
-                                cx.stop_propagation();
-                                view.set_branch_filter(Some(target.clone()), cx);
-                            })),
+                        RefBadge::new(
+                            format!("history-from-{ix}"),
+                            ui::t!("history.badge.from", name = name),
+                        )
+                        .dashed()
+                        .max_label_width(px(BADGE_LABEL_MAX))
+                        .tooltip(ui::t!("history.badge.from_tooltip", name = name))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            // The row's own click must not also select a
+                            // row of the list that is about to change.
+                            cx.stop_propagation();
+                            view.set_branch_filter(Some(target.clone()), cx);
+                        })),
                     );
                 }
                 row_div = row_div.child(
@@ -3343,11 +3401,11 @@ impl HistoryView {
                     let message = SharedString::from(message.clone());
                     let actions = div().flex().gap(px(8.)).child(
                         Button::primary("empty-day-retry")
-                            .label("Retry")
+                            .label(ui::t!("history.action.retry"))
                             .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
                     );
                     centred(
-                        EmptyState::new("Could not list the commits of this day")
+                        EmptyState::new(ui::t!("history.empty.day_failed"))
                             .icon(IconName::Warn)
                             .icon_color(cx.theme().colors.warning)
                             .text(message)
@@ -3355,7 +3413,7 @@ impl HistoryView {
                     )
                 }
                 DayState::Ready if day.items.is_empty() => centred(
-                    EmptyState::new("No commits on this day")
+                    EmptyState::new(ui::t!("history.empty.day_none"))
                         .icon(IconName::Git)
                         .icon_color(cx.theme().colors.muted),
                 ),
@@ -3370,11 +3428,11 @@ impl HistoryView {
                     let message = SharedString::from(message.clone());
                     let actions = div().flex().gap(px(8.)).child(
                         Button::primary("empty-branch-retry")
-                            .label("Retry")
+                            .label(ui::t!("history.action.retry"))
                             .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
                     );
                     centred(
-                        EmptyState::new("Could not list the commits of this branch")
+                        EmptyState::new(ui::t!("history.empty.branch_failed"))
                             .icon(IconName::Warn)
                             .icon_color(cx.theme().colors.warning)
                             .text(message)
@@ -3384,18 +3442,16 @@ impl HistoryView {
                 DayState::Ready if branch.items.is_empty() => {
                     let actions = div().flex().gap(px(8.)).child(
                         Button::new("empty-branch-clear")
-                            .label("Show all commits")
+                            .label(ui::t!("history.action.show_all_commits"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.set_branch_filter(None, cx);
                             })),
                     );
                     centred(
-                        EmptyState::new("No commits to show")
+                        EmptyState::new(ui::t!("history.empty.branch_none"))
                             .icon(IconName::Branch)
                             .icon_color(cx.theme().colors.muted)
-                            .text(format!(
-                                "{name} has no commits in this repository view. It may be gone or not fetched yet."
-                            ))
+                            .text(ui::t!("history.empty.branch_none_detail", name = name))
                             .actions(actions),
                     )
                 }
@@ -3431,7 +3487,7 @@ impl HistoryView {
                     // possible instead of showing the full empty state.
                     let colors = cx.theme().colors;
                     let strip = self.status_strip(
-                        "History is incomplete — loading was cancelled".into(),
+                        ui::t!("history.strip.cancelled"),
                         IconName::Warn,
                         colors.warning,
                         false,
@@ -3465,17 +3521,22 @@ impl HistoryView {
         let root = self.root.clone().unwrap_or_else(|| self.path.clone());
         let path = root.join(".gitignore");
         if path.exists() {
-            ui::toast::show(ToastKind::Info, ".gitignore already exists", window, cx);
+            ui::toast::show(
+                ToastKind::Info,
+                ui::t!("history.gitignore.exists"),
+                window,
+                cx,
+            );
         } else if let Err(error) = std::fs::write(&path, STARTER_GITIGNORE) {
             ui::toast::show(
                 ToastKind::Error,
-                format!("Could not add a .gitignore: {error}"),
+                ui::t!("history.gitignore.failed", error = error),
                 window,
                 cx,
             );
             return;
         } else {
-            ui::toast::show(ToastKind::Ok, "Added a .gitignore", window, cx);
+            ui::toast::show(ToastKind::Ok, ui::t!("history.gitignore.added"), window, cx);
         }
         self.show_local_changes(window, cx);
     }
@@ -3484,27 +3545,26 @@ impl HistoryView {
     fn render_no_commits(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
         let style = body_style(colors);
-        let body = BodyText::new()
-            .plain("This repository is empty. Stage some files and make your first commit to see history here.");
+        let body = BodyText::new().plain(&ui::t!("history.empty.no_commits_body"));
         let actions = div()
             .flex()
             .gap(px(8.))
             .child(
                 Button::primary("empty-no-commits-primary")
-                    .label("Go to Local changes")
+                    .label(ui::t!("history.empty.go_to_changes"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.show_local_changes(window, cx);
                     })),
             )
             .child(
                 Button::new("empty-no-commits-secondary")
-                    .label("Add .gitignore")
+                    .label(ui::t!("history.empty.add_gitignore"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.add_gitignore(window, cx);
                     })),
             );
         centred(
-            EmptyState::new("No commits yet")
+            EmptyState::new(ui::t!("history.empty.no_commits"))
                 .icon(IconName::Git)
                 .icon_color(colors.muted)
                 .body(body.element(&style))
@@ -3516,14 +3576,14 @@ impl HistoryView {
     fn render_cancelled(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let actions = div().flex().gap(px(8.)).child(
             Button::primary("empty-cancelled-retry")
-                .label("Retry")
+                .label(ui::t!("history.action.retry"))
                 .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
         );
         centred(
-            EmptyState::new("Loading cancelled")
+            EmptyState::new(ui::t!("history.empty.cancelled"))
                 .icon(IconName::Fetch)
                 .icon_color(cx.theme().colors.muted)
-                .text("The history was not loaded completely.")
+                .text(ui::t!("history.empty.cancelled_detail"))
                 .actions(actions),
         )
     }
@@ -3534,21 +3594,22 @@ impl HistoryView {
         match failure {
             Failure::NotARepository(path) => {
                 let path = path.display().to_string();
-                let body = BodyText::new()
-                    .code(&path)
-                    .plain(" is not inside a git working tree.");
+                let body = BodyText::templated(
+                    &ui::t!("history.empty.not_a_repository_body"),
+                    &[("path", &path)],
+                );
                 let actions = div()
                     .flex()
                     .gap(px(8.))
                     .child(
                         Button::primary("empty-not-a-repo-init")
                             .icon(IconName::Init)
-                            .label("Initialize repository here")
+                            .label(ui::t!("history.empty.init_here"))
                             .on_click(cx.listener(|this, _, _, cx| this.init_repository(cx))),
                     )
                     .child(
                         Button::new("empty-not-a-repo-open")
-                            .label("Open another…")
+                            .label(ui::t!("history.action.open_another"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if let Some(workspace) = this.workspace.upgrade() {
                                     workspace.update(cx, |workspace, cx| {
@@ -3558,7 +3619,7 @@ impl HistoryView {
                             })),
                     );
                 centred(
-                    EmptyState::new("Not a git repository")
+                    EmptyState::new(ui::t!("history.failure.not_a_repository"))
                         .icon(IconName::Folder)
                         .icon_color(colors.muted)
                         .body(body.element(&style))
@@ -3568,7 +3629,10 @@ impl HistoryView {
             Failure::PathNotFound(path) => {
                 let shown = path.display().to_string();
                 let remove_path = path.clone();
-                let body = BodyText::new().code(&shown).plain(" does not exist.");
+                let body = BodyText::templated(
+                    &ui::t!("history.empty.folder_missing_body"),
+                    &[("path", &shown)],
+                );
                 // Removing the dead entry is the way out: the welcome screen
                 // shows the rest of the recent list again. Retry only repeats
                 // the same answer.
@@ -3577,7 +3641,7 @@ impl HistoryView {
                     .gap(px(8.))
                     .child(
                         Button::primary("empty-path-missing-remove")
-                            .label("Remove from recent")
+                            .label(ui::t!("history.empty.remove_from_recent"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 crate::update_settings(cx, |settings| {
                                     settings.remove_recent(&remove_path)
@@ -3591,7 +3655,7 @@ impl HistoryView {
                     )
                     .child(
                         Button::new("empty-path-missing-open")
-                            .label("Open another…")
+                            .label(ui::t!("history.action.open_another"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if let Some(workspace) = this.workspace.upgrade() {
                                     workspace.update(cx, |workspace, cx| {
@@ -3601,7 +3665,7 @@ impl HistoryView {
                             })),
                     );
                 centred(
-                    EmptyState::new("Folder not found")
+                    EmptyState::new(ui::t!("history.failure.folder_not_found"))
                         .icon(IconName::Folder)
                         .icon_color(colors.muted)
                         .body(body.element(&style))
@@ -3609,24 +3673,24 @@ impl HistoryView {
                 )
             }
             Failure::GitNotFound => {
-                let body = BodyText::new()
-                    .plain("GitWarp could not find a usable git. The bundled copy is missing and there is no ")
-                    .code("git")
-                    .plain(" in PATH.");
+                let body = BodyText::templated(
+                    &ui::t!("history.empty.git_not_found_body"),
+                    &[("git", "git")],
+                );
                 let actions = div()
                     .flex()
                     .gap(px(8.))
                     .child(
                         Button::primary("empty-git-not-found-settings")
                             .icon(IconName::Gear)
-                            .label("Open Git settings")
+                            .label(ui::t!("history.empty.open_git_settings"))
                             .on_click(cx.listener(|_, _, window, cx| {
                                 window.dispatch_action(Box::new(OpenGitSettings), cx);
                             })),
                     )
                     .child(self.retry_git_button("empty-git-not-found-retry", cx));
                 centred(
-                    EmptyState::new("git was not found")
+                    EmptyState::new(ui::t!("history.failure.git_not_found"))
                         .body(body.element(&style))
                         .icon(IconName::Err)
                         .icon_color(colors.error)
@@ -3639,23 +3703,23 @@ impl HistoryView {
                 source,
                 path,
             } => {
-                let body = BodyText::new()
-                    .plain("GitWarp needs git ")
-                    .plain(&required.to_string())
-                    .plain(" or newer. ")
-                    .plain(source_label(*source))
-                    .plain(" git at ")
-                    .code(&path.display().to_string())
-                    .plain(" reports ")
-                    .plain(&found.to_string())
-                    .plain(".");
+                // `{path}` stays in the template: it becomes a code run.
+                let body = BodyText::templated(
+                    &ui::t!(
+                        "history.empty.git_too_old_body",
+                        required = required,
+                        source = source_label(*source),
+                        found = found
+                    ),
+                    &[("path", &path.display().to_string())],
+                );
                 let actions = div()
                     .flex()
                     .gap(px(8.))
                     .child(
                         Button::primary("empty-git-too-old-settings")
                             .icon(IconName::Gear)
-                            .label("Open Git settings")
+                            .label(ui::t!("history.empty.open_git_settings"))
                             .on_click(cx.listener(|_, _, window, cx| {
                                 window.dispatch_action(Box::new(OpenGitSettings), cx);
                             })),
@@ -3674,26 +3738,25 @@ impl HistoryView {
                 code,
                 stderr,
             } => {
-                let body = BodyText::new()
-                    .plain("The command ")
-                    .code(&format!("git {command}"));
-                let body = match code {
-                    Some(code) => body.plain(&format!(" failed with exit code {code}.")),
-                    None => body.plain(" was stopped."),
+                let template = match code {
+                    Some(code) => ui::t!("history.empty.git_failed_body", code = code),
+                    None => ui::t!("history.empty.git_stopped_body"),
                 };
+                let body =
+                    BodyText::templated(&template, &[("command", &format!("git {command}"))]);
                 let actions = div()
                     .flex()
                     .gap(px(8.))
                     .child(
                         Button::primary("empty-git-error-retry")
                             .icon(IconName::Fetch)
-                            .label("Retry")
+                            .label(ui::t!("history.action.retry"))
                             .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
                     )
                     .child(
                         Button::new("empty-git-error-copy")
                             .icon(IconName::Copy)
-                            .label("Copy details")
+                            .label(ui::t!("history.action.copy_details"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let LoadState::Failed(failure) = &this.state {
                                     if let Some(details) = failure.copy_details() {
@@ -3723,13 +3786,13 @@ impl HistoryView {
                     .child(
                         Button::primary("empty-other-retry")
                             .icon(IconName::Fetch)
-                            .label("Retry")
+                            .label(ui::t!("history.action.retry"))
                             .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
                     )
                     .child(
                         Button::new("empty-other-copy")
                             .icon(IconName::Copy)
-                            .label("Copy details")
+                            .label(ui::t!("history.action.copy_details"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let LoadState::Failed(failure) = &this.state {
                                     if let Some(details) = failure.copy_details() {
@@ -3754,7 +3817,7 @@ impl HistoryView {
     fn retry_git_button(&self, id: &'static str, cx: &mut Context<Self>) -> Button {
         let workspace = self.workspace.clone();
         Button::new(id)
-            .label("Retry")
+            .label(ui::t!("history.action.retry"))
             .on_click(cx.listener(move |_, _, window, cx| {
                 workspace
                     .update(cx, |workspace, cx| workspace.retry_git(window, cx))
@@ -3767,10 +3830,10 @@ impl HistoryView {
     fn render_incomplete(&mut self, failure: &Failure, cx: &mut Context<Self>) -> AnyElement {
         let text: SharedString = match failure {
             Failure::Git { command, .. } => {
-                format!("History is incomplete: git {command} failed").into()
+                ui::t!("history.strip.git_failed", command = command)
             }
-            Failure::Other { message } => format!("History is incomplete: {message}").into(),
-            _ => "History is incomplete".into(),
+            Failure::Other { message } => ui::t!("history.strip.generic", message = message),
+            _ => ui::t!("history.strip.incomplete"),
         };
         let colors = cx.theme().colors;
         let strip = self.status_strip(text, IconName::Err, colors.error, true, cx);
@@ -3807,14 +3870,14 @@ impl HistoryView {
             .child(div().flex_1())
             .child(
                 Button::new("history-strip-retry")
-                    .label("Retry")
+                    .label(ui::t!("history.action.retry"))
                     .size(ButtonSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
             );
         if copy_details {
             strip = strip.child(
                 Button::new("history-strip-copy")
-                    .label("Copy details")
+                    .label(ui::t!("history.action.copy_details"))
                     .size(ButtonSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let LoadState::Failed(failure) = &this.state {
@@ -3915,6 +3978,19 @@ impl BodyText {
         self.text.push_str(text);
         self.code.push(start..self.text.len());
         self
+    }
+
+    /// A whole translated sentence whose `{name}` placeholders become code runs
+    /// with the matching value; the rest is plain. Translators see one
+    /// sentence, so word order can differ per language.
+    fn templated(template: &str, code: &[(&str, &str)]) -> Self {
+        let names: Vec<&str> = code.iter().map(|(name, _)| *name).collect();
+        ui::i18n::split_template(template, &names)
+            .into_iter()
+            .fold(Self::new(), |body, piece| match piece {
+                ui::i18n::Piece::Text(text) => body.plain(&text),
+                ui::i18n::Piece::Slot(index) => body.code(code[index].1),
+            })
     }
 
     /// The styled runs for [`Self::element`]: one per plain or code stretch.
@@ -4068,7 +4144,7 @@ fn fork_note(colors: ThemeColors) -> impl IntoElement {
         .border_color(colors.border_strong)
         .text_color(colors.muted)
         .text_size(FS_XS)
-        .child("fork point")
+        .child(ui::t!("history.badge.fork_point"))
 }
 
 /// Lays out a branch's commits as a graph of their own: only parents in the

@@ -1,0 +1,10 @@
+{
+  "format.days_ago.other": "{n} 日前",
+  "format.hours_ago.other": "{n} 時間前",
+  "format.just_now": "たった今",
+  "format.minutes_ago.other": "{n} 分前",
+  "format.months_ago.other": "{n} か月前",
+  "format.weeks_ago.other": "{n} 週間前",
+  "format.years_ago.other": "{n} 年前",
+  "format.yesterday": "昨日"
+}

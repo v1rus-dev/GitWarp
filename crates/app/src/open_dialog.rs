@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use gpui::{
     div, px, App, AppContext, ClickEvent, Context, ElementId, Entity, FocusHandle,
-    InteractiveElement, IntoElement, ParentElement, PathPromptOptions, StatefulInteractiveElement,
-    Styled, Subscription, WeakEntity, Window,
+    InteractiveElement, IntoElement, ParentElement, PathPromptOptions, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window,
 };
 
 use git_core::{Error, FolderProbe, Git};
@@ -57,10 +57,28 @@ pub(crate) struct OpenRepoDialog {
 }
 
 /// What a folder picker answer means for the dialog.
-enum Browse {
+pub(crate) enum Browse {
     Picked(Option<PathBuf>),
     Cancelled,
     Failed(String),
+}
+
+/// Opens the native folder picker; shared with the Clone dialog's Browse button.
+pub(crate) fn pick_folder(cx: &mut App) -> impl std::future::Future<Output = Browse> {
+    let receiver = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: Some(ui::t!("welcome.init.open")),
+    });
+    async move {
+        match receiver.await {
+            Ok(Ok(Some(paths))) => Browse::Picked(paths.into_iter().next()),
+            Ok(Ok(None)) => Browse::Cancelled,
+            Ok(Err(error)) => Browse::Failed(error.to_string()),
+            Err(error) => Browse::Failed(error.to_string()),
+        }
+    }
 }
 
 impl OpenRepoDialog {
@@ -107,12 +125,17 @@ impl OpenRepoDialog {
                     if created {
                         toast::show(
                             ToastKind::Ok,
-                            format!("Initialized repository in {label}"),
+                            ui::t!("welcome.open.toast_initialized", path = label),
                             window,
                             cx,
                         );
                     } else {
-                        toast::show(ToastKind::Ok, format!("Opened {name}"), window, cx);
+                        toast::show(
+                            ToastKind::Ok,
+                            ui::t!("welcome.open.toast_opened", name = name),
+                            window,
+                            cx,
+                        );
                     }
                 });
             }));
@@ -242,19 +265,9 @@ impl OpenRepoDialog {
 
     fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let home = self.home.clone();
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Open".into()),
-        });
+        let picked = pick_folder(cx);
         cx.spawn_in(window, async move |this, cx| {
-            let outcome = match receiver.await {
-                Ok(Ok(Some(paths))) => Browse::Picked(paths.into_iter().next()),
-                Ok(Ok(None)) => Browse::Cancelled,
-                Ok(Err(error)) => Browse::Failed(error.to_string()),
-                Err(error) => Browse::Failed(error.to_string()),
-            };
+            let outcome = picked.await;
             this.update_in(cx, |dialog, window, cx| {
                 dialog.finish_browse(outcome, home, window, cx)
             })
@@ -291,7 +304,7 @@ impl OpenRepoDialog {
                 // No xdg portal, no picker: the field stays the way in.
                 toast::show(
                     ToastKind::Error,
-                    format!("Could not open the folder picker: {message}"),
+                    ui::t!("welcome.open.picker_failed", message = message),
                     window,
                     cx,
                 );
@@ -370,7 +383,7 @@ pub(crate) fn open(
     let state = dialog.downgrade();
     let (layer, host) = dialog::open_with_view(window, cx, move |_, cx| match state.upgrade() {
         Some(state) => build(&state, cx),
-        None => Dialog::new("Open from folder")
+        None => Dialog::new(ui::t!("welcome.open.title"))
             .icon(IconName::Folder)
             .width(px(540.)),
     });
@@ -394,7 +407,7 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
     let init_error = flow.error().cloned();
     let recent = read_recent(cx);
 
-    let label = |text: &'static str| div().text_size(FS_SM).text_color(colors.muted).child(text);
+    let label = |text: SharedString| div().text_size(FS_SM).text_color(colors.muted).child(text);
 
     let browse: ClickAction = {
         let state = state.clone();
@@ -430,7 +443,7 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
                 .flex()
                 .items_center()
                 .gap(px(2.))
-                .child(label("Folder"))
+                .child(label(ui::t!("welcome.open.folder")))
                 .child(div().text_size(FS_SM).text_color(colors.error).child("*")),
         )
         .child(
@@ -441,7 +454,7 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
                 .child(div().flex_1().min_w_0().child(dialog.folder.clone()))
                 .child(
                     Button::new("open-browse")
-                        .label("Browse…")
+                        .label(ui::t!("welcome.open.browse"))
                         .icon(IconName::Folder)
                         .disabled(busy)
                         .focus_handle(dialog.browse_focus.clone())
@@ -464,9 +477,8 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
         has_status = true;
     }
     if let Some(error) = init_error {
-        status = status.child(
-            Banner::new(BannerKind::Error, "Could not initialize the repository").body(error),
-        );
+        status = status
+            .child(Banner::new(BannerKind::Error, ui::t!("welcome.open.init_failed")).body(error));
         has_status = true;
     }
 
@@ -516,7 +528,7 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
                 .flex()
                 .flex_col()
                 .gap(px(6.))
-                .child(label("Recent folders"))
+                .child(label(ui::t!("welcome.open.recent")))
                 .child(list),
         );
     }
@@ -527,7 +539,7 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
         .gap(px(8.))
         .child(
             Button::new("open-cancel")
-                .label("Cancel")
+                .label(ui::t!("welcome.common.cancel"))
                 .min_width(px(72.))
                 .disabled(busy)
                 .focus_handle(dialog.cancel_focus.clone())
@@ -553,7 +565,7 @@ fn build(state: &Entity<OpenRepoDialog>, cx: &App) -> Dialog {
     focus_order.push(DialogFocus::control(dialog.cancel_focus.clone()));
     focus_order.push(DialogFocus::control(dialog.primary_focus.clone()));
 
-    let mut panel = Dialog::new("Open from folder")
+    let mut panel = Dialog::new(ui::t!("welcome.open.title"))
         .icon(IconName::Folder)
         .width(px(540.))
         .compact_body()
@@ -598,7 +610,7 @@ fn init_controls(
         .gap(px(8.))
         .child(
             Checkbox::new("open-initial-commit")
-                .label("Create an initial commit with a .gitignore")
+                .label(ui::t!("welcome.init.initial_commit"))
                 .checked(initial_commit)
                 .disabled(busy)
                 .focus_handle(checkbox_focus)
@@ -613,7 +625,7 @@ fn init_controls(
                     div()
                         .text_size(FS_SM)
                         .text_color(colors.muted)
-                        .child("Default branch"),
+                        .child(ui::t!("welcome.init.default_branch")),
                 )
                 .child(div().w(px(220.)).child(branch)),
         )

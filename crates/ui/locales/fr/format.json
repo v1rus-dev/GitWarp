@@ -1,0 +1,16 @@
+{
+  "format.days_ago.one": "il y a {n} j",
+  "format.days_ago.other": "il y a {n} j",
+  "format.hours_ago.one": "il y a {n} h",
+  "format.hours_ago.other": "il y a {n} h",
+  "format.just_now": "à l’instant",
+  "format.minutes_ago.one": "il y a {n} min",
+  "format.minutes_ago.other": "il y a {n} min",
+  "format.months_ago.one": "il y a {n} mois",
+  "format.months_ago.other": "il y a {n} mois",
+  "format.weeks_ago.one": "il y a 1 semaine",
+  "format.weeks_ago.other": "il y a {n} semaines",
+  "format.years_ago.one": "il y a {n} an",
+  "format.years_ago.other": "il y a {n} ans",
+  "format.yesterday": "hier"
+}

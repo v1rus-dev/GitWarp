@@ -12,7 +12,7 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, AnyElement, App, AppContext, ClickEvent, Context, Entity, FocusHandle, IntoElement,
-    ParentElement, PathPromptOptions, Styled, Subscription, WeakEntity, Window,
+    ParentElement, PathPromptOptions, SharedString, Styled, Subscription, WeakEntity, Window,
 };
 
 use git_core::{Error, Git, Oid, Repo, Worktree};
@@ -326,7 +326,7 @@ impl WorktreeDialog {
         }
     }
 
-    fn path_error(&self, cx: &App) -> Option<&'static str> {
+    fn path_error(&self, cx: &App) -> Option<SharedString> {
         let raw = self.path_text(cx);
         worktree_path_error(
             &raw,
@@ -373,7 +373,7 @@ impl WorktreeDialog {
             .collect();
         if let Some(selected) = &self.selected {
             options.push((
-                format!("{} — selected commit", selected.short),
+                ui::t!("worktrees.dialog.selected_commit", short = selected.short).to_string(),
                 selected.oid,
             ));
         }
@@ -411,21 +411,21 @@ impl WorktreeDialog {
                 || (self.has_free_branch() && self.branches.get(self.branch).is_some()))
             && !self.running;
         let hint = if path.is_empty() {
-            Some("Choose a folder for the worktree")
+            Some(ui::i18n::t("worktrees.dialog.hint.choose_folder"))
         } else if path_error.is_some() {
-            Some("Fix the folder to continue")
+            Some(ui::i18n::t("worktrees.dialog.hint.fix_folder"))
         } else if self.branch_mode == BranchMode::Existing
             && (!self.has_free_branch() || self.branches.get(self.branch).is_none())
         {
-            Some("Choose a branch to check out")
+            Some(ui::i18n::t("worktrees.dialog.hint.choose_branch"))
         } else if used.is_some() {
-            Some("Choose a branch that is not in use")
+            Some(ui::i18n::t("worktrees.dialog.hint.branch_in_use"))
         } else if self.branch_mode == BranchMode::New && name.is_empty() {
-            Some("Enter a branch name")
+            Some(ui::i18n::t("worktrees.dialog.hint.enter_name"))
         } else if name_error.is_some() {
-            Some("Fix the name to continue")
+            Some(ui::i18n::t("worktrees.dialog.hint.fix_name"))
         } else if self.branch_mode == BranchMode::New && self.base_oid().is_none() {
-            Some("Choose a start commit")
+            Some(ui::i18n::t("worktrees.dialog.hint.choose_start"))
         } else {
             None
         };
@@ -497,19 +497,19 @@ impl WorktreeDialog {
         .detach();
     }
 
-    fn remove_hint(&self) -> Option<&'static str> {
+    fn remove_hint(&self) -> Option<SharedString> {
         let target = self.remove_target()?;
         if self.unlocking {
             // The hint is the footer's `Unlocking…` (design), not the lock reminder.
             None
         } else if target.main {
-            Some("Not available for the main worktree")
+            Some(ui::i18n::t("worktrees.dialog.hint.main_unavailable"))
         } else if target.locked.is_some() {
-            Some("Unlock the worktree first")
+            Some(ui::i18n::t("worktrees.dialog.hint.unlock_first"))
         } else if dirty(target) && !self.force {
-            Some("Confirm to discard changes")
+            Some(ui::i18n::t("worktrees.dialog.hint.confirm_discard"))
         } else if self.branch_confirm_pending() {
-            Some("Confirm deleting the unmerged branch")
+            Some(ui::i18n::t("worktrees.dialog.hint.confirm_branch"))
         } else {
             None
         }
@@ -564,14 +564,24 @@ impl WorktreeDialog {
                 Box::new(move |repo: &Repo| match branch_mode {
                     BranchMode::Existing => {
                         repo.add_worktree(&path, &branch)?;
-                        Ok(format!("Added worktree {} on {branch}", path.display()))
+                        Ok(ui::t!(
+                            "worktrees.dialog.toast.added",
+                            path = path.display(),
+                            branch = branch
+                        )
+                        .to_string())
                     }
                     BranchMode::New => {
                         let Some(base) = base else {
                             return Err(Error::Parse("start commit"));
                         };
                         repo.add_worktree_for_new_branch(&path, &new_name, base)?;
-                        Ok(format!("Added worktree {} on {new_name}", path.display()))
+                        Ok(ui::t!(
+                            "worktrees.dialog.toast.added",
+                            path = path.display(),
+                            branch = new_name
+                        )
+                        .to_string())
                     }
                 })
             }
@@ -584,7 +594,11 @@ impl WorktreeDialog {
                 let force_branch = self.force_delete_branch();
                 Box::new(move |repo: &Repo| {
                     repo.remove_worktree(&target.path, force)?;
-                    let mut notice = format!("Removed worktree {}", target.path.display());
+                    let mut notice = ui::t!(
+                        "worktrees.dialog.toast.removed",
+                        path = target.path.display()
+                    )
+                    .to_string();
                     if delete_branch {
                         if let Some(branch) = &target.branch {
                             // The worktree is gone already: a branch that is
@@ -592,11 +606,13 @@ impl WorktreeDialog {
                             // (or switched the confirmation off), and the toast
                             // says so instead of leaving the dialog on a stale path.
                             if let Err(error) = repo.delete_branch(branch, force_branch) {
-                                notice = format!(
-                                    "Removed worktree {}; kept {branch}: {}",
-                                    target.path.display(),
-                                    git_message(&error)
-                                );
+                                notice = ui::t!(
+                                    "worktrees.dialog.toast.removed_kept",
+                                    path = target.path.display(),
+                                    branch = branch,
+                                    reason = git_message(&error)
+                                )
+                                .to_string();
                             }
                         }
                     }
@@ -700,7 +716,12 @@ impl WorktreeDialog {
                         if let Some(target) = &mut dialog.target {
                             target.locked = None;
                         }
-                        toast::show(ToastKind::Ok, "Worktree unlocked", window, cx);
+                        toast::show(
+                            ToastKind::Ok,
+                            ui::i18n::t("worktrees.dialog.toast.unlocked"),
+                            window,
+                            cx,
+                        );
                         let on_done = dialog.on_done.clone();
                         on_done(window, cx);
                     }
@@ -720,7 +741,7 @@ type Operation = Box<dyn FnOnce(&Repo) -> git_core::Result<String> + Send>;
 
 struct Validity {
     enabled: bool,
-    hint: Option<&'static str>,
+    hint: Option<SharedString>,
 }
 
 fn dirty(target: &RemoveTarget) -> bool {
@@ -740,7 +761,7 @@ pub(crate) fn worktree_path_error(
     root: &Path,
     worktrees: &[PathBuf],
     home: Option<&Path>,
-) -> Option<&'static str> {
+) -> Option<SharedString> {
     let raw = input.trim();
     if raw.is_empty() {
         return None;
@@ -753,13 +774,13 @@ pub(crate) fn worktree_path_error(
     };
     let path = trim_trailing_separators(&path);
     if worktrees.iter().any(|worktree| same_path(&path, worktree)) {
-        return Some("A worktree already exists at this path.");
+        return Some(ui::i18n::t("worktrees.dialog.path.exists"));
     }
     if path.starts_with(root) {
-        return Some("This path is inside the repository. Choose a sibling folder instead.");
+        return Some(ui::i18n::t("worktrees.dialog.path.inside_repo"));
     }
     if path.exists() && !path.is_dir() {
-        return Some("This path is not a folder.");
+        return Some(ui::i18n::t("worktrees.dialog.path.not_folder"));
     }
     None
 }
@@ -817,7 +838,9 @@ fn finish_open<T: 'static>(
     let state = dialog.downgrade();
     let (layer, host) = dialog::open_with_view(window, cx, move |_, cx| match state.upgrade() {
         Some(state) => build(&state, cx),
-        None => Dialog::new("Worktree").icon(IconName::Worktree),
+        None => {
+            Dialog::new(ui::i18n::t("worktrees.dialog.fallback_title")).icon(IconName::Worktree)
+        }
     });
     dialog.update(cx, |dialog, cx| {
         dialog.layer = Some(layer);
@@ -832,8 +855,16 @@ fn build(state: &Entity<WorktreeDialog>, cx: &App) -> Dialog {
     let colors = cx.theme().colors;
     let valid = dialog.validity(cx);
     let (title, icon, width) = match dialog.mode {
-        Mode::Add => ("Add worktree", IconName::Worktree, 520.),
-        Mode::Remove => ("Remove worktree", IconName::Trash, 500.),
+        Mode::Add => (
+            ui::i18n::t("worktrees.dialog.add_title"),
+            IconName::Worktree,
+            520.,
+        ),
+        Mode::Remove => (
+            ui::i18n::t("worktrees.dialog.remove_title"),
+            IconName::Trash,
+            500.,
+        ),
     };
 
     let mut body: AnyElement = match dialog.mode {
@@ -846,7 +877,10 @@ fn build(state: &Entity<WorktreeDialog>, cx: &App) -> Dialog {
             .flex_col()
             .gap(px(14.))
             .child(body)
-            .child(Banner::new(BannerKind::Error, "The operation failed").body(error.clone()))
+            .child(
+                Banner::new(BannerKind::Error, ui::i18n::t("worktrees.dialog.failed"))
+                    .body(error.clone()),
+            )
             .into_any_element();
     }
 
@@ -864,13 +898,13 @@ fn build(state: &Entity<WorktreeDialog>, cx: &App) -> Dialog {
     };
 
     let primary_label = match dialog.mode {
-        Mode::Add => "Add worktree",
+        Mode::Add => ui::i18n::t("worktrees.dialog.add_title"),
         Mode::Remove => {
             let dirty = dialog.remove_target().is_some_and(dirty);
             if dirty && dialog.force {
-                "Discard and remove"
+                ui::i18n::t("worktrees.dialog.discard_remove")
             } else {
-                "Remove worktree"
+                ui::i18n::t("worktrees.dialog.remove_title")
             }
         }
     };
@@ -892,7 +926,7 @@ fn build(state: &Entity<WorktreeDialog>, cx: &App) -> Dialog {
         .gap(px(8.))
         .child(
             Button::new("worktree-cancel")
-                .label("Cancel")
+                .label(ui::i18n::t("worktrees.dialog.cancel"))
                 .min_width(px(72.))
                 .disabled(dialog.running || dialog.unlocking)
                 .focus_handle(dialog.cancel_focus.clone())
@@ -972,9 +1006,9 @@ fn build(state: &Entity<WorktreeDialog>, cx: &App) -> Dialog {
     if let Some(hint) = valid.hint {
         panel = panel.hint(hint);
     } else if dialog.unlocking {
-        panel = panel.hint("Unlocking…");
+        panel = panel.hint(ui::i18n::t("worktrees.dialog.unlocking"));
     } else if dialog.running {
-        panel = panel.hint("Working…");
+        panel = panel.hint(ui::i18n::t("worktrees.dialog.working"));
     }
     panel
 }
@@ -999,11 +1033,12 @@ fn add_body(
         .iter()
         .filter(|_| dialog.has_free_branch())
         .map(|branch| match dialog.branch_used(&branch.name) {
-            Some(worktree) => format!(
-                "{} — checked out in {}",
-                branch.name,
-                display_path(&worktree.path, dialog.home.as_deref())
-            ),
+            Some(worktree) => ui::t!(
+                "worktrees.dialog.branch_option_used",
+                name = branch.name,
+                path = display_path(&worktree.path, dialog.home.as_deref())
+            )
+            .to_string(),
             None => branch.name.clone(),
         })
         .collect();
@@ -1063,10 +1098,10 @@ fn add_body(
         .filter(|_| dialog.branch_mode == BranchMode::Existing && dialog.has_free_branch())
         .and_then(|branch| dialog.branch_used(&branch.name));
     let branch_error = used.map(|worktree| {
-        format!(
-            "“{}” is already checked out in {}. A branch can only be open in one worktree.",
-            dialog.branches[dialog.branch].name,
-            display_path(&worktree.path, dialog.home.as_deref())
+        ui::t!(
+            "worktrees.dialog.branch_used_error",
+            name = dialog.branches[dialog.branch].name,
+            path = display_path(&worktree.path, dialog.home.as_deref())
         )
     });
     let name_error = dialog.name_touched.then(|| dialog.name_error(cx)).flatten();
@@ -1079,42 +1114,38 @@ fn add_body(
             div()
                 .text_size(FS_SM)
                 .text_color(colors.muted)
+                .child(ui::i18n::t("worktrees.dialog.intro")),
+        )
+        .child(field(
+            ui::i18n::t("worktrees.dialog.folder"),
+            div()
+                .flex()
+                .w_full()
+                .items_center()
+                .gap(px(8.))
                 .child(
-                    "A worktree is a second working folder for this repository, so you can work on another branch without stashing.",
-                ),
-        )
-        .child(
-            field(
-                "Folder",
-                div()
-                    .flex()
-                    .w_full()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            dialog
-                                .path
-                                .clone()
-                                .map(IntoElement::into_any_element)
-                                .unwrap_or_else(|| div().into_any_element()),
-                        ),
-                    )
-                    .child(
-                        Button::new("worktree-browse")
-                            .label("Browse…")
-                            .icon(IconName::Folder)
-                            .focus_handle(dialog.browse_focus.clone())
-                            .disabled(busy)
-                            .on_click(browse),
-                    )
-                    .into_any_element(),
-                path_error,
-                Some("Pick a folder outside the repository. It is created if it does not exist."),
-                true,
-                colors,
-            ),
-        )
+                    div().flex_1().min_w_0().child(
+                        dialog
+                            .path
+                            .clone()
+                            .map(IntoElement::into_any_element)
+                            .unwrap_or_else(|| div().into_any_element()),
+                    ),
+                )
+                .child(
+                    Button::new("worktree-browse")
+                        .label(ui::i18n::t("worktrees.dialog.browse"))
+                        .icon(IconName::Folder)
+                        .focus_handle(dialog.browse_focus.clone())
+                        .disabled(busy)
+                        .on_click(browse),
+                )
+                .into_any_element(),
+            path_error.as_deref(),
+            Some(ui::i18n::t("worktrees.dialog.folder_help").as_ref()),
+            true,
+            colors,
+        ))
         .child(
             div()
                 .flex()
@@ -1126,17 +1157,17 @@ fn add_body(
                     div()
                         .text_size(FS_SM)
                         .text_color(colors.muted)
-                        .child("Branch"),
+                        .child(ui::i18n::t("worktrees.dialog.branch")),
                 )
                 .child(
                     Segmented::new("worktree-mode")
                         .item(
-                            SegmentItem::new("Existing branch")
+                            SegmentItem::new(ui::i18n::t("worktrees.dialog.mode_existing"))
                                 .id("existing")
                                 .focus_handle(dialog.mode_existing_focus.clone()),
                         )
                         .item(
-                            SegmentItem::new("New branch")
+                            SegmentItem::new(ui::i18n::t("worktrees.dialog.mode_new"))
                                 .id("new")
                                 .focus_handle(dialog.mode_new_focus.clone()),
                         )
@@ -1151,7 +1182,7 @@ fn add_body(
         );
     if dialog.branch_mode == BranchMode::Existing {
         body = body.child(field(
-            "Check out",
+            ui::i18n::t("worktrees.dialog.check_out"),
             div()
                 .child(
                     Select::new("worktree-branch")
@@ -1174,7 +1205,7 @@ fn add_body(
                 .gap(px(12.))
                 .child(
                     div().flex_1().min_w_0().child(field(
-                        "New branch name",
+                        ui::i18n::t("worktrees.dialog.new_name"),
                         dialog
                             .new_name
                             .clone()
@@ -1188,7 +1219,7 @@ fn add_body(
                 )
                 .child(
                     div().flex_1().min_w_0().child(field(
-                        "Start from",
+                        ui::i18n::t("worktrees.dialog.start_from"),
                         div()
                             .child(
                                 Select::new("worktree-base")
@@ -1209,7 +1240,7 @@ fn add_body(
     }
     body = body.child(
         Checkbox::new("worktree-open")
-            .label("Open the worktree in a new window")
+            .label(ui::i18n::t("worktrees.dialog.open_new_window"))
             .checked(dialog.open_after)
             .disabled(busy)
             .focus_handle(dialog.open_focus.clone())
@@ -1232,9 +1263,11 @@ fn remove_body(
     if target.main {
         return body
             .child(
-                Banner::new(BannerKind::Error, "This is the main worktree").body(
-                    "It holds the repository itself and cannot be removed. Close the repository instead if you are done with it.",
-                ),
+                Banner::new(
+                    BannerKind::Error,
+                    ui::i18n::t("worktrees.dialog.main_title"),
+                )
+                .body(ui::i18n::t("worktrees.dialog.main_body")),
             )
             .into_any_element();
     }
@@ -1243,28 +1276,34 @@ fn remove_body(
             .flex()
             .flex_col()
             .gap(px(3.))
-            .child(kv("Folder", target.path.display().to_string(), colors))
             .child(kv(
-                "Branch",
+                ui::i18n::t("worktrees.dialog.folder"),
+                target.path.display().to_string(),
+                colors,
+            ))
+            .child(kv(
+                ui::i18n::t("worktrees.dialog.branch"),
                 target
                     .branch
                     .clone()
-                    .unwrap_or_else(|| "detached".to_owned()),
+                    .unwrap_or_else(|| ui::i18n::t("worktrees.dialog.detached").to_string()),
                 colors,
             )),
     );
     if target.missing {
         body = body.child(
-            Banner::new(BannerKind::Info, "The folder no longer exists on disk").body(
-                "Git still lists this worktree. Removing it only cleans up the record — no files are touched.",
-            ),
+            Banner::new(
+                BannerKind::Info,
+                ui::i18n::t("worktrees.dialog.missing_title"),
+            )
+            .body(ui::i18n::t("worktrees.dialog.missing_body")),
         );
     }
     if let Some(reason) = &target.locked {
         let reason = if reason.is_empty() {
-            "review in progress"
+            ui::i18n::t("worktrees.dialog.default_lock_reason")
         } else {
-            reason
+            SharedString::from(reason.clone())
         };
         let unlock = {
             let state = state.clone();
@@ -1274,15 +1313,17 @@ fn remove_body(
         };
         body = body
             .child(
-                Banner::new(BannerKind::Warn, "This worktree is locked").body(format!(
-                    "Locked with reason “{reason}”. Unlock it before removing."
-                )),
+                Banner::new(
+                    BannerKind::Warn,
+                    ui::i18n::t("worktrees.dialog.locked_title"),
+                )
+                .body(ui::t!("worktrees.dialog.locked_body", reason = reason)),
             )
             .child(
                 // Content-width button, not stretched to the column.
                 div().flex().child(
                     Button::new("worktree-unlock")
-                        .label("Unlock")
+                        .label(ui::i18n::t("worktrees.dialog.unlock"))
                         .icon(IconName::Lock)
                         .focus_handle(dialog.unlock_focus.clone())
                         .disabled(busy)
@@ -1304,13 +1345,13 @@ fn remove_body(
         body = body
             .child(
                 Banner::new(BannerKind::Warn, uncommitted_title(target.changes.len()))
-                    .body("Removing the worktree discards them for good.")
+                    .body(ui::i18n::t("worktrees.dialog.discard_note"))
                     .plain_list()
                     .list(target.changes.clone()),
             )
             .child(
                 Checkbox::new("worktree-force")
-                    .label("Discard these changes and remove the worktree")
+                    .label(ui::i18n::t("worktrees.dialog.discard_label"))
                     .checked(dialog.force)
                     .disabled(busy)
                     .focus_handle(dialog.force_focus.clone())
@@ -1327,13 +1368,13 @@ fn remove_body(
                 .gap_x(px(4.))
                 .text_size(FS_SM)
                 .text_color(colors.muted)
-                .child("The folder is deleted from disk. The branch")
+                .child(ui::i18n::t("worktrees.dialog.note_before"))
                 .child(
                     div()
                         .font_family(FONT_MONO)
                         .child(target.branch.clone().unwrap_or_else(|| "HEAD".to_owned())),
                 )
-                .child("and its commits stay in the repository."),
+                .child(ui::i18n::t("worktrees.dialog.note_after")),
         );
     }
     if let Some(branch) = &target.branch {
@@ -1359,11 +1400,11 @@ fn remove_body(
                         .flex()
                         .items_center()
                         .gap(px(4.))
-                        .child("Also delete branch")
+                        .child(ui::i18n::t("worktrees.dialog.delete_branch"))
                         .child(div().font_family(FONT_MONO).child(branch.clone()))
                         // Only claimed once git confirmed it; see `open_remove`.
                         .when(dialog.unmerged == Some(false), |this| {
-                            this.child("(fully merged)")
+                            this.child(ui::i18n::t("worktrees.dialog.fully_merged"))
                         }),
                 )
                 .checked(dialog.delete_branch)
@@ -1384,12 +1425,15 @@ fn remove_body(
             };
             body = body
                 .child(
-                    Banner::new(BannerKind::Warn, format!("{branch} is not merged"))
-                        .body("Unmerged commits stay reachable from the reflog for 30 days."),
+                    Banner::new(
+                        BannerKind::Warn,
+                        ui::t!("worktrees.dialog.unmerged_title", branch = branch),
+                    )
+                    .body(ui::i18n::t("worktrees.dialog.unmerged_body")),
                 )
                 .child(
                     Checkbox::new("worktree-force-branch")
-                        .label(format!("Delete {branch} anyway"))
+                        .label(ui::t!("worktrees.dialog.delete_anyway", branch = branch))
                         .checked(dialog.force_branch)
                         .disabled(busy)
                         .focus_handle(dialog.force_branch_focus.clone())
@@ -1402,13 +1446,10 @@ fn remove_body(
 
 /// The dirty-files banner title: `1 file has …` / `N files have …`.
 fn uncommitted_title(count: usize) -> String {
-    format!(
-        "{count} {} uncommitted changes",
-        if count == 1 { "file has" } else { "files have" }
-    )
+    ui::i18n::t_count("worktrees.dialog.uncommitted", count as u64, &[]).to_string()
 }
 
-fn kv(label: &'static str, value: String, colors: ThemeColors) -> impl IntoElement {
+fn kv(label: SharedString, value: String, colors: ThemeColors) -> impl IntoElement {
     div()
         .flex()
         .items_start()
@@ -1432,7 +1473,7 @@ fn kv(label: &'static str, value: String, colors: ThemeColors) -> impl IntoEleme
 }
 
 fn field(
-    label: &'static str,
+    label: SharedString,
     control: AnyElement,
     error: Option<&str>,
     help: Option<&str>,
@@ -1488,7 +1529,7 @@ impl WorktreeDialog {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Choose a folder for the worktree".into()),
+            prompt: Some(ui::i18n::t("worktrees.dialog.picker_prompt")),
         });
         cx.spawn_in(window, async move |this, cx| {
             let picked = match receiver.await {
@@ -1511,7 +1552,7 @@ impl WorktreeDialog {
                 Err(message) => {
                     toast::show(
                         ToastKind::Error,
-                        format!("Could not open the folder picker: {message}"),
+                        ui::t!("worktrees.dialog.picker_error", message = message),
                         window,
                         cx,
                     );
@@ -1552,7 +1593,7 @@ mod tests {
                 &worktrees,
                 Some(&home())
             ),
-            Some("A worktree already exists at this path.")
+            Some("A worktree already exists at this path.".into())
         );
         assert_eq!(
             worktree_path_error(
@@ -1561,7 +1602,7 @@ mod tests {
                 &worktrees,
                 Some(&home())
             ),
-            Some("This path is inside the repository. Choose a sibling folder instead.")
+            Some("This path is inside the repository. Choose a sibling folder instead.".into())
         );
         assert_eq!(
             worktree_path_error("~/develop/gitwarp-review", root, &worktrees, Some(&home())),
@@ -1589,7 +1630,7 @@ mod tests {
     fn a_relative_path_is_resolved_against_the_repository() {
         assert_eq!(
             worktree_path_error("tmp", Path::new("/repo"), &[], None),
-            Some("This path is inside the repository. Choose a sibling folder instead.")
+            Some("This path is inside the repository. Choose a sibling folder instead.".into())
         );
     }
 

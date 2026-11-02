@@ -37,7 +37,7 @@ use ui::theme::{ActiveTheme, Density as UiDensity, ThemeStyle};
 use ui::{Button, Icon, IconName};
 
 use crate::settings::{Density, Settings};
-use crate::workspace::{git_label, git_tooltip, titlebar, titlebar_end, titlebar_fill, Workspace};
+use crate::workspace::{git_label, git_tooltip, titlebar, Workspace};
 
 /// One page of the Settings surface, in navigation order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -67,17 +67,17 @@ impl Page {
         Page::Accounts,
     ];
 
-    fn title(self) -> &'static str {
+    fn title(self) -> SharedString {
         match self {
-            Page::General => "General",
-            Page::Appearance => "Appearance",
-            Page::Git => "Git",
-            Page::Worktrees => "Worktrees",
-            Page::Ssh => "SSH keys",
-            Page::Keybindings => "Keybindings",
-            Page::Diff => "Diff & merge",
-            Page::Identity => "Identity",
-            Page::Accounts => "Accounts",
+            Page::General => ui::t!("settings.page.general"),
+            Page::Appearance => ui::t!("settings.page.appearance"),
+            Page::Git => "Git".into(),
+            Page::Worktrees => ui::t!("settings.page.worktrees"),
+            Page::Ssh => ui::t!("settings.page.ssh"),
+            Page::Keybindings => ui::t!("settings.page.keybindings"),
+            Page::Diff => ui::t!("settings.diff.title"),
+            Page::Identity => ui::t!("settings.page.identity"),
+            Page::Accounts => ui::t!("settings.page.accounts"),
         }
     }
 
@@ -186,13 +186,13 @@ impl SettingsView {
         let custom_git = cx.new(|cx| {
             let mut input = ui::TextInput::new(window, cx);
             input.set_text(settings.git_path.clone(), cx);
-            input.set_placeholder("/path/to/git", cx);
+            input.set_placeholder(ui::t!("settings.placeholder.git_path"), cx);
             input.set_font_family(ui::metrics::FONT_MONO, cx);
             input
         });
         let kb_query = cx.new(|cx| {
             let mut input = ui::TextInput::new(window, cx);
-            input.set_placeholder("Search actions or shortcuts", cx);
+            input.set_placeholder(ui::t!("settings.placeholder.search_actions"), cx);
             input
         });
         let merge_command = cx.new(|cx| {
@@ -204,12 +204,12 @@ impl SettingsView {
         });
         let name_input = cx.new(|cx| {
             let mut input = ui::TextInput::new(window, cx);
-            input.set_placeholder("Your name", cx);
+            input.set_placeholder(ui::t!("settings.placeholder.name"), cx);
             input
         });
         let email_input = cx.new(|cx| {
             let mut input = ui::TextInput::new(window, cx);
-            input.set_placeholder("you@example.com", cx);
+            input.set_placeholder(ui::t!("settings.placeholder.email"), cx);
             input
         });
 
@@ -420,7 +420,7 @@ impl SettingsView {
             .border_color(colors.border)
             .text_size(FS_SM)
             .text_color(colors.muted)
-            .child("Changes are saved automatically")
+            .child(ui::t!("settings.status.autosave"))
             .child(div().flex_1())
             .child(
                 div()
@@ -444,10 +444,6 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let client = matches!(
-            window.window_decorations(),
-            gpui::Decorations::Client { .. }
-        );
         let colors = cx.theme().colors;
         let close = {
             let view = cx.entity();
@@ -455,7 +451,9 @@ impl Render for SettingsView {
                 view.update(cx, |view, cx| view.close(window, cx));
             }
         };
-        let mut bar = titlebar(cx)
+        // Settings is a modal card inside the window, so its header has no
+        // window buttons and its empty stretch does not move the window.
+        let bar = titlebar(cx)
             .child(
                 div()
                     .flex()
@@ -464,16 +462,15 @@ impl Render for SettingsView {
                     .pl(px(4.))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(Icon::new(IconName::Gear).size(px(14.)).color(colors.muted))
-                    .child("Settings"),
+                    .child(ui::t!("settings.title")),
             )
-            .child(titlebar_fill())
+            .child(div().flex_1())
             .child(
                 Button::ghost("settings-close")
                     .icon_only(IconName::X)
-                    .tooltip("Close settings (Esc)")
+                    .tooltip(ui::t!("settings.close_tooltip"))
                     .on_click(close),
             );
-        bar = titlebar_end(bar, client);
 
         let nav = self.render_nav(cx);
         let page = self.render_page(window, cx);
@@ -562,19 +559,22 @@ impl SettingsView {
 }
 
 /// Shared heading for every page.
-pub(crate) fn heading(title: &'static str, lead: impl Into<SharedString>) -> Div {
+pub(crate) fn heading(title: impl Into<SharedString>, lead: impl Into<SharedString>) -> Div {
     div()
         .flex()
         .flex_col()
         .gap(px(4.))
         .mb(px(16.))
-        .child(div().text_size(FS_XL).child(title))
+        .child(div().text_size(FS_XL).child(title.into()))
         .child(div().max_w(px(760.)).text_size(FS_BASE).child(lead.into()))
 }
 
 /// One section: an uppercase label and the bordered list around it.
-pub(crate) fn group(title: &'static str, rows: Vec<AnyElement>) -> Group {
-    Group { title, rows }
+pub(crate) fn group(title: impl Into<SharedString>, rows: Vec<AnyElement>) -> Group {
+    Group {
+        title: title.into(),
+        rows,
+    }
 }
 
 /// A titled section card (design `.slist`): surface fill, 1px border, and a
@@ -582,7 +582,7 @@ pub(crate) fn group(title: &'static str, rows: Vec<AnyElement>) -> Group {
 /// It is a component because the colours come from the theme at render time.
 #[derive(IntoElement)]
 pub(crate) struct Group {
-    title: &'static str,
+    title: SharedString,
     rows: Vec<AnyElement>,
 }
 

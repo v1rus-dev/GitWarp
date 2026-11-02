@@ -32,14 +32,14 @@ impl SettingsView {
         let root = self.root.clone();
         if root.is_none() && scope == ConfigScope::Local {
             self.identity = None;
-            self.identity_error = Some("Open a repository to edit its identity.".into());
+            self.identity_error = Some(ui::t!("settings.identity.open_repo"));
             self.identity_busy = false;
             cx.notify();
             return;
         }
         let Ok(git) = self.git.clone() else {
             self.identity = None;
-            self.identity_error = Some("Git is not available.".into());
+            self.identity_error = Some(ui::t!("settings.identity.git_unavailable"));
             self.identity_busy = false;
             cx.notify();
             return;
@@ -135,21 +135,19 @@ impl SettingsView {
         let email = self.email_input.read(cx).text().trim().to_owned();
         if name.is_empty() {
             self.identity_touched = true;
-            self.identity_error =
-                Some("Name is required — git refuses to commit without it.".into());
+            self.identity_error = Some(ui::t!("settings.identity.name_required"));
             cx.notify();
             return;
         }
         if !valid_email(&email) {
             self.identity_touched = true;
-            self.identity_error =
-                Some("Enter a valid email address, like name@example.com.".into());
+            self.identity_error = Some(ui::t!("settings.identity.email_invalid"));
             cx.notify();
             return;
         }
         let root = self.root.clone();
         let Ok(git) = self.git.clone() else {
-            self.identity_error = Some("Git is not available.".into());
+            self.identity_error = Some(ui::t!("settings.identity.git_unavailable"));
             cx.notify();
             return;
         };
@@ -247,13 +245,13 @@ pub(super) fn render(
     let mut page = div().flex().flex_col();
 
     page = page.child(heading(
-        "Identity",
-        "Who your commits are attributed to and how they are signed.",
+        ui::t!("settings.page.identity"),
+        ui::t!("settings.identity.subtitle"),
     ));
     if let Some(error) = &view.identity_error {
         page = page.child(
             div().max_w(px(760.)).mb(px(12.)).child(
-                Banner::new(BannerKind::Error, "Could not read or save the identity")
+                Banner::new(BannerKind::Error, ui::t!("settings.identity.banner_title"))
                     .body(error.clone()),
             ),
         );
@@ -263,7 +261,10 @@ pub(super) fn render(
         let entity = cx.entity();
         let control = form::segmented(
             "settings-id-scope".into(),
-            ["All repositories", "This repository only"],
+            [
+                ui::t!("settings.identity.scope.global"),
+                ui::t!("settings.identity.scope.repo"),
+            ],
             usize::from(settings.identity_scope == IdentityScope::Repository),
             false,
             move |index, _, cx| {
@@ -281,22 +282,22 @@ pub(super) fn render(
         div().w(px(330.)).child(control).into_any_element()
     };
     let scope_help = if settings.identity_scope == IdentityScope::Global {
-        "Written to ~/.gitconfig. A repository can still override it."
+        ui::t!("settings.identity.scope.global_help")
     } else {
-        "Written to .git/config of the open repository."
+        ui::t!("settings.identity.scope.repo_help")
     };
 
     let name = div().w_full().h(px(26.)).child(view.name_input.clone());
     let email = div().w_full().h(px(26.)).child(view.email_input.clone());
     let name_empty = view.name_input.read(cx).text().trim().is_empty();
-    let name_error = (view.identity_touched && name_empty)
-        .then_some("Name is required — git refuses to commit without it.");
+    let name_error =
+        (view.identity_touched && name_empty).then(|| ui::t!("settings.identity.name_required"));
     let email_text = view.email_input.read(cx).text().trim().to_owned();
     let email_error = (view.identity_touched && !valid_email(&email_text))
-        .then_some("Enter a valid email address, like name@example.com.");
+        .then(|| ui::t!("settings.identity.email_invalid"));
 
     let mut author_rows = vec![
-        form::field_row("Apply to", None, scope).into_any_element(),
+        form::field_row(ui::t!("settings.identity.apply_to"), None, scope).into_any_element(),
         div()
             .px(px(12.))
             .pb(px(6.))
@@ -311,7 +312,11 @@ pub(super) fn render(
             .flex_col()
             .gap(px(4.))
             .border_t_1()
-            .child(div().text_size(FS_SM).child("Name"))
+            .child(
+                div()
+                    .text_size(FS_SM)
+                    .child(ui::t!("settings.identity.name")),
+            )
             .child(name)
             .when_some(name_error, |this, error| this.child(form::error(error, cx)))
             .into_any_element(),
@@ -322,13 +327,17 @@ pub(super) fn render(
             .flex_col()
             .gap(px(4.))
             .border_t_1()
-            .child(div().text_size(FS_SM).child("Email"))
+            .child(
+                div()
+                    .text_size(FS_SM)
+                    .child(ui::t!("settings.identity.email")),
+            )
             .child(email)
-            .when_some(email_error, |this, error| {
+            .when_some(email_error.clone(), |this, error| {
                 this.child(form::error(error, cx))
             })
             .when(view.identity_touched && email_error.is_none(), |this| {
-                this.child(form::help("Visible in every commit you create.", cx))
+                this.child(form::help(ui::t!("settings.identity.email_help"), cx))
             })
             .into_any_element(),
     ];
@@ -339,11 +348,11 @@ pub(super) fn render(
                 .pb(px(8.))
                 .text_size(FS_SM)
                 .text_color(colors.muted)
-                .child("Saving…")
+                .child(ui::t!("settings.identity.saving"))
                 .into_any_element(),
         );
     }
-    page = page.child(group("Commit author", author_rows));
+    page = page.child(group(ui::t!("settings.identity.group.author"), author_rows));
 
     let sign = {
         let entity = cx.entity();
@@ -371,7 +380,7 @@ pub(super) fn render(
         .position(|name| *name == settings.signing_key)
         .map(|index| index + 1)
         .unwrap_or(0);
-    let mut key_options = vec!["No signing key".to_owned()];
+    let mut key_options = vec![ui::t!("settings.identity.no_signing_key").to_string()];
     key_options.extend(key_names.clone());
     let signing_key = {
         let entity = cx.entity();
@@ -395,19 +404,19 @@ pub(super) fn render(
         )
     };
     page = page.child(group(
-        "Signing",
+        ui::t!("settings.identity.group.signing"),
         vec![
             form::row(
                 "settings-id-sign-row",
-                "Sign commits",
-                "Adds a verified badge on hosts that know your key.",
+                ui::t!("settings.identity.sign.title"),
+                ui::t!("settings.identity.sign.desc"),
                 sign,
                 false,
             ),
             form::row(
                 "settings-id-key-row",
-                "Signing key",
-                "Used for commits and tags.",
+                ui::t!("settings.identity.key.title"),
+                ui::t!("settings.identity.key.desc"),
                 signing_key,
                 !settings.sign_commits,
             ),
@@ -425,7 +434,7 @@ pub(super) fn render(
                 div()
                     .text_size(ui::metrics::FS_XS)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("HOSTING ACCOUNTS"),
+                    .child(ui::t!("settings.identity.accounts_heading")),
             )
             .child(
                 div()
@@ -434,7 +443,7 @@ pub(super) fn render(
                     .gap(px(4.))
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child("Accounts for GitHub, GitLab and other services now live in")
+                    .child(ui::t!("settings.identity.accounts_moved"))
                     .child(
                         div()
                             .id("settings-identity-accounts-link")
@@ -449,7 +458,7 @@ pub(super) fn render(
                                     });
                                 }
                             })
-                            .child("Settings → Accounts"),
+                            .child(ui::t!("settings.identity.accounts_link")),
                     )
                     .child("."),
             ),

@@ -30,26 +30,21 @@ pub fn relative_time(now: u64, then: u64) -> String {
 
     let age = now.saturating_sub(then);
     if age < MINUTE {
-        "just now".to_owned()
+        ui::i18n::t("format.just_now").to_string()
     } else if age < HOUR {
-        format!("{} min ago", age / MINUTE)
+        ui::i18n::t_count("format.minutes_ago", age / MINUTE, &[]).to_string()
     } else if age < DAY {
-        format!("{} h ago", age / HOUR)
+        ui::i18n::t_count("format.hours_ago", age / HOUR, &[]).to_string()
     } else if age < 2 * DAY {
-        "yesterday".to_owned()
+        ui::i18n::t("format.yesterday").to_string()
     } else if age < WEEK {
-        format!("{} d ago", age / DAY)
+        ui::i18n::t_count("format.days_ago", age / DAY, &[]).to_string()
     } else if age < MONTH {
-        let weeks = age / WEEK;
-        if weeks == 1 {
-            "1 week ago".to_owned()
-        } else {
-            format!("{weeks} weeks ago")
-        }
+        ui::i18n::t_count("format.weeks_ago", age / WEEK, &[]).to_string()
     } else if age < YEAR {
-        format!("{} mo ago", age / MONTH)
+        ui::i18n::t_count("format.months_ago", age / MONTH, &[]).to_string()
     } else {
-        format!("{} y ago", age / YEAR)
+        ui::i18n::t_count("format.years_ago", age / YEAR, &[]).to_string()
     }
 }
 

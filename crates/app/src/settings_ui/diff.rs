@@ -5,9 +5,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use gpui::prelude::FluentBuilder;
-use gpui::{
-    div, px, AnyElement, App, Context, IntoElement, ParentElement, SharedString, Styled, Window,
-};
+use gpui::{div, px, AnyElement, App, Context, IntoElement, ParentElement, Styled, Window};
 
 use ui::metrics::{FONT_MONO, FS_SM, R_MD};
 use ui::theme::ActiveTheme;
@@ -25,10 +23,11 @@ const TOOLS: [MergeTool; 5] = [
     MergeTool::Custom,
 ];
 
+/// Catalog keys of the whitespace options.
 const WHITESPACE: [(WhitespaceMode, &str); 3] = [
-    (WhitespaceMode::None, "Show all"),
-    (WhitespaceMode::Eol, "Ignore at line end"),
-    (WhitespaceMode::All, "Ignore all"),
+    (WhitespaceMode::None, "settings.diff.whitespace.none"),
+    (WhitespaceMode::Eol, "settings.diff.whitespace.eol"),
+    (WhitespaceMode::All, "settings.diff.whitespace.all"),
 ];
 
 pub(super) fn render(
@@ -41,15 +40,18 @@ pub(super) fn render(
     let mut page = div().flex().flex_col();
 
     page = page.child(heading(
-        "Diff & merge",
-        "How changes are displayed, and which tool resolves conflicts.",
+        ui::t!("settings.diff.title"),
+        ui::t!("settings.diff.subtitle"),
     ));
 
     let layout = {
         let entity = cx.entity();
         form::segmented(
             "settings-diff-layout".into(),
-            ["Unified", "Side-by-side"],
+            [
+                ui::t!("settings.diff.layout.unified"),
+                ui::t!("settings.diff.layout.split"),
+            ],
             usize::from(settings.diff_layout == DiffLayout::Split),
             false,
             move |index, _, cx| {
@@ -105,32 +107,32 @@ pub(super) fn render(
     };
 
     page = page.child(group(
-        "Display",
+        ui::t!("settings.diff.group.display"),
         vec![
             form::row(
                 "settings-diff-layout-row",
-                "Layout",
-                "Side-by-side needs a details pane at least 900 px wide; narrower panes fall back to unified.",
+                ui::t!("settings.diff.layout.title"),
+                ui::t!("settings.diff.layout.desc"),
                 layout,
                 false,
             ),
             form::row(
                 "settings-diff-word-row",
-                "Highlight changed words",
-                "Marks the exact characters that differ inside a modified line.",
+                ui::t!("settings.diff.word.title"),
+                ui::t!("settings.diff.word.desc"),
                 word,
                 false,
             ),
             form::row(
                 "settings-diff-wrap-row",
-                "Wrap long lines",
-                "Off scrolls horizontally.",
+                ui::t!("settings.diff.wrap.title"),
+                ui::t!("settings.diff.wrap.desc"),
                 wrap,
                 false,
             ),
             form::row(
                 "settings-diff-numbers-row",
-                "Line numbers",
+                ui::t!("settings.diff.numbers.title"),
                 "",
                 numbers,
                 false,
@@ -142,7 +144,7 @@ pub(super) fn render(
         let entity = cx.entity();
         form::select(
             "settings-diff-whitespace".into(),
-            WHITESPACE.iter().map(|(_, label)| *label),
+            WHITESPACE.iter().map(|(_, key)| ui::i18n::t(key)),
             WHITESPACE
                 .iter()
                 .position(|(mode, _)| *mode == settings.diff_whitespace)
@@ -187,19 +189,19 @@ pub(super) fn render(
         )
     };
     page = page.child(group(
-        "Content",
+        ui::t!("settings.diff.group.content"),
         vec![
             form::row(
                 "settings-diff-whitespace-row",
-                "Whitespace",
-                "Hidden whitespace-only changes are still staged and committed.",
+                ui::t!("settings.diff.whitespace.title"),
+                ui::t!("settings.diff.whitespace.desc"),
                 whitespace,
                 false,
             ),
             form::row(
                 "settings-diff-context-row",
-                "Context lines",
-                "Unchanged lines shown around each change (0–20).",
+                ui::t!("settings.diff.context.title"),
+                ui::t!("settings.diff.context.desc"),
                 context,
                 false,
             ),
@@ -218,7 +220,7 @@ pub(super) fn render(
                 div()
                     .text_size(ui::metrics::FS_XS)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("PREVIEW"),
+                    .child(ui::t!("settings.diff.preview")),
             )
             .child(
                 div()
@@ -236,19 +238,18 @@ pub(super) fn render(
                             .font_family(FONT_MONO)
                             .text_size(FS_SM)
                             .text_color(colors.muted)
-                            .child(format!(
-                                "src/history/graph.rs · {}{}",
-                                if settings.diff_layout == DiffLayout::Split {
-                                    "side-by-side"
+                            .child({
+                                let layout = if settings.diff_layout == DiffLayout::Split {
+                                    ui::t!("settings.diff.preview.side_by_side")
                                 } else {
-                                    "unified"
-                                },
+                                    ui::t!("settings.diff.preview.unified")
+                                };
                                 if settings.diff_whitespace == WhitespaceMode::None {
-                                    ""
+                                    ui::t!("settings.diff.preview.header", layout = layout)
                                 } else {
-                                    " · whitespace ignored"
+                                    ui::t!("settings.diff.preview.header_ws", layout = layout)
                                 }
-                            )),
+                            }),
                     )
                     .child(preview),
             ),
@@ -281,8 +282,8 @@ pub(super) fn render(
     let merge_rows = match settings.merge_tool {
         MergeTool::Builtin => vec![form::row(
             "settings-merge-tool-row",
-            "Resolve conflicts with",
-            "Three-way editor inside GitWarp. No setup needed.",
+            ui::t!("settings.merge.tool.title"),
+            ui::t!("settings.merge.tool.builtin_desc"),
             tool,
             false,
         )],
@@ -295,8 +296,8 @@ pub(super) fn render(
             let bad = command_text.trim().is_empty() || !missing.is_empty();
             let mut rows = vec![form::row(
                 "settings-merge-tool-row",
-                "Resolve conflicts with",
-                "Opened from the conflict banner; GitWarp waits until the tool exits.",
+                ui::t!("settings.merge.tool.title"),
+                ui::t!("settings.merge.tool.external_desc"),
                 tool,
                 false,
             )];
@@ -312,7 +313,7 @@ pub(super) fn render(
                     .child(
                         div()
                             .text_size(FS_SM)
-                            .child("Command"),
+                            .child(ui::t!("settings.merge.command")),
                     )
                     .child(
                         div()
@@ -325,7 +326,7 @@ pub(super) fn render(
                                 Button::new("settings-merge-test")
                                     .size(ButtonSize::Small)
                                     .icon(IconName::Play)
-                                    .label("Test")
+                                    .label(ui::t!("settings.merge.test"))
                                     .disabled(bad)
                                     .on_click(move |_, _, cx: &mut App| {
                                         entity.update(cx, |view, cx| {
@@ -341,22 +342,16 @@ pub(super) fn render(
                         })
                     })
                     .child(if command_text.trim().is_empty() {
-                        form::error("Enter a command.", cx)
+                        form::error(ui::t!("settings.merge.enter_command"), cx)
                     } else if !missing.is_empty() {
                         form::error(
-                            format!(
-                                "Missing {}. The tool would not receive all required files.",
-                                missing.join(", ")
-                            ),
+                            ui::t!("settings.merge.missing", list = missing.join(", ")),
                             cx,
                         )
                     } else {
-                        form::success("All required placeholders present.", cx)
+                        form::success(ui::t!("settings.merge.all_present"), cx)
                     })
-                    .child(form::help(
-                        "Placeholders: $LOCAL your side · $REMOTE their side · $BASE common ancestor · $MERGED result file.",
-                        cx,
-                    ))
+                    .child(form::help(ui::t!("settings.merge.placeholders_help"), cx))
                     .into_any_element(),
             );
             rows
@@ -365,8 +360,8 @@ pub(super) fn render(
             let command = settings.merge_tool.preset().to_owned();
             let mut rows = vec![form::row(
                 "settings-merge-tool-row",
-                "Resolve conflicts with",
-                "Opened from the conflict banner; GitWarp waits until the tool exits.",
+                ui::t!("settings.merge.tool.title"),
+                ui::t!("settings.merge.tool.external_desc"),
                 tool,
                 false,
             )];
@@ -378,7 +373,11 @@ pub(super) fn render(
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(div().text_size(FS_SM).child("Command"))
+                    .child(
+                        div()
+                            .text_size(FS_SM)
+                            .child(ui::t!("settings.merge.command")),
+                    )
                     .child(
                         div()
                             .px(px(8.))
@@ -391,16 +390,13 @@ pub(super) fn render(
                             .text_size(FS_SM)
                             .child(command),
                     )
-                    .child(form::help(
-                        "Choose “Custom command…” to edit the command.",
-                        cx,
-                    ))
+                    .child(form::help(ui::t!("settings.merge.choose_custom"), cx))
                     .into_any_element(),
             );
             rows
         }
     };
-    page = page.child(group("Merge tool", merge_rows));
+    page = page.child(group(ui::t!("settings.merge.group"), merge_rows));
     page.into_any_element()
 }
 
@@ -496,7 +492,7 @@ fn diff_preview(settings: &crate::settings::Settings, cx: &Context<SettingsView>
                 .pt(px(4.))
                 .text_size(FS_SM)
                 .text_color(colors.muted)
-                .child("Side-by-side preview uses the same rows in two columns."),
+                .child(ui::t!("settings.diff.preview.split_note")),
         );
     }
     body.into_any_element()
@@ -531,10 +527,8 @@ impl SettingsView {
                 .await;
             this.update(cx, |view, cx| {
                 view.merge_test = Some(match result {
-                    Ok(()) => Ok(SharedString::from(format!(
-                        "Started {program} with sample files"
-                    ))),
-                    Err(error) => Err(SharedString::from(format!("Could not start: {error}"))),
+                    Ok(()) => Ok(ui::t!("settings.merge.started", program = program)),
+                    Err(error) => Err(ui::t!("settings.merge.start_failed", error = error)),
                 });
                 cx.notify();
             })
@@ -610,9 +604,11 @@ fn start_sample_merge(command: &str) -> std::io::Result<()> {
                     Some(0) => Ok(()),
                     Some(code) if code == not_found => Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        format!("command not found: {program}"),
+                        ui::t!("settings.merge.not_found", program = program).to_string(),
                     )),
-                    Some(code) => Err(std::io::Error::other(format!("exited with code {code}"))),
+                    Some(code) => Err(std::io::Error::other(
+                        ui::t!("settings.merge.exited", code = code).to_string(),
+                    )),
                     None => Ok(()),
                 };
             }

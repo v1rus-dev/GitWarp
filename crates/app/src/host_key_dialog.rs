@@ -133,7 +133,7 @@ pub(crate) fn open(
     let state = dialog.downgrade();
     let (layer, host) = dialog::open_with_view(window, cx, move |_, cx| match state.upgrade() {
         Some(state) => build(&state, cx),
-        None => Dialog::new("SSH host key"),
+        None => Dialog::new(ui::t!("dialogs.host_key.title")),
     });
     dialog.update(cx, |dialog, _| {
         dialog.layer = Some(layer);
@@ -185,55 +185,49 @@ fn build(state: &Entity<HostKeyDialog>, cx: &App) -> Dialog {
     let mut body = div().flex().flex_col().gap(px(12.));
     if dialog.changed {
         body = body.child(
-            Banner::new(BannerKind::Error, "Possible man-in-the-middle attack").body(format!(
-                "The key presented by {} is different from the one trusted before. \
-                     Someone may be intercepting the connection, or the server was reinstalled.",
-                dialog.address
-            )),
+            Banner::new(BannerKind::Error, ui::t!("dialogs.host_key.mitm_title"))
+                .body(ui::t!("dialogs.host_key.mitm_body", host = dialog.address)),
         );
         body = body
             .child(
                 div()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child("Previously trusted"),
+                    .child(ui::t!("dialogs.host_key.previously_trusted")),
             )
             .child(fingerprints(&dialog.old, colors))
             .child(
                 div()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child("Presented now"),
+                    .child(ui::t!("dialogs.host_key.presented_now")),
             )
             .child(fingerprints(&dialog.new, colors));
     } else {
         body = body
             .child(
-                Banner::new(BannerKind::Info, "Trust this host?").body(format!(
-                    "The authenticity of {} cannot be verified yet. This is the first \
-                         time you connect to it.",
-                    dialog.address
-                )),
+                Banner::new(BannerKind::Info, ui::t!("dialogs.host_key.trust_title"))
+                    .body(ui::t!("dialogs.host_key.trust_body", host = dialog.address)),
             )
             .child(fingerprints(&dialog.new, colors))
             .child(
                 div()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child("Compare the fingerprint with the one published by your Git host."),
+                    .child(ui::t!("dialogs.host_key.compare_hint")),
             );
     }
     body = body.child(
         div()
             .text_size(FS_SM)
             .text_color(colors.muted)
-            .child("The key is remembered in ~/.ssh/known_hosts."),
+            .child(ui::t!("dialogs.host_key.remembered")),
     );
 
     let primary_label = if dialog.changed {
-        "Replace key"
+        ui::t!("dialogs.host_key.replace_key")
     } else {
-        "Trust host"
+        ui::t!("dialogs.host_key.trust_host")
     };
     let footer = div()
         .flex()
@@ -241,7 +235,7 @@ fn build(state: &Entity<HostKeyDialog>, cx: &App) -> Dialog {
         .gap(px(8.))
         .child(
             Button::new("host-key-cancel")
-                .label("Cancel")
+                .label(ui::t!("dialogs.common.cancel"))
                 .min_width(px(72.))
                 .focus_handle(dialog.cancel_focus.clone())
                 .on_click(cancel),
@@ -261,9 +255,9 @@ fn build(state: &Entity<HostKeyDialog>, cx: &App) -> Dialog {
         });
 
     let title = if dialog.changed {
-        "Host key has changed"
+        ui::t!("dialogs.host_key.changed_title")
     } else {
-        "SSH host key"
+        ui::t!("dialogs.host_key.title")
     };
     Dialog::new(title)
         .icon(if dialog.changed {

@@ -172,7 +172,7 @@ pub fn stepper(
                 .icon_only(ui::IconName::Minus)
                 .size(ButtonSize::Small)
                 .disabled(!can_decrease)
-                .tooltip("Decrease")
+                .tooltip(ui::i18n::t("settings.form.decrease"))
                 .on_click(move |_, window, cx| on_decrease(window, cx)),
         )
         .child(
@@ -195,7 +195,7 @@ pub fn stepper(
                 .icon_only(ui::IconName::Plus)
                 .size(ButtonSize::Small)
                 .disabled(!can_increase)
-                .tooltip("Increase")
+                .tooltip(ui::i18n::t("settings.form.increase"))
                 .on_click(move |_, window, cx| on_increase(window, cx)),
         )
         .into_any_element()

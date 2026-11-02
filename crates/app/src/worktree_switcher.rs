@@ -8,6 +8,7 @@
 //! shows is pure ([`items_for`], [`rows`]) so it is unit tested without a
 //! window.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -41,10 +42,6 @@ actions!(
 );
 
 const CONTEXT: &str = "WorktreeSwitcher";
-const PLACEHOLDER: &str = "Filter worktrees, or type a new branch name";
-const EMPTY: &str = "No worktree matches. Type a branch name to create one.";
-const INVALID: &str = "This is not a valid branch name.";
-const DETACHED: &str = "detached HEAD";
 
 /// Binds the popover's own keys in its key context: Alt 1…9 jump to the
 /// first nine worktrees. The key that opens it is bound with the other
@@ -88,8 +85,11 @@ pub(crate) enum Item {
 }
 
 /// The branch line of a worktree.
-fn branch_label(entry: &WorktreeEntry) -> &str {
-    entry.branch().unwrap_or(DETACHED)
+fn branch_label(entry: &WorktreeEntry) -> Cow<'_, str> {
+    entry.branch().map_or_else(
+        || Cow::Owned(ui::i18n::t("worktrees.detached_head").to_string()),
+        Cow::Borrowed,
+    )
 }
 
 /// The matched characters of the name and the branch line, when `query`
@@ -99,7 +99,7 @@ fn match_entry(entry: &WorktreeEntry, query: &str) -> Option<(Vec<usize>, Vec<us
         return Some((Vec::new(), Vec::new()));
     }
     let name = fuzzy(query, &entry.name()).map(|found| found.positions);
-    let branch = fuzzy(query, branch_label(entry)).map(|found| found.positions);
+    let branch = fuzzy(query, &branch_label(entry)).map(|found| found.positions);
     let path = entry
         .path()
         .to_string_lossy()
@@ -146,6 +146,7 @@ pub(crate) fn items_for(entries: &[WorktreeEntry], query: &str, check: &BranchCh
 /// One line of the list: a section header or an item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Row {
+    /// A section header; holds the catalog key of its title.
     Header(&'static str),
     Item(usize),
 }
@@ -159,11 +160,11 @@ pub(crate) fn rows(items: &[Item]) -> Vec<Row> {
         match item {
             Item::Worktree { .. } if !worktrees => {
                 worktrees = true;
-                rows.push(Row::Header("WORKTREES"));
+                rows.push(Row::Header("worktrees.switcher.section_worktrees"));
             }
             Item::Worktree { .. } => {}
-            Item::Create { .. } => rows.push(Row::Header("CREATE")),
-            Item::Invalid => rows.push(Row::Header("NOT AVAILABLE")),
+            Item::Create { .. } => rows.push(Row::Header("worktrees.switcher.section_create")),
+            Item::Invalid => rows.push(Row::Header("worktrees.switcher.section_unavailable")),
         }
         rows.push(Row::Item(index));
     }
@@ -231,8 +232,11 @@ pub(crate) fn titlebar_button(
         .on_click(on_click)
         .child(Icon::new(IconName::Worktree).size(px(14.)).color(icon));
     row = match key_cap {
-        Some(cap) => row.tooltip(Tooltip::with_kbd("Switch worktree", cap)),
-        None => row.tooltip(Tooltip::text("Switch worktree")),
+        Some(cap) => row.tooltip(Tooltip::with_kbd(
+            ui::i18n::t("worktrees.switcher.tooltip"),
+            cap,
+        )),
+        None => row.tooltip(Tooltip::text(ui::i18n::t("worktrees.switcher.tooltip"))),
     };
     if let Some(max) = name_max {
         row = row.child(
@@ -281,7 +285,7 @@ pub(crate) fn open(
 ) -> Entity<WorktreeSwitcher> {
     let input = cx.new(|cx| {
         let mut input = TextInput::new(window, cx);
-        input.set_placeholder(PLACEHOLDER, cx);
+        input.set_placeholder(ui::i18n::t("worktrees.switcher.placeholder"), cx);
         input
     });
     let view = cx.new(|cx| WorktreeSwitcher::new(model, input.clone(), add, window, cx));
@@ -446,7 +450,7 @@ impl WorktreeSwitcher {
         self.model.update(cx, |model, cx| model.prune(window, cx));
     }
 
-    fn render_section(label: &'static str, colors: ThemeColors) -> Div {
+    fn render_section(label_key: &'static str, colors: ThemeColors) -> Div {
         div()
             .flex_none()
             .pt(px(6.))
@@ -455,7 +459,7 @@ impl WorktreeSwitcher {
             .text_size(FS_XS)
             .font_weight(FontWeight::BOLD)
             .text_color(colors.muted)
-            .child(label)
+            .child(ui::i18n::t(label_key).to_uppercase())
     }
 
     /// The row shell: highlight ring, hover, click.
@@ -570,13 +574,13 @@ impl WorktreeSwitcher {
                             .when(entry.is_main(), |row| {
                                 row.child(Chip::new(
                                     ("worktree-switcher-default", index),
-                                    "default",
+                                    ui::i18n::t("worktrees.switcher.default"),
                                 ))
                             }),
                     )
                     .child(div().min_w_0().truncate().text_size(FS_SM).child(
                         palette::highlighted_in(
-                            branch_label(entry),
+                            &branch_label(entry),
                             branch_positions,
                             branch_style,
                             colors.accent,
@@ -607,7 +611,11 @@ impl WorktreeSwitcher {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let colors = cx.theme().colors;
-        let verb = if existing { "Open" } else { "Create" };
+        let title = if existing {
+            ui::t!("worktrees.switcher.open_new", name = name)
+        } else {
+            ui::t!("worktrees.switcher.create_new", name = name)
+        };
         self.row_shell(index, cx)
             .child(Icon::new(IconName::Plus).size(px(16.)).color(colors.muted))
             .child(
@@ -622,7 +630,7 @@ impl WorktreeSwitcher {
                             .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("{verb} “{name}” in a new worktree")),
+                            .child(title),
                     )
                     .child(
                         div()
@@ -670,7 +678,7 @@ impl WorktreeSwitcher {
                     .truncate()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(colors.muted)
-                    .child(INVALID),
+                    .child(ui::i18n::t("worktrees.toast.invalid_branch")),
             )
     }
 
@@ -688,7 +696,7 @@ impl WorktreeSwitcher {
                 Button::ghost("worktree-switcher-add")
                     .size(ButtonSize::Small)
                     .icon(IconName::Plus)
-                    .label("Add worktree…")
+                    .label(ui::i18n::t("worktrees.quick.add"))
                     .on_click(cx.listener(|this, _, window, cx| this.add_worktree(window, cx))),
             )
             .when(missing > 0, |row| {
@@ -696,7 +704,7 @@ impl WorktreeSwitcher {
                     Button::ghost("worktree-switcher-prune")
                         .size(ButtonSize::Small)
                         .icon(IconName::Trash)
-                        .label(format!("Prune {missing} missing"))
+                        .label(ui::t!("worktrees.view.prune", n = missing))
                         .on_click(cx.listener(|this, _, window, cx| this.prune(window, cx))),
                 )
             })
@@ -742,7 +750,7 @@ impl Render for WorktreeSwitcher {
                 .text_color(colors.muted)
                 .flex()
                 .justify_center()
-                .child(EMPTY)
+                .child(ui::i18n::t("worktrees.switcher.empty"))
                 .into_any_element()
         } else {
             let mut list = div()
@@ -1002,16 +1010,19 @@ mod tests {
         assert_eq!(
             rows(&items),
             vec![
-                Row::Header("WORKTREES"),
+                Row::Header("worktrees.switcher.section_worktrees"),
                 Row::Item(0),
-                Row::Header("CREATE"),
+                Row::Header("worktrees.switcher.section_create"),
                 Row::Item(1)
             ]
         );
         let invalid = items_for(&[], "x y", &BranchCheck::Invalid);
         assert_eq!(
             rows(&invalid),
-            vec![Row::Header("NOT AVAILABLE"), Row::Item(0)]
+            vec![
+                Row::Header("worktrees.switcher.section_unavailable"),
+                Row::Item(0)
+            ]
         );
         assert!(rows(&[]).is_empty());
     }

@@ -13,11 +13,11 @@ use crate::settings::{AfterCreate, WORKTREE_BASES, WORKTREE_TEMPLATES};
 const EXAMPLE_BRANCH: &str = "fix-git-detect";
 
 /// The label of a base folder in the select.
-fn base_label(base: &str) -> &str {
+fn base_label(base: &str) -> gpui::SharedString {
     if base == WORKTREE_BASES[0] {
-        "~/develop (next to the repository)"
+        ui::t!("settings.worktrees.base_next_to_repo")
     } else {
-        base
+        base.to_owned().into()
     }
 }
 
@@ -35,8 +35,8 @@ pub(super) fn render(
     let mut page = div().flex().flex_col();
 
     page = page.child(heading(
-        "Worktrees",
-        "Where new worktrees go and what happens after you create one. Applies to quick create and the switcher; the Add worktree dialog still lets you pick any folder.",
+        ui::t!("settings.page.worktrees"),
+        ui::t!("settings.worktrees.subtitle"),
     ));
 
     let repo = view
@@ -86,19 +86,22 @@ pub(super) fn render(
         )
     };
     page = page.child(group(
-        "Location",
+        ui::t!("settings.worktrees.group.location"),
         vec![
             form::row(
                 "settings-wt-base-row",
-                "Base folder",
-                "New worktrees are created inside this folder, never inside the repository.",
+                ui::t!("settings.worktrees.base.title"),
+                ui::t!("settings.worktrees.base.desc"),
                 base,
                 false,
             ),
             form::row(
                 "settings-wt-template-row",
-                "Folder name",
-                format!("Example: {}", example.display()),
+                ui::t!("settings.worktrees.template.title"),
+                ui::t!(
+                    "settings.worktrees.template.example",
+                    path = example.display()
+                ),
                 template,
                 false,
             ),
@@ -109,7 +112,10 @@ pub(super) fn render(
         let entity = cx.entity();
         form::segmented(
             "settings-wt-after".into(),
-            ["Switch to it", "Stay here"],
+            [
+                ui::t!("settings.worktrees.after.switch"),
+                ui::t!("settings.worktrees.after.stay"),
+            ],
             usize::from(wt.after_create == AfterCreate::Stay),
             false,
             move |index, _, cx| {
@@ -138,19 +144,19 @@ pub(super) fn render(
         )
     };
     page = page.child(group(
-        "After creating",
+        ui::t!("settings.worktrees.group.after"),
         vec![
             form::row(
                 "settings-wt-after-row",
-                "When the worktree is ready",
-                "Switching keeps your current worktree untouched — its changes stay where they are.",
+                ui::t!("settings.worktrees.ready.title"),
+                ui::t!("settings.worktrees.ready.desc"),
                 after,
                 false,
             ),
             form::row(
                 "settings-wt-env-row",
-                "Copy untracked config files",
-                "Copies .env and .env.local into the new worktree so it runs right away. Ignored build output is never copied.",
+                ui::t!("settings.worktrees.copy.title"),
+                ui::t!("settings.worktrees.copy.desc"),
                 copy_env,
                 false,
             ),
@@ -161,7 +167,7 @@ pub(super) fn render(
         let entity = cx.entity();
         form::checkbox(
             "settings-wt-confirm-remove".into(),
-            "Confirm",
+            ui::t!("settings.general.confirm.label"),
             wt.confirm_remove_clean,
             false,
             move |checked, _, cx| {
@@ -177,7 +183,7 @@ pub(super) fn render(
         let entity = cx.entity();
         form::checkbox(
             "settings-wt-confirm-branch".into(),
-            "Confirm",
+            ui::t!("settings.general.confirm.label"),
             wt.confirm_delete_branch,
             false,
             move |checked, _, cx| {
@@ -190,19 +196,19 @@ pub(super) fn render(
         )
     };
     page = page.child(group(
-        "Ask before…",
+        ui::t!("settings.general.group.confirm"),
         vec![
             form::row(
                 "settings-wt-confirm-remove-row",
-                "Removing a worktree",
-                "Always shows unsaved changes first; this only controls the confirmation for clean worktrees.",
+                ui::t!("settings.worktrees.remove.title"),
+                ui::t!("settings.worktrees.remove.desc"),
                 confirm_remove,
                 false,
             ),
             form::row(
                 "settings-wt-confirm-branch-row",
-                "Deleting its branch together with the worktree",
-                "Unmerged commits stay reachable from the reflog for 30 days.",
+                ui::t!("settings.worktrees.delete_branch.title"),
+                ui::t!("settings.general.confirm.branch.desc"),
                 confirm_branch,
                 false,
             ),
@@ -221,7 +227,7 @@ pub(super) fn render(
             .gap(px(4.))
             .text_size(ui::metrics::FS_SM)
             .child(ui::Icon::new(ui::IconName::Info).size(px(12.)))
-            .child("Settings file: ")
+            .child(ui::t!("settings.general.file_label"))
             .child(div().font_family(ui::metrics::FONT_MONO).child(path)),
     )
     .into_any_element()

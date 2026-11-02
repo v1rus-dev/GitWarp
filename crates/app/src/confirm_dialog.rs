@@ -62,7 +62,7 @@ pub(crate) fn open(
     let state = dialog.downgrade();
     let (layer, host) = dialog::open_with_view(window, cx, move |_, cx| match state.upgrade() {
         Some(state) => build(&state, cx),
-        None => Dialog::new("Confirm"),
+        None => Dialog::new(ui::t!("dialogs.confirm.title_fallback")),
     });
     dialog.update(cx, |dialog, _| {
         dialog.layer = Some(layer);
@@ -96,7 +96,7 @@ fn build(state: &Entity<ConfirmDialog>, cx: &App) -> Dialog {
         .gap(px(8.))
         .child(
             Button::new("confirm-cancel")
-                .label("Cancel")
+                .label(ui::t!("dialogs.common.cancel"))
                 .min_width(px(72.))
                 .focus_handle(dialog.cancel_focus.clone())
                 .on_click(cancel),

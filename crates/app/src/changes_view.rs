@@ -560,20 +560,17 @@ impl ChangesView {
         let picks = self.picks(hunk);
         let picked = picks[0].lines.as_ref().map_or(0, Vec::len);
         let staged = selection.side.staged();
-        let notice = if picked > 0 {
-            format!(
-                "{} {} lines",
-                if staged { "Unstaged" } else { "Staged" },
-                picked
-            )
-        } else {
-            format!(
-                "{} hunk {} of {}",
-                if staged { "Unstaged" } else { "Staged" },
-                hunk + 1,
-                file.path
-            )
-        };
+        let notice = match (picked > 0, staged) {
+            (true, true) => ui::i18n::t_count("changes.notice.unstaged_lines", picked as u64, &[]),
+            (true, false) => ui::i18n::t_count("changes.notice.staged_lines", picked as u64, &[]),
+            (false, true) => ui::t!(
+                "changes.notice.unstaged_hunk",
+                n = hunk + 1,
+                path = file.path
+            ),
+            (false, false) => ui::t!("changes.notice.staged_hunk", n = hunk + 1, path = file.path),
+        }
+        .to_string();
         self.picked.clear();
         self.pick_anchor = None;
         self.start_action(cx, move |repo| {
@@ -623,10 +620,11 @@ impl ChangesView {
         let path = file.path.clone();
         let staged = side.staged();
         let notice = if staged {
-            format!("Unstaged {path}")
+            ui::t!("changes.notice.unstaged_file", path = path)
         } else {
-            format!("Staged {path}")
-        };
+            ui::t!("changes.notice.staged_file", path = path)
+        }
+        .to_string();
         self.start_action(cx, move |repo| {
             if staged {
                 repo.unstage(std::slice::from_ref(&path))?;
@@ -654,10 +652,11 @@ impl ChangesView {
         }
         let staged = side.staged();
         let notice = if staged {
-            format!("Unstaged {} files", paths.len())
+            ui::i18n::t_count("changes.notice.unstaged_files", paths.len() as u64, &[])
         } else {
-            format!("Staged {} files", paths.len())
-        };
+            ui::i18n::t_count("changes.notice.staged_files", paths.len() as u64, &[])
+        }
+        .to_string();
         self.start_action(cx, move |repo| {
             if staged {
                 repo.unstage(&paths)?;
@@ -681,7 +680,7 @@ impl ChangesView {
         };
         let path = file.path.clone();
         let untracked = file.untracked;
-        let notice = format!("Discarded changes to {path}");
+        let notice = ui::t!("changes.notice.discarded", path = path).to_string();
         self.confirming_discard = None;
         self.start_action(cx, move |repo| {
             if untracked {
@@ -776,7 +775,12 @@ impl ChangesView {
         }
         let message = self.message.read(cx).text().trim_end().to_string();
         if message.trim().is_empty() {
-            toast::show(ToastKind::Warn, "Write a commit message first", window, cx);
+            toast::show(
+                ToastKind::Warn,
+                ui::t!("changes.commit.message_required"),
+                window,
+                cx,
+            );
             return;
         }
         let staged = self.staged_count();
@@ -789,13 +793,14 @@ impl ChangesView {
             .and_then(|status| status.branch.clone())
             .unwrap_or_else(|| "HEAD".to_string());
         let notice = if amend {
-            "Amended the previous commit".to_string()
+            ui::t!("changes.notice.amended").to_string()
         } else {
-            format!(
-                "Committed {} {} to {branch}",
-                staged,
-                if staged == 1 { "file" } else { "files" }
+            ui::i18n::t_count(
+                "changes.notice.committed",
+                staged as u64,
+                &[("branch", &branch)],
             )
+            .to_string()
         };
         let git = match &self.git {
             Ok(git) => git.clone(),
@@ -928,12 +933,12 @@ impl ChangesView {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(format!("Discard changes to {path}?")),
+                            .child(ui::t!("changes.discard.confirm", path = path)),
                     )
                     .child(
                         Button::danger("confirm-discard")
                             .size(ButtonSize::Small)
-                            .label("Discard")
+                            .label(ui::t!("changes.discard.button"))
                             .on_click(move |_, _, cx| {
                                 discard_view.update(cx, |view, cx| {
                                     view.discard(selection.side, selection.index, cx);
@@ -943,7 +948,7 @@ impl ChangesView {
                     .child(
                         Button::new("cancel-discard")
                             .size(ButtonSize::Small)
-                            .label("Cancel")
+                            .label(ui::t!("changes.discard.cancel"))
                             .on_click(move |_, _, cx| {
                                 cancel_view.update(cx, |view, cx| {
                                     view.confirming_discard = None;
@@ -961,18 +966,18 @@ impl ChangesView {
         panel
             .child(self.render_group(
                 Side::Unstaged,
-                "Unstaged",
+                ui::t!("changes.group.unstaged"),
                 &unstaged,
-                "No unstaged changes",
+                ui::t!("changes.group.unstaged_empty"),
                 self.unstaged_scroll.clone(),
                 view.clone(),
                 cx,
             ))
             .child(self.render_group(
                 Side::Staged,
-                "Staged",
+                ui::t!("changes.group.staged"),
                 &staged,
-                "Nothing staged",
+                ui::t!("changes.group.staged_empty"),
                 self.staged_scroll.clone(),
                 view,
                 cx,
@@ -983,9 +988,9 @@ impl ChangesView {
     fn render_group(
         &mut self,
         side: Side,
-        title: &'static str,
+        title: SharedString,
         files: &[WorkingFile],
-        empty: &'static str,
+        empty: SharedString,
         scroll: ScrollHandle,
         view: Entity<Self>,
         cx: &mut Context<Self>,
@@ -994,8 +999,8 @@ impl ChangesView {
         let busy = self.busy;
         let all_view = view.clone();
         let all_label = match side {
-            Side::Unstaged => "Stage all",
-            Side::Staged => "Unstage all",
+            Side::Unstaged => ui::t!("changes.group.stage_all"),
+            Side::Staged => ui::t!("changes.group.unstage_all"),
         };
         let mut rows = Vec::with_capacity(files.len());
         for (index, file) in files.iter().enumerate() {
@@ -1029,10 +1034,10 @@ impl ChangesView {
                 side == Side::Unstaged,
                 crate::settings_ui::keybindings::key_cap(cx, "stage"),
             ) {
-                (true, Some(cap)) => format!("Stage file · {cap}"),
-                (false, Some(cap)) => format!("Unstage file · {cap}"),
-                (true, None) => "Stage file".to_owned(),
-                (false, None) => "Unstage file".to_owned(),
+                (true, Some(cap)) => ui::t!("changes.row.stage_with_key", cap = cap),
+                (false, Some(cap)) => ui::t!("changes.row.unstage_with_key", cap = cap),
+                (true, None) => ui::t!("changes.row.stage"),
+                (false, None) => ui::t!("changes.row.unstage"),
             };
             row = row.action(
                 Button::ghost(format!("stage-{side:?}-{index}"))
@@ -1051,8 +1056,11 @@ impl ChangesView {
                         .icon_only(IconName::Undo)
                         .tooltip(
                             match crate::settings_ui::keybindings::key_cap(cx, "discard") {
-                                Some(cap) => format!("Discard changes · {}", cap.replace(' ', "+")),
-                                None => "Discard changes".to_owned(),
+                                Some(cap) => ui::t!(
+                                    "changes.row.discard_with_key",
+                                    cap = cap.replace(' ', "+")
+                                ),
+                                None => ui::t!("changes.row.discard"),
                             },
                         )
                         .disabled(busy)
@@ -1180,17 +1188,18 @@ impl ChangesView {
         );
         if let Some(selection) = selection {
             let side = match selection.side {
-                Side::Unstaged => "unstaged",
-                Side::Staged => "staged",
+                Side::Unstaged => ui::t!("changes.side.unstaged"),
+                Side::Staged => ui::t!("changes.side.staged"),
             };
             toolbar = toolbar.child(
                 div()
                     .flex_none()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child(format!(
-                        "{side} · {hunks} hunk{}",
-                        if hunks == 1 { "" } else { "s" }
+                    .child(ui::i18n::t_count(
+                        "changes.diff.side_hunks",
+                        hunks as u64,
+                        &[("side", &side)],
                     )),
             );
         }
@@ -1198,12 +1207,12 @@ impl ChangesView {
             Segmented::new("changes-layout")
                 .small()
                 .item(
-                    SegmentItem::new("Unified")
+                    SegmentItem::new(ui::t!("changes.layout.unified"))
                         .with_icon(IconName::Unified)
                         .id("changes-unified"),
                 )
                 .item(
-                    SegmentItem::new("Side-by-side")
+                    SegmentItem::new(ui::t!("changes.layout.split"))
                         .with_icon(IconName::Split)
                         .id("changes-split"),
                 )
@@ -1219,7 +1228,7 @@ impl ChangesView {
         );
 
         let body = match &self.diff {
-            DiffState::Empty => diff_note("Select a file", colors),
+            DiffState::Empty => diff_note(ui::t!("changes.diff.select_file"), colors),
             DiffState::Loading => div()
                 .flex_1()
                 .min_h_0()
@@ -1238,9 +1247,9 @@ impl ChangesView {
                 .child(message.clone()),
             DiffState::Loaded(data) => {
                 if data.diff.binary {
-                    diff_note("Binary file", colors)
+                    diff_note(ui::t!("changes.diff.binary"), colors)
                 } else if data.rows.is_empty() {
-                    diff_note("No changes", colors)
+                    diff_note(ui::t!("changes.diff.no_changes"), colors)
                 } else if layout == DiffLayout::Split {
                     let row_width = split_width(pane_width);
                     let data = data.clone();
@@ -1338,10 +1347,14 @@ impl ChangesView {
                         let hunk = row.hunk.unwrap_or(0);
                         let picked = self.picked_in(hunk);
                         let label = match (picked, staged) {
-                            (0, false) => "Stage hunk".to_string(),
-                            (0, true) => "Unstage hunk".to_string(),
-                            (n, false) => format!("Stage {n} lines"),
-                            (n, true) => format!("Unstage {n} lines"),
+                            (0, false) => ui::t!("changes.hunk.stage"),
+                            (0, true) => ui::t!("changes.hunk.unstage"),
+                            (n, false) => {
+                                ui::i18n::t_count("changes.hunk.stage_lines", n as u64, &[])
+                            }
+                            (n, true) => {
+                                ui::i18n::t_count("changes.hunk.unstage_lines", n as u64, &[])
+                            }
                         };
                         let stage_view = cx.entity();
                         let button = Button::new(format!("changes-hunk-{hunk}"))
@@ -1515,33 +1528,31 @@ impl ChangesView {
         let staged = self.staged_count();
         let busy = self.busy;
         let commit_label = if self.amend {
-            "Amend commit".to_string()
+            ui::t!("changes.commit.amend")
         } else {
-            format!(
-                "Commit {staged} {} to {branch}",
-                if staged == 1 { "file" } else { "files" }
+            ui::i18n::t_count(
+                "changes.commit.button",
+                staged as u64,
+                &[("branch", &branch)],
             )
         };
         let can_commit = !busy && (!commit_label.is_empty()) && (self.amend || staged > 0);
         let commit_view = cx.entity();
         let amend_view = cx.entity();
         let switch = Switch::new("amend-switch")
-            .label("Amend previous commit")
+            .label(ui::t!("changes.commit.amend_switch"))
             .checked(self.amend)
             .disabled(busy || head.is_none())
             .on_toggle(move |checked, _, cx| {
                 amend_view.update(cx, |view, cx| view.set_amend(checked, cx));
             });
         let help = match &head {
-            Some(head) => format!(
-                "Amend reuses the message of {} and rewrites it.",
-                head.short
-            ),
-            None => "There is no commit to amend yet.".to_string(),
+            Some(head) => ui::t!("changes.commit.amend_help", short = head.short),
+            None => ui::t!("changes.commit.amend_none"),
         };
         let guide_50 = 10. + SUBJECT_LIMIT as f32 * f32::from(self.mono_cell);
         let guide_72 = 10. + BODY_LIMIT as f32 * f32::from(self.mono_cell);
-        let counter = |value: usize, limit: usize, label: String| {
+        let counter = |value: usize, limit: usize, label: SharedString| {
             div()
                 .text_size(FS_XS)
                 .text_color(if value > limit {
@@ -1571,9 +1582,7 @@ impl ChangesView {
                             .text_size(FS_SM)
                             .text_color(colors.muted)
                             .mb(px(4.))
-                            .child(
-                            "Commit message — subject on the first line, body after a blank line",
-                        ),
+                            .child(ui::t!("changes.commit.message_help")),
                     )
                     .child(
                         div()
@@ -1605,18 +1614,22 @@ impl ChangesView {
                             .flex()
                             .items_center()
                             .gap(px(16.))
-                            .child(counter(subject, SUBJECT_LIMIT, "Subject".to_string()))
+                            .child(counter(
+                                subject,
+                                SUBJECT_LIMIT,
+                                ui::t!("changes.commit.subject"),
+                            ))
                             .child(counter(
                                 longest_body,
                                 BODY_LIMIT,
-                                "Longest body line".to_string(),
+                                ui::t!("changes.commit.longest_body"),
                             ))
                             .child(div().flex_1())
                             .child(
                                 div()
                                     .text_size(FS_XS)
                                     .text_color(colors.muted)
-                                    .child("Ctrl+Enter to commit"),
+                                    .child(ui::t!("changes.commit.hint", key = "Ctrl+Enter")),
                             ),
                     ),
             )
@@ -1652,7 +1665,7 @@ impl ChangesView {
                             .child({
                                 let commit_view = commit_view.clone();
                                 Button::new("commit-push-button")
-                                    .label("Commit & Push")
+                                    .label(ui::t!("changes.commit.commit_and_push"))
                                     .disabled(!can_commit)
                                     .on_click(move |_, window, cx| {
                                         commit_view.update(cx, |view, cx| {
@@ -1757,7 +1770,7 @@ fn message_counters(text: &str) -> (usize, usize) {
 }
 
 /// A muted, centred note for a pane with nothing to paint.
-fn diff_note(text: &'static str, colors: ThemeColors) -> Div {
+fn diff_note(text: SharedString, colors: ThemeColors) -> Div {
     div()
         .flex_1()
         .min_h_0()

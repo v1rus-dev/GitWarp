@@ -28,6 +28,7 @@ mod sidebar;
 mod syntax;
 #[cfg(test)]
 mod test_support;
+mod text_runs;
 mod theme;
 mod welcome;
 mod welcome_activity;
@@ -188,6 +189,8 @@ fn main() {
             Settings::default()
         }
     };
+    // Before the first window renders, so every view reads the chosen language.
+    ui::i18n::set_language(loaded.language.code());
     // The command line and GITWARP_GIT win over the Git page's choice.
     let git_choice = git_choice.unwrap_or_else(|| loaded.git_choice());
     // Resolved once, before any window exists, so the probe cannot freeze the UI.

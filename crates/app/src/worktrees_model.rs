@@ -434,7 +434,7 @@ impl WorktreesModel {
         let Some(entry) = self.entry(path).cloned() else {
             toast::show(
                 ToastKind::Warn,
-                "The worktree is no longer in the list",
+                ui::i18n::t("worktrees.toast.gone"),
                 window,
                 cx,
             );
@@ -445,9 +445,7 @@ impl WorktreesModel {
         if entry.missing {
             toast::show(
                 ToastKind::Error,
-                format!(
-                    "The folder of {name} is missing. Remove the record or restore the folder."
-                ),
+                ui::t!("worktrees.toast.folder_missing", name = name),
                 window,
                 cx,
             );
@@ -456,17 +454,20 @@ impl WorktreesModel {
         if entry.is_current() {
             toast::show(
                 ToastKind::Info,
-                format!("{name} is already the current worktree"),
+                ui::t!("worktrees.toast.already_current", name = name),
                 window,
                 cx,
             );
             return;
         }
         self.touch(path, cx);
-        let branch = entry.branch().unwrap_or("detached HEAD").to_owned();
+        let branch = entry
+            .branch()
+            .map(str::to_owned)
+            .unwrap_or_else(|| ui::i18n::t("worktrees.detached_head").to_string());
         toast::show(
             ToastKind::Ok,
-            format!("Switched to {name} · {branch}"),
+            ui::t!("worktrees.toast.switched", name = name, branch = branch),
             window,
             cx,
         );
@@ -488,9 +489,7 @@ impl WorktreesModel {
         if entry.missing {
             toast::show(
                 ToastKind::Error,
-                format!(
-                    "The folder of {name} is missing. Remove the record or restore the folder."
-                ),
+                ui::t!("worktrees.toast.folder_missing", name = name),
                 window,
                 cx,
             );
@@ -505,7 +504,7 @@ impl WorktreesModel {
             .ok();
         toast::show(
             ToastKind::Ok,
-            format!("Opened {name} in a new window"),
+            ui::t!("worktrees.toast.opened_new_window", name = name),
             window,
             cx,
         );
@@ -528,7 +527,7 @@ impl WorktreesModel {
             BranchCheck::InUse { name: used, .. } => {
                 toast::show(
                     ToastKind::Error,
-                    format!("“{name}” is already checked out in {used}."),
+                    ui::t!("worktrees.toast.branch_in_use", name = name, used = used),
                     window,
                     cx,
                 );
@@ -537,7 +536,7 @@ impl WorktreesModel {
             BranchCheck::Empty | BranchCheck::Invalid => {
                 toast::show(
                     ToastKind::Error,
-                    "This is not a valid branch name.",
+                    ui::i18n::t("worktrees.toast.invalid_branch"),
                     window,
                     cx,
                 );
@@ -565,7 +564,7 @@ impl WorktreesModel {
         self.creating = true;
         toast::show(
             ToastKind::Info,
-            format!("Creating worktree {label}…"),
+            ui::t!("worktrees.toast.creating", label = label),
             window,
             cx,
         );
@@ -608,12 +607,20 @@ impl WorktreesModel {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         let mut message = if created.new_branch {
-            format!("Created {folder} on new branch {branch}")
+            ui::t!(
+                "worktrees.toast.created_new",
+                folder = folder,
+                branch = branch
+            )
         } else {
-            format!("Created {folder} on {branch}")
-        };
+            ui::t!("worktrees.toast.created", folder = folder, branch = branch)
+        }
+        .to_string();
         if !created.copied.is_empty() {
-            message.push_str(&format!(" · copied {}", created.copied.join(", ")));
+            message.push_str(&ui::t!(
+                "worktrees.toast.copied_suffix",
+                files = created.copied.join(", ")
+            ));
         }
         toast::show(ToastKind::Ok, message, window, cx);
         self.selected = Some(path.clone());
@@ -662,8 +669,12 @@ impl WorktreesModel {
                 .await;
             this.update_in(cx, |model, window, cx| match result {
                 Ok(()) => {
-                    let verb = if locked { "Unlocked" } else { "Locked" };
-                    toast::show(ToastKind::Ok, format!("{verb} {name}"), window, cx);
+                    let message = if locked {
+                        ui::t!("worktrees.toast.unlocked", name = name)
+                    } else {
+                        ui::t!("worktrees.toast.locked", name = name)
+                    };
+                    toast::show(ToastKind::Ok, message, window, cx);
                     model.operation_done(cx);
                 }
                 Err(error) => {
@@ -691,10 +702,7 @@ impl WorktreesModel {
                 Ok(()) => {
                     toast::show(
                         ToastKind::Ok,
-                        format!(
-                            "Pruned {stale} stale worktree record{}",
-                            if stale == 1 { "" } else { "s" }
-                        ),
+                        ui::i18n::t_count("worktrees.toast.pruned", stale as u64, &[]),
                         window,
                         cx,
                     );
@@ -727,7 +735,7 @@ impl WorktreesModel {
                 Ok(()) => {
                     toast::show(
                         ToastKind::Ok,
-                        format!("Removed worktree {label}"),
+                        ui::t!("worktrees.toast.removed", label = label),
                         window,
                         cx,
                     );
@@ -752,14 +760,24 @@ impl WorktreesModel {
     pub fn reveal(&self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         cx.reveal_path(path);
         let label = display_path(path, self.home.as_deref());
-        toast::show(ToastKind::Info, format!("Revealed {label}"), window, cx);
+        toast::show(
+            ToastKind::Info,
+            ui::t!("worktrees.toast.revealed", label = label),
+            window,
+            cx,
+        );
     }
 
     /// Copies the folder path to the clipboard.
     pub fn copy_path(&self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let text = path.display().to_string();
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-        toast::show(ToastKind::Ok, format!("Copied {text}"), window, cx);
+        toast::show(
+            ToastKind::Ok,
+            ui::t!("worktrees.toast.copied", text = text),
+            window,
+            cx,
+        );
     }
 }
 

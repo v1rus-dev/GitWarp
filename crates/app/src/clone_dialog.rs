@@ -24,6 +24,7 @@ use ui::{
 use crate::format::{display_path, expand_home, home_dir};
 use crate::network_ops::{self, friendly_error};
 use crate::network_service::{HostKeyAsker, NetworkService};
+use crate::open_dialog::{pick_folder, Browse};
 use crate::workspace::{repo_name, Workspace};
 
 const CLONE_TIMEOUT: Duration = Duration::from_millis(80);
@@ -92,6 +93,7 @@ pub(crate) struct CloneDialog {
 
     url_focus: gpui::FocusHandle,
     dest_focus: gpui::FocusHandle,
+    browse_focus: gpui::FocusHandle,
     name_focus: gpui::FocusHandle,
     branch_focus: gpui::FocusHandle,
     depth_focus: gpui::FocusHandle,
@@ -134,7 +136,7 @@ impl CloneDialog {
         });
         let branch = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder("Default branch", cx);
+            input.set_placeholder(ui::t!("welcome.init.default_branch"), cx);
             input
         });
         let depth = cx.new(|cx| {
@@ -220,6 +222,7 @@ impl CloneDialog {
             generation: 0,
             url_focus,
             dest_focus,
+            browse_focus: cx.focus_handle().tab_stop(true),
             name_focus,
             branch_focus,
             depth_focus,
@@ -228,6 +231,51 @@ impl CloneDialog {
             cancel_focus: cx.focus_handle().tab_stop(true),
             primary_focus: cx.focus_handle().tab_stop(true),
             secondary_focus: cx.focus_handle().tab_stop(true),
+        }
+    }
+
+    fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let home = self.home.clone();
+        let picked = pick_folder(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = picked.await;
+            this.update_in(cx, |dialog, window, cx| {
+                dialog.finish_browse(outcome, home, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_browse(
+        &mut self,
+        outcome: Browse,
+        home: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A picker that was already open when the clone started must not
+        // change the folder the clone is running for.
+        if matches!(self.phase, Phase::Cloning | Phase::Done(_)) {
+            return;
+        }
+        match outcome {
+            // `set_text` emits `Changed`, which the `dest_events` subscription
+            // turns into `dest_text` and a re-render.
+            Browse::Picked(Some(path)) => {
+                let label = display_path(&path, home.as_deref());
+                self.dest.update(cx, |input, cx| input.set_text(label, cx));
+            }
+            Browse::Picked(None) | Browse::Cancelled => {}
+            Browse::Failed(message) => {
+                // No xdg portal, no picker: the field stays the way in.
+                toast::show(
+                    ToastKind::Error,
+                    ui::t!("welcome.open.picker_failed", message = message),
+                    window,
+                    cx,
+                );
+            }
         }
     }
 
@@ -247,15 +295,12 @@ impl CloneDialog {
         network::clone_target(&self.url_text)
     }
 
-    fn url_error(&self) -> Option<&'static str> {
+    fn url_error(&self) -> Option<SharedString> {
         if self.url_text.trim().is_empty() {
             return None;
         }
         if self.target().is_none() {
-            return Some(
-                "Not a Git address. Use https://host/user/repo.git, git@host:user/repo.git or \
-                 ssh://…",
-            );
+            return Some(ui::t!("welcome.clone.bad_url"));
         }
         None
     }
@@ -276,11 +321,11 @@ impl CloneDialog {
             return None;
         }
         if name.contains('/') || name.contains('\\') {
-            return Some("The folder name cannot contain slashes.".into());
+            return Some(ui::t!("welcome.clone.name_slashes"));
         }
         let path = self.destination();
         if path.exists() {
-            return Some(format!("{} already exists.", path.display()).into());
+            return Some(ui::t!("welcome.clone.path_exists", path = path.display()));
         }
         None
     }
@@ -343,7 +388,7 @@ impl CloneDialog {
         let cancel = self.cancel.clone();
         self.phase = Phase::Cloning;
         self.progress = None;
-        self.phase_text = "Connecting…".into();
+        self.phase_text = ui::t!("welcome.clone.connecting");
         cx.notify();
 
         let (tx, rx) = mpsc::channel();
@@ -417,7 +462,12 @@ impl CloneDialog {
                 }
                 Err(failure) => {
                     if failure.cancelled {
-                        toast::show(ToastKind::Info, "Clone cancelled", window, cx);
+                        toast::show(
+                            ToastKind::Info,
+                            ui::t!("welcome.clone.cancelled"),
+                            window,
+                            cx,
+                        );
                         self.generation = self.generation.wrapping_add(1);
                         self.phase = Phase::Form;
                         self.progress = None;
@@ -441,7 +491,12 @@ impl CloneDialog {
         cx: &mut Context<Self>,
     ) {
         if cancelled {
-            toast::show(ToastKind::Info, "Clone cancelled", window, cx);
+            toast::show(
+                ToastKind::Info,
+                ui::t!("welcome.clone.cancelled"),
+                window,
+                cx,
+            );
         }
         self.phase = Phase::Failed(CloneFailure {
             message: message.into(),
@@ -461,7 +516,7 @@ impl CloneDialog {
         match &self.phase {
             Phase::Cloning => {
                 self.cancel.cancel();
-                self.phase_text = "Cancelling…".into();
+                self.phase_text = ui::t!("welcome.clone.cancelling");
                 cx.notify();
             }
             Phase::Done(_) => self.close(window, cx),
@@ -533,7 +588,7 @@ pub(crate) fn open(
     let state = dialog.downgrade();
     let (layer, host) = dialog::open_with_view(window, cx, move |_, cx| match state.upgrade() {
         Some(state) => build(&state, cx),
-        None => Dialog::new("Clone repository"),
+        None => Dialog::new(ui::t!("welcome.clone.title")),
     });
     dialog.update(cx, |dialog, _| {
         dialog.layer = Some(layer);
@@ -615,12 +670,12 @@ fn build(state: &Entity<CloneDialog>, cx: &App) -> Dialog {
 
             let footer = div().flex().items_center().gap(px(8.)).child(
                 Button::new("clone-cancel-running")
-                    .label("Cancel clone")
+                    .label(ui::t!("welcome.clone.cancel_running"))
                     .min_width(px(96.))
                     .focus_handle(dialog.primary_focus.clone())
                     .on_click(primary),
             );
-            Dialog::new("Cloning repository")
+            Dialog::new(ui::t!("welcome.clone.title_running"))
                 .icon(IconName::Clone)
                 .width(px(520.))
                 .compact_body()
@@ -651,7 +706,7 @@ fn build(state: &Entity<CloneDialog>, cx: &App) -> Dialog {
                     state.update(cx, |dialog, cx| dialog.close(window, cx));
                 }
             };
-            let details = |label: &'static str, value: String, colors: ThemeColors| {
+            let details = |label: SharedString, value: String, colors: ThemeColors| {
                 div()
                     .flex()
                     .items_start()
@@ -678,26 +733,37 @@ fn build(state: &Entity<CloneDialog>, cx: &App) -> Dialog {
                 .flex_col()
                 .gap(px(10.))
                 .child(
-                    Banner::new(BannerKind::Ok, format!("Cloned {}", repo_name(&done.path))).body(
-                        format!(
-                            "{} commit{} · {} {} · {} tag{}",
-                            done.commits,
-                            plural(done.commits as usize),
-                            done.branches,
-                            branch_word(done.branches),
-                            done.tags,
-                            plural(done.tags)
+                    Banner::new(
+                        BannerKind::Ok,
+                        ui::t!("welcome.clone.done_title", name = repo_name(&done.path)),
+                    )
+                    .body(ui::t!(
+                        "welcome.clone.done_summary",
+                        commits = ui::i18n::t_count("welcome.clone.commits", done.commits, &[]),
+                        branches = ui::i18n::t_count(
+                            "welcome.clone.branches",
+                            u64::try_from(done.branches).unwrap_or(u64::MAX),
+                            &[]
                         ),
-                    ),
+                        tags = ui::i18n::t_count(
+                            "welcome.clone.tags",
+                            u64::try_from(done.tags).unwrap_or(u64::MAX),
+                            &[]
+                        )
+                    )),
                 )
-                .child(details("Location", done.path.display().to_string(), colors))
                 .child(details(
-                    "Branch",
+                    ui::t!("welcome.clone.location"),
+                    done.path.display().to_string(),
+                    colors,
+                ))
+                .child(details(
+                    ui::t!("welcome.clone.branch"),
                     done.branch.clone().unwrap_or_else(|| "HEAD".to_owned()),
                     colors,
                 ))
                 .child(details(
-                    "Remote",
+                    ui::t!("welcome.clone.remote"),
                     done.remote
                         .clone()
                         .map(|url| format!("origin → {url}"))
@@ -710,19 +776,19 @@ fn build(state: &Entity<CloneDialog>, cx: &App) -> Dialog {
                 .gap(px(8.))
                 .child(
                     Button::new("clone-close")
-                        .label("Close")
+                        .label(ui::t!("welcome.clone.close"))
                         .min_width(px(72.))
                         .focus_handle(dialog.secondary_focus.clone())
                         .on_click(close),
                 )
                 .child(
                     Button::primary("clone-open")
-                        .label("Open")
+                        .label(ui::t!("welcome.init.open"))
                         .min_width(px(72.))
                         .focus_handle(dialog.primary_focus.clone())
                         .on_click(open),
                 );
-            Dialog::new("Clone complete")
+            Dialog::new(ui::t!("welcome.clone.title_done"))
                 .icon(IconName::Check)
                 .width(px(520.))
                 .compact_body()
@@ -760,12 +826,18 @@ fn build_form(
     cx: &App,
 ) -> Dialog {
     let dialog = state.read(cx);
+    let browse = {
+        let state = state.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            state.update(cx, |dialog, cx| dialog.browse(window, cx));
+        }
+    };
     let target = dialog.target();
     let url_error = dialog.url_error().filter(|_| dialog.url_touched);
     let name_error = dialog.name_error();
     let depth_error = dialog.depth_value().is_err();
 
-    let label = |text: &'static str| div().text_size(FS_SM).text_color(colors.muted).child(text);
+    let label = |text: SharedString| div().text_size(FS_SM).text_color(colors.muted).child(text);
     let error = |text: SharedString, colors: ThemeColors| {
         div().text_size(FS_SM).text_color(colors.error).child(text)
     };
@@ -773,7 +845,11 @@ fn build_form(
     let protocol = match target.as_ref().map(|target| target.kind) {
         Some(CloneKind::Https) => Some(("ok", IconName::Link, "HTTPS".to_owned())),
         Some(CloneKind::Ssh) => Some(("key", IconName::Key, "SSH".to_owned())),
-        Some(CloneKind::Local) => Some(("folder", IconName::Folder, "Local".to_owned())),
+        Some(CloneKind::Local) => Some((
+            "folder",
+            IconName::Folder,
+            ui::t!("welcome.clone.local").to_string(),
+        )),
         None => None,
     };
     let protocol = protocol.map(|(_, icon, text)| {
@@ -794,10 +870,10 @@ fn build_form(
             .flex()
             .flex_col()
             .gap(px(4.))
-            .child(label("Repository URL"))
+            .child(label(ui::t!("welcome.clone.url")))
             .child(dialog.url.clone())
             .when_some(url_error, |this, message| {
-                this.child(error(message.into(), colors))
+                this.child(error(message, colors))
             })
             .when_some(protocol, |this, protocol| this.child(protocol)),
     );
@@ -813,8 +889,21 @@ fn build_form(
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(label("Folder"))
-                    .child(dialog.dest.clone()),
+                    .child(label(ui::t!("welcome.open.folder")))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().flex_1().min_w_0().child(dialog.dest.clone()))
+                            .child(
+                                Button::new("clone-browse")
+                                    .label(ui::t!("welcome.open.browse"))
+                                    .icon(IconName::Folder)
+                                    .focus_handle(dialog.browse_focus.clone())
+                                    .on_click(browse),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -822,7 +911,7 @@ fn build_form(
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(label("Folder name"))
+                    .child(label(ui::t!("welcome.clone.folder_name")))
                     .child(dialog.name.clone())
                     .when_some(name_error, |this, message| {
                         this.child(error(message, colors))
@@ -841,7 +930,7 @@ fn build_form(
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(label("Branch (optional)"))
+                    .child(label(ui::t!("welcome.clone.branch_optional")))
                     .child(dialog.branch.clone()),
             )
             .child(
@@ -850,10 +939,10 @@ fn build_form(
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(label("Depth"))
+                    .child(label(ui::t!("welcome.clone.depth")))
                     .child(dialog.depth.clone())
                     .when(depth_error, |this| {
-                        this.child(error("Use a number above 0.".into(), colors))
+                        this.child(error(ui::t!("welcome.clone.depth_error"), colors))
                     }),
             ),
     );
@@ -888,14 +977,14 @@ fn build_form(
             .gap(px(6.))
             .child(
                 Checkbox::new("clone-submodules")
-                    .label("Clone submodules recursively")
+                    .label(ui::t!("welcome.clone.submodules"))
                     .checked(dialog.recurse)
                     .focus_handle(dialog.checkbox_focus.clone())
                     .on_toggle(recurse),
             )
             .child(
                 Checkbox::new("clone-shallow")
-                    .label("Shallow clone — only recent history")
+                    .label(ui::t!("welcome.clone.shallow"))
                     .checked(dialog.shallow)
                     .focus_handle(dialog.shallow_focus.clone())
                     .on_toggle(shallow),
@@ -910,7 +999,7 @@ fn build_form(
                 } else {
                     BannerKind::Error
                 },
-                "Clone failed",
+                ui::t!("welcome.clone.failed"),
             )
             .body(failure.message.clone()),
         );
@@ -923,7 +1012,7 @@ fn build_form(
         .gap(px(8.))
         .child(
             Button::new("clone-cancel")
-                .label("Cancel")
+                .label(ui::t!("welcome.common.cancel"))
                 .min_width(px(72.))
                 .focus_handle(dialog.cancel_focus.clone())
                 .on_click(cancel),
@@ -931,9 +1020,9 @@ fn build_form(
         .child(
             Button::primary("clone-start")
                 .label(if matches!(dialog.phase, Phase::Failed(_)) {
-                    "Retry"
+                    ui::t!("welcome.clone.retry")
                 } else {
-                    "Clone"
+                    ui::t!("welcome.clone.start")
                 })
                 .min_width(px(72.))
                 .disabled(!ready)
@@ -944,6 +1033,7 @@ fn build_form(
     let focus_order = vec![
         DialogFocus::input(dialog.url_focus.clone()),
         DialogFocus::input(dialog.dest_focus.clone()),
+        DialogFocus::control(dialog.browse_focus.clone()),
         DialogFocus::input(dialog.name_focus.clone()),
         DialogFocus::input(dialog.branch_focus.clone()),
         DialogFocus::input(dialog.depth_focus.clone()),
@@ -953,7 +1043,7 @@ fn build_form(
         DialogFocus::control(dialog.primary_focus.clone()),
     ];
 
-    Dialog::new("Clone repository")
+    Dialog::new(ui::t!("welcome.clone.title"))
         .icon(IconName::Clone)
         .width(px(560.))
         .compact_body()
@@ -969,22 +1059,6 @@ fn build_form(
                 state.update(cx, |dialog, cx| dialog.start(window, cx));
             }
         })
-}
-
-fn plural(count: usize) -> &'static str {
-    if count == 1 {
-        ""
-    } else {
-        "s"
-    }
-}
-
-fn branch_word(count: usize) -> &'static str {
-    if count == 1 {
-        "branch"
-    } else {
-        "branches"
-    }
 }
 
 #[cfg(test)]

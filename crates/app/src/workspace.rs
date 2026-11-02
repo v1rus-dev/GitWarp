@@ -579,7 +579,7 @@ impl Render for Workspace {
             .cursor(CursorStyle::Arrow)
             .bg(colors.bg)
             .text_color(colors.text)
-            .font_family(FONT_UI)
+            .font(ui::fonts::ui_font())
             .text_size(FS_BASE)
             .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
                 // The frame covers the whole padded area, so this is where the
@@ -783,8 +783,10 @@ pub fn git_label(git: &Result<Arc<Git>, Arc<Error>>) -> SharedString {
     match git {
         Ok(git) => format!("git {} · {}", git.version(), git.source()).into(),
         Err(error) => match error.class() {
-            git_core::ErrorClass::GitTooOld { found, .. } => format!("git {found} too old").into(),
-            _ => "git not found".into(),
+            git_core::ErrorClass::GitTooOld { found, .. } => {
+                ui::t!("repo.git.too_old", version = found)
+            }
+            _ => ui::t!("repo.git.not_found"),
         },
     }
 }

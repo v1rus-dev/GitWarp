@@ -52,7 +52,7 @@ pub use counter::{CountPill, Counter, Kbd};
 pub use dialog::{Dialog, DialogFocus, DialogFocusKind, DialogHost};
 pub use empty_state::EmptyState;
 pub use file_row::{fit_path_start, FileRow, FittedPath};
-pub use heatmap::{HeatLegend, Heatmap};
+pub use heatmap::{long_date, HeatLegend, Heatmap};
 pub use list_row::ListRow;
 pub use menu::{MenuEntry, MenuItem, MenuNav};
 pub use progress::Progress;
