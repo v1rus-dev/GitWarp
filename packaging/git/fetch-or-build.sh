@@ -26,8 +26,10 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 dest=$out/git
-work=$out/.git-work
-rm -rf "$dest" "$work"
+# Outside the repository: git's own Cargo.toml (Rust parts since 2.52) must not
+# be taken for a member of GitWarp's cargo workspace when <out-dir> is inside it.
+work=$(mktemp -d "${TMPDIR:-/tmp}/gitwarp-git.XXXXXX")
+rm -rf "$dest"
 mkdir -p "$work/dl" "$work/src"
 trap 'rm -rf "$work"' EXIT
 
