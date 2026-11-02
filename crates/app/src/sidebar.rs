@@ -7,12 +7,24 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use git_core::{Git, Head, Oid, Ref, RefKind, Repo, Stash, Submodule, SubmoduleState, Worktree};
-use gpui::SharedString;
-use ui::{IconName, TreeNodeData};
+use gpui::prelude::FluentBuilder;
+use gpui::{
+    div, px, App, ElementId, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, RenderOnce, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Window,
+};
+use ui::actions::{Cancel, Confirm, SelectNext, SelectPrev, TreeDelete};
+use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_SM};
+use ui::theme::{ActiveTheme, ThemeColors};
+use ui::{Button, Chip, CountPill, Icon, IconName, Skeleton, Tooltip, TreeNodeData};
+
+use crate::worktree_glyphs::{main_worktree_tip, worktree_glyphs};
+use crate::worktrees_model::WorktreeEntry;
 
 /// The six sidebar sections, in display order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,6 +232,15 @@ pub enum SidebarAction {
     PushTags,
     /// Deletes a remote branch, e.g. `origin/feat/x`.
     DeleteRemoteBranch(String),
+    /// Shows a stash's files and diff in the details dock.
+    ViewStash(usize),
+    /// Initialises and updates a submodule, by path.
+    UpdateSubmodule(String),
+    /// Opens an initialised submodule's folder in a second window.
+    OpenSubmodule(String),
+    /// Narrows the History list to one branch's own commits (local name or
+    /// `<remote>/<name>`).
+    ShowBranchCommits(String),
     /// Shows the Worktrees page.
     ShowWorktrees,
     /// Opens the add-worktree dialog.
@@ -335,36 +356,62 @@ pub fn sidebar_menu(
     if let Some(name) = key.strip_prefix("local:") {
         let current = name == head;
         return vec![
-            item("Checkout", IconName::Check)
+            item(&ui::t!("sidebar.menu.checkout"), IconName::Check)
                 .shortcut("Enter")
                 .maybe_action((!current).then(|| SidebarAction::CheckoutBranch(name.to_owned()))),
-            item(&format!("Merge {name} into {head}"), IconName::Branch),
-            item(&format!("Rebase {head} onto {name}"), IconName::Branch),
+            item(
+                &ui::t!("sidebar.menu.show_commits_of", name = name),
+                IconName::Branch,
+            )
+            .action(SidebarAction::ShowBranchCommits(name.to_owned())),
+            item(
+                &ui::t!("sidebar.menu.merge_into", name = name, head = head),
+                IconName::Branch,
+            ),
+            item(
+                &ui::t!("sidebar.menu.rebase_onto", name = name, head = head),
+                IconName::Branch,
+            ),
             SidebarMenuEntry::Separator,
-            item("Rename…", IconName::Edit)
+            item(&ui::t!("sidebar.menu.rename"), IconName::Edit)
                 .shortcut("F2")
                 .action(SidebarAction::RenameBranch(name.to_owned())),
-            item("Set upstream…", IconName::Link)
+            item(&ui::t!("sidebar.menu.set_upstream"), IconName::Link)
                 .action(SidebarAction::SetUpstream(name.to_owned())),
-            item("Delete branch", IconName::Trash)
+            item(&ui::t!("sidebar.menu.delete_branch"), IconName::Trash)
                 .danger()
                 .shortcut("Del")
                 .maybe_action((!current).then(|| SidebarAction::DeleteBranch(name.to_owned()))),
             SidebarMenuEntry::Separator,
-            item("Copy branch name", IconName::Copy)
+            item(&ui::t!("sidebar.menu.copy_branch_name"), IconName::Copy)
                 .action(SidebarAction::CopyText(name.to_owned())),
         ];
     }
     if let Some(name) = key.strip_prefix("rbranch:") {
         return vec![
-            item("Checkout as local branch", IconName::Check)
-                .action(SidebarAction::CheckoutRemoteBranch(name.to_owned())),
-            item(&format!("Merge {name} into {head}"), IconName::Branch),
+            item(
+                &ui::t!("sidebar.menu.checkout_as_local_branch"),
+                IconName::Check,
+            )
+            .shortcut("Enter")
+            .action(SidebarAction::CheckoutRemoteBranch(name.to_owned())),
+            item(
+                &ui::t!("sidebar.menu.show_commits_of", name = name),
+                IconName::Branch,
+            )
+            .action(SidebarAction::ShowBranchCommits(name.to_owned())),
+            item(
+                &ui::t!("sidebar.menu.merge_into", name = name, head = head),
+                IconName::Branch,
+            ),
             SidebarMenuEntry::Separator,
-            item("Delete remote branch…", IconName::Trash)
-                .danger()
-                .action(SidebarAction::DeleteRemoteBranch(name.to_owned())),
-            item("Copy branch name", IconName::Copy)
+            item(
+                &ui::t!("sidebar.menu.delete_remote_branch"),
+                IconName::Trash,
+            )
+            .danger()
+            .action(SidebarAction::DeleteRemoteBranch(name.to_owned())),
+            item(&ui::t!("sidebar.menu.copy_branch_name"), IconName::Copy)
                 .action(SidebarAction::CopyText(name.to_owned())),
         ];
     }
@@ -375,38 +422,48 @@ pub fn sidebar_menu(
                 .map(|r| r.target)
         });
         return vec![
-            item("Checkout", IconName::Check).action(SidebarAction::CheckoutTag(name.to_owned())),
-            item("Create branch here…", IconName::Branch)
+            item(&ui::t!("sidebar.menu.checkout"), IconName::Check)
+                .shortcut("Enter")
+                .action(SidebarAction::CheckoutTag(name.to_owned())),
+            item(&ui::t!("sidebar.menu.create_branch_here"), IconName::Branch)
                 .maybe_action(target.map(SidebarAction::CreateBranchAt)),
-            item("Push tag to origin", IconName::Up)
+            item(&ui::t!("sidebar.menu.push_tag_to_origin"), IconName::Up)
                 .action(SidebarAction::PushTag(name.to_owned())),
             SidebarMenuEntry::Separator,
-            item("Rename tag…", IconName::Edit).action(SidebarAction::RenameTag(name.to_owned())),
-            item("Delete tag", IconName::Trash)
+            item(&ui::t!("sidebar.menu.rename_tag"), IconName::Edit)
+                .shortcut("F2")
+                .action(SidebarAction::RenameTag(name.to_owned())),
+            item(&ui::t!("sidebar.menu.delete_tag"), IconName::Trash)
                 .danger()
+                .shortcut("Del")
                 .action(SidebarAction::DeleteTag(name.to_owned())),
         ];
     }
     if let Some(index) = key.strip_prefix("stash:") {
         let index = index.parse::<usize>().ok();
         return vec![
-            item("Apply stash", IconName::Check).maybe_action(index.map(SidebarAction::ApplyStash)),
-            item("Pop stash", IconName::Undo).maybe_action(index.map(SidebarAction::PopStash)),
-            // Viewing a stash needs the detail diff of a stash commit; that is
-            // part of the history work, not this stage.
-            item("View changes", IconName::Eye),
+            item(&ui::t!("sidebar.menu.apply_stash"), IconName::Check)
+                .maybe_action(index.map(SidebarAction::ApplyStash)),
+            item(&ui::t!("sidebar.menu.pop_stash"), IconName::Undo)
+                .maybe_action(index.map(SidebarAction::PopStash)),
+            item(&ui::t!("sidebar.menu.view_changes"), IconName::Eye)
+                .maybe_action(index.map(SidebarAction::ViewStash)),
             SidebarMenuEntry::Separator,
-            item("Drop stash", IconName::Trash)
+            item(&ui::t!("sidebar.menu.drop_stash"), IconName::Trash)
                 .danger()
+                .shortcut("Del")
                 .maybe_action(index.map(SidebarAction::DropStash)),
         ];
     }
     if let Some(name) = key.strip_prefix("remote:") {
         return vec![
-            item("Fetch", IconName::Fetch).action(SidebarAction::FetchRemote(name.to_owned())),
-            item("Edit remote…", IconName::Edit).action(SidebarAction::EditRemote(name.to_owned())),
-            item("Remove remote", IconName::Trash)
+            item(&ui::t!("sidebar.menu.fetch"), IconName::Fetch)
+                .action(SidebarAction::FetchRemote(name.to_owned())),
+            item(&ui::t!("sidebar.menu.edit_remote"), IconName::Edit)
+                .action(SidebarAction::EditRemote(name.to_owned())),
+            item(&ui::t!("sidebar.menu.remove_remote"), IconName::Trash)
                 .danger()
+                .shortcut("Del")
                 .action(SidebarAction::RemoveRemote(name.to_owned())),
         ];
     }
@@ -420,53 +477,115 @@ pub fn sidebar_menu(
             })
             .is_some_and(|worktree| worktree.locked.is_some());
         return vec![
-            item("Open in new window", IconName::Folder)
+            item(&ui::t!("sidebar.menu.open_in_new_window"), IconName::Folder)
                 .action(SidebarAction::OpenWorktree(path.to_owned())),
-            item("Rename worktree…", IconName::Edit)
+            item(&ui::t!("sidebar.menu.rename_worktree"), IconName::Edit)
+                .shortcut("F2")
                 .action(SidebarAction::RenameWorktree(path.to_owned())),
-            item("Manage worktrees…", IconName::Worktree).action(SidebarAction::ShowWorktrees),
-            item("Add worktree…", IconName::Plus).action(SidebarAction::AddWorktree),
+            item(&ui::t!("sidebar.menu.manage_worktrees"), IconName::Worktree)
+                .action(SidebarAction::ShowWorktrees),
+            item(&ui::t!("sidebar.menu.add_worktree"), IconName::Plus)
+                .action(SidebarAction::AddWorktree),
             SidebarMenuEntry::Separator,
-            item(if locked { "Unlock" } else { "Lock" }, IconName::Lock).action(if locked {
+            item(
+                &if locked {
+                    ui::t!("sidebar.menu.unlock")
+                } else {
+                    ui::t!("sidebar.menu.lock")
+                },
+                IconName::Lock,
+            )
+            .action(if locked {
                 SidebarAction::UnlockWorktree(path.to_owned())
             } else {
                 SidebarAction::LockWorktree(path.to_owned())
             }),
-            item("Remove worktree…", IconName::Trash)
+            item(&ui::t!("sidebar.menu.remove_worktree"), IconName::Trash)
                 .danger()
+                .shortcut("Del")
                 .action(SidebarAction::RemoveWorktree(path.to_owned())),
         ];
     }
-    if key.starts_with("sub:") {
+    if let Some(path) = key.strip_prefix("sub:") {
+        // A submodule that is not checked out has no folder with a `.git` to open.
+        let initialised = extras
+            .and_then(|extras| extras.submodules.iter().find(|sub| sub.path == path))
+            .is_some_and(|sub| sub.state != SubmoduleState::Uninitialized);
         return vec![
-            item("Update submodule", IconName::Fetch),
-            item("Open in new window", IconName::Folder),
+            item(&ui::t!("sidebar.menu.update_submodule"), IconName::Fetch)
+                .action(SidebarAction::UpdateSubmodule(path.to_owned())),
+            item(&ui::t!("sidebar.menu.open_in_new_window"), IconName::Folder)
+                .maybe_action(initialised.then(|| SidebarAction::OpenSubmodule(path.to_owned()))),
         ];
     }
     match key {
         "section:remotes" => vec![
-            item("Add remote…", IconName::Plus).action(SidebarAction::AddRemote),
+            item(&ui::t!("sidebar.menu.add_remote"), IconName::Plus)
+                .action(SidebarAction::AddRemote),
             SidebarMenuEntry::Separator,
-            item("Fetch all remotes", IconName::Fetch)
+            item(&ui::t!("sidebar.menu.fetch_all_remotes"), IconName::Fetch)
                 .shortcut("Ctrl+Shift+F")
                 .action(SidebarAction::FetchAll),
-            item("Prune stale remote branches", IconName::Trash).action(SidebarAction::FetchPrune),
+            item(
+                &ui::t!("sidebar.menu.prune_stale_remote_branches"),
+                IconName::Trash,
+            )
+            .action(SidebarAction::FetchPrune),
         ],
         "section:tags" => vec![
-            item("Create tag…", IconName::Plus).action(SidebarAction::CreateTag),
+            item(&ui::t!("sidebar.menu.create_tag"), IconName::Plus)
+                .action(SidebarAction::CreateTag),
             SidebarMenuEntry::Separator,
-            item("Fetch tags from origin", IconName::Fetch).action(SidebarAction::FetchAll),
-            item("Push all tags to origin", IconName::Up).action(SidebarAction::PushTags),
+            item(
+                &ui::t!("sidebar.menu.fetch_tags_from_origin"),
+                IconName::Fetch,
+            )
+            .action(SidebarAction::FetchAll),
+            item(
+                &ui::t!("sidebar.menu.push_all_tags_to_origin"),
+                IconName::Up,
+            )
+            .action(SidebarAction::PushTags),
         ],
         "section:worktrees" => vec![
-            item("Manage worktrees…", IconName::Worktree).action(SidebarAction::ShowWorktrees),
-            item("Add worktree…", IconName::Plus).action(SidebarAction::AddWorktree),
+            item(&ui::t!("sidebar.menu.manage_worktrees"), IconName::Worktree)
+                .action(SidebarAction::ShowWorktrees),
+            item(&ui::t!("sidebar.menu.add_worktree"), IconName::Plus)
+                .action(SidebarAction::AddWorktree),
             SidebarMenuEntry::Separator,
-            item("Prune missing worktrees", IconName::Trash).action(SidebarAction::PruneWorktrees),
-            item("Refresh list", IconName::Fetch).action(SidebarAction::Refresh),
+            item(
+                &ui::t!("sidebar.menu.prune_missing_worktrees"),
+                IconName::Trash,
+            )
+            .action(SidebarAction::PruneWorktrees),
+            item(&ui::t!("sidebar.menu.refresh_list"), IconName::Fetch)
+                .action(SidebarAction::Refresh),
         ],
         _ => Vec::new(),
     }
+}
+
+/// The action a keyboard shortcut runs on a sidebar row: the enabled menu item
+/// whose shortcut hint is `hint` (`Enter`, `F2` or `Del`), so the key and the
+/// menu can never disagree. `None` when the row's menu has no such item or it
+/// is disabled (e.g. Checkout / Delete on the current branch).
+pub fn shortcut_action(
+    key: &str,
+    hint: &str,
+    head: Option<&Head>,
+    extras: Option<&SidebarExtras>,
+    refs: Option<&[Ref]>,
+) -> Option<SidebarAction> {
+    sidebar_menu(key, head, extras, refs)
+        .into_iter()
+        .find_map(|entry| match entry {
+            SidebarMenuEntry::Item(item)
+                if item.enabled && item.shortcut.as_deref() == Some(hint) =>
+            {
+                Some(item.action)
+            }
+            _ => None,
+        })
 }
 
 /// A disabled menu item, for the compact builders above.
@@ -607,7 +726,7 @@ impl Builder<'_> {
             if level.leaves > 0 {
                 nodes.push(self.section_node(
                     Section::Local,
-                    "Local branches",
+                    &ui::t!("sidebar.section.local"),
                     Some(level.leaves),
                     true,
                 ));
@@ -618,7 +737,12 @@ impl Builder<'_> {
 
         let expanded = self.expanded(Section::Local.key(), direct <= MAX_DIRECT_CHILDREN);
         let count = self.refs.is_some().then_some(locals.len());
-        nodes.push(self.section_node(Section::Local, "Local branches", count, expanded));
+        nodes.push(self.section_node(
+            Section::Local,
+            &ui::t!("sidebar.section.local"),
+            count,
+            expanded,
+        ));
         // Children of a collapsed section are not built at all.
         if expanded {
             nodes.extend(self.local_level(1, &entries, "").nodes);
@@ -773,13 +897,23 @@ impl Builder<'_> {
 
         if self.filtering() {
             if matches > 0 {
-                nodes.push(self.section_node(Section::Remotes, "Remotes", Some(matches), true));
+                nodes.push(self.section_node(
+                    Section::Remotes,
+                    &ui::t!("sidebar.section.remotes"),
+                    Some(matches),
+                    true,
+                ));
                 nodes.extend(built);
             }
             return;
         }
         let expanded = self.expanded(Section::Remotes.key(), names.len() <= MAX_DIRECT_CHILDREN);
-        nodes.push(self.section_node(Section::Remotes, "Remotes", count, expanded));
+        nodes.push(self.section_node(
+            Section::Remotes,
+            &ui::t!("sidebar.section.remotes"),
+            count,
+            expanded,
+        ));
         if expanded {
             nodes.extend(built);
         }
@@ -818,7 +952,12 @@ impl Builder<'_> {
             matched.sort_by_cached_key(|reference| Reverse(natural_key(&reference.name)));
             if !matched.is_empty() {
                 let count = matched.len();
-                nodes.push(self.section_node(Section::Tags, "Tags", Some(count), true));
+                nodes.push(self.section_node(
+                    Section::Tags,
+                    &ui::t!("sidebar.section.tags"),
+                    Some(count),
+                    true,
+                ));
                 nodes.extend(
                     matched
                         .into_iter()
@@ -830,7 +969,12 @@ impl Builder<'_> {
 
         let expanded = self.expanded(Section::Tags.key(), tags.len() <= MAX_DIRECT_CHILDREN);
         let count = self.refs.is_some().then_some(tags.len());
-        nodes.push(self.section_node(Section::Tags, "Tags", count, expanded));
+        nodes.push(self.section_node(
+            Section::Tags,
+            &ui::t!("sidebar.section.tags"),
+            count,
+            expanded,
+        ));
         // Children of a collapsed section are not built, and the sort only
         // runs when they are needed.
         if expanded {
@@ -866,7 +1010,12 @@ impl Builder<'_> {
             matched.sort_by_key(|(stash, _)| stash.index);
             if !matched.is_empty() {
                 let count = matched.len();
-                nodes.push(self.section_node(Section::Stashes, "Stashes", Some(count), true));
+                nodes.push(self.section_node(
+                    Section::Stashes,
+                    &ui::t!("sidebar.section.stashes"),
+                    Some(count),
+                    true,
+                ));
                 nodes.extend(
                     matched
                         .into_iter()
@@ -878,7 +1027,12 @@ impl Builder<'_> {
 
         let expanded = self.expanded(Section::Stashes.key(), stashes.len() <= MAX_DIRECT_CHILDREN);
         let count = self.extras.map(|_| stashes.len());
-        nodes.push(self.section_node(Section::Stashes, "Stashes", count, expanded));
+        nodes.push(self.section_node(
+            Section::Stashes,
+            &ui::t!("sidebar.section.stashes"),
+            count,
+            expanded,
+        ));
         if expanded {
             let mut sorted: Vec<&Stash> = stashes.iter().collect();
             sorted.sort_by_key(|stash| stash.index);
@@ -914,7 +1068,12 @@ impl Builder<'_> {
                 .collect();
             if !matched.is_empty() {
                 let count = matched.len();
-                nodes.push(self.section_node(Section::Worktrees, "Worktrees", Some(count), true));
+                nodes.push(self.section_node(
+                    Section::Worktrees,
+                    &ui::t!("sidebar.section.worktrees"),
+                    Some(count),
+                    true,
+                ));
                 nodes.extend(
                     matched
                         .into_iter()
@@ -929,7 +1088,12 @@ impl Builder<'_> {
             worktrees.len() <= MAX_DIRECT_CHILDREN,
         );
         let count = self.extras.map(|_| worktrees.len());
-        nodes.push(self.section_node(Section::Worktrees, "Worktrees", count, expanded));
+        nodes.push(self.section_node(
+            Section::Worktrees,
+            &ui::t!("sidebar.section.worktrees"),
+            count,
+            expanded,
+        ));
         if expanded {
             nodes.extend(
                 worktrees
@@ -969,7 +1133,12 @@ impl Builder<'_> {
                 .collect();
             if !matched.is_empty() {
                 let count = matched.len();
-                nodes.push(self.section_node(Section::Submodules, "Submodules", Some(count), true));
+                nodes.push(self.section_node(
+                    Section::Submodules,
+                    &ui::t!("sidebar.section.submodules"),
+                    Some(count),
+                    true,
+                ));
                 nodes.extend(
                     matched
                         .into_iter()
@@ -984,7 +1153,12 @@ impl Builder<'_> {
             submodules.len() <= MAX_DIRECT_CHILDREN,
         );
         let count = self.extras.map(|_| submodules.len());
-        nodes.push(self.section_node(Section::Submodules, "Submodules", count, expanded));
+        nodes.push(self.section_node(
+            Section::Submodules,
+            &ui::t!("sidebar.section.submodules"),
+            count,
+            expanded,
+        ));
         if expanded {
             nodes.extend(
                 submodules
@@ -1065,7 +1239,7 @@ fn distinct_prefixes(refs: &[Ref]) -> Vec<String> {
 /// The ahead/behind arrows, or `gone` when the upstream disappeared.
 fn tracking(node: TreeNodeData, reference: &Ref) -> TreeNodeData {
     if reference.upstream_gone {
-        return node.state("gone");
+        return node.state(ui::t!("sidebar.state.gone"));
     }
     let mut node = node;
     if reference.ahead > 0 {
@@ -1083,7 +1257,7 @@ fn tracking(node: TreeNodeData, reference: &Ref) -> TreeNodeData {
 fn stash_label(message: &str) -> String {
     if let Some(rest) = message.strip_prefix("WIP on ") {
         return match rest.split_once(':') {
-            Some((branch, _)) => format!("WIP on {branch}"),
+            Some((branch, _)) => ui::t!("sidebar.stash.wip_on", branch = branch).to_string(),
             None => message.to_owned(),
         };
     }
@@ -1097,23 +1271,23 @@ fn stash_label(message: &str) -> String {
 
 fn worktree_state(worktree: &Worktree) -> Option<String> {
     if worktree.prunable {
-        Some("missing".to_owned())
+        Some(ui::t!("sidebar.state.missing").to_string())
     } else if worktree.locked.is_some() {
-        Some("locked".to_owned())
+        Some(ui::t!("sidebar.state.locked").to_string())
     } else if worktree.bare {
-        Some("bare".to_owned())
+        Some(ui::t!("sidebar.state.bare").to_string())
     } else if worktree.detached {
-        Some("detached".to_owned())
+        Some(ui::t!("sidebar.state.detached").to_string())
     } else {
         worktree.branch.clone()
     }
 }
 
-fn submodule_state(state: SubmoduleState) -> Option<&'static str> {
+fn submodule_state(state: SubmoduleState) -> Option<SharedString> {
     match state {
-        SubmoduleState::Modified => Some("modified"),
-        SubmoduleState::Uninitialized => Some("not initialized"),
-        SubmoduleState::Conflict => Some("conflict"),
+        SubmoduleState::Modified => Some(ui::t!("sidebar.state.modified")),
+        SubmoduleState::Uninitialized => Some(ui::t!("sidebar.state.not_initialized")),
+        SubmoduleState::Conflict => Some(ui::t!("sidebar.state.conflict")),
         SubmoduleState::Clean => None,
     }
 }
@@ -1198,6 +1372,537 @@ impl TagRun {
             TagRun::Text(lower)
         }
     }
+}
+
+// ----- the Worktrees view's panel -----
+
+/// The rows of the worktree panel: those whose folder name or branch contain
+/// `query` (case-insensitive), the main worktree pinned first and the rest by
+/// recency (the model's order breaks ties).
+pub fn worktree_panel_rows<'a>(
+    entries: &'a [WorktreeEntry],
+    query: &str,
+) -> Vec<&'a WorktreeEntry> {
+    let query = query.trim().to_lowercase();
+    let mut rows: Vec<&WorktreeEntry> = entries
+        .iter()
+        .filter(|entry| {
+            query.is_empty()
+                || format!("{} {}", entry.name(), entry.branch().unwrap_or(""))
+                    .to_lowercase()
+                    .contains(&query)
+        })
+        .collect();
+    // `sort_by_key` is stable: equal recency keeps the model's order.
+    rows.sort_by_key(|entry| (!entry.is_main(), Reverse(entry.last_used.unwrap_or(0))));
+    rows
+}
+
+/// What a worktree's context menu item does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeAction {
+    Switch,
+    OpenInWindow,
+    Reveal,
+    CopyPath,
+    ToggleLock,
+    Remove,
+}
+
+/// One item of a worktree's context menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeMenuItem {
+    pub action: WorktreeAction,
+    pub label: SharedString,
+    pub icon: IconName,
+    pub disabled: bool,
+    pub danger: bool,
+}
+
+/// The context menu of `entry`; `None` is the separator. The disabled rules
+/// are the design's: switching needs another, existing folder; locking and
+/// removing never apply to the main worktree, locking not to a missing one.
+pub fn worktree_menu(entry: &WorktreeEntry) -> Vec<Option<WorktreeMenuItem>> {
+    let item = |action, label, icon, disabled, danger| {
+        Some(WorktreeMenuItem {
+            action,
+            label,
+            icon,
+            disabled,
+            danger,
+        })
+    };
+    vec![
+        item(
+            WorktreeAction::Switch,
+            ui::t!("sidebar.worktree_menu.switch"),
+            IconName::Worktree,
+            entry.is_current() || entry.missing,
+            false,
+        ),
+        item(
+            WorktreeAction::OpenInWindow,
+            ui::t!("sidebar.worktree_menu.open_in_window"),
+            IconName::Sidebar,
+            entry.missing,
+            false,
+        ),
+        item(
+            WorktreeAction::Reveal,
+            ui::t!("sidebar.worktree_menu.reveal"),
+            IconName::Folder,
+            entry.missing,
+            false,
+        ),
+        item(
+            WorktreeAction::CopyPath,
+            ui::t!("sidebar.worktree_menu.copy_path"),
+            IconName::Copy,
+            false,
+            false,
+        ),
+        None,
+        item(
+            WorktreeAction::ToggleLock,
+            if entry.locked().is_some() {
+                ui::t!("sidebar.worktree_menu.unlock")
+            } else {
+                ui::t!("sidebar.worktree_menu.lock")
+            },
+            IconName::Lock,
+            entry.is_main() || entry.missing,
+            false,
+        ),
+        item(
+            WorktreeAction::Remove,
+            ui::t!("sidebar.worktree_menu.remove"),
+            IconName::Trash,
+            entry.is_main(),
+            true,
+        ),
+    ]
+}
+
+/// What the panel reports to its owner.
+#[derive(Clone, Debug)]
+pub enum PanelEvent {
+    /// A click: show this worktree in the detail pane.
+    Select(PathBuf),
+    /// A double-click: switch to this worktree.
+    Switch(PathBuf),
+    /// A right-click, with the pointer position.
+    Menu(PathBuf, Point<Pixels>),
+    /// ↓ / ↑: move the selection.
+    Move(isize),
+    /// Enter: switch to the selected worktree.
+    Confirm,
+    /// Del: remove the selected worktree.
+    Delete,
+    /// Esc: leave the Worktrees view.
+    Leave,
+    /// "New worktree…".
+    NewWorktree,
+}
+
+/// What the panel shows instead of rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PanelState {
+    Loading,
+    Error,
+    Ready,
+}
+
+type PanelHandler = Rc<dyn Fn(PanelEvent, &mut Window, &mut App) + 'static>;
+
+/// The worktree list that replaces the sidebar tree in the Worktrees view.
+#[derive(IntoElement)]
+pub struct WorktreePanel {
+    state: PanelState,
+    /// The visible rows, already filtered and ordered.
+    rows: Vec<WorktreeEntry>,
+    /// Every worktree, for the header count.
+    total: usize,
+    query: String,
+    selected: Option<PathBuf>,
+    focus: FocusHandle,
+    scroll: ScrollHandle,
+    on_event: PanelHandler,
+}
+
+impl WorktreePanel {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        state: PanelState,
+        rows: Vec<WorktreeEntry>,
+        total: usize,
+        query: String,
+        selected: Option<PathBuf>,
+        focus: FocusHandle,
+        scroll: ScrollHandle,
+        on_event: impl Fn(PanelEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            state,
+            rows,
+            total,
+            query,
+            selected,
+            focus,
+            scroll,
+            on_event: Rc::new(on_event),
+        }
+    }
+}
+
+impl RenderOnce for WorktreePanel {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let ring_visible = ui::focus::focus_visible(&self.focus, window, cx);
+
+        let mut root = div()
+            .id("worktree-panel")
+            .debug_selector(|| "worktree-panel".to_string())
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            // `ui-tree` carries the Delete binding; ←/→/Space/F2 are not
+            // handled here and do nothing.
+            .key_context("ui-tree")
+            .track_focus(&self.focus);
+        {
+            let on_event = self.on_event.clone();
+            root = root.on_action(move |_: &SelectNext, window: &mut Window, cx: &mut App| {
+                on_event(PanelEvent::Move(1), window, cx)
+            });
+        }
+        {
+            let on_event = self.on_event.clone();
+            root = root.on_action(move |_: &SelectPrev, window: &mut Window, cx: &mut App| {
+                on_event(PanelEvent::Move(-1), window, cx)
+            });
+        }
+        {
+            let on_event = self.on_event.clone();
+            root = root.on_action(move |_: &Confirm, window: &mut Window, cx: &mut App| {
+                on_event(PanelEvent::Confirm, window, cx)
+            });
+        }
+        {
+            let on_event = self.on_event.clone();
+            root = root.on_action(move |_: &TreeDelete, window: &mut Window, cx: &mut App| {
+                on_event(PanelEvent::Delete, window, cx)
+            });
+        }
+        {
+            let on_event = self.on_event.clone();
+            root = root.on_action(move |_: &Cancel, window: &mut Window, cx: &mut App| {
+                on_event(PanelEvent::Leave, window, cx)
+            });
+        }
+
+        // Header: WORKTREES + count.
+        let mut header = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .px(px(12.))
+            .pt(px(10.))
+            .pb(px(4.))
+            .text_size(FS_XS)
+            .font_weight(FontWeight::BOLD)
+            .text_color(colors.muted)
+            .child(ui::t!("sidebar.panel.header"));
+        if self.state == PanelState::Ready {
+            header = header.child(CountPill::new(self.total.to_string()));
+        }
+        // Design: while loading or failed only the skeleton / message shows,
+        // no WORKTREES header and no "New worktree…" button.
+        if self.state == PanelState::Ready {
+            root = root.child(header);
+        }
+
+        let message = |text: SharedString| {
+            div()
+                .px(px(12.))
+                .py(px(16.))
+                .text_size(FS_SM)
+                .text_color(colors.muted)
+                .child(text)
+        };
+        let body = match self.state {
+            PanelState::Loading => div()
+                .id("worktree-panel-loading")
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .px(px(12.))
+                .py(px(16.))
+                .children(
+                    [180., 140., 170., 150.]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, w)| Skeleton::new(("worktree-panel-skeleton", i), px(w))),
+                )
+                .into_any_element(),
+            PanelState::Error => div()
+                .flex_1()
+                .min_h_0()
+                .child(message(ui::t!("sidebar.panel.error")))
+                .into_any_element(),
+            PanelState::Ready if self.rows.is_empty() => div()
+                .flex_1()
+                .min_h_0()
+                .child(message(ui::t!(
+                    "sidebar.panel.no_match",
+                    query = self.query.trim()
+                )))
+                .into_any_element(),
+            PanelState::Ready => {
+                let mut list = div()
+                    .id("worktree-panel-list")
+                    // Shrinks to scroll but does not grow: "New worktree…"
+                    // sits right under the rows (design `.add-row`).
+                    .flex_initial()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll);
+                let pinned = self.rows.first().is_some_and(WorktreeEntry::is_main);
+                for (index, entry) in self.rows.iter().enumerate() {
+                    let selected = self.selected.as_deref() == Some(entry.path());
+                    let row = worktree_row(
+                        index,
+                        entry,
+                        selected,
+                        selected && ring_visible,
+                        &self.focus,
+                        &self.on_event,
+                        colors,
+                        cx,
+                    );
+                    // The divider below the pinned main worktree lives in the
+                    // same list child, so scroll-to-item indexes stay rows.
+                    let divider = pinned && index == 0 && self.rows.len() > 1;
+                    list =
+                        list.child(div().flex_none().flex().flex_col().child(row).when(
+                            divider,
+                            |this| {
+                                this.child(div().h(px(1.)).mx(px(14.)).my(px(4.)).bg(colors.border))
+                            },
+                        ));
+                }
+                list.into_any_element()
+            }
+        };
+        root = root.child(body);
+
+        // "New worktree…" focuses the quick-create input of the centre pane.
+        if self.state != PanelState::Ready {
+            return root;
+        }
+        let on_event = self.on_event.clone();
+        root.child(
+            div().flex_none().px(px(8.)).pt(px(6.)).pb(px(8.)).child(
+                div().w_full().child(
+                    Button::new("worktree-panel-new")
+                        .icon(IconName::Plus)
+                        .label(ui::t!("sidebar.panel.new"))
+                        .on_click(move |_, window, cx| {
+                            on_event(PanelEvent::NewWorktree, window, cx)
+                        }),
+                ),
+            ),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// One two-line row: name (and the "default" chip) over the branch, status
+/// glyphs at the end. The current worktree has the accent bar and a bold
+/// name; the selected one the selection background; the two are independent.
+fn worktree_row(
+    index: usize,
+    entry: &WorktreeEntry,
+    selected: bool,
+    ring: bool,
+    focus: &FocusHandle,
+    on_event: &PanelHandler,
+    colors: ThemeColors,
+    cx: &App,
+) -> impl IntoElement {
+    let main = entry.is_main();
+    let current = entry.is_current();
+    let missing = entry.missing;
+    let path = entry.path().to_path_buf();
+    let foreground = if selected {
+        colors.selection_fg
+    } else if missing {
+        colors.muted
+    } else {
+        colors.text
+    };
+    let secondary = if selected {
+        colors.selection_sub
+    } else {
+        colors.muted
+    };
+    let icon_color = if selected {
+        if main {
+            colors.selection_sub
+        } else {
+            colors.selection_fg
+        }
+    } else if main || current {
+        colors.accent
+    } else {
+        colors.muted
+    };
+
+    let mut name = div()
+        .min_w_0()
+        .truncate()
+        .font_weight(if current {
+            FontWeight::BOLD
+        } else {
+            FontWeight::SEMIBOLD
+        })
+        .child(entry.name());
+    if missing {
+        name = name.line_through();
+    }
+    let branch = div()
+        .min_w_0()
+        .truncate()
+        .font_family(FONT_MONO)
+        .text_size(FS_SM)
+        .text_color(secondary)
+        .child(match entry.branch() {
+            Some(branch) => SharedString::from(branch.to_owned()),
+            None => ui::t!("sidebar.panel.detached_head"),
+        });
+
+    let id = format!("worktree-row-{index}");
+    let mut row = div()
+        .id(ElementId::named_usize("worktree-row", index))
+        .debug_selector({
+            let id = id.clone();
+            move || id.clone()
+        })
+        .relative()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(8.))
+        .min_h(px(40.))
+        .mx(px(6.))
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(R_SM)
+        .font_family(FONT_UI)
+        .text_size(FS_BASE)
+        .text_color(foreground)
+        .child(
+            div().flex_none().child(
+                Icon::new(if main {
+                    IconName::Git
+                } else {
+                    IconName::Worktree
+                })
+                .size(px(14.))
+                .color(icon_color),
+            ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .min_w_0()
+                        .child(name)
+                        .when(main, |this| {
+                            this.child(div().flex_none().child(Chip::new(
+                                ElementId::named_usize("worktree-row-default", index),
+                                ui::t!("sidebar.panel.default"),
+                            )))
+                        }),
+                )
+                .child(branch),
+        )
+        .child(worktree_glyphs(&id, entry, selected, colors));
+
+    if main {
+        row = row.tooltip(Tooltip::text(main_worktree_tip()));
+    }
+    if current {
+        row = row.child(
+            div()
+                .absolute()
+                .left(px(-4.))
+                .top(px(4.))
+                .bottom(px(4.))
+                .w(px(2.))
+                .rounded(px(1.))
+                .bg(colors.accent),
+        );
+    }
+    if selected {
+        row = row.bg(colors.selection);
+    } else {
+        let hover = colors.hover;
+        row = row.hover(move |style| style.bg(hover));
+    }
+    if ring {
+        row = row.child(ui::focus::focus_ring(
+            ui::focus::RingOffset::Inset2,
+            R_SM,
+            cx,
+        ));
+    }
+    {
+        let on_event = on_event.clone();
+        let focus = focus.clone();
+        let path = path.clone();
+        row = row.on_mouse_down(
+            MouseButton::Left,
+            move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                // The panel keeps the keyboard even when a menu or dialog
+                // opens from the handler.
+                window.focus(&focus, cx);
+                if event.click_count >= 2 {
+                    on_event(PanelEvent::Switch(path.clone()), window, cx);
+                } else {
+                    on_event(PanelEvent::Select(path.clone()), window, cx);
+                }
+                window.prevent_default();
+            },
+        );
+    }
+    {
+        let on_event = on_event.clone();
+        let focus = focus.clone();
+        row = row.on_mouse_down(
+            MouseButton::Right,
+            move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                window.focus(&focus, cx);
+                on_event(PanelEvent::Menu(path.clone(), event.position), window, cx);
+                window.prevent_default();
+            },
+        );
+    }
+    row
 }
 
 #[cfg(test)]
@@ -1894,6 +2599,37 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn submodule_menu_enables_open_only_when_initialised() {
+        let extras = SidebarExtras {
+            submodules: vec![
+                Submodule {
+                    path: "vendor/a".to_owned(),
+                    oid: Some(oid()),
+                    state: SubmoduleState::Clean,
+                },
+                Submodule {
+                    path: "vendor/b".to_owned(),
+                    oid: None,
+                    state: SubmoduleState::Uninitialized,
+                },
+            ],
+            ..Default::default()
+        };
+        let ready = sidebar_menu("sub:vendor/a", None, Some(&extras), None);
+        assert_eq!(
+            menu_item(&ready, "Update submodule").action,
+            SidebarAction::UpdateSubmodule("vendor/a".to_owned())
+        );
+        assert_eq!(
+            menu_item(&ready, "Open in new window").action,
+            SidebarAction::OpenSubmodule("vendor/a".to_owned())
+        );
+        let missing = sidebar_menu("sub:vendor/b", None, Some(&extras), None);
+        assert!(menu_item(&missing, "Update submodule").enabled);
+        assert!(!menu_item(&missing, "Open in new window").enabled);
+    }
+
     fn menu_item<'a>(entries: &'a [SidebarMenuEntry], label: &str) -> &'a SidebarMenuItem {
         entries
             .iter()
@@ -1927,11 +2663,12 @@ mod tests {
             )),
             vec![
                 "Checkout",
+                "Show all commits of feat/idle-lanes",
                 "Merge feat/idle-lanes into main",
                 "Rebase main onto feat/idle-lanes",
                 "—",
                 "Rename…",
-                "Set upstream…",
+                "Set upstream",
                 "Delete branch",
                 "—",
                 "Copy branch name",
@@ -1946,6 +2683,7 @@ mod tests {
             )),
             vec![
                 "Checkout as local branch",
+                "Show all commits of origin/feat/idle-lanes",
                 "Merge origin/feat/idle-lanes into main",
                 "—",
                 "Delete remote branch…",
@@ -2083,11 +2821,12 @@ mod tests {
             menu_labels(&sidebar_menu("local:feat/x", Some(&detached), None, None)),
             vec![
                 "Checkout",
+                "Show all commits of feat/x",
                 "Merge feat/x into HEAD",
                 "Rebase HEAD onto feat/x",
                 "—",
                 "Rename…",
-                "Set upstream…",
+                "Set upstream",
                 "Delete branch",
                 "—",
                 "Copy branch name",
@@ -2102,6 +2841,7 @@ mod tests {
             )),
             vec![
                 "Checkout as local branch",
+                "Show all commits of origin/feat/x",
                 "Merge origin/feat/x into HEAD",
                 "—",
                 "Delete remote branch…",
@@ -2110,7 +2850,7 @@ mod tests {
         );
         // HEAD not read yet is named the same way.
         assert_eq!(
-            menu_labels(&sidebar_menu("local:feat/x", None, None, None))[1],
+            menu_labels(&sidebar_menu("local:feat/x", None, None, None))[2],
             "Merge feat/x into HEAD"
         );
     }
@@ -2150,13 +2890,15 @@ mod tests {
             let expected: &[&str] = match key {
                 "local:feat/idle-lanes" => &[
                     "Checkout",
+                    "Show all commits of feat/idle-lanes",
                     "Rename…",
-                    "Set upstream…",
+                    "Set upstream",
                     "Delete branch",
                     "Copy branch name",
                 ],
                 "rbranch:origin/feat/idle-lanes" => &[
                     "Checkout as local branch",
+                    "Show all commits of origin/feat/idle-lanes",
                     "Delete remote branch…",
                     "Copy branch name",
                 ],
@@ -2166,7 +2908,10 @@ mod tests {
                     "Rename tag…",
                     "Delete tag",
                 ],
-                "stash:0" => &["Apply stash", "Pop stash", "Drop stash"],
+                "stash:0" => &["Apply stash", "Pop stash", "View changes", "Drop stash"],
+                // Open in new window stays disabled: this fixture has no
+                // initialised `vendor/a`.
+                "sub:vendor/a" => &["Update submodule"],
                 "remote:origin" => &["Fetch", "Edit remote…", "Remove remote"],
                 "wt:/tmp/wt" => &[
                     "Open in new window",
@@ -2253,7 +2998,10 @@ mod tests {
             SidebarAction::PushTag("v1".to_owned())
         );
         let stash_menu = sidebar_menu("stash:0", Some(&head), Some(&extras), None);
-        assert!(!menu_item(&stash_menu, "View changes").enabled);
+        assert_eq!(
+            menu_item(&stash_menu, "View changes").action,
+            SidebarAction::ViewStash(0)
+        );
         // The shortcut hints of the design are kept.
         assert_eq!(
             menu_item(&local_menu, "Checkout").shortcut.as_deref(),
@@ -2275,5 +3023,175 @@ mod tests {
                 .as_deref(),
             Some("Ctrl+Shift+F")
         );
+    }
+
+    #[test]
+    fn shortcut_actions_follow_the_menu_hints() {
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        let run = |key: &str, hint: &str| shortcut_action(key, hint, Some(&head), None, None);
+        assert_eq!(
+            run("local:feat", "Enter"),
+            Some(SidebarAction::CheckoutBranch("feat".into()))
+        );
+        assert_eq!(run("local:main", "Enter"), None, "the current branch");
+        assert_eq!(
+            run("rbranch:origin/x", "Enter"),
+            Some(SidebarAction::CheckoutRemoteBranch("origin/x".into()))
+        );
+        assert_eq!(
+            run("tag:v1", "Enter"),
+            Some(SidebarAction::CheckoutTag("v1".into()))
+        );
+        assert_eq!(run("stash:0", "Enter"), None);
+        assert_eq!(
+            run("local:feat", "F2"),
+            Some(SidebarAction::RenameBranch("feat".into()))
+        );
+        assert_eq!(
+            run("tag:v1", "F2"),
+            Some(SidebarAction::RenameTag("v1".into()))
+        );
+        assert_eq!(
+            run("wt:/tmp/w", "F2"),
+            Some(SidebarAction::RenameWorktree("/tmp/w".into()))
+        );
+        assert_eq!(
+            run("local:feat", "Del"),
+            Some(SidebarAction::DeleteBranch("feat".into()))
+        );
+        assert_eq!(run("local:main", "Del"), None, "the current branch");
+        assert_eq!(
+            run("tag:v1", "Del"),
+            Some(SidebarAction::DeleteTag("v1".into()))
+        );
+        assert_eq!(run("stash:2", "Del"), Some(SidebarAction::DropStash(2)));
+        assert_eq!(
+            run("remote:origin", "Del"),
+            Some(SidebarAction::RemoveRemote("origin".into()))
+        );
+        assert_eq!(
+            run("wt:/tmp/w", "Del"),
+            Some(SidebarAction::RemoveWorktree("/tmp/w".into()))
+        );
+        assert_eq!(run("section:tags", "Del"), None);
+    }
+
+    fn worktree_entry(
+        name: &str,
+        branch: Option<&str>,
+        main: bool,
+        last_used: Option<u64>,
+    ) -> WorktreeEntry {
+        WorktreeEntry {
+            worktree: Worktree {
+                path: PathBuf::from(format!("/tmp/{name}")),
+                branch: branch.map(str::to_owned),
+                head: None,
+                bare: false,
+                detached: branch.is_none(),
+                locked: None,
+                prunable: false,
+                current: false,
+                main,
+            },
+            changes: Vec::new(),
+            missing: false,
+            head_summary: None,
+            ahead: 0,
+            behind: 0,
+            has_upstream: false,
+            last_used,
+        }
+    }
+
+    fn panel_names(entries: &[WorktreeEntry], query: &str) -> Vec<String> {
+        worktree_panel_rows(entries, query)
+            .iter()
+            .map(|entry| entry.name())
+            .collect()
+    }
+
+    #[test]
+    fn the_panel_pins_main_first_then_orders_by_recency() {
+        // The model hands them over current first; main is not the current one.
+        let entries = [
+            worktree_entry("review", Some("feat/palette"), false, Some(300)),
+            worktree_entry("app", Some("main"), true, Some(10)),
+            worktree_entry("hotfix", Some("fix/git"), false, Some(500)),
+            worktree_entry("bisect", None, false, None),
+        ];
+        assert_eq!(
+            panel_names(&entries, ""),
+            ["app", "hotfix", "review", "bisect"]
+        );
+    }
+
+    #[test]
+    fn the_panel_filter_matches_name_and_branch_ignoring_case() {
+        let entries = [
+            worktree_entry("app", Some("main"), true, None),
+            worktree_entry("review", Some("feat/Palette"), false, None),
+            worktree_entry("bisect", None, false, None),
+        ];
+        assert_eq!(panel_names(&entries, "PAL"), ["review"]);
+        assert_eq!(panel_names(&entries, " bis "), ["bisect"]);
+        assert_eq!(panel_names(&entries, "main"), ["app"]);
+        // The panel's "detached HEAD" label is not searchable text.
+        assert!(panel_names(&entries, "detached").is_empty());
+        assert!(panel_names(&entries, "nothing").is_empty());
+    }
+
+    #[test]
+    fn the_worktree_menu_follows_the_designs_disabled_rules() {
+        let disabled = |entry: &WorktreeEntry| -> Vec<(&'static str, bool)> {
+            worktree_menu(entry)
+                .into_iter()
+                .flatten()
+                // Leaked so the expectations below stay `&str` literals; test-only.
+                .map(|item| {
+                    let label: &'static str = Box::leak(item.label.to_string().into_boxed_str());
+                    (label, item.disabled)
+                })
+                .collect()
+        };
+        // The main, current worktree: no switch, no lock, no remove.
+        let mut main = worktree_entry("app", Some("main"), true, None);
+        main.worktree.current = true;
+        assert_eq!(
+            disabled(&main),
+            [
+                ("Switch to this worktree", true),
+                ("Open in new window", false),
+                ("Reveal in file manager", false),
+                ("Copy path", false),
+                ("Lock", true),
+                ("Remove worktree…", true),
+            ]
+        );
+        // A plain linked worktree: everything is available; a lock flips the
+        // label.
+        let mut linked = worktree_entry("hotfix", Some("fix"), false, None);
+        assert!(disabled(&linked).iter().all(|(_, off)| !off));
+        linked.worktree.locked = Some("why".to_owned());
+        assert!(disabled(&linked).contains(&("Unlock", false)));
+        // A missing folder cannot be opened, revealed, switched to or locked,
+        // but its record can be copied and removed.
+        linked.missing = true;
+        assert_eq!(
+            disabled(&linked),
+            [
+                ("Switch to this worktree", true),
+                ("Open in new window", true),
+                ("Reveal in file manager", true),
+                ("Copy path", false),
+                ("Unlock", true),
+                ("Remove worktree…", false),
+            ]
+        );
+        // The separator sits between Copy path and Lock/Unlock.
+        assert!(worktree_menu(&linked)[4].is_none());
     }
 }

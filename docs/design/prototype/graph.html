@@ -3,9 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gitwarp — commit graph spec</title>
+<title>GitWarp — commit graph spec</title>
 <link rel="stylesheet" href="tokens.css">
 <link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="shell.css">
 <style>
   .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
   .themebox { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-lg); padding: 16px; }
@@ -34,18 +35,22 @@
   <h2>Anatomy</h2>
   <div class="anat"><div><div class="zoom" aria-label="Graph rows at 4× zoom"><div id="zoomrows" class="hist" style="--row-bg:var(--bg)"></div></div><div class="cap">Rows 1–8 of the sample history at 4×.</div></div>
   <table class="t"><tr><th>Element</th><th>Value</th></tr>
-    <tr><td>Lane width</td><td>14px; lane <i>n</i> centre = 14n + 7</td></tr>
+    <tr><td>Lane width</td><td>14px; lane <i>n</i> centre = 14n + 9 (2px left inset so the HEAD ring is not clipped)</td></tr>
     <tr><td>Row height</td><td>26px; commit dot centred at y = 13</td></tr>
     <tr><td>Dot</td><td>radius 4.5px, filled, 1.5px halo in the row background so lines never touch it</td></tr>
     <tr><td>Merge commit</td><td>hollow ring: outer radius 4.5px, 2px stroke, row-colour fill</td></tr>
     <tr><td>HEAD</td><td>extra 1.5px ring in the text colour, radius 7.5px</td></tr>
-    <tr><td>Line</td><td>2px, round joins; same-lane lines are vertical</td></tr>
+    <tr><td>Line</td><td>1–3px (Appearance setting, default 2px), round joins; same-lane lines are vertical</td></tr>
+    <tr><td>Monochrome</td><td>Appearance “graph colored” off: every lane line and dot is drawn in <code>muted</code> instead of the golden-angle hues; the HEAD ring and idle-lane dashes are unchanged</td></tr>
+    <tr><td>Merge ring</td><td>outer 4.5px / inner 2.5px</td></tr>
+    <tr><td>Dot halo</td><td>radius 6px in the row background; a dot is still drawn up to 6px past the clip edge</td></tr>
+    <tr><td>Clip fade / dashes</td><td>20px fade at the clipped edge; folded lanes dashed 2 on / 3 off, running continuously across rows</td></tr>
     <tr><td>Lane change</td><td>S-curve (cubic): control points at 7px / 20px so the bend completes inside the row</td></tr>
-    <tr><td>Colour</td><td>hue = lane × 137.508° · saturation 0.65 · lightness 0.62 dark / 0.46 light</td></tr>
+    <tr><td>Colour</td><td>hue = lane × 137.508° · saturation 0.65 · lightness 0.62 dark / 0.45 light</td></tr>
     <tr><td>Selection</td><td>row background changes, the dot halo follows it (--row-bg); lane colours never change</td></tr></table></div>
 
   <h2>Lane palette — golden angle, unbounded</h2>
-  <p class="lead">Because hue = lane × 137.508° (mod 360), consecutive lanes are ~137° apart and no run of lanes repeats a hue; any number of lanes works. Lightness is the only theme-dependent value: 0.62 reads on dark; on light it drops to 0.46 so thin lines keep 3:1 against the surface. Computed contrast below is measured against each theme's background.</p>
+  <p class="lead">Because hue = lane × 137.508° (mod 360), consecutive lanes are ~137° apart and no run of lanes repeats a hue; any number of lanes works. Lightness is the only theme-dependent value: 0.62 reads on dark; on light it drops to 0.45 so thin lines keep 3:1 against the surface. Computed contrast below is measured against each theme's background.</p>
   <div class="two">
     <div class="themebox" data-theme="dark"><b>Dark</b> <span class="cap" id="cd"></span><div class="sw" id="sd"></div></div>
     <div class="themebox" data-theme="light"><b>Light</b> <span class="cap" id="cl"></span><div class="sw" id="sl"></div></div>
@@ -54,7 +59,8 @@
   <h2>A very wide graph: clipping, widening, collapsing idle lanes</h2>
   <p class="lead">This history has <b>241 lanes</b> (240 stale remote branch tips plus main). The graph column has a fixed width, so wide graphs are <b>clipped</b>: lanes fade out over the last 20px and the header shows a <b>+N</b> badge with the number of hidden lanes. The user can <b>drag the grip</b> on the column edge, <b>double-click</b> it (or click <b>+N</b>) to fit, or switch on <b>Collapse idle lanes</b>: runs of ≥3 lanes that only carry a single tip commit and then run straight down are folded into one 12px dashed gap lane, so the active lanes stay visible. Scroll the list to see the fan of tips.</p>
   <div class="ctl"><div class="seg sm" role="group" aria-label="Graph width mode"><button id="m-clip" aria-pressed="true">Clipped · 112px</button><button id="m-wide" aria-pressed="false">Widened · 420px</button><button id="m-col" aria-pressed="false">Idle lanes collapsed</button></div><span class="muted" id="wstat"></span></div>
-  <div class="frame"><div id="wide" style="display:flex;flex:1;min-width:0"></div></div>
+  <div class="ctl"><b style="font-size:var(--fs-sm)">Appearance</b><div class="seg sm" role="group" aria-label="Graph colors"><button id="c-on" aria-pressed="true">Colored</button><button id="c-off" aria-pressed="false">Monochrome</button></div><div class="seg sm" role="group" aria-label="Line width"><button data-lw="1" aria-pressed="false">1px</button><button data-lw="2" aria-pressed="true">2px</button><button data-lw="3" aria-pressed="false">3px</button></div><span class="muted">Right-click the “Graph” header for the menu: <b>Collapse idle lanes</b> (check when on) and <b>Fit graph to content</b> (width + 8, clamped 40–420, saved). Clicking the +N pill or double-clicking the grip also fits; a grip drag (40–480) saves only when the pointer actually moved. Double-click a row to check out its branch or commit.</span></div>
+  <div class="frame" id="frame" data-menu-host style="position:relative"><div id="wide" style="display:flex;flex:1;min-width:0"></div></div>
   </div>`);
 
   // sample anatomy
@@ -89,7 +95,12 @@
   mk('m3', ['m4'], 'perf(history): chunked row models');
   for (let k = 1; k <= 240; k++) mk('t' + k, ['x' + k], `WIP: experiment ${k}`, k < 4 ? [{ t: 'rm', n: 'origin/wip/' + k }] : []);
   for (let k = 4; k <= 40; k++) mk('m' + k, k === 40 ? [] : ['m' + (k + 1)], k === 40 ? 'Initial commit' : `chore: housekeeping ${k}`);
-  const H = G.history(document.getElementById('wide'), C, { gw: 112 });
+  const H = G.history(document.getElementById('wide'), C, { gw: 112, onCollapse: () => stat() });
+  G.initTips(document.getElementById('frame'));
+  const zoomHist = document.getElementById('zoomrows').closest('.zoom');
+  const setColor = (on) => { H.setMono(!on); zoomHist.classList.toggle('hist', true); zoomHist.classList.toggle('mono', !on); document.getElementById('c-on').setAttribute('aria-pressed', on); document.getElementById('c-off').setAttribute('aria-pressed', !on); };
+  document.getElementById('c-on').onclick = () => setColor(true); document.getElementById('c-off').onclick = () => setColor(false);
+  document.querySelectorAll('[data-lw]').forEach((b) => { b.onclick = () => { H.setLine(b.dataset.lw); zoomHist.style.setProperty('--line-w', b.dataset.lw + 'px'); document.querySelectorAll('[data-lw]').forEach((x) => x.setAttribute('aria-pressed', x === b)); }; });
   const geoW = H.geo(), btns = { clip: document.getElementById('m-clip'), wide: document.getElementById('m-wide'), col: document.getElementById('m-col') };
   const stat = () => { const g = H.geo(); document.getElementById('wstat').textContent = `${geoW.xs.length} lanes · full width ${geoW.width}px${g.idle ? ` · collapsed width ${g.width}px (${g.idle} idle lanes folded)` : ''}`; };
   const setM = (m) => { Object.entries(btns).forEach(([k, b]) => b.setAttribute('aria-pressed', k === m)); if (m === 'clip') { H.setCollapse(false); H.setWidth(112); } if (m === 'wide') { H.setCollapse(false); H.setWidth(420); } if (m === 'col') { H.setCollapse(true); H.setWidth(Math.min(420, H.geo().width + 8)); } stat(); };

@@ -1,6 +1,9 @@
 //! Settings → Diff & merge: layout, whitespace, context and the conflict tool,
 //! with a live preview built from the same row shapes as the real diff pane.
 
+use std::path::Path;
+use std::process::{Command, Stdio};
+
 use gpui::prelude::FluentBuilder;
 use gpui::{div, px, AnyElement, App, Context, IntoElement, ParentElement, Styled, Window};
 
@@ -20,10 +23,11 @@ const TOOLS: [MergeTool; 5] = [
     MergeTool::Custom,
 ];
 
+/// Catalog keys of the whitespace options.
 const WHITESPACE: [(WhitespaceMode, &str); 3] = [
-    (WhitespaceMode::None, "Show all"),
-    (WhitespaceMode::Eol, "Ignore at line end"),
-    (WhitespaceMode::All, "Ignore all"),
+    (WhitespaceMode::None, "settings.diff.whitespace.none"),
+    (WhitespaceMode::Eol, "settings.diff.whitespace.eol"),
+    (WhitespaceMode::All, "settings.diff.whitespace.all"),
 ];
 
 pub(super) fn render(
@@ -36,15 +40,18 @@ pub(super) fn render(
     let mut page = div().flex().flex_col();
 
     page = page.child(heading(
-        "Diff & merge",
-        "How changes are displayed, and which tool resolves conflicts.",
+        ui::t!("settings.diff.title"),
+        ui::t!("settings.diff.subtitle"),
     ));
 
     let layout = {
         let entity = cx.entity();
         form::segmented(
             "settings-diff-layout".into(),
-            ["Unified", "Side-by-side"],
+            [
+                ui::t!("settings.diff.layout.unified"),
+                ui::t!("settings.diff.layout.split"),
+            ],
             usize::from(settings.diff_layout == DiffLayout::Split),
             false,
             move |index, _, cx| {
@@ -100,32 +107,32 @@ pub(super) fn render(
     };
 
     page = page.child(group(
-        "Display",
+        ui::t!("settings.diff.group.display"),
         vec![
             form::row(
                 "settings-diff-layout-row",
-                "Layout",
-                "Side-by-side needs a details pane at least 900 px wide; narrower panes fall back to unified.",
+                ui::t!("settings.diff.layout.title"),
+                ui::t!("settings.diff.layout.desc"),
                 layout,
                 false,
             ),
             form::row(
                 "settings-diff-word-row",
-                "Highlight changed words",
-                "Marks the exact characters that differ inside a modified line.",
+                ui::t!("settings.diff.word.title"),
+                ui::t!("settings.diff.word.desc"),
                 word,
                 false,
             ),
             form::row(
                 "settings-diff-wrap-row",
-                "Wrap long lines",
-                "Off scrolls horizontally.",
+                ui::t!("settings.diff.wrap.title"),
+                ui::t!("settings.diff.wrap.desc"),
                 wrap,
                 false,
             ),
             form::row(
                 "settings-diff-numbers-row",
-                "Line numbers",
+                ui::t!("settings.diff.numbers.title"),
                 "",
                 numbers,
                 false,
@@ -137,7 +144,7 @@ pub(super) fn render(
         let entity = cx.entity();
         form::select(
             "settings-diff-whitespace".into(),
-            WHITESPACE.iter().map(|(_, label)| *label),
+            WHITESPACE.iter().map(|(_, key)| ui::i18n::t(key)),
             WHITESPACE
                 .iter()
                 .position(|(mode, _)| *mode == settings.diff_whitespace)
@@ -182,19 +189,19 @@ pub(super) fn render(
         )
     };
     page = page.child(group(
-        "Content",
+        ui::t!("settings.diff.group.content"),
         vec![
             form::row(
                 "settings-diff-whitespace-row",
-                "Whitespace",
-                "Hidden whitespace-only changes are still staged and committed.",
+                ui::t!("settings.diff.whitespace.title"),
+                ui::t!("settings.diff.whitespace.desc"),
                 whitespace,
                 false,
             ),
             form::row(
                 "settings-diff-context-row",
-                "Context lines",
-                "Unchanged lines shown around each change (0–20).",
+                ui::t!("settings.diff.context.title"),
+                ui::t!("settings.diff.context.desc"),
                 context,
                 false,
             ),
@@ -213,7 +220,7 @@ pub(super) fn render(
                 div()
                     .text_size(ui::metrics::FS_XS)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("PREVIEW"),
+                    .child(ui::t!("settings.diff.preview")),
             )
             .child(
                 div()
@@ -231,19 +238,18 @@ pub(super) fn render(
                             .font_family(FONT_MONO)
                             .text_size(FS_SM)
                             .text_color(colors.muted)
-                            .child(format!(
-                                "src/history/graph.rs · {}{}",
-                                if settings.diff_layout == DiffLayout::Split {
-                                    "side-by-side"
+                            .child({
+                                let layout = if settings.diff_layout == DiffLayout::Split {
+                                    ui::t!("settings.diff.preview.side_by_side")
                                 } else {
-                                    "unified"
-                                },
+                                    ui::t!("settings.diff.preview.unified")
+                                };
                                 if settings.diff_whitespace == WhitespaceMode::None {
-                                    ""
+                                    ui::t!("settings.diff.preview.header", layout = layout)
                                 } else {
-                                    " · whitespace ignored"
+                                    ui::t!("settings.diff.preview.header_ws", layout = layout)
                                 }
-                            )),
+                            }),
                     )
                     .child(preview),
             ),
@@ -276,8 +282,8 @@ pub(super) fn render(
     let merge_rows = match settings.merge_tool {
         MergeTool::Builtin => vec![form::row(
             "settings-merge-tool-row",
-            "Resolve conflicts with",
-            "Three-way editor inside GitWarp. No setup needed.",
+            ui::t!("settings.merge.tool.title"),
+            ui::t!("settings.merge.tool.builtin_desc"),
             tool,
             false,
         )],
@@ -290,8 +296,8 @@ pub(super) fn render(
             let bad = command_text.trim().is_empty() || !missing.is_empty();
             let mut rows = vec![form::row(
                 "settings-merge-tool-row",
-                "Resolve conflicts with",
-                "Opened from the conflict banner; GitWarp waits until the tool exits.",
+                ui::t!("settings.merge.tool.title"),
+                ui::t!("settings.merge.tool.external_desc"),
                 tool,
                 false,
             )];
@@ -304,11 +310,10 @@ pub(super) fn render(
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .border_b_1()
                     .child(
                         div()
                             .text_size(FS_SM)
-                            .child("Command"),
+                            .child(ui::t!("settings.merge.command")),
                     )
                     .child(
                         div()
@@ -321,35 +326,32 @@ pub(super) fn render(
                                 Button::new("settings-merge-test")
                                     .size(ButtonSize::Small)
                                     .icon(IconName::Play)
-                                    .label("Test")
+                                    .label(ui::t!("settings.merge.test"))
                                     .disabled(bad)
                                     .on_click(move |_, _, cx: &mut App| {
                                         entity.update(cx, |view, cx| {
-                                            view.merge_test = Some(
-                                                "Merge tool started with sample files".into(),
-                                            );
-                                            cx.notify();
+                                            view.start_merge_test(cx);
                                         });
                                     })
                             }),
                     )
+                    .when_some(view.merge_test.clone(), |this, result| {
+                        this.child(match result {
+                            Ok(text) => form::success(text, cx),
+                            Err(text) => form::error(text, cx),
+                        })
+                    })
                     .child(if command_text.trim().is_empty() {
-                        form::error("Enter a command.", cx)
+                        form::error(ui::t!("settings.merge.enter_command"), cx)
                     } else if !missing.is_empty() {
                         form::error(
-                            format!(
-                                "Missing {}. The tool would not receive all required files.",
-                                missing.join(", ")
-                            ),
+                            ui::t!("settings.merge.missing", list = missing.join(", ")),
                             cx,
                         )
                     } else {
-                        form::success("All required placeholders present.", cx)
+                        form::success(ui::t!("settings.merge.all_present"), cx)
                     })
-                    .child(form::help(
-                        "Placeholders: $LOCAL your side · $REMOTE their side · $BASE common ancestor · $MERGED result file.",
-                        cx,
-                    ))
+                    .child(form::help(ui::t!("settings.merge.placeholders_help"), cx))
                     .into_any_element(),
             );
             rows
@@ -358,8 +360,8 @@ pub(super) fn render(
             let command = settings.merge_tool.preset().to_owned();
             let mut rows = vec![form::row(
                 "settings-merge-tool-row",
-                "Resolve conflicts with",
-                "Opened from the conflict banner; GitWarp waits until the tool exits.",
+                ui::t!("settings.merge.tool.title"),
+                ui::t!("settings.merge.tool.external_desc"),
                 tool,
                 false,
             )];
@@ -371,8 +373,11 @@ pub(super) fn render(
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .border_b_1()
-                    .child(div().text_size(FS_SM).child("Command"))
+                    .child(
+                        div()
+                            .text_size(FS_SM)
+                            .child(ui::t!("settings.merge.command")),
+                    )
                     .child(
                         div()
                             .px(px(8.))
@@ -385,16 +390,13 @@ pub(super) fn render(
                             .text_size(FS_SM)
                             .child(command),
                     )
-                    .child(form::help(
-                        "Choose “Custom command…” to edit the command.",
-                        cx,
-                    ))
+                    .child(form::help(ui::t!("settings.merge.choose_custom"), cx))
                     .into_any_element(),
             );
             rows
         }
     };
-    page = page.child(group("Merge tool", merge_rows));
+    page = page.child(group(ui::t!("settings.merge.group"), merge_rows));
     page.into_any_element()
 }
 
@@ -490,7 +492,7 @@ fn diff_preview(settings: &crate::settings::Settings, cx: &Context<SettingsView>
                 .pt(px(4.))
                 .text_size(FS_SM)
                 .text_color(colors.muted)
-                .child("Side-by-side preview uses the same rows in two columns."),
+                .child(ui::t!("settings.diff.preview.split_note")),
         );
     }
     body.into_any_element()
@@ -505,4 +507,183 @@ fn gutter(line: Option<u32>, colors: ui::ThemeColors, size: gpui::Pixels) -> Any
         .text_align(gpui::TextAlign::Right)
         .child(line.map(|line| line.to_string()).unwrap_or_default())
         .into_any_element()
+}
+
+impl SettingsView {
+    /// Starts the configured merge tool on three sample files, detached, and
+    /// reports whether the process could be spawned.
+    pub(super) fn start_merge_test(&mut self, cx: &mut Context<Self>) {
+        let command = self.merge_command.read(cx).text().trim().to_owned();
+        if command.is_empty() {
+            return;
+        }
+        self.merge_test = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let program = first_word(&command);
+            let result = cx
+                .background_executor()
+                .spawn(async move { start_sample_merge(&command) })
+                .await;
+            this.update(cx, |view, cx| {
+                view.merge_test = Some(match result {
+                    Ok(()) => Ok(ui::t!("settings.merge.started", program = program)),
+                    Err(error) => Err(ui::t!("settings.merge.start_failed", error = error)),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+/// The program name the result line shows.
+fn first_word(command: &str) -> String {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or(command)
+        .to_owned()
+}
+
+/// Writes base/local/remote files with one conflicting line into a fresh
+/// temporary directory and spawns the tool on them. It never waits.
+fn start_sample_merge(command: &str) -> std::io::Result<()> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("gitwarp-merge-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+
+    let base = dir.join("base.txt");
+    let local = dir.join("local.txt");
+    let remote = dir.join("remote.txt");
+    let merged = dir.join("merged.txt");
+    std::fs::write(&base, "one\nshared\nthree\n")?;
+    std::fs::write(&local, "one\nlocal\nthree\n")?;
+    std::fs::write(&remote, "one\nremote\nthree\n")?;
+    std::fs::write(&merged, "")?;
+
+    let program = first_word(command);
+    let mut command = command.to_owned();
+    for (placeholder, path) in [
+        ("$BASE", &base),
+        ("$LOCAL", &local),
+        ("$REMOTE", &remote),
+        ("$MERGED", &merged),
+    ] {
+        command = substitute(&command, placeholder, path);
+    }
+
+    let mut shell = if cfg!(windows) {
+        let mut shell = Command::new("cmd");
+        shell.arg("/C");
+        shell
+    } else {
+        let mut shell = Command::new("sh");
+        shell.arg("-c");
+        shell
+    };
+    let mut child = shell
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    // A missing tool only shows up as the shell's exit status, so watch the
+    // child briefly: 127 (sh) / 9009 (cmd) mean "command not found".
+    let not_found = if cfg!(windows) { 9009 } else { 127 };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait()? {
+            Some(status) => {
+                return match status.code() {
+                    Some(0) => Ok(()),
+                    Some(code) if code == not_found => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        ui::t!("settings.merge.not_found", program = program).to_string(),
+                    )),
+                    Some(code) => Err(std::io::Error::other(
+                        ui::t!("settings.merge.exited", code = code).to_string(),
+                    )),
+                    None => Ok(()),
+                };
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    // Still running: reap it in the background so it does not linger as a
+    // zombie after it exits.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Replaces one placeholder with the quoted path, also consuming quotes the
+/// command already put around it.
+fn substitute(command: &str, placeholder: &str, path: &Path) -> String {
+    let quoted = quote_path(path);
+    // Quoted forms first so their quotes are consumed; the bare form then
+    // handles whatever is left.
+    command
+        .replace(&format!("\"{placeholder}\""), &quoted)
+        .replace(&format!("'{placeholder}'"), &quoted)
+        .replace(placeholder, &quoted)
+}
+
+/// Quotes a path for the platform shell.
+fn quote_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    const P: &str = "'/tmp/m.txt'";
+    #[cfg(windows)]
+    const P: &str = "\"/tmp/m.txt\"";
+
+    #[test]
+    fn substitute_quoted_and_bare() {
+        let path = Path::new("/tmp/m.txt");
+        assert_eq!(
+            substitute("tool \"$MERGED\"", "$MERGED", path),
+            format!("tool {P}")
+        );
+        assert_eq!(
+            substitute("tool '$MERGED'", "$MERGED", path),
+            format!("tool {P}")
+        );
+        assert_eq!(
+            substitute("tool $MERGED", "$MERGED", path),
+            format!("tool {P}")
+        );
+    }
+
+    #[test]
+    fn substitute_mixed_forms() {
+        let path = Path::new("/tmp/m.txt");
+        assert_eq!(
+            substitute("tool \"$MERGED\" '$MERGED' $MERGED", "$MERGED", path),
+            format!("tool {P} {P} {P}")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_tool_is_an_error() {
+        let result = start_sample_merge("definitely-not-a-real-tool-xyz $MERGED");
+        assert!(result.is_err());
+    }
 }

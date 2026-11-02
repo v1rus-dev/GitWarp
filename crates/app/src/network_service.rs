@@ -44,11 +44,11 @@ impl CredentialPrompt {
     }
 
     /// A short label for the dialog field.
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self) -> gpui::SharedString {
         if self.secret() {
-            "Password"
+            ui::t!("network.credential.password")
         } else {
-            "User name"
+            ui::t!("network.credential.user_name")
         }
     }
 }

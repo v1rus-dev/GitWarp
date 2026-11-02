@@ -17,3 +17,11 @@ pub const HEAD_RING_WIDTH: Pixels = px(1.5);
 /// Width of the fade at the graph column's right edge when the graph is wider
 /// than the column.
 pub const GRAPH_FADE_WIDTH: Pixels = px(20.);
+/// Left inset of the graph's lanes, px: lane `n`'s centre is `14n + 7 + 2`, so
+/// the HEAD ring (radius 7.5 plus half its stroke) on lane 0 is not cut by the
+/// column's left edge. `git-graph` stays inset-free; this is added when its x
+/// is turned into pixels.
+pub const GRAPH_INSET: f32 = 2.;
+/// How far a straight lane segment runs past the top and bottom of its row, px,
+/// so no hairline seam shows between rows at fractional scale factors.
+pub const LANE_OVERDRAW: f32 = 1.;

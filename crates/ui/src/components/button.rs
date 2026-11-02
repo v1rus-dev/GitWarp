@@ -1,5 +1,7 @@
 //! The button, in its five variants and three sizes.
 
+use std::rc::Rc;
+
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, point, px, transparent_black, App, BoxShadow, ClickEvent, Div, ElementId, FocusHandle,
@@ -7,11 +9,12 @@ use gpui::{
 };
 use gpui::{InteractiveElement, StatefulInteractiveElement};
 
+use crate::actions::Confirm;
 use crate::components::counter::Counter;
 use crate::components::Tooltip;
 use crate::focus::{self, RingOffset};
 use crate::icon::{Icon, IconName};
-use crate::metrics::{CTL, CTL_SM, FONT_UI, FS_BASE, FS_SM, R_SM};
+use crate::metrics::{CTL, CTL_SM, FONT_MONO, FONT_UI, FS_BASE, FS_SM, R_SM};
 use crate::theme::ActiveTheme;
 
 /// Visual variants of [`Button`].
@@ -46,6 +49,7 @@ pub struct Button {
     size: ButtonSize,
     selected: bool,
     disabled: bool,
+    mono: bool,
     min_width: Option<Pixels>,
     counter: Option<Counter>,
     tooltip: Option<(SharedString, Option<SharedString>)>,
@@ -64,6 +68,7 @@ impl Button {
             size: ButtonSize::Default,
             selected: false,
             disabled: false,
+            mono: false,
             min_width: None,
             counter: None,
             tooltip: None,
@@ -123,6 +128,12 @@ impl Button {
 
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Sets the label in the monospace font (ref and path chips).
+    pub fn mono(mut self, mono: bool) -> Self {
+        self.mono = mono;
         self
     }
 
@@ -269,7 +280,7 @@ impl RenderOnce for Button {
             .h(tool_height)
             .text_size(font_size)
             .line_height(font_size)
-            .font_family(FONT_UI)
+            .font_family(if self.mono { FONT_MONO } else { FONT_UI })
             .font_weight(weight)
             .rounded(R_SM)
             .border_1()
@@ -330,7 +341,16 @@ impl RenderOnce for Button {
             }
 
             if let Some(listener) = self.on_click {
-                root = root.on_click(move |event, window, cx| listener(event, window, cx));
+                let listener: crate::components::SharedClickHandler = Rc::from(listener);
+                let on_enter = listener.clone();
+                root = root
+                    .on_click(move |event, window, cx| listener(event, window, cx))
+                    // Enter on the focused button activates it (see `focus::activate_on_enter`).
+                    .on_action(move |_: &Confirm, window, cx| {
+                        focus::activate_on_enter(window, cx, |window, cx| {
+                            on_enter(&ClickEvent::default(), window, cx)
+                        });
+                    });
             }
             root = root.track_focus(&focus);
         }

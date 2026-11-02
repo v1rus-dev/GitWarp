@@ -6,7 +6,7 @@ use gpui::{
 };
 
 use crate::icon::{Icon, IconName};
-use crate::metrics::{FS_BASE, FS_SM, R_MD};
+use crate::metrics::{FONT_MONO, FS_BASE, FS_SM, R_MD};
 use crate::theme::{ActiveTheme, ThemeColors};
 
 /// What a banner communicates.
@@ -25,6 +25,8 @@ pub struct Banner {
     title: SharedString,
     body: Option<SharedString>,
     list: Vec<SharedString>,
+    plain_list: bool,
+    mono_body: bool,
 }
 
 impl Banner {
@@ -34,11 +36,25 @@ impl Banner {
             title: title.into(),
             body: None,
             list: Vec::new(),
+            plain_list: false,
+            mono_body: false,
         }
     }
 
     pub fn body(mut self, body: impl Into<SharedString>) -> Self {
         self.body = Some(body.into());
+        self
+    }
+
+    /// Draws the body in the mono font (raw git output).
+    pub fn mono_body(mut self) -> Self {
+        self.mono_body = true;
+        self
+    }
+
+    /// Draws the list as plain mono rows: no bullets, no indent (file names).
+    pub fn plain_list(mut self) -> Self {
+        self.plain_list = true;
         self
     }
 
@@ -94,22 +110,30 @@ impl RenderOnce for Banner {
                             .child(self.title),
                     )
                     .when_some(self.body, |this, body| {
-                        this.child(div().text_color(colors.muted).child(body))
+                        this.child(
+                            div()
+                                .when(self.mono_body, |this| this.font_family(FONT_MONO))
+                                .text_color(colors.muted)
+                                .child(body),
+                        )
                     })
                     .when(!self.list.is_empty(), |this| {
                         this.child(
                             div()
-                                .pl(px(18.))
+                                .when(!self.plain_list, |this| this.pl(px(18.)))
+                                .when(self.plain_list, |this| this.font_family(FONT_MONO))
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.))
                                 .text_size(FS_SM)
                                 .text_color(colors.muted)
-                                .children(
-                                    self.list
-                                        .into_iter()
-                                        .map(|item| div().child(format!("• {item}"))),
-                                ),
+                                .children(self.list.into_iter().map(|item| {
+                                    if self.plain_list {
+                                        div().child(item)
+                                    } else {
+                                        div().child(format!("• {item}"))
+                                    }
+                                })),
                         )
                     }),
             )

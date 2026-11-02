@@ -1,4 +1,4 @@
-//! The Settings surface: seven pages in the design's order, with a persistent
+//! The Settings surface: eight pages in the design's order, with a persistent
 //! left navigation and an automatically saved settings file.
 //!
 //! The page is a centred window drawn over the workspace, not a replacement for
@@ -15,8 +15,9 @@ mod form;
 mod general;
 mod git;
 mod identity;
-mod keybindings;
+pub(crate) mod keybindings;
 mod ssh;
+mod worktrees;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,7 +25,7 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, AnyElement, App, AppContext, ClickEvent, Context, Div, Entity, FocusHandle,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    InteractiveElement, IntoElement, ParentElement, Render, RenderOnce, SharedString,
     StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window,
 };
 
@@ -34,7 +35,7 @@ use ui::theme::{ActiveTheme, Density as UiDensity, ThemeStyle};
 use ui::{Button, Icon, IconName};
 
 use crate::settings::{Density, Settings};
-use crate::workspace::{git_label, git_tooltip, titlebar, titlebar_end, titlebar_fill, Workspace};
+use crate::workspace::{git_label, git_tooltip, titlebar, Workspace};
 
 /// One page of the Settings surface, in navigation order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -43,6 +44,7 @@ pub enum Page {
     General,
     Appearance,
     Git,
+    Worktrees,
     Ssh,
     Keybindings,
     Diff,
@@ -50,25 +52,27 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 7] = [
+    pub const ALL: [Page; 8] = [
         Page::General,
         Page::Appearance,
         Page::Git,
+        Page::Worktrees,
         Page::Ssh,
         Page::Keybindings,
         Page::Diff,
         Page::Identity,
     ];
 
-    fn title(self) -> &'static str {
+    fn title(self) -> SharedString {
         match self {
-            Page::General => "General",
-            Page::Appearance => "Appearance",
-            Page::Git => "Git",
-            Page::Ssh => "SSH keys",
-            Page::Keybindings => "Keybindings",
-            Page::Diff => "Diff & merge",
-            Page::Identity => "Identity",
+            Page::General => ui::t!("settings.page.general"),
+            Page::Appearance => ui::t!("settings.page.appearance"),
+            Page::Git => "Git".into(),
+            Page::Worktrees => ui::t!("settings.page.worktrees"),
+            Page::Ssh => ui::t!("settings.page.ssh"),
+            Page::Keybindings => ui::t!("settings.page.keybindings"),
+            Page::Diff => ui::t!("settings.diff.title"),
+            Page::Identity => ui::t!("settings.page.identity"),
         }
     }
 
@@ -77,6 +81,7 @@ impl Page {
             Page::General => IconName::Gear,
             Page::Appearance => IconName::Eye,
             Page::Git => IconName::Git,
+            Page::Worktrees => IconName::Worktree,
             Page::Ssh => IconName::Key,
             Page::Keybindings => IconName::Keyboard,
             Page::Diff => IconName::Split,
@@ -152,8 +157,8 @@ pub struct SettingsView {
     /// Diff & merge: the editable merge command.
     pub(crate) merge_command: Entity<ui::TextInput>,
     pub(crate) _merge_command_events: Subscription,
-    /// Merge tool test feedback.
-    pub(crate) merge_test: Option<SharedString>,
+    /// Merge tool test feedback: the started tool or the I/O error.
+    pub(crate) merge_test: Option<Result<SharedString, SharedString>>,
 }
 
 impl SettingsView {
@@ -161,6 +166,7 @@ impl SettingsView {
         root: Option<PathBuf>,
         git: Result<Arc<Git>, Arc<Error>>,
         workspace: WeakEntity<Workspace>,
+        page: Page,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -168,13 +174,13 @@ impl SettingsView {
         let custom_git = cx.new(|cx| {
             let mut input = ui::TextInput::new(window, cx);
             input.set_text(settings.git_path.clone(), cx);
-            input.set_placeholder("/path/to/git", cx);
+            input.set_placeholder(ui::t!("settings.placeholder.git_path"), cx);
             input.set_font_family(ui::metrics::FONT_MONO, cx);
             input
         });
         let kb_query = cx.new(|cx| {
             let mut input = ui::TextInput::new(window, cx);
-            input.set_placeholder("Search actions or shortcuts", cx);
+            input.set_placeholder(ui::t!("settings.placeholder.search_actions"), cx);
             input
         });
         let merge_command = cx.new(|cx| {
@@ -186,12 +192,12 @@ impl SettingsView {
         });
         let name_input = cx.new(|cx| {
             let mut input = ui::TextInput::new(window, cx);
-            input.set_placeholder("Your name", cx);
+            input.set_placeholder(ui::t!("settings.placeholder.name"), cx);
             input
         });
         let email_input = cx.new(|cx| {
             let mut input = ui::TextInput::new(window, cx);
-            input.set_placeholder("you@example.com", cx);
+            input.set_placeholder(ui::t!("settings.placeholder.email"), cx);
             input
         });
 
@@ -227,7 +233,7 @@ impl SettingsView {
             root,
             git,
             workspace,
-            page: Page::General,
+            page,
             focus: cx.focus_handle().tab_stop(false),
             home: crate::format::home_dir(),
             language_changed: false,
@@ -267,6 +273,11 @@ impl SettingsView {
             merge_test: None,
         };
         view.start_git_detection(window, cx);
+        match page {
+            Page::Ssh => view.reload_ssh(cx),
+            Page::Identity => view.reload_identity(cx),
+            _ => {}
+        }
         view
     }
 
@@ -285,7 +296,7 @@ impl SettingsView {
         }
     }
 
-    fn set_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         if self.page == page {
             return;
         }
@@ -369,6 +380,7 @@ impl SettingsView {
             Page::General => general::render(self, window, cx),
             Page::Appearance => appearance::render(self, window, cx),
             Page::Git => git::render(self, window, cx),
+            Page::Worktrees => worktrees::render(self, window, cx),
             Page::Ssh => ssh::render(self, window, cx),
             Page::Keybindings => keybindings::render(self, window, cx),
             Page::Diff => diff::render(self, window, cx),
@@ -378,6 +390,7 @@ impl SettingsView {
 
     fn render_status(&self, cx: &Context<Self>) -> Div {
         let colors = cx.theme().colors;
+        let workspace = self.workspace.clone();
         div()
             .h(STATUS)
             .px(px(10.))
@@ -389,7 +402,7 @@ impl SettingsView {
             .border_color(colors.border)
             .text_size(FS_SM)
             .text_color(colors.muted)
-            .child("Changes are saved automatically")
+            .child(ui::t!("settings.status.autosave"))
             .child(div().flex_1())
             .child(
                 div()
@@ -397,7 +410,14 @@ impl SettingsView {
                     .flex()
                     .items_center()
                     .gap(px(4.))
+                    .cursor_pointer()
+                    .hover(|this| this.bg(colors.hover))
                     .tooltip(ui::Tooltip::text(git_tooltip(&self.git)))
+                    .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        let _ = workspace.update(cx, |workspace, cx| {
+                            workspace.open_settings_at(Page::Git, window, cx)
+                        });
+                    })
                     .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
                     .child(git_label(&self.git)),
             )
@@ -406,10 +426,6 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let client = matches!(
-            window.window_decorations(),
-            gpui::Decorations::Client { .. }
-        );
         let colors = cx.theme().colors;
         let close = {
             let view = cx.entity();
@@ -417,7 +433,9 @@ impl Render for SettingsView {
                 view.update(cx, |view, cx| view.close(window, cx));
             }
         };
-        let mut bar = titlebar(cx)
+        // Settings is a modal card inside the window, so its header has no
+        // window buttons and its empty stretch does not move the window.
+        let bar = titlebar(cx)
             .child(
                 div()
                     .flex()
@@ -426,16 +444,15 @@ impl Render for SettingsView {
                     .pl(px(4.))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(Icon::new(IconName::Gear).size(px(14.)).color(colors.muted))
-                    .child("Settings"),
+                    .child(ui::t!("settings.title")),
             )
-            .child(titlebar_fill())
+            .child(div().flex_1())
             .child(
                 Button::ghost("settings-close")
                     .icon_only(IconName::X)
-                    .tooltip("Close settings (Esc)")
+                    .tooltip(ui::t!("settings.close_tooltip"))
                     .on_click(close),
             );
-        bar = titlebar_end(bar, client);
 
         let nav = self.render_nav(cx);
         let page = self.render_page(window, cx);
@@ -524,39 +541,67 @@ impl SettingsView {
 }
 
 /// Shared heading for every page.
-pub(crate) fn heading(title: &'static str, lead: impl Into<SharedString>) -> Div {
+pub(crate) fn heading(title: impl Into<SharedString>, lead: impl Into<SharedString>) -> Div {
     div()
         .flex()
         .flex_col()
         .gap(px(4.))
         .mb(px(16.))
-        .child(div().text_size(FS_XL).child(title))
+        .child(div().text_size(FS_XL).child(title.into()))
         .child(div().max_w(px(760.)).text_size(FS_BASE).child(lead.into()))
 }
 
 /// One section: an uppercase label and the bordered list around it.
-pub(crate) fn group(title: &'static str, rows: Vec<AnyElement>) -> Div {
-    let mut list = div()
-        .flex()
-        .flex_col()
-        .border_1()
-        .rounded(R_MD)
-        .overflow_hidden();
-    for row in rows {
-        list = list.child(row);
+pub(crate) fn group(title: impl Into<SharedString>, rows: Vec<AnyElement>) -> Group {
+    Group {
+        title: title.into(),
+        rows,
     }
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.))
-        .mb(px(20.))
-        .w_full()
-        .max_w(px(760.))
-        .child(
-            div()
-                .text_size(ui::metrics::FS_XS)
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(title.to_uppercase()),
-        )
-        .child(list)
+}
+
+/// A titled section card (design `.slist`): surface fill, 1px border, and a
+/// divider under every row but the last (`.srow:last-child { border: 0 }`).
+/// It is a component because the colours come from the theme at render time.
+#[derive(IntoElement)]
+pub(crate) struct Group {
+    title: SharedString,
+    rows: Vec<AnyElement>,
+}
+
+impl RenderOnce for Group {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let last = self.rows.len().saturating_sub(1);
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.surface)
+            .rounded(R_MD)
+            .overflow_hidden();
+        for (index, row) in self.rows.into_iter().enumerate() {
+            list = list.child(
+                div()
+                    .when(index != last, |this| {
+                        this.border_b_1().border_color(colors.border)
+                    })
+                    .child(row),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .mb(px(20.))
+            .w_full()
+            .max_w(px(760.))
+            .child(
+                div()
+                    .text_size(ui::metrics::FS_XS)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(self.title.to_uppercase()),
+            )
+            .child(list)
+    }
 }

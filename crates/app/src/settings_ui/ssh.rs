@@ -62,7 +62,7 @@ impl SettingsView {
         if key.public_key.is_empty() {
             ui::toast::show(
                 ToastKind::Warn,
-                "This key has no public half to copy",
+                ui::t!("settings.ssh.no_public"),
                 window,
                 cx,
             );
@@ -71,7 +71,7 @@ impl SettingsView {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(key.public_key.clone()));
         ui::toast::show(
             ToastKind::Ok,
-            format!("Public key of {} copied", key.name),
+            ui::t!("settings.ssh.copied", name = key.name),
             window,
             cx,
         );
@@ -179,8 +179,8 @@ pub(super) fn render(
     let colors = cx.theme().colors;
     let mut page = div().flex().flex_col();
     page = page.child(heading(
-        "SSH keys",
-        "Keys GitWarp can use to clone, fetch and push over SSH. Private keys stay in ~/.ssh; only fingerprints and public keys are shown here.",
+        ui::t!("settings.page.ssh"),
+        ui::t!("settings.ssh.subtitle"),
     ));
 
     let generate = {
@@ -209,13 +209,13 @@ pub(super) fn render(
             .gap(px(8.))
             .child(
                 Button::primary("settings-ssh-generate")
-                    .label("Generate key…")
+                    .label(ui::t!("settings.ssh.generate"))
                     .icon(IconName::Plus)
                     .on_click(generate),
             )
             .child(
                 Button::new("settings-ssh-import")
-                    .label("Import…")
+                    .label(ui::t!("settings.ssh.import"))
                     .icon(IconName::Folder)
                     .on_click(import),
             )
@@ -223,7 +223,7 @@ pub(super) fn render(
             .child(
                 Button::new("settings-ssh-refresh")
                     .icon(IconName::Fetch)
-                    .label("Refresh")
+                    .label(ui::t!("settings.ssh.refresh"))
                     .disabled(view.ssh_loading)
                     .on_click({
                         let entity = cx.entity();
@@ -238,22 +238,24 @@ pub(super) fn render(
     match view.ssh_agent {
         Some(true) => {
             page = page.child(div().max_w(px(760.)).mb(px(12.)).child(
-                Banner::new(BannerKind::Info, "ssh-agent is running").body(format!(
-                    "{loaded} of {} keys loaded. Loaded keys are offered to hosts automatically.",
-                    view.ssh_keys.len()
+                Banner::new(BannerKind::Info, ui::t!("settings.ssh.agent_running")).body(ui::t!(
+                    "settings.ssh.agent_loaded",
+                    loaded = loaded,
+                    total = view.ssh_keys.len()
                 )),
             ));
         }
         Some(false) => {
-            page = page.child(div().max_w(px(760.)).mb(px(12.)).child(
-                Banner::new(BannerKind::Error, "ssh-agent is not running").body(
-                    "Keys protected by a passphrase cannot be used until it starts. Start it with eval \"$(ssh-agent -s)\" or enable the ssh-agent user service, then retry.",
+            page = page.child(
+                div().max_w(px(760.)).mb(px(12.)).child(
+                    Banner::new(BannerKind::Error, ui::t!("settings.ssh.agent_stopped"))
+                        .body(ui::t!("settings.ssh.agent_stopped_body")),
                 ),
-            ));
+            );
             page = page.child(
                 div().max_w(px(760.)).mb(px(12.)).child(
                     Button::new("settings-ssh-agent-retry")
-                        .label("Check again")
+                        .label(ui::t!("settings.ssh.check_again"))
                         .icon(IconName::Fetch)
                         .on_click({
                             let entity = cx.entity();
@@ -267,10 +269,9 @@ pub(super) fn render(
         None => {}
     }
     if let Some(error) = &view.ssh_error {
-        page =
-            page.child(div().max_w(px(760.)).mb(px(12.)).child(
-                Banner::new(BannerKind::Error, "Could not read ~/.ssh").body(error.clone()),
-            ));
+        page = page.child(div().max_w(px(760.)).mb(px(12.)).child(
+            Banner::new(BannerKind::Error, ui::t!("settings.ssh.read_failed")).body(error.clone()),
+        ));
     }
 
     let mut keys = div()
@@ -294,14 +295,14 @@ pub(super) fn render(
                 .child(
                     div()
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child("No SSH keys yet"),
+                        .child(ui::t!("settings.ssh.empty_title")),
                 )
                 .child(
                     div()
                         .max_w(px(420.))
                         .text_size(FS_SM)
                         .text_color(colors.muted)
-                        .child("Create a key and add its public half to GitHub, GitLab or your own server to clone private repositories without typing a password."),
+                        .child(ui::t!("settings.ssh.empty_body")),
                 )
                 .child(
                     div()
@@ -310,20 +311,24 @@ pub(super) fn render(
                         .gap(px(8.))
                         .child(
                             Button::primary("settings-ssh-empty-generate")
-                                .label("Generate key…")
+                                .label(ui::t!("settings.ssh.generate"))
                                 .icon(IconName::Plus)
                                 .on_click({
                                     let entity = cx.entity();
                                     move |_, window, cx: &mut App| {
                                         entity.update(cx, |view, cx| {
-                                            view.open_ssh_dialog(SshDialogKind::Generate, window, cx)
+                                            view.open_ssh_dialog(
+                                                SshDialogKind::Generate,
+                                                window,
+                                                cx,
+                                            )
                                         });
                                     }
                                 }),
                         )
                         .child(
                             Button::new("settings-ssh-empty-import")
-                                .label("Import existing key…")
+                                .label(ui::t!("settings.ssh.import_existing"))
                                 .icon(IconName::Folder)
                                 .on_click({
                                     let entity = cx.entity();
@@ -342,7 +347,7 @@ pub(super) fn render(
             keys = keys.child(card);
         }
     }
-    page = page.child(section("YOUR KEYS", keys));
+    page = page.child(section(ui::t!("settings.ssh.keys_heading"), keys));
 
     let mut hosts = div()
         .w_full()
@@ -364,18 +369,21 @@ pub(super) fn render(
                 .child(
                     div()
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child("No trusted hosts"),
+                        .child(ui::t!("settings.ssh.no_hosts")),
                 )
-                .child(div().text_size(FS_SM).text_color(colors.muted).child(
-                    "Hosts appear here after you confirm their fingerprint on first connection.",
-                )),
+                .child(
+                    div()
+                        .text_size(FS_SM)
+                        .text_color(colors.muted)
+                        .child(ui::t!("settings.ssh.no_hosts_body")),
+                ),
         );
     } else {
         for (index, host) in view.ssh_hosts.iter().enumerate() {
             hosts = hosts.child(host_row(view, index, host, cx));
         }
     }
-    page = page.child(section("TRUSTED HOSTS", hosts));
+    page = page.child(section(ui::t!("settings.ssh.hosts_heading"), hosts));
     page = page.child(
         div()
             .max_w(px(760.))
@@ -385,12 +393,12 @@ pub(super) fn render(
             .text_size(FS_SM)
             .text_color(colors.muted)
             .child(Icon::new(IconName::Info).size(px(12.)).color(colors.muted))
-            .child("Stored in ~/.ssh/known_hosts."),
+            .child(ui::t!("settings.ssh.known_hosts")),
     );
     page.into_any_element()
 }
 
-fn section(label: &'static str, body: impl IntoElement) -> AnyElement {
+fn section(label: gpui::SharedString, body: impl IntoElement) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -463,21 +471,21 @@ fn key_card(view: &SettingsView, key: &SshKey, cx: &Context<SettingsView>) -> An
     chips = chips.child(Chip::new("ssh-type", key.kind.clone()).icon(IconName::Key));
     if key.agent {
         chips = chips.child(
-            Chip::new("ssh-agent", "in ssh-agent")
+            Chip::new("ssh-agent", ui::t!("settings.ssh.chip_agent"))
                 .kind(ChipKind::Ok)
                 .icon(IconName::Check),
         );
     }
     chips = chips.child(if key.encrypted {
-        Chip::new("ssh-pass", "passphrase").icon(IconName::Lock)
+        Chip::new("ssh-pass", ui::t!("settings.ssh.chip_passphrase")).icon(IconName::Lock)
     } else {
-        Chip::new("ssh-nopass", "no passphrase")
+        Chip::new("ssh-nopass", ui::t!("settings.ssh.chip_no_passphrase"))
             .kind(ChipKind::Warn)
             .icon(IconName::Warn)
     });
     if key.kind == "rsa-2048" {
         chips = chips.child(
-            Chip::new("ssh-weak", "weak: RSA 2048")
+            Chip::new("ssh-weak", ui::t!("settings.ssh.chip_weak"))
                 .kind(ChipKind::Warn)
                 .icon(IconName::Warn),
         );
@@ -491,14 +499,14 @@ fn key_card(view: &SettingsView, key: &SshKey, cx: &Context<SettingsView>) -> An
             Button::new(format!("ssh-copy-{}", key.name))
                 .size(ButtonSize::Small)
                 .icon(IconName::Copy)
-                .label("Copy public key")
+                .label(ui::t!("settings.ssh.copy_public"))
                 .on_click(copy),
         )
         .child(
             Button::new(format!("ssh-test-{}", key.name))
                 .size(ButtonSize::Small)
                 .icon(IconName::Fetch)
-                .label("Test connection")
+                .label(ui::t!("settings.ssh.test_connection"))
                 .disabled(test_host.is_none() || matches!(test, Some(TestState::Running(_))))
                 .on_click(test_button),
         )
@@ -506,9 +514,9 @@ fn key_card(view: &SettingsView, key: &SshKey, cx: &Context<SettingsView>) -> An
             Button::new(format!("ssh-agent-{}", key.name))
                 .size(ButtonSize::Small)
                 .label(if key.agent {
-                    "Remove from agent"
+                    ui::t!("settings.ssh.agent_remove")
                 } else {
-                    "Add to agent"
+                    ui::t!("settings.ssh.agent_add")
                 })
                 .disabled(view.ssh_agent != Some(true))
                 .on_click(agent),
@@ -517,7 +525,7 @@ fn key_card(view: &SettingsView, key: &SshKey, cx: &Context<SettingsView>) -> An
             Button::danger(format!("ssh-delete-{}", key.name))
                 .size(ButtonSize::Small)
                 .icon(IconName::Trash)
-                .label("Delete…")
+                .label(ui::t!("settings.ssh.delete"))
                 .on_click(delete),
         );
 
@@ -527,7 +535,6 @@ fn key_card(view: &SettingsView, key: &SshKey, cx: &Context<SettingsView>) -> An
         .flex()
         .items_start()
         .gap(px(12.))
-        .border_b_1()
         .child(
             div()
                 .w(px(28.))
@@ -566,7 +573,7 @@ fn key_card(view: &SettingsView, key: &SshKey, cx: &Context<SettingsView>) -> An
                         .text_color(colors.muted)
                         .truncate()
                         .child(if key.fingerprint.is_empty() {
-                            "fingerprint unavailable (key needs its passphrase)".to_owned()
+                            ui::t!("settings.ssh.fingerprint_unavailable").to_string()
                         } else {
                             key.fingerprint.clone()
                         }),
@@ -575,19 +582,22 @@ fn key_card(view: &SettingsView, key: &SshKey, cx: &Context<SettingsView>) -> An
                     div()
                         .text_size(FS_SM)
                         .text_color(colors.muted)
-                        .child(format!(
-                            "{} · {}",
-                            if created.is_empty() {
-                                "Created date unknown".to_owned()
+                        .child(ui::t!(
+                            "settings.ssh.created_tested",
+                            created = if created.is_empty() {
+                                ui::t!("settings.ssh.created_unknown").to_string()
                             } else {
-                                format!("Created {created}")
+                                ui::t!("settings.ssh.created", date = created).to_string()
                             },
-                            match test {
+                            tested = match test {
                                 Some(_) => test_host
                                     .as_ref()
-                                    .map(|host| format!("tested against {host}"))
-                                    .unwrap_or_else(|| "not tested against any host".to_owned()),
-                                None => "not tested against any host".to_owned(),
+                                    .map(|host| ui::t!("settings.ssh.tested_against", host = host)
+                                        .to_string())
+                                    .unwrap_or_else(
+                                        || ui::t!("settings.ssh.not_tested").to_string()
+                                    ),
+                                None => ui::t!("settings.ssh.not_tested").to_string(),
                             }
                         )),
                 )
@@ -602,7 +612,7 @@ fn test_line(test: &TestState, colors: ui::ThemeColors) -> AnyElement {
         TestState::Running(host) => div()
             .text_size(FS_SM)
             .text_color(colors.muted)
-            .child(format!("Connecting to {host}…"))
+            .child(ui::t!("settings.ssh.connecting", host = host))
             .into_any_element(),
         TestState::Ok(host, message) => div()
             .flex()
@@ -615,7 +625,11 @@ fn test_line(test: &TestState, colors: ui::ThemeColors) -> AnyElement {
                     .size(px(12.))
                     .color(colors.success),
             )
-            .child(format!("{host} — {message}"))
+            .child(ui::t!(
+                "settings.ssh.test_result",
+                host = host,
+                message = message
+            ))
             .into_any_element(),
         TestState::Failed(host, message) => div()
             .flex()
@@ -624,7 +638,11 @@ fn test_line(test: &TestState, colors: ui::ThemeColors) -> AnyElement {
             .text_size(FS_SM)
             .text_color(colors.error)
             .child(Icon::new(IconName::Err).size(px(12.)).color(colors.error))
-            .child(format!("{host} — {message}"))
+            .child(ui::t!(
+                "settings.ssh.test_result",
+                host = host,
+                message = message
+            ))
             .into_any_element(),
     }
 }
@@ -650,7 +668,6 @@ fn host_row(
         .flex()
         .items_center()
         .gap(px(12.))
-        .border_b_1()
         .child(
             div()
                 .flex_1()
@@ -684,7 +701,7 @@ fn host_row(
             Button::ghost(format!("settings-ssh-forget-{index}"))
                 .icon_only(IconName::Trash)
                 .size(ButtonSize::Small)
-                .tooltip(format!("Forget {}", host.host))
+                .tooltip(ui::t!("settings.ssh.forget", host = host.host))
                 .on_click(forget),
         )
         .into_any_element()
@@ -743,19 +760,19 @@ pub(super) fn open_dialog(
         });
         let comment = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder("you@example.com", cx);
+            input.set_placeholder(ui::t!("settings.placeholder.email"), cx);
             input.set_text(std::env::var("GIT_AUTHOR_EMAIL").unwrap_or_default(), cx);
             input
         });
         let passphrase = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder("Passphrase", cx);
+            input.set_placeholder(ui::t!("settings.ssh.dialog.passphrase"), cx);
             input.set_masked(true, cx);
             input
         });
         let repeat = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder("Repeat passphrase", cx);
+            input.set_placeholder(ui::t!("settings.ssh.dialog.repeat"), cx);
             input.set_masked(true, cx);
             input
         });
@@ -830,14 +847,14 @@ impl SshDialog {
             || name.contains('\\')
             || name.contains(' ')
         {
-            self.error = Some("Choose a file name without spaces or slashes.".into());
+            self.error = Some(ui::t!("settings.ssh.dialog.bad_name"));
             cx.notify();
             return;
         }
         let pass = self.passphrase.read(cx).text().to_owned();
         let repeat = self.repeat.read(cx).text().to_owned();
         if self.use_passphrase && (pass.len() < 5 || pass != repeat) {
-            self.error = Some("The passphrases must match and be at least 5 characters.".into());
+            self.error = Some(ui::t!("settings.ssh.dialog.bad_passphrase"));
             cx.notify();
             return;
         }
@@ -879,7 +896,7 @@ impl SshDialog {
     fn import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.path.read(cx).text().trim().to_owned();
         if text.is_empty() {
-            self.error = Some("Choose a private key file.".into());
+            self.error = Some(ui::t!("settings.ssh.dialog.no_file"));
             cx.notify();
             return;
         }
@@ -938,12 +955,12 @@ fn build(state: &Entity<SshDialog>, cx: &App) -> Dialog {
     let colors = cx.theme().colors;
     let dialog = state.read(cx);
     let (title, icon) = match &dialog.kind {
-        SshDialogKind::Generate => ("Generate SSH key", IconName::Key),
-        SshDialogKind::Import => ("Import SSH key", IconName::Key),
-        SshDialogKind::Delete(_) => ("Delete SSH key", IconName::Trash),
+        SshDialogKind::Generate => (ui::t!("settings.ssh.dialog.generate_title"), IconName::Key),
+        SshDialogKind::Import => (ui::t!("settings.ssh.dialog.import_title"), IconName::Key),
+        SshDialogKind::Delete(_) => (ui::t!("settings.ssh.dialog.delete_title"), IconName::Trash),
     };
     if let Some(key) = &dialog.result {
-        return result_dialog(state, key, title.into(), icon, cx);
+        return result_dialog(state, key, title, icon, cx);
     }
     let cancel = {
         let state = state.clone();
@@ -960,14 +977,14 @@ fn build(state: &Entity<SshDialog>, cx: &App) -> Dialog {
                 .gap(px(8.))
                 .child(
                     Button::new("ssh-dialog-cancel")
-                        .label("Cancel")
+                        .label(ui::t!("settings.ssh.dialog.cancel"))
                         .focus_handle(dialog.cancel_focus.clone())
                         .on_click(cancel),
                 )
                 .child({
                     let state = state.clone();
                     Button::primary("ssh-dialog-generate")
-                        .label("Generate key")
+                        .label(ui::t!("settings.ssh.dialog.generate"))
                         .disabled(dialog.busy)
                         .focus_handle(dialog.primary_focus.clone())
                         .on_click(move |_, window, cx| {
@@ -980,14 +997,14 @@ fn build(state: &Entity<SshDialog>, cx: &App) -> Dialog {
                 .gap(px(8.))
                 .child(
                     Button::new("ssh-dialog-cancel")
-                        .label("Cancel")
+                        .label(ui::t!("settings.ssh.dialog.cancel"))
                         .focus_handle(dialog.cancel_focus.clone())
                         .on_click(cancel),
                 )
                 .child({
                     let state = state.clone();
                     Button::primary("ssh-dialog-import")
-                        .label("Import key")
+                        .label(ui::t!("settings.ssh.dialog.import"))
                         .disabled(dialog.busy)
                         .focus_handle(dialog.primary_focus.clone())
                         .on_click(move |_, window, cx| {
@@ -1002,14 +1019,14 @@ fn build(state: &Entity<SshDialog>, cx: &App) -> Dialog {
                     .gap(px(8.))
                     .child(
                         Button::new("ssh-dialog-cancel")
-                            .label("Cancel")
+                            .label(ui::t!("settings.ssh.dialog.cancel"))
                             .focus_handle(dialog.cancel_focus.clone())
                             .on_click(cancel),
                     )
                     .child({
                         let state = state.clone();
                         Button::danger("ssh-dialog-delete")
-                            .label("Delete key")
+                            .label(ui::t!("settings.ssh.dialog.delete"))
                             .disabled(!dialog.ack_delete || dialog.busy)
                             .focus_handle(dialog.primary_focus.clone())
                             .on_click(move |_, window, cx| {
@@ -1074,7 +1091,12 @@ fn result_dialog(
         let public = key.public_key.clone();
         move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(public.clone()));
-            ui::toast::show(ToastKind::Ok, "Public key copied to clipboard", window, cx);
+            ui::toast::show(
+                ToastKind::Ok,
+                ui::t!("settings.ssh.dialog.copied"),
+                window,
+                cx,
+            );
             state.update(cx, |dialog, cx| dialog.close(window, cx));
         }
     };
@@ -1083,16 +1105,19 @@ fn result_dialog(
         .flex_col()
         .gap(px(10.))
         .child(
-            Banner::new(BannerKind::Ok, "Add the public key to your Git host").body(
-                "Paste it in GitHub → Settings → SSH and GPG keys, or the same page on your host. The private key never leaves this machine.",
-            ),
+            Banner::new(BannerKind::Ok, ui::t!("settings.ssh.dialog.added_title"))
+                .body(ui::t!("settings.ssh.dialog.added_body")),
         )
         .child(
             div()
                 .flex()
                 .flex_col()
                 .gap(px(4.))
-                .child(div().text_size(FS_SM).child("Public key"))
+                .child(
+                    div()
+                        .text_size(FS_SM)
+                        .child(ui::t!("settings.ssh.dialog.public_key")),
+                )
                 .child(
                     div()
                         .p(px(8.))
@@ -1109,14 +1134,17 @@ fn result_dialog(
             div()
                 .text_size(FS_SM)
                 .text_color(colors.muted)
-                .child(format!("Fingerprint: {}", key.fingerprint)),
+                .child(ui::t!(
+                    "settings.ssh.dialog.fingerprint_line",
+                    fingerprint = key.fingerprint
+                )),
         )
         .when(!key.agent && key.encrypted, |this| {
             this.child(
                 div()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child("The key was not added to ssh-agent: it needs its passphrase first."),
+                    .child(ui::t!("settings.ssh.dialog.not_in_agent")),
             )
         });
     Dialog::new(title)
@@ -1131,12 +1159,12 @@ fn result_dialog(
                 .child(
                     Button::new("ssh-result-copy")
                         .icon(IconName::Copy)
-                        .label("Copy public key")
+                        .label(ui::t!("settings.ssh.copy_public"))
                         .on_click(copy),
                 )
                 .child(
                     Button::primary("ssh-result-done")
-                        .label("Done")
+                        .label(ui::t!("settings.ssh.dialog.done"))
                         .focus_handle(dialog.primary_focus.clone())
                         .on_click(close),
                 ),
@@ -1154,7 +1182,11 @@ fn generate_body(state: &Entity<SshDialog>, cx: &App, colors: ui::ThemeColors) -
             .flex()
             .flex_col()
             .gap(px(4.))
-            .child(div().text_size(FS_SM).child("File name"))
+            .child(
+                div()
+                    .text_size(FS_SM)
+                    .child(ui::t!("settings.ssh.dialog.file_name")),
+            )
             .child(
                 div()
                     .flex()
@@ -1172,13 +1204,13 @@ fn generate_body(state: &Entity<SshDialog>, cx: &App, colors: ui::ThemeColors) -
                 div()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child("The public key is saved next to it with a .pub extension."),
+                    .child(ui::t!("settings.ssh.dialog.file_name_help")),
             ),
     );
     let type_select = {
         let state = state.clone();
         Select::new("ssh-key-type")
-            .options(["Ed25519", "RSA 4096", "ECDSA"])
+            .options(["Ed25519", "RSA 4096", "ECDSA"]) // algorithm names, not translated
             .selected(dialog.key_type)
             .on_change(move |index, _, cx| {
                 state.update(cx, |dialog, cx| {
@@ -1192,15 +1224,19 @@ fn generate_body(state: &Entity<SshDialog>, cx: &App, colors: ui::ThemeColors) -
             .flex()
             .flex_col()
             .gap(px(4.))
-            .child(div().text_size(FS_SM).child("Type"))
+            .child(
+                div()
+                    .text_size(FS_SM)
+                    .child(ui::t!("settings.ssh.dialog.type")),
+            )
             .child(type_select)
             .child(div().text_size(FS_SM).text_color(colors.muted).child(
                 if dialog.key_type == 0 {
-                    "Recommended: short, fast, supported by GitHub, GitLab and Bitbucket."
+                    ui::t!("settings.ssh.dialog.type_ed25519")
                 } else if dialog.key_type == 1 {
-                    "Compatible with old servers; slower and larger."
+                    ui::t!("settings.ssh.dialog.type_rsa")
                 } else {
-                    "Supported by most hosts; prefer Ed25519 when you can."
+                    ui::t!("settings.ssh.dialog.type_ecdsa")
                 },
             )),
     );
@@ -1209,19 +1245,23 @@ fn generate_body(state: &Entity<SshDialog>, cx: &App, colors: ui::ThemeColors) -
             .flex()
             .flex_col()
             .gap(px(4.))
-            .child(div().text_size(FS_SM).child("Comment"))
+            .child(
+                div()
+                    .text_size(FS_SM)
+                    .child(ui::t!("settings.ssh.dialog.comment")),
+            )
             .child(dialog.comment.clone())
             .child(
                 div()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child("Helps you recognise the key on the host, usually your email."),
+                    .child(ui::t!("settings.ssh.dialog.comment_help")),
             ),
     );
     let use_pass = {
         let state = state.clone();
         Checkbox::new("ssh-use-pass")
-            .label("Protect the key with a passphrase (recommended)")
+            .label(ui::t!("settings.ssh.dialog.use_passphrase"))
             .checked(dialog.use_passphrase)
             .on_toggle(move |checked, _, cx| {
                 state.update(cx, |dialog, cx| {
@@ -1238,7 +1278,11 @@ fn generate_body(state: &Entity<SshDialog>, cx: &App, colors: ui::ThemeColors) -
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(div().text_size(FS_SM).child("Passphrase"))
+                    .child(
+                        div()
+                            .text_size(FS_SM)
+                            .child(ui::t!("settings.ssh.dialog.passphrase")),
+                    )
                     .child(dialog.passphrase.clone()),
             )
             .child(
@@ -1246,22 +1290,26 @@ fn generate_body(state: &Entity<SshDialog>, cx: &App, colors: ui::ThemeColors) -
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(div().text_size(FS_SM).child("Repeat passphrase"))
+                    .child(
+                        div()
+                            .text_size(FS_SM)
+                            .child(ui::t!("settings.ssh.dialog.repeat")),
+                    )
                     .child(dialog.repeat.clone()),
             );
     } else {
         body = body.child(
             Banner::new(
                 BannerKind::Warn,
-                "Anyone who can read the file can use this key",
+                ui::t!("settings.ssh.dialog.no_pass_title"),
             )
-            .body("Without a passphrase, a stolen backup or laptop gives access to every host this key is registered on."),
+            .body(ui::t!("settings.ssh.dialog.no_pass_body")),
         );
     }
     let add_agent = {
         let state = state.clone();
         Checkbox::new("ssh-add-agent")
-            .label("Add the key to ssh-agent now")
+            .label(ui::t!("settings.ssh.dialog.add_agent"))
             .checked(dialog.add_agent)
             .on_toggle(move |checked, _, cx| {
                 state.update(cx, |dialog, cx| {
@@ -1290,19 +1338,23 @@ fn import_body(state: &Entity<SshDialog>, cx: &App, colors: ui::ThemeColors) -> 
             .flex()
             .flex_col()
             .gap(px(4.))
-            .child(div().text_size(FS_SM).child("Private key file"))
+            .child(
+                div()
+                    .text_size(FS_SM)
+                    .child(ui::t!("settings.ssh.dialog.private_file")),
+            )
             .child(dialog.path.clone())
             .child(
                 div()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child("Choose the private file, for example id_ed25519, not the .pub file."),
+                    .child(ui::t!("settings.ssh.dialog.private_file_help")),
             ),
     );
     let copy = {
         let state = state.clone();
         Checkbox::new("ssh-import-copy")
-            .label("Copy into ~/.ssh (the original stays where it is)")
+            .label(ui::t!("settings.ssh.dialog.copy_into"))
             .checked(dialog.copy_import)
             .on_toggle(move |checked, _, cx| {
                 state.update(cx, |dialog, cx| {
@@ -1341,7 +1393,12 @@ fn delete_body(
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(div().w(px(90.)).text_color(colors.muted).child("Key"))
+                    .child(
+                        div()
+                            .w(px(90.))
+                            .text_color(colors.muted)
+                            .child(ui::t!("settings.ssh.dialog.key")),
+                    )
                     .child(key.name.clone()),
             )
             .child(
@@ -1353,7 +1410,7 @@ fn delete_body(
                         div()
                             .w(px(90.))
                             .text_color(colors.muted)
-                            .child("Fingerprint"),
+                            .child(ui::t!("settings.ssh.dialog.fingerprint")),
                     )
                     .child(
                         div()
@@ -1366,16 +1423,14 @@ fn delete_body(
     body = body.child(
         Banner::new(
             BannerKind::Warn,
-            "The private key file is deleted from ~/.ssh",
+            ui::t!("settings.ssh.dialog.delete_warn_title"),
         )
-        .body(
-            "Hosts that use it will reject you until you add another key. This cannot be undone.",
-        ),
+        .body(ui::t!("settings.ssh.dialog.delete_warn_body")),
     );
     let ack = {
         let state = state.clone();
         Checkbox::new("ssh-delete-ack")
-            .label("I have a backup or no longer need this key")
+            .label(ui::t!("settings.ssh.dialog.ack"))
             .checked(dialog.ack_delete)
             .on_toggle(move |checked, _, cx| {
                 state.update(cx, |dialog, cx| {

@@ -1,113 +1,119 @@
-//! The Worktrees page: the repository's working folders, their checked-out
-//! branches and local changes, with add / remove / lock / prune.
+//! The Worktrees page: quick create, the selected worktree's details and the
+//! actions on it (switch, open in a new window, reveal, lock, remove), over the
+//! shared [`WorktreesModel`].
 //!
-//! The page loads off the UI thread and is opened from the Worktrees section's
-//! context menu, a worktree leaf's double-click, or the repository menu.
+//! The page is opened from the toolbar tab, the Worktrees section's context
+//! menu, a worktree leaf's double-click, or the repository menu.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    WeakEntity, Window,
+    div, px, AnyElement, App, AppContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
+    FontWeight, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Window,
 };
 
-use git_core::{Error, Git, Head, RefKind, Repo, Worktree};
-use ui::metrics::{FONT_MONO, FS_BASE, FS_LG, FS_SM, FS_XS, R_MD};
+use ui::actions::Cancel;
+use ui::metrics::{FONT_MONO, FS_BASE, FS_LG, FS_MD, FS_SM, FS_XS, R_MD};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    toast, Banner, BannerKind, Button, ButtonSize, Chip, ChipKind, Icon, IconName, Spinner,
-    ToastKind,
+    toast, Banner, BannerKind, Button, ButtonSize, Chip, ChipKind, Icon, IconName, Kbd, Skeleton,
+    Spinner, StatusGlyph, TextInput, TextInputEvent, ToastKind,
 };
 
-use crate::format::{display_path, home_dir};
-use crate::workspace::Workspace;
+use crate::format::display_path;
 use crate::worktree_dialog::{
-    self, BranchChoice, Done, RemoveTarget, SelectedCommit, WorktreeDialog, WorktreeDialogContext,
+    self, Done, RemoveTarget, SelectedCommit, WorktreeDialog, WorktreeDialogContext,
 };
+use crate::worktrees_model::{BranchCheck, WorktreeEntry, WorktreesModel, WorktreesModelEvent};
 
-/// One worktree plus the local changes found in its folder.
-#[derive(Clone, Debug)]
-pub struct WorktreeEntry {
-    pub worktree: Worktree,
-    pub changes: Vec<String>,
-    pub missing: bool,
-}
+/// How many changed files the detail pane lists before "+N more".
+const CHANGES_SHOWN: usize = 5;
 
-impl WorktreeEntry {
-    #[cfg(test)]
-    pub fn main(&self) -> bool {
-        self.worktree.main
-    }
-
-    #[cfg(test)]
-    pub fn locked(&self) -> bool {
-        self.worktree.locked.is_some()
-    }
-}
-
-/// Emitted after anything that can change the worktree list or a branch.
+/// Emitted by the page for its owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorktreesEvent {
-    Changed,
+    /// Esc with nothing open and no input focused: back to History.
+    Leave,
 }
 
 pub struct WorktreesView {
-    root: PathBuf,
-    git: Result<Arc<Git>, Arc<Error>>,
-    workspace: WeakEntity<Workspace>,
-    home: Option<PathBuf>,
-    entries: Vec<WorktreeEntry>,
-    branches: Vec<BranchChoice>,
-    current_branch: Option<String>,
-    selected: Option<SelectedCommit>,
-    loaded: bool,
-    loading: bool,
-    generation: u64,
-    error: Option<String>,
+    model: Entity<WorktreesModel>,
+    selected_commit: Option<SelectedCommit>,
     focus: FocusHandle,
+    quick: Entity<TextInput>,
+    /// The quick-create input changed at least once, so errors may show.
+    quick_touched: bool,
     dialog: Option<Entity<WorktreeDialog>>,
-}
-
-struct Loaded {
-    entries: Vec<WorktreeEntry>,
-    branches: Vec<BranchChoice>,
-    current_branch: Option<String>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl WorktreesView {
     pub(crate) fn new(
-        root: PathBuf,
-        git: Result<Arc<Git>, Arc<Error>>,
-        workspace: WeakEntity<Workspace>,
-        _window: &mut Window,
+        model: Entity<WorktreesModel>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut view = Self {
-            root,
-            git,
-            workspace,
-            home: home_dir(),
-            entries: Vec::new(),
-            branches: Vec::new(),
-            current_branch: None,
-            selected: None,
-            loaded: false,
-            loading: false,
-            generation: 0,
-            error: None,
+        let quick = cx.new(|cx| {
+            let mut input = TextInput::new(window, cx);
+            input.set_font_family(FONT_MONO, cx);
+            input.set_placeholder(ui::i18n::t("worktrees.quick.placeholder"), cx);
+            input
+        });
+        let subscriptions = vec![
+            cx.subscribe_in(
+                &quick,
+                window,
+                |this, _, event: &TextInputEvent, window, cx| match event {
+                    TextInputEvent::Changed(_) => {
+                        this.quick_touched = true;
+                        this.sync_input(cx);
+                        cx.notify();
+                    }
+                    TextInputEvent::Submit => this.submit_quick(window, cx),
+                },
+            ),
+            cx.observe(&model, |this, _, cx| {
+                this.sync_input(cx);
+                cx.notify();
+            }),
+            cx.subscribe(&model, |this, _, event: &WorktreesModelEvent, cx| {
+                if *event == WorktreesModelEvent::Created {
+                    // The name was used: start the next one from scratch.
+                    this.quick_touched = false;
+                    this.quick.update(cx, |quick, cx| quick.set_text("", cx));
+                }
+            }),
+        ];
+        Self {
+            model,
+            selected_commit: None,
             focus: cx.focus_handle().tab_stop(false),
+            quick,
+            quick_touched: false,
             dialog: None,
-        };
-        view.refresh(cx);
-        view
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// Whether the add or remove dialog is open (tests).
+    #[cfg(test)]
+    pub(crate) fn has_dialog(&self) -> bool {
+        self.dialog.is_some()
     }
 
     pub(crate) fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()
+    }
+
+    /// Puts the cursor in the quick-create input (the sidebar's "New
+    /// worktree…").
+    pub(crate) fn focus_quick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.quick.read(cx).focus_handle().clone();
+        window.focus(&handle, cx);
+        self.quick.update(cx, |quick, cx| quick.select_all(cx));
     }
 
     /// The selected history commit, offered as a "Start from" option.
@@ -116,103 +122,98 @@ impl WorktreesView {
         selected: Option<SelectedCommit>,
         cx: &mut Context<Self>,
     ) {
-        if self.selected == selected {
+        if self.selected_commit == selected {
             return;
         }
-        self.selected = selected;
+        self.selected_commit = selected;
         cx.notify();
     }
 
-    /// Adopts the repository root the history resolved (it differs when the
-    /// repository was opened from a subdirectory) and reads the worktrees
-    /// again, because the path validation depends on it.
+    /// Adopts the repository root the history resolved.
     pub(crate) fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        if self.root == root {
-            return;
-        }
-        self.root = root;
-        self.refresh(cx);
+        self.model.update(cx, |model, cx| model.set_root(root, cx));
     }
 
-    /// Reads the worktree list, the branches and every worktree's changes off
-    /// the UI thread.
+    /// Reads the worktrees again.
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
-        let git = match &self.git {
-            Ok(git) => git.clone(),
-            Err(error) => {
-                self.loaded = true;
-                self.loading = false;
-                self.error = Some(error.to_string());
-                cx.notify();
-                return;
-            }
-        };
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-        let root = self.root.clone();
-        self.loading = true;
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { load(git, &root) })
-                .await;
-            this.update(cx, |view, cx| view.set_loaded(generation, result, cx))
-                .ok();
-        })
-        .detach();
-        cx.notify();
+        self.model.update(cx, |model, cx| model.reload(cx));
     }
 
-    fn set_loaded(
-        &mut self,
-        generation: u64,
-        result: git_core::Result<Loaded>,
-        cx: &mut Context<Self>,
-    ) {
-        if generation != self.generation {
+    /// Input state follows the model: locked while creating, red on an error.
+    fn sync_input(&mut self, cx: &mut Context<Self>) {
+        let creating = self.model.read(cx).is_creating();
+        let error = self.quick_error(cx);
+        self.quick.update(cx, |quick, cx| {
+            quick.set_disabled(creating, cx);
+            quick.set_error(error, cx);
+        });
+    }
+
+    fn quick_text(&self, cx: &App) -> String {
+        self.quick.read(cx).text().trim().to_owned()
+    }
+
+    fn quick_check(&self, cx: &App) -> BranchCheck {
+        self.model.read(cx).check_branch(&self.quick_text(cx))
+    }
+
+    fn quick_error(&self, cx: &App) -> bool {
+        self.quick_touched
+            && matches!(
+                self.quick_check(cx),
+                BranchCheck::Invalid | BranchCheck::InUse { .. }
+            )
+    }
+
+    /// Enter in the input: Create, when the name allows it.
+    fn submit_quick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.model.read(cx).is_creating() {
             return;
         }
-        self.loading = false;
-        self.loaded = true;
-        match result {
-            Ok(loaded) => {
-                self.error = None;
-                self.entries = loaded.entries;
-                self.branches = loaded.branches;
-                self.current_branch = loaded.current_branch;
-            }
-            Err(error) => {
-                self.error = Some(error.to_string());
-            }
+        if matches!(
+            self.quick_check(cx),
+            BranchCheck::Existing | BranchCheck::Tracking(_) | BranchCheck::New
+        ) {
+            let name = self.quick_text(cx);
+            self.create(&name, window, cx);
         }
-        cx.notify();
     }
 
-    fn dialog_context(&self) -> WorktreeDialogContext {
+    fn create(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.model
+            .update(cx, |model, cx| model.create(name, window, cx));
+    }
+
+    fn dialog_context(&self, cx: &App) -> WorktreeDialogContext {
+        let model = self.model.read(cx);
+        let settings = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.worktrees.clone())
+            .unwrap_or_default();
         WorktreeDialogContext {
-            root: self.root.clone(),
-            git: self.git.clone(),
-            home: self.home.clone(),
-            branches: self.branches.clone(),
-            worktrees: self
-                .entries
+            root: model.root().to_path_buf(),
+            git: model.git().clone(),
+            home: model.home().map(Path::to_path_buf),
+            branches: model.branches().to_vec(),
+            worktrees: model
+                .entries()
                 .iter()
                 .map(|entry| entry.worktree.clone())
                 .collect(),
-            current_branch: self.current_branch.clone(),
-            selected: self.selected.clone(),
-            workspace: self.workspace.clone(),
+            current_branch: model.current_branch().map(str::to_owned),
+            selected: self.selected_commit.clone(),
+            workspace: model.workspace().clone(),
+            main_line: model.main_line().map(str::to_owned),
+            confirm_delete_branch: settings.confirm_delete_branch,
+            open_after: settings.after_create == crate::settings::AfterCreate::Switch,
         }
     }
 
-    fn changed_callback(&self, cx: &Context<Self>) -> Done {
-        let view = cx.entity();
+    fn changed_callback(&self) -> Done {
+        let model = self.model.clone();
         Rc::new(move |window: &mut Window, cx: &mut App| {
             let _ = window;
-            view.update(cx, |view, cx| {
-                view.refresh(cx);
-                cx.emit(WorktreesEvent::Changed);
-            });
+            model.update(cx, |model, cx| model.operation_done(cx));
         })
     }
 
@@ -223,10 +224,18 @@ impl WorktreesView {
     }
 
     pub(crate) fn open_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.loaded || self.loading && self.entries.is_empty() {
+        let (loaded, loading, empty) = {
+            let model = self.model.read(cx);
+            (
+                model.is_loaded(),
+                model.is_loading(),
+                model.entries().is_empty(),
+            )
+        };
+        if !loaded || loading && empty {
             toast::show(
                 ToastKind::Info,
-                "The worktree list is still loading",
+                ui::i18n::t("worktrees.toast.list_loading"),
                 window,
                 cx,
             );
@@ -234,145 +243,51 @@ impl WorktreesView {
             return;
         }
         self.close_previous_dialog(window, cx);
-        let context = self.dialog_context();
-        let on_done = self.changed_callback(cx);
+        let context = self.dialog_context(cx);
+        let on_done = self.changed_callback();
         self.dialog = Some(worktree_dialog::open_add(context, on_done, window, cx));
     }
 
+    /// Opens the remove dialog, or removes at once when the worktree is clean
+    /// and Settings → Worktrees no longer asks about clean ones.
     pub(crate) fn open_remove(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(entry) = self
-            .entries
-            .iter()
-            .find(|entry| entry.worktree.path == path)
-            .cloned()
-        else {
+        let Some(entry) = self.model.read(cx).entry(path).cloned() else {
             toast::show(
                 ToastKind::Warn,
-                "The worktree is no longer in the list",
+                ui::i18n::t("worktrees.toast.gone"),
                 window,
                 cx,
             );
             self.refresh(cx);
             return;
         };
+        let confirm_clean = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.worktrees.confirm_remove_clean)
+            .unwrap_or(true);
+        if !confirm_clean
+            && !entry.is_main()
+            && entry.locked().is_none()
+            && entry.changes.is_empty()
+        {
+            self.model
+                .update(cx, |model, cx| model.remove_clean(path, window, cx));
+            return;
+        }
         self.close_previous_dialog(window, cx);
         let target = RemoveTarget {
-            path: entry.worktree.path.clone(),
+            path: entry.path().to_path_buf(),
             branch: entry.worktree.branch.clone(),
             locked: entry.worktree.locked.clone(),
             missing: entry.missing,
-            main: entry.worktree.main,
-            changes: entry.changes.clone(),
+            main: entry.is_main(),
+            changes: entry.changed_paths(),
         };
-        let context = self.dialog_context();
-        let on_done = self.changed_callback(cx);
+        let context = self.dialog_context(cx);
+        let on_done = self.changed_callback();
         self.dialog = Some(worktree_dialog::open_remove(
             target, context, on_done, window, cx,
         ));
-    }
-
-    /// The row's lock button: locks with a manual reason or unlocks again.
-    pub(crate) fn toggle_lock(
-        &mut self,
-        path: PathBuf,
-        locked: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let git = match &self.git {
-            Ok(git) => git.clone(),
-            Err(error) => {
-                toast::show(ToastKind::Error, error.to_string(), window, cx);
-                return;
-            }
-        };
-        let root = self.root.clone();
-        let label = display_path(&path, self.home.as_deref());
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let repo = Repo::open(git, &root)?;
-                    if locked {
-                        repo.unlock_worktree(&path)?;
-                    } else {
-                        repo.lock_worktree(&path, Some("locked manually"))?;
-                    }
-                    Ok::<_, Error>(())
-                })
-                .await;
-            this.update_in(cx, |view, window, cx| match result {
-                Ok(()) => {
-                    toast::show(
-                        ToastKind::Ok,
-                        if locked {
-                            format!("Unlocked {label}")
-                        } else {
-                            format!("Locked {label}")
-                        },
-                        window,
-                        cx,
-                    );
-                    view.refresh(cx);
-                    cx.emit(WorktreesEvent::Changed);
-                }
-                Err(error) => {
-                    toast::show(ToastKind::Error, error.to_string(), window, cx);
-                }
-            })
-            .ok();
-        })
-        .detach();
-        cx.notify();
-    }
-
-    /// "Prune N missing": drops the records whose folders are gone.
-    pub(crate) fn prune(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let git = match &self.git {
-            Ok(git) => git.clone(),
-            Err(error) => {
-                toast::show(ToastKind::Error, error.to_string(), window, cx);
-                return;
-            }
-        };
-        let root = self.root.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let repo = Repo::open(git, &root)?;
-                    repo.prune_worktrees()
-                })
-                .await;
-            this.update_in(cx, |view, window, cx| match result {
-                Ok(()) => {
-                    toast::show(ToastKind::Ok, "Pruned stale worktree records", window, cx);
-                    view.refresh(cx);
-                    cx.emit(WorktreesEvent::Changed);
-                }
-                Err(error) => {
-                    toast::show(ToastKind::Error, error.to_string(), window, cx);
-                }
-            })
-            .ok();
-        })
-        .detach();
-        cx.notify();
-    }
-
-    fn open_window(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let label = display_path(&path, self.home.as_deref());
-        self.workspace
-            .update(cx, |workspace, cx| {
-                workspace.open_repository_window(path, window, cx);
-            })
-            .ok();
-        toast::show(
-            ToastKind::Ok,
-            format!("Opened {label} in a new window"),
-            window,
-            cx,
-        );
     }
 }
 
@@ -381,21 +296,11 @@ impl EventEmitter<WorktreesEvent> for WorktreesView {}
 impl Render for WorktreesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
-        let count = self.entries.len();
-        let missing = self.entries.iter().filter(|entry| entry.missing).count();
-
-        let add = {
-            let view = cx.entity();
-            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
-                view.update(cx, |view, cx| view.open_add(window, cx));
-            }
-        };
-        let prune = {
-            let view = cx.entity();
-            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
-                view.update(cx, |view, cx| view.prune(window, cx));
-            }
-        };
+        let model = self.model.read(cx);
+        let count = model.entries().len();
+        let stale = model.entries().iter().filter(|e| e.missing).count();
+        let loaded = model.is_loaded();
+        let error = model.error().map(str::to_owned);
 
         let mut header = div().flex().items_center().gap(px(8.)).child(
             div()
@@ -407,58 +312,27 @@ impl Render for WorktreesView {
                 .child(
                     div()
                         .text_size(FS_LG)
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child("Worktrees"),
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(ui::i18n::t("worktrees.view.title")),
                 )
-                .child(
-                    div()
-                        .text_size(FS_BASE)
-                        .text_color(colors.muted)
-                        .child(count.to_string()),
-                ),
+                .when(loaded && error.is_none(), |this| {
+                    this.child(
+                        div()
+                            .text_size(FS_BASE)
+                            .text_color(colors.muted)
+                            .child(count.to_string()),
+                    )
+                }),
         );
-        if missing > 0 {
+        if stale > 0 {
             header = header.child(
                 Button::new("worktrees-prune")
-                    .label(format!("Prune {missing} missing"))
+                    .label(ui::t!("worktrees.view.prune", n = stale))
                     .icon(IconName::Trash)
-                    .on_click(prune),
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.model.update(cx, |model, cx| model.prune(window, cx));
+                    })),
             );
-        }
-        header = header.child(
-            Button::primary("worktrees-add")
-                .label("Add worktree…")
-                .icon(IconName::Plus)
-                .on_click(add),
-        );
-
-        let mut list = div()
-            .flex()
-            .flex_col()
-            .border_1()
-            .border_color(colors.border)
-            .rounded(R_MD)
-            .bg(colors.bg)
-            .overflow_hidden()
-            .child(table_header(colors));
-        if self.loading && self.entries.is_empty() {
-            list = list.child(
-                div()
-                    .h(px(80.))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(8.))
-                    .text_size(FS_SM)
-                    .text_color(colors.muted)
-                    .child(Spinner::new("worktrees-loading", px(14.)))
-                    .child("Loading worktrees…"),
-            );
-        } else {
-            for (index, entry) in self.entries.iter().enumerate() {
-                list = list.child(self.row(index, entry, cx));
-            }
         }
 
         let mut content = div()
@@ -467,388 +341,699 @@ impl Render for WorktreesView {
             .size_full()
             .flex()
             .flex_col()
-            .gap(px(12.))
+            .gap(px(16.))
             .px(px(20.))
             .py(px(16.))
             .overflow_y_scroll()
             .track_focus(&self.focus)
-            .child(header)
-            .child(list);
-        if let Some(error) = &self.error {
+            .key_context("worktrees")
+            .on_action(cx.listener(|this, _: &Cancel, window, cx| {
+                // Esc in the input belongs to the input; elsewhere it leaves
+                // the page. (A dialog has its own focus and handles its Esc.)
+                if this.quick.read(cx).focus_handle().is_focused(window) {
+                    return;
+                }
+                cx.emit(WorktreesEvent::Leave);
+            }))
+            .child(header);
+
+        if let Some(error) = error {
+            return content
+                .child(
+                    Banner::new(BannerKind::Error, ui::i18n::t("worktrees.view.read_error"))
+                        .body(error)
+                        .mono_body(),
+                )
+                .child(
+                    // Content-width button, not stretched to the column.
+                    div().flex().child(
+                        Button::new("worktrees-retry")
+                            .label(ui::i18n::t("worktrees.view.retry"))
+                            .icon(IconName::Fetch)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx))),
+                    ),
+                )
+                .into_any_element();
+        }
+        if !loaded {
+            return content.child(skeleton(colors)).into_any_element();
+        }
+
+        content = content.child(self.quick_card(colors, cx));
+        if count == 1 {
             content = content.child(
-                Banner::new(BannerKind::Error, "Could not read the worktrees").body(error.clone()),
+                Banner::new(BannerKind::Info, ui::i18n::t("worktrees.view.only_title"))
+                    .body(ui::i18n::t("worktrees.view.only_body")),
             );
         }
-        content.child(
-            div()
-                .text_size(FS_SM)
-                .text_color(colors.muted)
-                .child("Each worktree is its own folder with its own checked-out branch. A branch can only be open in one worktree at a time."),
-        )
+        let selected = self.model.read(cx).selected().cloned();
+        if let Some(entry) = selected {
+            content = content.child(self.detail(&entry, colors, cx));
+        }
+        content.child(key_hints(colors)).into_any_element()
     }
 }
 
 impl WorktreesView {
-    fn row(&self, index: usize, entry: &WorktreeEntry, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors;
-        let worktree = &entry.worktree;
-        let label = display_path(&worktree.path, self.home.as_deref());
-        let missing = entry.missing;
-        let locked = worktree.locked.is_some();
-        let main = worktree.main;
+    /// The quick-create card: input, buttons, hint line and branch chips.
+    fn quick_card(&self, colors: ThemeColors, cx: &mut Context<Self>) -> AnyElement {
+        let model = self.model.read(cx);
+        let text = self.quick_text(cx);
+        let check = model.check_branch(&text);
+        let creating = model.is_creating();
+        let show_error =
+            self.quick_touched && matches!(check, BranchCheck::Invalid | BranchCheck::InUse { .. });
+        let can_create = matches!(
+            check,
+            BranchCheck::Existing | BranchCheck::Tracking(_) | BranchCheck::New
+        ) && !creating;
 
-        let open = {
-            let view = cx.entity();
-            let path = worktree.path.clone();
-            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
-                view.update(cx, |view, cx| {
-                    view.open_window(path.clone(), window, cx);
-                });
+        let hint: AnyElement = match &check {
+            BranchCheck::Invalid if show_error => {
+                error_hint(ui::i18n::t("worktrees.toast.invalid_branch"), colors)
             }
-        };
-        let lock = {
-            let view = cx.entity();
-            let path = worktree.path.clone();
-            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
-                view.update(cx, |view, cx| {
-                    view.toggle_lock(path.clone(), locked, window, cx)
-                });
+            BranchCheck::InUse { path, name } if show_error => {
+                let path = path.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(error_hint(
+                        ui::t!("worktrees.toast.branch_in_use", name = text, used = name),
+                        colors,
+                    ))
+                    .child(
+                        Button::ghost("worktrees-goto")
+                            .size(ButtonSize::Small)
+                            .label(ui::t!("worktrees.quick.goto", name = name))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                let path = path.clone();
+                                this.model.update(cx, |model, cx| model.select(&path, cx));
+                            })),
+                    )
+                    .into_any_element()
             }
-        };
-        let remove = {
-            let view = cx.entity();
-            let path = worktree.path.clone();
-            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
-                view.update(cx, |view, cx| view.open_remove(&path, window, cx));
+            BranchCheck::Existing | BranchCheck::Tracking(_) | BranchCheck::New => {
+                let folder = display_path(&model.preview_path(&text, cx), model.home());
+                let kind = match &check {
+                    BranchCheck::Existing => {
+                        ui::i18n::t("worktrees.quick.kind_existing").to_string()
+                    }
+                    BranchCheck::Tracking(remote) => {
+                        ui::t!("worktrees.quick.kind_tracks", remote = remote).to_string()
+                    }
+                    _ => match model.main_line() {
+                        Some(base) => {
+                            ui::t!("worktrees.quick.kind_new_from", base = base).to_string()
+                        }
+                        None => ui::i18n::t("worktrees.quick.kind_new_from_current").to_string(),
+                    },
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .min_w_0()
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(px(12.))
+                            .color(colors.muted),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .font_family(FONT_MONO)
+                            .text_color(colors.text)
+                            .child(folder),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .child(format!("· {kind}")),
+                    )
+                    .into_any_element()
+            }
+            _ => {
+                let settings = cx
+                    .try_global::<crate::AppSettings>()
+                    .map(|state| state.settings.worktrees.clone())
+                    .unwrap_or_default();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(ui::i18n::t("worktrees.quick.template_hint"))
+                    .child(
+                        div()
+                            .font_family(FONT_MONO)
+                            .whitespace_nowrap()
+                            .child(format!("{}/{}", settings.base, settings.template)),
+                    )
+                    .into_any_element()
             }
         };
 
-        let folder = {
-            let mut folder = div()
-                .flex_1()
-                .min_w_0()
+        let create_label = if creating {
+            div()
                 .flex()
-                .flex_col()
-                .gap(px(2.))
-                .child(
-                    div()
-                        .truncate()
-                        .font_family(FONT_MONO)
-                        .text_size(FS_SM)
-                        .when(missing, |this| this.line_through().text_color(colors.muted))
-                        .child(label),
-                );
-            if let Some(reason) = &worktree.locked {
-                folder = folder.child(
-                    div()
-                        .truncate()
-                        .text_size(FS_SM)
-                        .text_color(colors.muted)
-                        .child(if reason.is_empty() {
-                            "Locked".to_owned()
-                        } else {
-                            format!("Locked: {reason}")
-                        }),
-                );
-            }
-            folder
+                .items_center()
+                .gap(px(6.))
+                .child(Spinner::new("worktrees-creating", px(14.)))
+                .child(ui::i18n::t("worktrees.quick.creating"))
+                .into_any_element()
+        } else {
+            Button::primary("worktrees-create")
+                .icon(IconName::Plus)
+                .label(ui::i18n::t("worktrees.quick.create"))
+                .disabled(!can_create)
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| this.submit_quick(window, cx)),
+                )
+                .into_any_element()
         };
 
-        let head = worktree.head.map(|oid| {
-            let mut short = oid.to_string();
-            short.truncate(7);
-            short
-        });
+        let free: Vec<String> = model
+            .free_branches()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
 
-        let status = status_chips(index, entry);
-
-        let actions = div()
+        let mut card = div()
             .flex()
-            .items_center()
-            .gap(px(4.))
-            .child(
-                Button::new(format!("worktree-open-{index}"))
-                    .label("Open")
-                    .size(ButtonSize::Small)
-                    .disabled(missing)
-                    .on_click(open),
-            )
-            .child(
-                Button::ghost(format!("worktree-lock-{index}"))
-                    .icon_only(IconName::Lock)
-                    .size(ButtonSize::Small)
-                    .tooltip(if locked { "Unlock" } else { "Lock" })
-                    .disabled(main)
-                    .on_click(lock),
-            )
-            .child(
-                Button::ghost(format!("worktree-remove-{index}"))
-                    .icon_only(IconName::Trash)
-                    .size(ButtonSize::Small)
-                    .tooltip("Remove worktree…")
-                    .on_click(remove),
-            );
-
-        div()
-            .id(SharedString::from(format!("worktree-row-{index}")))
-            .debug_selector(move || format!("worktree-row-{index}"))
-            .w_full()
-            .flex()
-            .items_center()
-            .gap(px(12.))
-            .min_h(px(52.))
-            .px(px(12.))
-            .py(px(6.))
-            .border_b_1()
+            .flex_col()
+            .gap(px(8.))
+            .p(px(12.))
+            .bg(colors.surface)
+            .border_1()
             .border_color(colors.border)
-            .child(
-                div().w(px(20.)).flex_none().child(
-                    Icon::new(IconName::Worktree)
-                        .size(px(16.))
-                        .color(if missing { colors.muted } else { colors.text }),
-                ),
-            )
-            .child(folder)
+            .rounded(R_MD)
             .child(
                 div()
-                    .flex_basis(px(0.))
-                    .flex_grow(1.)
-                    .min_w_0()
-                    .truncate()
-                    .font_family(FONT_MONO)
-                    .text_size(FS_SM)
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
                     .child(
-                        worktree
-                            .branch
-                            .clone()
-                            .unwrap_or_else(|| "detached".to_owned()),
+                        Icon::new(IconName::Branch)
+                            .size(px(14.))
+                            .color(colors.muted),
+                    )
+                    .child(div().flex_1().min_w_0().child(self.quick.clone()))
+                    .child(create_label)
+                    .child(
+                        Button::new("worktrees-add")
+                            .label(ui::i18n::t("worktrees.quick.add"))
+                            .disabled(creating)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.open_add(window, cx)
+                            })),
                     ),
             )
             .child(
                 div()
-                    .w(px(84.))
-                    .flex_none()
-                    .font_family(FONT_MONO)
+                    .flex()
+                    .items_center()
+                    .min_h(px(22.))
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child(head.unwrap_or_default()),
+                    .child(hint),
+            );
+        if !free.is_empty() {
+            let mut chips = div().flex().flex_wrap().items_center().gap(px(6.)).child(
+                div()
+                    .text_size(FS_SM)
+                    .text_color(colors.muted)
+                    .child(ui::i18n::t("worktrees.quick.free_branches")),
+            );
+            for (index, branch) in free.into_iter().enumerate() {
+                let name = branch.clone();
+                chips = chips.child(
+                    Button::new(format!("worktrees-chip-{index}"))
+                        .size(ButtonSize::Small)
+                        .icon(IconName::Branch)
+                        .label(branch)
+                        // Design `.bchip` is set in the mono font.
+                        .mono(true)
+                        .disabled(creating)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.create(&name, window, cx)
+                        })),
+                );
+            }
+            card = card.child(chips);
+        }
+        card.into_any_element()
+    }
+
+    /// The selected worktree: title, actions, facts, local changes, footer.
+    fn detail(
+        &self,
+        entry: &WorktreeEntry,
+        colors: ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let home = self.model.read(cx).home().map(Path::to_path_buf);
+        let path = entry.path().to_path_buf();
+        let name = entry.name();
+        let missing = entry.missing;
+        let current = entry.is_current();
+        let main = entry.is_main();
+        let locked = entry.locked().is_some();
+
+        let mut chips = div().flex().flex_wrap().items_center().gap(px(6.));
+        if current {
+            chips = chips.child(
+                Chip::new("wt-chip-current", ui::i18n::t("worktrees.chip.current"))
+                    .kind(ChipKind::Acc)
+                    .icon(IconName::Check),
+            );
+        }
+        if main {
+            chips = chips.child(
+                Chip::new("wt-chip-main", ui::i18n::t("worktrees.chip.default"))
+                    .icon(IconName::Git),
+            );
+        }
+        if let Some(reason) = entry.locked() {
+            chips = chips.child(
+                Chip::new(
+                    "wt-chip-locked",
+                    if reason.is_empty() {
+                        ui::i18n::t("worktrees.chip.locked")
+                    } else {
+                        ui::t!("worktrees.chip.locked_reason", reason = reason)
+                    },
+                )
+                .kind(ChipKind::Warn)
+                .icon(IconName::Lock),
+            );
+        }
+        if missing {
+            chips = chips.child(
+                Chip::new("wt-chip-missing", ui::i18n::t("worktrees.chip.missing"))
+                    .kind(ChipKind::Err)
+                    .icon(IconName::Warn),
+            );
+        } else if entry.changes.is_empty() {
+            chips = chips.child(
+                Chip::new("wt-chip-clean", ui::i18n::t("worktrees.chip.clean"))
+                    .kind(ChipKind::Ok)
+                    .icon(IconName::Check),
+            );
+        } else {
+            chips = chips.child(
+                Chip::new(
+                    "wt-chip-dirty",
+                    ui::t!("worktrees.chip.changed", n = entry.changes.len()),
+                )
+                .kind(ChipKind::Warn)
+                .icon(IconName::Edit),
+            );
+        }
+
+        let switch_path = path.clone();
+        let window_path = path.clone();
+        let copy_path = path.clone();
+        let top = div()
+            .flex()
+            .items_start()
+            .gap(px(12.))
+            .px(px(16.))
+            .py(px(14.))
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                div().mt(px(2.)).child(
+                    Icon::new(if main {
+                        IconName::Git
+                    } else {
+                        IconName::Worktree
+                    })
+                    .size(px(20.))
+                    .color(colors.accent),
+                ),
             )
             .child(
                 div()
-                    .flex_basis(px(0.))
-                    .flex_grow(1.)
+                    .flex_1()
                     .min_w_0()
-                    .child(status),
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .text_size(FS_MD)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(name.clone()),
+                            )
+                            .child(chips),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(FONT_MONO)
+                                    .text_size(FS_SM)
+                                    .text_color(colors.muted)
+                                    .when(missing, |this| this.line_through())
+                                    .child(display_path(&path, home.as_deref())),
+                            )
+                            .child(
+                                Button::ghost("worktree-copy-path")
+                                    .icon_only(IconName::Copy)
+                                    .size(ButtonSize::Small)
+                                    .tooltip(ui::i18n::t("worktrees.detail.copy_path"))
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.model.update(cx, |model, cx| {
+                                                model.copy_path(&copy_path, window, cx)
+                                            });
+                                        },
+                                    )),
+                            ),
+                    ),
             )
-            .child(actions)
-            .into_any_element()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        Button::primary("worktree-switch")
+                            .label(if current {
+                                ui::i18n::t("worktrees.detail.current")
+                            } else {
+                                ui::i18n::t("worktrees.detail.switch")
+                            })
+                            .disabled(current || missing)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.model.update(cx, |model, cx| {
+                                    model.switch_to(&switch_path, window, cx)
+                                });
+                            })),
+                    )
+                    .child(
+                        Button::new("worktree-window")
+                            .label(ui::i18n::t("worktrees.detail.new_window"))
+                            .disabled(missing)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.model.update(cx, |model, cx| {
+                                    model.open_in_window(&window_path, window, cx)
+                                });
+                            })),
+                    ),
+            );
+
+        let mut detail = div()
+            .id("worktree-detail")
+            .debug_selector(|| "worktree-detail".to_string())
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(colors.border)
+            .rounded(R_MD)
+            .bg(colors.surface)
+            .child(top);
+
+        if missing {
+            detail = detail.child(
+                div().px(px(16.)).py(px(12.)).child(
+                    Banner::new(
+                        BannerKind::Warn,
+                        ui::i18n::t("worktrees.detail.missing_title"),
+                    )
+                    .body(ui::i18n::t("worktrees.detail.missing_body")),
+                ),
+            );
+        }
+
+        // BRANCH / HEAD / REMOTE
+        let branch_label = entry.branch().map_or_else(
+            || ui::i18n::t("worktrees.detached_head").to_string(),
+            str::to_owned,
+        );
+        let head_short = entry
+            .worktree
+            .head
+            .map(|oid| {
+                let mut short = oid.to_string();
+                short.truncate(7);
+                short
+            })
+            .unwrap_or_default();
+        let remote = if entry.ahead > 0 || entry.behind > 0 {
+            let mut parts = Vec::new();
+            if entry.ahead > 0 {
+                parts.push(ui::t!("worktrees.detail.ahead", n = entry.ahead).to_string());
+            }
+            if entry.behind > 0 {
+                parts.push(ui::t!("worktrees.detail.behind", n = entry.behind).to_string());
+            }
+            div().text_color(colors.text).child(parts.join(" · "))
+        } else if entry.branch().is_none() {
+            div()
+                .text_color(colors.muted)
+                .child(ui::i18n::t("worktrees.detail.no_upstream_detached"))
+        } else if entry.has_upstream {
+            div()
+                .text_color(colors.muted)
+                .child(ui::i18n::t("worktrees.detail.up_to_date"))
+        } else {
+            div()
+                .text_color(colors.muted)
+                .child(ui::i18n::t("worktrees.detail.no_upstream"))
+        };
+        let cell = |label: SharedString, value: AnyElement| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_size(FS_XS)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.muted)
+                        .child(label.to_uppercase()),
+                )
+                .child(value)
+        };
+        detail = detail.child(
+            div()
+                .flex()
+                .gap(px(16.))
+                .px(px(16.))
+                .py(px(12.))
+                .border_b_1()
+                .border_color(colors.border)
+                .text_size(FS_BASE)
+                .child(cell(
+                    ui::i18n::t("worktrees.detail.branch"),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            Icon::new(IconName::Branch)
+                                .size(px(14.))
+                                .color(colors.muted),
+                        )
+                        .child(div().truncate().font_family(FONT_MONO).child(branch_label))
+                        .into_any_element(),
+                ))
+                .child(cell(
+                    ui::i18n::t("worktrees.detail.head"),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .min_w_0()
+                        .child(div().flex_none().font_family(FONT_MONO).child(head_short))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(FS_SM)
+                                .text_color(colors.muted)
+                                .child(entry.head_summary.clone().unwrap_or_default()),
+                        )
+                        .into_any_element(),
+                ))
+                .child(cell(
+                    ui::i18n::t("worktrees.detail.remote"),
+                    remote.into_any_element(),
+                )),
+        );
+
+        if !missing {
+            let mut section = div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .px(px(16.))
+                .py(px(12.))
+                .border_b_1()
+                .border_color(colors.border)
+                .child(
+                    div()
+                        .text_size(FS_XS)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.muted)
+                        .child(ui::i18n::t("worktrees.detail.local_changes").to_uppercase()),
+                );
+            if entry.changes.is_empty() {
+                section = section.child(
+                    div()
+                        .text_size(FS_BASE)
+                        .text_color(colors.muted)
+                        .child(ui::i18n::t("worktrees.detail.clean_note")),
+                );
+            } else {
+                for change in entry.changes.iter().take(CHANGES_SHOWN) {
+                    section = section.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_size(FS_BASE)
+                            .child(StatusGlyph::new(change.status))
+                            .child(div().min_w_0().truncate().child(change.path.clone())),
+                    );
+                }
+                if entry.changes.len() > CHANGES_SHOWN {
+                    section = section.child(div().text_size(FS_SM).text_color(colors.muted).child(
+                        ui::t!(
+                            "worktrees.detail.more",
+                            n = entry.changes.len() - CHANGES_SHOWN
+                        ),
+                    ));
+                }
+            }
+            detail = detail.child(section);
+        }
+
+        let reveal_path = path.clone();
+        let lock_path = path.clone();
+        let remove_path = path;
+        let reveal_label = display_path(&reveal_path, home.as_deref());
+        detail = detail.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .px(px(12.))
+                .py(px(8.))
+                .child(
+                    Button::ghost("worktree-reveal")
+                        .size(ButtonSize::Small)
+                        .icon(IconName::Folder)
+                        .label(ui::i18n::t("worktrees.detail.reveal"))
+                        .disabled(missing)
+                        .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
+                            cx.reveal_path(&reveal_path);
+                            toast::show(
+                                ToastKind::Info,
+                                ui::t!("worktrees.toast.revealed", label = reveal_label),
+                                window,
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    Button::ghost("worktree-lock")
+                        .size(ButtonSize::Small)
+                        .icon(IconName::Lock)
+                        .label(if locked {
+                            ui::i18n::t("worktrees.detail.unlock")
+                        } else {
+                            ui::i18n::t("worktrees.detail.lock")
+                        })
+                        .disabled(main || missing)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.model
+                                .update(cx, |model, cx| model.toggle_lock(&lock_path, window, cx));
+                        })),
+                )
+                .child(div().flex_1())
+                .when(main, |this| {
+                    this.child(
+                        div()
+                            .text_size(FS_SM)
+                            .text_color(colors.muted)
+                            .child(ui::i18n::t("worktrees.detail.main_note")),
+                    )
+                })
+                .child(
+                    Button::danger("worktree-remove")
+                        .size(ButtonSize::Small)
+                        .icon(IconName::Trash)
+                        .label(ui::i18n::t("worktrees.detail.remove"))
+                        .disabled(main)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.open_remove(&remove_path, window, cx)
+                        })),
+                ),
+        );
+        detail.into_any_element()
     }
 }
 
-fn table_header(colors: ThemeColors) -> AnyElement {
-    let cell = |text: &'static str| {
-        div()
-            .text_size(FS_XS)
-            .text_color(colors.muted)
-            .child(text.to_uppercase())
-    };
+fn error_hint(text: impl Into<SharedString>, colors: ThemeColors) -> AnyElement {
     div()
-        .w_full()
-        .h(px(28.))
         .flex()
         .items_center()
-        .gap(px(12.))
-        .px(px(12.))
-        .bg(colors.surface)
-        .border_b_1()
-        .border_color(colors.border)
-        .child(div().w(px(20.)).flex_none())
-        .child(cell("Folder").flex_1().min_w_0())
-        .child(cell("Branch").flex_basis(px(0.)).flex_grow(1.).min_w_0())
-        .child(cell("HEAD").w(px(84.)).flex_none())
-        .child(cell("Status").flex_basis(px(0.)).flex_grow(1.).min_w_0())
-        .child(div().w(px(128.)).flex_none())
+        .gap(px(4.))
+        .text_color(colors.error)
+        .child(Icon::new(IconName::Warn).size(px(12.)).color(colors.error))
+        .child(text.into())
         .into_any_element()
 }
 
-fn status_chips(index: usize, entry: &WorktreeEntry) -> AnyElement {
-    let worktree = &entry.worktree;
-    let mut row = div().flex().items_center().gap(px(4.));
-    if worktree.main {
-        row = row.child(
-            Chip::new(format!("wt-{index}-main"), "main worktree")
-                .kind(ChipKind::Acc)
-                .icon(IconName::Git),
-        );
-    }
-    if worktree.locked.is_some() {
-        row = row.child(
-            Chip::new(format!("wt-{index}-locked"), "locked")
-                .kind(ChipKind::Warn)
-                .icon(IconName::Lock),
-        );
-    }
-    if !entry.changes.is_empty() {
-        row = row.child(
-            Chip::new(
-                format!("wt-{index}-dirty"),
-                format!("{} changed", entry.changes.len()),
-            )
-            .kind(ChipKind::Warn)
-            .icon(IconName::Edit),
-        );
-    }
-    if entry.missing {
-        row = row.child(
-            Chip::new(format!("wt-{index}-missing"), "folder missing")
-                .kind(ChipKind::Err)
-                .icon(IconName::Warn),
-        );
-    }
-    if !worktree.main && worktree.locked.is_none() && entry.changes.is_empty() && !entry.missing {
-        row = row.child(
-            Chip::new(format!("wt-{index}-clean"), "clean")
-                .kind(ChipKind::Ok)
-                .icon(IconName::Check),
-        );
-    }
-    row.into_any_element()
-}
-
-/// Reads the list, branches and per-worktree changes; runs on the background
-/// executor.
-fn load(git: Arc<Git>, root: &Path) -> git_core::Result<Loaded> {
-    let repo = Repo::open(git.clone(), root)?;
-    let worktrees = repo.worktrees()?;
-    let refs = repo.refs()?;
-    let current_branch = match repo.head()? {
-        Head::Branch { name, .. } => Some(name),
-        Head::Detached(_) => None,
-    };
-    let branches: Vec<BranchChoice> = refs
-        .iter()
-        .filter(|reference| reference.kind == RefKind::LocalBranch)
-        .map(|reference| BranchChoice {
-            name: reference.name.clone(),
-            target: reference.target,
-        })
-        .collect();
-    let mut entries = Vec::with_capacity(worktrees.len());
-    for worktree in worktrees {
-        let missing = worktree.prunable || !worktree.path.is_dir();
-        let changes = if missing {
-            Vec::new()
-        } else {
-            match Repo::open(git.clone(), &worktree.path).and_then(|repo| repo.changed_paths()) {
-                Ok(paths) => paths,
-                Err(error) => {
-                    log::warn!(
-                        "could not read the changes in {}: {error}",
-                        worktree.path.display()
-                    );
-                    Vec::new()
-                }
-            }
-        };
-        entries.push(WorktreeEntry {
-            worktree,
-            changes,
-            missing,
-        });
-    }
-    Ok(Loaded {
-        entries,
-        branches,
-        current_branch,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::{git, TempRepo};
-    use git_core::Oid;
-    use std::process::Command;
-
-    fn run(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
-            .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .status()
-            .expect("git is installed");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    fn entry(main: bool, locked: Option<&str>, changes: &[&str], missing: bool) -> WorktreeEntry {
-        WorktreeEntry {
-            worktree: Worktree {
-                path: PathBuf::from("/tmp/wt"),
-                branch: Some("main".to_owned()),
-                head: Oid::from_hex(&"ab".repeat(20)),
-                bare: false,
-                detached: false,
-                locked: locked.map(str::to_owned),
-                prunable: missing,
-                current: main,
-                main,
-            },
-            changes: changes.iter().map(|path| (*path).to_owned()).collect(),
-            missing,
-        }
-    }
-
-    #[test]
-    fn clean_rows_show_one_chip_and_used_rows_show_their_state() {
-        let _ = entry(false, None, &[], false);
-        assert!(!entry(false, None, &[], false).locked());
-        assert!(entry(true, None, &[], false).main());
-        assert!(entry(false, Some("busy"), &[], false).locked());
-        assert!(entry(true, None, &[], false).main());
-    }
-
-    #[test]
-    fn loads_worktrees_branches_and_each_folder_changes() {
-        let repo = TempRepo::new("worktrees-load");
-        std::fs::write(repo.path().join("a.txt"), "one\n").unwrap();
-        run(repo.path(), &["add", "a.txt"]);
-        run(repo.path(), &["commit", "-qm", "one"]);
-        run(repo.path(), &["branch", "feat"]);
-        let linked = repo.path().parent().unwrap().join(format!(
-            "{}-linked",
-            repo.path().file_name().unwrap().to_string_lossy()
+fn skeleton(_colors: ThemeColors) -> AnyElement {
+    let mut bars = div().flex().flex_col().gap(px(14.));
+    for (index, width) in [360., 520., 280., 440.].into_iter().enumerate() {
+        bars = bars.child(Skeleton::new(
+            format!("worktrees-skeleton-{index}"),
+            px(width),
         ));
-        let _ = std::fs::remove_dir_all(&linked);
-        {
-            let repo = git_core::Repo::open(git(), repo.path()).unwrap();
-            repo.add_worktree(&linked, "feat").unwrap();
-        }
-        std::fs::write(linked.join("dirty.txt"), "dirty\n").unwrap();
-
-        let loaded = load(git(), repo.path()).unwrap();
-        assert_eq!(loaded.entries.len(), 2);
-        assert!(loaded.entries[0].worktree.main);
-        assert!(loaded.entries[0].changes.is_empty());
-        assert_eq!(loaded.entries[1].worktree.branch.as_deref(), Some("feat"));
-        assert_eq!(loaded.entries[1].changes, vec!["dirty.txt".to_owned()]);
-        assert_eq!(loaded.current_branch.as_deref(), Some("main"));
-        assert!(loaded.branches.iter().any(|branch| branch.name == "main"));
-        assert!(loaded.branches.iter().any(|branch| branch.name == "feat"));
-
-        // A folder that disappears is flagged as missing; pruning drops the
-        // record without touching the branch.
-        std::fs::remove_dir_all(&linked).unwrap();
-        let loaded = load(git(), repo.path()).unwrap();
-        assert!(loaded.entries[1].missing);
-        {
-            let repo = git_core::Repo::open(git(), repo.path()).unwrap();
-            repo.prune_worktrees().unwrap();
-        }
-        let loaded = load(git(), repo.path()).unwrap();
-        assert_eq!(loaded.entries.len(), 1);
-        let _ = std::fs::remove_dir_all(&linked);
     }
+    bars.into_any_element()
+}
+
+fn key_hints(colors: ThemeColors) -> AnyElement {
+    let group = |keys: &[&'static str], label: SharedString| {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .children(keys.iter().map(|key| Kbd::new(*key)))
+            .child(div().ml(px(2.)).child(label))
+    };
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(16.))
+        .text_size(FS_SM)
+        .text_color(colors.muted)
+        // One cap with "+" between the keys, as everywhere else in the app.
+        .child(group(
+            &["Ctrl+Alt+W"],
+            ui::i18n::t("worktrees.hints.switcher"),
+        ))
+        .child(group(&["Alt+1–9"], ui::i18n::t("worktrees.hints.jump")))
+        .child(group(&["Enter"], ui::i18n::t("worktrees.hints.switch")))
+        .child(group(&["Del"], ui::i18n::t("worktrees.hints.remove")))
+        .into_any_element()
 }

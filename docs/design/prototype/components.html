@@ -19,6 +19,8 @@
   .box-static { border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; background: var(--bg); }
   .demo-menu { position: static; }
   .spec-tbl { font-size: var(--fs-sm); color: var(--muted); }
+  .splitter.is-hover-demo::after { background: var(--accent); opacity: 1; }
+  .dialog.w520 { max-width: 100%; }
 </style>
 <script src="app.js"></script>
 </head>
@@ -28,7 +30,7 @@
   const G = GL, ic = G.ic, esc = G.esc;
   G.stagebar();
   const btnStates = (cls, label, extra) => ['', 'is-hover', 'is-active', 'is-focus', 'is-disabled'].map((s) => `<button class="btn ${cls} ${s}" ${s === 'is-disabled' ? 'disabled' : ''}>${label}</button>`).join('');
-  const checks = ['', 'on', 'mixed', 'is-focus', 'dis'].map((s, i) => `<span class="check ${s}" ${i === 3 ? 'style="outline:2px solid var(--focus);outline-offset:2px;border-radius:2px"' : ''} ${i === 4 ? 'style="opacity:.45"' : ''}><span class="box">${s === 'on' ? ic('check', 10) : s === 'mixed' ? ic('minus', 10) : ''}</span>${['Off', 'On', 'Mixed', 'Focus', 'Disabled'][i]}</span>`).join('');
+  const checks = ['', 'on', 'mixed', 'is-focus', 'dis'].map((s, i) => `<span class="check ${s}" ${i === 3 ? 'style="outline:2px solid var(--focus);outline-offset:2px;border-radius:2px"' : ''} ><span class="box">${s === 'on' ? ic('check', 10) : s === 'mixed' ? ic('minus', 10) : ''}</span>${['Off', 'On', 'Mixed', 'Focus', 'Disabled'][i]}</span>`).join('');
   // history-row states built from the real graph renderer
   const lay = G.layout(G.commits.slice(0, 6)), geo = G.geometry(lay, false);
   const hrow = (i, style, cls, label) => { const c = G.commits[i], r = lay.rows[i]; return `<div class="lrow ${cls || ''}" style="${style || ''}"><div class="gcol">${G.rowSVG(r, geo, { head: c.refs.some((x) => x.t === 'head') })}</div><div class="summary">${c.refs.some((x) => x.t === 'head') ? '<span class="ref head">' + ic('branch', 11) + 'main</span>' : ''}<span class="txt">${esc(c.summary)}</span></div><div class="au">${label}</div><div class="hash">${c.hash}</div></div>`; };
@@ -47,14 +49,17 @@
     <span class="l">Ghost</span>${btnStates('btn-ghost', 'Cancel')}
     <span class="l">Danger</span>${btnStates('btn-danger', 'Delete…')}
     <span class="l">Icon 26px</span>${btnStates('btn-icon btn-ghost', ic('gear', 16))}
+    <span class="l">Xs 20px</span>${btnStates('btn-xs btn-ghost', ic('x', 12))}
     <span class="l">Toolbar</span>${btnStates('btn-tool', ic('up', 14) + 'Push <span class="counter accent">↑4</span>')}
-  </div><div class="cap">Height 26px (small 22px), padding 0 10px, radius 3px, 1px border. Primary appears once per surface. Icon buttons are 26×26 with a tooltip and an aria-label.</div></div>
+    <span class="l">Tool · on</span>${btnStates('btn-tool on', ic('stash', 14) + 'Stash')}
+  </div><div class="cap">Height 26px (small 22px, Xs 20×20 icon-only with a 12px icon for row actions and the dialog ×), padding 0 10px, radius 5px, 1px border. Primary has an accent border (accent-hover on hover); danger has an error@55% border and text; a disabled ghost button has no border at all, a disabled secondary keeps the hairline. Selected tool button uses the <span class="mono">selection</span> fill. Primary appears once per surface. Icon buttons are 26×26 with a tooltip and an aria-label. No hover/press transitions: states switch instantly.</div></div>
 
   <h2>Form controls</h2>
   <div class="grid3">
     <div class="cell"><h4>Text input</h4>
       <input class="input" placeholder="Default (placeholder)"><input class="input is-hover" value="Hover">
-      <input class="input is-focus" value="Focus"><div><input class="input error" value="not-a-ref^"><div class="field-error">${ic('err', 12)}Branch names cannot contain ^</div></div><input class="input" value="Disabled" disabled></div>
+      <input class="input is-focus" value="Focus"><div><input class="input error" value="not-a-ref^"><div class="field-error">${ic('err', 12)}Branch names cannot contain ^</div></div><input class="input" value="Disabled" disabled>
+      <input class="input masked" type="password" value="passphrase" aria-label="Masked"><div class="cap" style="margin:0">Masked (password / passphrase): the value is drawn as bullets. Error is the same red border on any input. A disabled input drops out of the Tab order.</div></div>
     <div class="cell"><h4>Filter / search field</h4>
       <label class="input-wrap">${ic('search', 14)}<input class="input" placeholder="Filter branches, tags…"></label>
       <label class="input-wrap">${ic('search', 14)}<input class="input" placeholder="Search commits, authors, hashes"><span class="kbd">Ctrl K</span></label>
@@ -64,7 +69,10 @@
       <div class="flexrow">${checks}</div>
       <div class="flexrow"><span class="radio on"><span class="dotbox"></span>Bundled</span><span class="radio"><span class="dotbox"></span>System</span><span class="radio"><span class="dotbox"></span>Custom</span></div>
       <div class="flexrow"><span class="switch on"><span class="track"></span>Amend</span><span class="switch"><span class="track"></span>Sign commit</span></div>
-      <div class="flexrow"><div class="seg" role="group"><button aria-pressed="true">${ic('unified', 13)}Unified</button><button aria-pressed="false">${ic('split', 13)}Side-by-side</button></div><div class="seg ico"><button class="on" aria-label="Dock right">${ic('panelR', 14)}</button><button aria-label="Dock bottom">${ic('panelB', 14)}</button></div></div></div>
+      <div class="flexrow"><div class="seg" role="group"><button aria-pressed="true">${ic('unified', 13)}Unified</button><button aria-pressed="false">${ic('split', 13)}Side-by-side</button></div><div class="seg ico"><button class="on" aria-label="Dock right">${ic('panelR', 14)}</button><button aria-label="Dock bottom">${ic('panelB', 14)}</button></div></div>
+      <div class="flexrow"><span class="switch dis"><span class="track"></span>Disabled switch</span><span class="radio dis"><span class="dotbox"></span>Disabled radio</span></div>
+      <div class="flexrow"><div class="seg" role="group" aria-label="Focus"><button class="on">Normal</button><button class="is-focus">Focus ring</button><button disabled style="opacity:.45">Disabled</button></div><div class="seg sm ico" role="group" aria-label="Icon-only"><button class="on" aria-label="Unified">${ic('unified', 13)}</button><button aria-label="Side-by-side">${ic('split', 13)}</button></div></div>
+      <div class="cap">Disabled checkbox, radio and switch are drawn at 45% opacity. Segmented: 24px (small 22px), per-segment disabled state and tooltip, icon-only segments; a keyboard-focused segment shows an inset 2px focus ring.</div></div>
   </div>
 
   <h2>Tabs</h2>
@@ -96,16 +104,55 @@
       <div class="menu-item">${ic('check', 14)}<span class="menu-label">Checkout</span><span class="menu-key">Enter</span></div>
       <div class="menu-item hi">${ic('branch', 14)}<span class="menu-label">Merge into main</span></div>
       <div class="menu-item">${ic('branch', 14)}<span class="menu-label">Rebase main onto this</span></div><div class="menu-sep"></div>
+      <div class="menu-item"><span class="menu-gap"></span><span class="menu-label">Item without an icon</span><span class="menu-key">F2</span></div>
       <div class="menu-item disabled">${ic('edit', 14)}<span class="menu-label">Rename… (remote branch)</span></div>
       <div class="menu-item danger">${ic('trash', 14)}<span class="menu-label">Delete branch</span><span class="menu-key">Del</span></div></div>
-      <div class="cap">Item 24px, radius 3px, 4px padding; ↑ ↓ Enter Esc. Danger items are red text and always last.</div></div>
-    <div class="cell"><h4>Tooltip</h4><div class="flexrow"><div class="tip" style="position:static">Push 4 commits to origin/main <span class="kbd">Ctrl Shift P</span></div></div><div class="flexrow"><div class="tip" style="position:static">2026-10-29 13:28</div></div><div class="cap">350ms delay, 4px 8px padding, 320px max. Date cells show the absolute time; icon buttons show their name and shortcut. Never the only carrier of information.</div>
-      <h4 style="margin-top:8px">Progress</h4><div class="flexrow"><span class="progress"><i style="width:62%"></i></span><span class="muted" style="font-size:12px">62%</span><span class="progress indet"><i></i></span></div></div>
-    <div class="cell"><h4>Dialog</h4><div class="dialog" role="dialog" aria-label="Delete branch"><div class="dialog-head">${ic('warn', 16)}Delete branch feat/palette?</div><div class="dialog-body"><span>The branch has 2 commits that are not on any other branch. They can be recovered from the reflog for a while.</span><label class="check"><span class="box"></span>Also delete origin/feat/palette</label></div><div class="dialog-foot"><button class="btn">Cancel</button><button class="btn btn-danger">Delete branch</button></div></div><div class="cap">Radius 6px, 1px border, scrim over the window. Esc cancels, Enter triggers the default (non-destructive) button.</div></div>
-    <div class="cell"><h4>Toasts</h4>${['ok', 'info', 'warn', 'error'].map((k) => `<div class="toast ${k}" style="max-width:none">${ic(k === 'ok' ? 'check' : k === 'warn' ? 'warn' : k === 'error' ? 'err' : 'info', 14)}<span class="toast-msg">${{ ok: 'Pushed 4 commits to origin/main', info: 'Fetched origin — 2 new branches', warn: 'Pull skipped: local changes would be overwritten', error: 'Push rejected: non-fast-forward' }[k]}</span><button class="btn btn-icon btn-ghost btn-xs" aria-label="Dismiss">${ic('x', 12)}</button></div>`).join('')}<div class="cap">Bottom-right, 5s, stacked. Errors persist until dismissed.</div></div>
-    <div class="cell"><h4>Banners (inline)</h4>${[['ok', 'Using git 2.56.0 (bundled)'], ['info', 'Fetching in the background…'], ['warn', 'Bundled git failed to start — using system git'], ['error', 'git 2.28.1 is older than 2.31']].map(([k, t]) => `<div class="banner ${k}">${ic(k === 'ok' ? 'check' : k === 'warn' ? 'warn' : k === 'error' ? 'err' : 'info', 16)}<div><div class="b-title">${t}</div></div></div>`).join('')}</div>
-    <div class="cell"><h4>Splitter · scrollbar</h4><div class="flexrow" style="gap:16px"><div style="display:flex;align-items:center;gap:0;height:60px"><div style="width:90px;height:100%;background:var(--surface);border:1px solid var(--border)"></div><div class="splitter v" style="height:100%;margin:0 -2px;background:var(--accent);opacity:.6"></div><div style="width:90px;height:100%;background:var(--surface);border:1px solid var(--border)"></div></div><div style="width:10px;height:60px;position:relative;border-left:1px solid var(--border)"><div style="position:absolute;left:2px;right:2px;top:8px;height:28px;background:var(--border-strong);border-radius:3px"></div></div></div><div class="cap">Splitter hit area 5px (shown on hover/drag as a 2px accent line). Scrollbar: 10px track, 6px thumb, hidden until scroll/hover.</div></div>
-  </div></div>`);
+      <div class="cap">Panel min-width 220, padding 6, radius 7, <span class="mono">border-strong</span> border, pop shadow. Item 28px, padding 0 10, gap 8, radius 5, 14px icon slot (kept empty when there is no icon), 12px shortcut. Disabled items are rendered, show a not-allowed cursor and are skipped by ↑ ↓. Separators are 1px <span class="mono">border</span>, margin 4/2. ↑ ↓ Enter Esc; danger items are red and always last.</div></div>
+    <div class="cell"><h4>Tooltip</h4><div class="flexrow"><div class="tip" style="position:static">Push 4 commits to origin/main <span class="kbd">Ctrl Shift P</span></div></div><div class="flexrow"><div class="tip" style="position:static">2026-10-29 13:28</div></div><div class="cap">Platform tooltip: shown after a 500ms delay at the cursor (not anchored below the element), padding 4/8, radius 5, 320px max, optional key cap. Date cells show the absolute time; icon buttons show their name and shortcut. Never the only carrier of information.</div>
+      <h4 style="margin-top:8px">Progress</h4><div class="flexrow"><span class="progress"><i style="width:62%"></i></span><span class="muted" style="font-size:12px">62%</span><span class="progress indet"><i></i></span></div>
+      <div class="flexrow"><span class="progress dlg fill"><i style="width:40%"></i></span></div><div class="cap">140px × 4px (radius 2); dialog variant 6px (radius 3), full-width <span class="mono">fill</span>, and indeterminate. Progress bars and the switch are the only animated controls, plus the skeleton pulse and the spinner.</div></div>
+    <div class="cell"><h4>Toasts</h4>${['ok', 'info', 'warn', 'error'].map((k) => `<div class="toast ${k}" style="max-width:none">${ic(k === 'ok' ? 'check' : k === 'warn' ? 'warn' : k === 'error' ? 'err' : 'info', 14)}<span class="toast-msg">${{ ok: 'Pushed 4 commits to origin/main', info: 'Fetched origin — 2 new branches', warn: 'Pull skipped: local changes would be overwritten', error: 'Push rejected: non-fast-forward' }[k]}</span><button class="btn btn-icon btn-ghost btn-xs" aria-label="Dismiss">${ic('x', 12)}</button></div>`).join('')}<div class="cap">Bottom-right with a 12px inset, 260–380px wide, padding 8/8/12, 3px coloured left stripe, 14px icon, stacked. Error toasts stay until dismissed; all others auto-hide after 5s.</div></div>
+    <div class="cell"><h4>Banners (inline)</h4>${[['ok', 'Using git 2.56.0 (bundled)'], ['info', 'Fetching in the background…'], ['warn', 'Bundled git failed to start — using system git'], ['error', 'git 2.28.1 is older than 2.31']].map(([k, t]) => `<div class="banner ${k}">${ic(k === 'ok' ? 'check' : k === 'warn' ? 'warn' : k === 'error' ? 'err' : 'info', 16)}<div><div class="b-title">${t}</div></div></div>`).join('')}
+      <div class="banner warn">${ic('warn', 16)}<div><div class="b-title">3 submodules are not initialised</div><div>Run Update submodule to fetch them:</div><ul><li>vendor/tree-sitter-rust</li><li>vendor/inter</li><li>vendor/icons</li></ul></div></div><div class="cap">Banner: semibold title, optional body and a bulleted list (padding-left 18, gap 2).</div></div>
+    <div class="cell"><h4>Splitter · scrollbar</h4><div class="flexrow" style="gap:16px"><div style="display:flex;align-items:center;gap:0;height:60px"><div style="width:90px;height:100%;background:var(--surface);border:1px solid var(--border)"></div><div class="splitter v is-hover-demo" style="height:100%;margin:0 -2px"></div><div style="width:90px;height:100%;background:var(--surface);border:1px solid var(--border)"></div></div><div style="width:10px;height:60px;position:relative;border-left:1px solid var(--border)"><div style="position:absolute;left:2px;right:2px;top:8px;height:28px;background:var(--border-strong);border-radius:3px"></div></div></div><div class="cap">Splitter hit area 5px; on hover/drag a 2px accent line is drawn centred in it (not a filled strip). Scrollbar: 10px track, 6px thumb in <span class="mono">border-strong</span>, radius 3, always visible (not hidden until hover).</div></div>
+  </div>
+
+  <h2>Chips, counters, avatars</h2>
+  <div class="grid3">
+    <div class="cell"><h4>Chip</h4><div class="flexrow"><span class="chip">${ic('box', 10)}Default</span><span class="chip ok">${ic('check', 10)}Ready</span><span class="chip warn">${ic('warn', 10)}Dirty</span><span class="chip err">${ic('err', 10)}Failed</span><span class="chip acc">${ic('branch', 10)}main</span><span class="chip">Text only</span></div>
+      <div class="cap">18px high, padding 0 6, radius 5, 1px border, 11px text, optional 10px icon, gap 4. Kinds: none (muted text on <span class="mono">border-strong</span>), ok / warn / err / acc (token text, token@50% border).</div></div>
+    <div class="cell"><h4>CountPill</h4><div class="flexrow"><span class="count-pill">12</span><div class="node sel" style="--lvl:0;margin:0;width:150px"><span class="nlabel">Selected row</span><span class="ncount">12</span></div></div>
+      <div class="cap">Section counts (Changes group headers): 11px muted on <span class="mono">active</span>, radius 8, padding 0 6. On a selected tree row it gets a transparent fill and <span class="mono">selection-sub</span> text.</div></div>
+    <div class="cell"><h4>Avatar</h4><div class="flexrow"><span class="avt gen" style="--av:24px;--hue:210">MO</span><span class="avt gen" style="--av:24px;--hue:20">JD</span><span class="avt gen" style="--av:16px;--hue:140">AK</span></div>
+      <div class="cap">Round initials avatar. Initials are the first letters of the first and last words of the name ("Mira Okonkwo" → MO), else of the email local part ("john.doe" → JD). The colour is a deterministic hash of the email.</div></div>
+    <div class="cell"><h4>Window controls</h4><div class="titlebar" style="height:40px;border:1px solid var(--border);border-radius:var(--r-md);padding-right:0;overflow:hidden"><span class="muted" style="flex:1">Client-side decorations only</span><div class="wc"><button class="btn btn-ghost" aria-label="Minimise">${ic('min', 14)}</button><button class="btn btn-ghost" aria-label="Maximise">${ic('max', 14)}</button><button class="btn btn-ghost close is-hover" aria-label="Close">${ic('x', 14)}</button></div></div>
+      <div class="cap">Minimise / maximise-restore / close: three 32×40 ghost buttons, 14px icons, 8px left margin; close hovers red (shown). Only drawn with client-side decorations.</div></div>
+  </div>
+
+  <h2>Empty, loading, spinner</h2>
+  <div class="grid3">
+    <div class="cell"><h4>EmptyState</h4><div class="box-static"><div class="empty" style="min-height:0">
+      <div class="ei">${ic('search', 22)}</div><h4>No results found</h4><p>Try a different filter, or clear the search to see every commit.</p>
+      <div class="empty-act"><button class="btn">Clear search</button></div></div></div>
+      <div class="cap">Centred column, gap 8, padding 24; 44px round icon disc (22px icon, colour overridable), title, text max 322px, optional action row (mt 4, gap 8).</div></div>
+    <div class="cell"><h4>EmptyState · error</h4><div class="box-static"><div class="empty" style="min-height:0">
+      <div class="ei" style="color:var(--error)">${ic('err', 22)}</div><h4>Could not open the repository</h4><p>git reported an error.</p><div class="errbox">fatal: not a git repository (or any of the parent directories): .git</div>
+      <div class="empty-act"><button class="btn">Try again</button><button class="btn btn-primary">Choose another…</button></div></div></div>
+      <div class="cap">Monospace error box (max 392px, padding 8/10, line-height 18) and an action row.</div></div>
+    <div class="cell"><h4>Skeleton</h4><div class="od-stack" style="--od-gap:10px;padding:4px 0"><div class="skel" style="width:320px;max-width:100%"></div><div class="skel" style="width:260px;max-width:100%"></div><div class="skel" style="width:290px;max-width:100%"></div></div>
+      <div class="cap">10px-high bars (radius 3). GPUI cannot animate a gradient position, so the bar is an <span class="mono">active</span> base with a <span class="mono">hover</span> overlay whose opacity pulses 0.4 → 1 over 1.4s. The skeleton and the spinner animate in addition to the switch and progress bars.</div></div>
+    <div class="cell"><h4>Spinner</h4><div class="flexrow">${ic('fetch', 12, 'spin')}${ic('fetch', 16, 'spin')}${ic('fetch', 24, 'spin')}<span class="muted">Loading changes…</span></div>
+      <div class="cap">The <span class="mono">fetch</span> icon rotating once per second, any size (12px in the status bar).</div></div>
+  </div>
+
+  <h2>Dialog chrome</h2>
+  <div class="grid3" style="grid-template-columns:repeat(auto-fill,minmax(540px,1fr))">
+    <div class="cell"><h4>Default width 520</h4><div class="dialog w520" role="dialog" aria-label="Delete branch"><div class="dialog-head">${ic('warn', 16)}<span class="dialog-title">Delete branch feat/palette?</span><button class="btn btn-xs btn-ghost" data-tip="Close" aria-label="Close">${ic('x', 12)}</button></div><div class="dialog-body compact"><span>The branch has 2 commits that are not on any other branch. They can be recovered from the reflog for a while.</span><label class="check"><span class="box"></span>Also delete origin/feat/palette</label></div><div class="dialog-foot"><span class="foot-hint">Enter does not delete</span><button class="btn">Cancel</button><button class="btn btn-danger">Delete branch</button></div></div>
+      <div class="cap">Radius 12, 1px <span class="mono">border-strong</span>, scrim over the window. Header padding 16/20, gap 8, optional 16px muted icon, 14px title, <b>× close</b> (Xs ghost, tooltip "Close"). Body padding 20, gap 16 (14 in compact mode), max height 560 and scrolls. Footer padding 16/20, gap 8, optional left hint (12px muted) that pushes the buttons right. Enter runs only the dialog's default; a <b>danger default is never triggered by Enter</b> — the user clicks it or Tabs to it (Delete / Remove / Drop / Reset, generic confirm). Esc cancels.</div></div>
+    <div class="cell"><h4>Busy</h4><div class="dialog w520" role="dialog" aria-label="Fetching" aria-busy="true"><div class="dialog-head">${ic('fetch', 16)}<span class="dialog-title">Fetch all remotes</span><button class="btn btn-xs btn-ghost" disabled aria-label="Close">${ic('x', 12)}</button></div><div class="dialog-body compact"><div class="flexrow">${ic('fetch', 14, 'spin')}<span>Fetching origin…</span></div><span class="progress dlg fill indet"><i></i></span></div><div class="dialog-foot"><span class="foot-hint">Please wait</span><button class="btn" disabled>Cancel</button><button class="btn btn-primary" disabled>Fetch</button></div></div>
+      <div class="cap">While the git call runs the dialog is busy: the × is disabled, Esc is ignored, a click on the scrim does not dismiss it, Enter is ignored, and the dialog disables its own Cancel and primary buttons.</div></div>
+  </div>
+  </div>`);
 })();
 </script>
 </body>

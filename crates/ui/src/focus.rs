@@ -27,6 +27,23 @@ pub fn is_keyboard(cx: &App) -> bool {
     cx.global::<FocusState>().keyboard_modality
 }
 
+/// Runs `activate` for an Enter press on a focused control.
+///
+/// Enter is the global `Confirm` action, which swallows the key-down GPUI would
+/// pair with the key-up to click a focused element; so a control handles
+/// `Confirm` itself (the design's native buttons and checkboxes act on Enter).
+/// The focus restore of a layer the activation closes waits for the key-up, so
+/// the opener that regains focus is not activated by it.
+pub(crate) fn activate_on_enter(
+    window: &mut Window,
+    cx: &mut App,
+    activate: impl FnOnce(&mut Window, &mut App),
+) {
+    crate::overlay::defer_focus_restore(window, cx);
+    activate(window, cx);
+    crate::overlay::clear_deferred_focus_restore(window, cx);
+}
+
 /// True when `handle` is focused and focus came from the keyboard.
 pub fn focus_visible(handle: &FocusHandle, window: &Window, cx: &App) -> bool {
     handle.is_focused(window) && is_keyboard(cx)

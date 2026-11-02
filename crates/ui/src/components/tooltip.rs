@@ -7,7 +7,7 @@ use gpui::{
 };
 
 use crate::components::Kbd;
-use crate::metrics::{FONT_UI, FS_SM, R_SM};
+use crate::metrics::{FS_SM, R_SM};
 use crate::theme::ActiveTheme;
 
 /// A surface panel with a line of text and an optional trailing key cap.
@@ -66,7 +66,9 @@ impl Render for Tooltip {
             .border_color(colors.border_strong)
             .rounded(R_SM)
             .shadow(cx.theme().pop_shadow())
-            .font_family(FONT_UI)
+            // A tooltip is its own root and does not inherit the window's text style, so it
+            // needs the CJK fallbacks set explicitly.
+            .font(crate::fonts::ui_font())
             .text_size(FS_SM)
             .text_color(colors.text)
             .child(self.label.clone())

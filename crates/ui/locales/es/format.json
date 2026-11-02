@@ -1,0 +1,16 @@
+{
+  "format.days_ago.one": "hace {n} d",
+  "format.days_ago.other": "hace {n} d",
+  "format.hours_ago.one": "hace {n} h",
+  "format.hours_ago.other": "hace {n} h",
+  "format.just_now": "justo ahora",
+  "format.minutes_ago.one": "hace {n} min",
+  "format.minutes_ago.other": "hace {n} min",
+  "format.months_ago.one": "hace {n} mes",
+  "format.months_ago.other": "hace {n} meses",
+  "format.weeks_ago.one": "hace 1 semana",
+  "format.weeks_ago.other": "hace {n} semanas",
+  "format.years_ago.one": "hace {n} a",
+  "format.years_ago.other": "hace {n} a",
+  "format.yesterday": "ayer"
+}

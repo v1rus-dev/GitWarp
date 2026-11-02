@@ -1,3 +1,5 @@
+mod activity_strip;
+mod app_icon;
 mod changes_view;
 mod checkout_dialog;
 mod clone_dialog;
@@ -15,6 +17,7 @@ mod init_flow;
 mod network_ops;
 mod network_service;
 mod open_dialog;
+mod palette;
 mod ref_dialog;
 mod ref_ops;
 mod repo_view;
@@ -24,10 +27,16 @@ mod sidebar;
 mod syntax;
 #[cfg(test)]
 mod test_support;
+mod text_runs;
 mod theme;
 mod welcome;
+mod welcome_activity;
 mod workspace;
 mod worktree_dialog;
+mod worktree_glyphs;
+mod worktree_path;
+mod worktree_switcher;
+mod worktrees_model;
 mod worktrees_view;
 
 use gpui::{
@@ -179,6 +188,8 @@ fn main() {
             Settings::default()
         }
     };
+    // Before the first window renders, so every view reads the chosen language.
+    ui::i18n::set_language(loaded.language.code());
     // The command line and GITWARP_GIT win over the Git page's choice.
     let git_choice = git_choice.unwrap_or_else(|| loaded.git_choice());
     // Resolved once, before any window exists, so the probe cannot freeze the UI.
@@ -235,6 +246,12 @@ fn main() {
             let shortcuts = vec![
                 ui::actions::key_binding(
                     cx,
+                    &keys("palette", "secondary-p"),
+                    palette::OpenPalette,
+                    None,
+                ),
+                ui::actions::key_binding(
+                    cx,
                     &keys("sidebar", "secondary-b"),
                     repo_view::ToggleSidebar,
                     None,
@@ -266,6 +283,12 @@ fn main() {
                     repo_view::OpenBranchSwitcher,
                     None,
                 ),
+                ui::actions::key_binding(
+                    cx,
+                    &keys("worktree_switcher", "ctrl-alt-w"),
+                    repo_view::OpenWorktreeSwitcher,
+                    None,
+                ),
                 ui::actions::key_binding(cx, "secondary-shift-s", repo_view::StashChanges, None),
                 // Fetch every remote, as the sidebar's menu advertises.
                 ui::actions::key_binding(
@@ -274,6 +297,21 @@ fn main() {
                     repo_view::FetchAll,
                     None,
                 ),
+                ui::actions::key_binding(
+                    cx,
+                    &keys("pull", "secondary-shift-l"),
+                    repo_view::PullBranch,
+                    None,
+                ),
+                ui::actions::key_binding(
+                    cx,
+                    &keys("push", "secondary-shift-p"),
+                    repo_view::PushBranch,
+                    None,
+                ),
+                // Ctrl Shift O opens the Clone dialog on the welcome screen
+                // and in a repository window.
+                ui::actions::key_binding(cx, "secondary-shift-o", workspace::OpenCloneDialog, None),
                 // Welcome screen: Ctrl N opens the Initialize dialog and Del
                 // drops a recent entry.
                 ui::actions::key_binding(
@@ -288,6 +326,10 @@ fn main() {
             // The search field's own keys (Shift+Enter, F3, Esc, ↓) live in
             // its key context.
             repo_view::bind_search_keys(cx);
+            // The palette's own keys (PgUp/PgDn, Tab) live in its key context.
+            palette::bind_keys(cx);
+            // The worktree switcher's own keys (Alt 1…9) live in its context.
+            worktree_switcher::bind_keys(cx);
             // The history list's extra keys (j/k, PgUp/PgDn, Ctrl+C) live in
             // the list's own context.
             history_view::bind_history_keys(cx, &loaded);
@@ -310,7 +352,7 @@ fn main() {
             let window_size = if path.is_some() {
                 size(px(1200.), px(800.))
             } else {
-                size(px(960.), px(620.))
+                size(px(960.), px(680.))
             };
             let bounds = Bounds::centered(None, window_size, cx);
             cx.open_window(
@@ -327,6 +369,7 @@ fn main() {
                         ..Default::default()
                     }),
                     app_id: Some("dev.v1rus.gitwarp".into()),
+                    icon: app_icon::window_icon(),
                     ..Default::default()
                 },
                 |window, cx| {

@@ -20,6 +20,9 @@ use crate::theme::ActiveTheme;
 /// A menu callback.
 pub type MenuAction = Rc<dyn Fn(&mut Window, &mut App)>;
 
+/// Builds the rows an item replaces its menu with; called on every activation.
+pub type MenuSubmenu = Rc<dyn Fn() -> Vec<MenuEntry>>;
+
 /// One actionable row of a menu.
 #[derive(Clone)]
 pub struct MenuItem {
@@ -29,6 +32,9 @@ pub struct MenuItem {
     pub danger: bool,
     pub disabled: bool,
     pub action: MenuAction,
+    /// When set, activating the item swaps the open menu's rows for these
+    /// instead of closing it and running `action`.
+    pub submenu: Option<MenuSubmenu>,
 }
 
 impl MenuItem {
@@ -40,6 +46,7 @@ impl MenuItem {
             danger: false,
             disabled: false,
             action: Rc::new(|_, _| {}),
+            submenu: None,
         }
     }
 
@@ -65,6 +72,14 @@ impl MenuItem {
 
     pub fn action(mut self, action: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.action = Rc::new(action);
+        self
+    }
+
+    /// Makes the item replace the open menu's rows in place (same position,
+    /// same focus) instead of closing it. A "Back" row is just another such
+    /// item that returns the parent's rows.
+    pub fn submenu(mut self, entries: impl Fn() -> Vec<MenuEntry> + 'static) -> Self {
+        self.submenu = Some(Rc::new(entries));
         self
     }
 }
@@ -166,7 +181,7 @@ pub fn open_context_menu(
     window: &mut Window,
     cx: &mut App,
 ) -> LayerId {
-    open_at(position, entries, window, cx)
+    open_at(position, entries, None, window, cx)
 }
 
 /// Opens a menu 2px below the bottom-left corner of `anchor`.
@@ -176,18 +191,38 @@ pub fn open_dropdown(
     window: &mut Window,
     cx: &mut App,
 ) -> LayerId {
+    open_dropdown_at(anchor, entries, None, window, cx)
+}
+
+/// Like [`open_dropdown`], with item `highlight` (an item index, separators
+/// not counted) highlighted from the start: a select opens on its current
+/// value, so the arrows move from there.
+pub fn open_dropdown_at(
+    anchor: Bounds<Pixels>,
+    entries: Vec<MenuEntry>,
+    highlight: Option<usize>,
+    window: &mut Window,
+    cx: &mut App,
+) -> LayerId {
     let position = point(anchor.left(), anchor.bottom() + px(2.));
-    open_at(position, entries, window, cx)
+    open_at(position, entries, highlight, window, cx)
 }
 
 fn open_at(
     position: Point<Pixels>,
     entries: Vec<MenuEntry>,
+    highlight: Option<usize>,
     window: &mut Window,
     cx: &mut App,
 ) -> LayerId {
     close_previous(window, cx);
-    let view = cx.new(|cx| MenuView::new(entries, cx));
+    let view = cx.new(|cx| {
+        let mut menu = MenuView::new(entries, cx);
+        if let Some(index) = highlight.filter(|index| menu.enabled().get(*index) == Some(&true)) {
+            menu.nav.set(index);
+        }
+        menu
+    });
     let focus = view.read(cx).focus.clone();
     let id = overlay::open_popover(position, view.clone().into(), window, cx);
     view.update(cx, |menu, _| menu.layer = Some(id));
@@ -244,11 +279,11 @@ impl MenuView {
             .collect()
     }
 
-    fn item_action(&self, index: usize) -> Option<MenuAction> {
+    fn item(&self, index: usize) -> Option<&MenuItem> {
         self.entries
             .iter()
             .filter_map(|entry| match entry {
-                MenuEntry::Item(item) => Some(item.action.clone()),
+                MenuEntry::Item(item) => Some(item),
                 MenuEntry::Separator => None,
             })
             .nth(index)
@@ -264,10 +299,17 @@ impl MenuView {
         cx.notify();
     }
 
-    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut App) {
-        let Some(action) = self.item_action(index) else {
+    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.item(index) else {
             return;
         };
+        if let Some(submenu) = item.submenu.clone() {
+            self.entries = submenu();
+            self.nav.clear();
+            cx.notify();
+            return;
+        }
+        let action = item.action.clone();
         if let Some(layer) = self.layer {
             overlay::close(layer, window, cx);
         }

@@ -6,8 +6,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use git_core::{
-    probe_folder, ErrorClass, FolderProbe, Git, GitChoice, GitSource, Head, LogOptions, RefKind,
-    Repo, SubmoduleState, Worktree,
+    activity, level, levels, my_email, probe_folder, ErrorClass, FolderProbe, Git, GitChoice,
+    GitSource, Head, LogOptions, RefKind, Repo, SubmoduleState, Worktree,
 };
 use git_graph::GraphBuilder;
 
@@ -1627,4 +1627,105 @@ fn reads_a_staged_rename_against_its_old_path() {
     let kinds: Vec<_> = diff.hunks[0].lines.iter().map(|line| line.kind).collect();
     assert!(kinds.contains(&git_core::LineKind::Removed), "{kinds:?}");
     assert!(kinds.contains(&git_core::LineKind::Added), "{kinds:?}");
+}
+
+/// An empty commit by `email` at `date` (ISO 8601, with `Z`).
+fn commit_by(dir: &Path, email: &str, date: &str) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            &format!("user.email={email}"),
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "c",
+        ])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .status()
+        .expect("git is installed");
+    assert!(status.success());
+}
+
+#[test]
+fn activity_counts_mine_and_all_and_honours_the_bounds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    // 2026-03-10T12:00:00Z = 1_773_144_000; three commits at the same instant
+    // share a day in any timezone, so the counts do not depend on the host TZ.
+    // A week earlier, outside the range below. Committed first: `git log --since`
+    // stops walking at a commit older than the bound, so history is kept in
+    // chronological order like a real one.
+    commit_by(d, "me@example.com", "2026-03-03T12:00:00Z");
+    commit_by(d, "me@example.com", "2026-03-10T12:00:00Z");
+    commit_by(d, "ME@example.com", "2026-03-10T12:00:00Z");
+    commit_by(d, "other@example.com", "2026-03-10T12:00:00Z");
+    // A week later, outside the range below.
+    commit_by(d, "me@example.com", "2026-03-17T12:00:00Z");
+    let repo = open(d).unwrap();
+
+    let since = 1_773_144_000 - 3 * 86_400;
+    let until = 1_773_144_000 + 3 * 86_400;
+    let act = activity(&repo, since, until, Some("me@example.com")).unwrap();
+    assert_eq!(act.me.as_deref(), Some("me@example.com"));
+    assert_eq!(act.days.len(), 1, "{:?}", act.days);
+    assert_eq!((act.days[0].mine, act.days[0].all), (2, 3));
+
+    // Without an email nothing is "mine"; a wider range sees all three days.
+    let act = activity(&repo, 0, 4_000_000_000, None).unwrap();
+    assert_eq!(act.days.len(), 3);
+    assert!(act.days.windows(2).all(|w| w[0].day < w[1].day));
+    assert_eq!(act.days.iter().map(|d| d.all).sum::<u32>(), 5);
+    assert!(act.days.iter().all(|d| d.mine == 0));
+    assert_eq!(act.me, None);
+
+    // Both bounds exclude: a range before any commit is empty.
+    let act = activity(&repo, 0, 1_000_000_000, None).unwrap();
+    assert!(act.days.is_empty());
+}
+
+#[test]
+fn activity_of_an_empty_repository_is_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q"]);
+    let repo = open(tmp.path()).unwrap();
+    let act = activity(&repo, 0, 4_000_000_000, Some("a@b.c")).unwrap();
+    assert!(act.days.is_empty());
+}
+
+#[test]
+fn my_email_reads_the_repository_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    git(d, &["config", "user.email", "local@example.com"]);
+    // Not asserting the absent case: the machine's global config may set it.
+    assert_eq!(
+        my_email(&open(d).unwrap()).unwrap().as_deref(),
+        Some("local@example.com")
+    );
+}
+
+#[test]
+fn heat_levels_follow_the_counts_in_view() {
+    let t = levels(&[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(t, [2, 4, 6, 8]);
+    assert_eq!(level(0, &t), 0);
+    assert_eq!(
+        (level(1, &t), level(3, &t), level(5, &t), level(8, &t)),
+        (1, 2, 3, 4)
+    );
+    // Few distinct values: linear, ceil(4n / max).
+    let t = levels(&[1, 2, 4]);
+    assert_eq!([1, 2, 3, 4].map(|c| level(c, &t)), [1, 2, 3, 4]);
 }

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gitwarp — Dialogs: branch / tag</title>
+<title>GitWarp — Dialogs: branch / tag / remote</title>
 <link rel="stylesheet" href="tokens.css">
 <link rel="stylesheet" href="gitwarp.css">
 <link rel="stylesheet" href="dialogs.css">
@@ -13,24 +13,57 @@
 <body>
 <script>
 (function () {
-  const D = GLD;
-  const old = () => G_.commits[3];
-  const G_ = GL;
-  D.page('Dialogs: branch / tag', [
+  const D = GLD, G = GL;
+  const old = () => G.commits[3];
+  const mid = () => G.commits[2];
+  const E = 'error: The branch \'feat/idle-lanes\' is checked out at \'/home/mira/develop/gitwarp-hotfix\'\nfatal: could not lock config file .git/config: File exists';
+  D.page('Dialogs: branch / tag / remote', [
     ['Create branch · empty', (w) => D.branch(w, {})],
     ['Create branch · name taken', (w) => D.branch(w, { name: 'feat/palette', touched: { name: true } })],
     ['Create branch · invalid name', (w) => D.branch(w, { name: 'my branch', touched: { name: true } })],
-    ['Create branch · ready', (w) => D.branch(w, { name: 'feat/ssh-keys' })],
-    ['Create branch · older commit', (w) => D.branch(w, { name: 'fix/lane-gap', commit: old() })],
+    ['Create branch · ready (changes come along)', (w) => D.branch(w, { name: 'feat/ssh-keys' })],
+    ['Create branch · ready, clean work tree (no banner)', (w) => D.branch(w, { name: 'feat/ssh-keys', dirty: 0 })],
+    ['Create branch · older commit (may conflict)', (w) => D.branch(w, { name: 'fix/lane-gap', commit: old() })],
+    ['Create branch · running', (w) => D.branch(w, { name: 'feat/ssh-keys', phase: 'running' })],
+    ['Create branch · error', (w) => D.branch(w, { name: 'feat/ssh-keys', phase: 'error', err: E })],
     ['Create tag · empty', (w) => D.tag(w, {})],
     ['Create tag · message missing', (w) => D.tag(w, { name: 'v0.3.1', touched: { msg: true } })],
     ['Create tag · name taken', (w) => D.tag(w, { name: 'v0.3.0', msg: 'Release', touched: { name: true } })],
     ['Create tag · ready, push', (w) => D.tag(w, { name: 'v0.3.1', msg: 'Fix line staging on CRLF files', push: true })],
+    ['Create tag · no GPG key configured', (w) => D.tag(w, { name: 'v0.3.1', msg: 'Fix line staging on CRLF files', signKey: false })],
+    ['Create tag · repository has no tags', (w) => D.tag(w, { latest: '' })],
     ['Create tag · lightweight', (w) => D.tag(w, { name: 'checkpoint-1', type: 'light' })],
+    ['Create tag · running', (w) => D.tag(w, { name: 'v0.3.1', msg: 'Fix line staging', phase: 'running' })],
     ['Add remote · empty', (w) => D.remoteAdd(w, {})],
-    ['Add remote · name taken', (w) => D.remoteAdd(w, { name: 'origin', url: 'git@github.com:acme/gitlane.git', touched: { name: true } })],
+    ['Add remote · repository has no remotes', (w) => D.remoteAdd(w, { remotes: [] })],
+    ['Add remote · name taken', (w) => D.remoteAdd(w, { name: 'origin', url: 'git@github.com:acme/gitwarp.git', touched: { name: true } })],
     ['Add remote · invalid address', (w) => D.remoteAdd(w, { name: 'fork', url: 'github.com/mira', touched: { url: true } })],
-    ['Add remote · ready', (w) => D.remoteAdd(w, { name: 'fork', url: 'git@github.com:mira-k/gitlane.git' })]
+    ['Add remote · ready (SSH)', (w) => D.remoteAdd(w, { name: 'fork', url: 'git@github.com:mira-k/gitwarp.git' })],
+    ['Add remote · ready (HTTPS)', (w) => D.remoteAdd(w, { name: 'fork', url: 'https://github.com/mira-k/gitwarp.git' })],
+    ['Add remote · error', (w) => D.remoteAdd(w, { name: 'fork', url: 'git@github.com:mira-k/gitwarp.git', phase: 'error', err: 'error: could not lock config file .git/config: File exists' })],
+    ['Edit remote · prefilled', (w) => D.remoteEdit(w, {})],
+    ['Edit remote · name taken', (w) => D.remoteEdit(w, { name: 'origin', touched: { name: true } })],
+    ['Rename branch · unchanged', (w) => D.rename(w, 'branch', {})],
+    ['Rename branch · ready', (w) => D.rename(w, 'branch', { name: 'feat/command-palette' })],
+    ['Rename branch · name taken', (w) => D.rename(w, 'branch', { name: 'main', touched: { name: true } })],
+    ['Rename branch · error', (w) => D.rename(w, 'branch', { name: 'feat/command-palette', phase: 'error', err: 'fatal: Invalid branch name: \'feat/command-palette\'' })],
+    ['Rename tag · ready', (w) => D.rename(w, 'tag', { name: 'v0.3.0-rc1' })],
+    ['Reset · mixed (default)', (w) => D.reset(w, {})],
+    ['Reset · soft', (w) => D.reset(w, { mode: 'soft' })],
+    ['Reset · hard', (w) => D.reset(w, { mode: 'hard' })],
+    ['Reset · running', (w) => D.reset(w, { mode: 'hard', phase: 'running' })],
+    ['Cherry-pick', (w) => D.cherry(w, { commit: mid() })],
+    ['Cherry-pick · conflict error', (w) => D.cherry(w, { commit: mid(), phase: 'error', err: 'error: could not apply 8d41f6e... Fix detect order\nhint: Resolve all conflicts manually, mark them as resolved' })],
+    ['Revert', (w) => D.revert(w, { commit: mid() })],
+    ['Delete branch · step 1 (safe delete)', (w) => D.del(w, 'branch', { unmerged: true })],
+    ['Delete branch · step 2 (not merged → Delete anyway)', (w) => D.del(w, 'branch', { unmerged: true, step: 2 })],
+    ['Delete tag', (w) => D.del(w, 'tag', {})],
+    ['Remove remote', (w) => D.del(w, 'remote', {})],
+    ['Drop stash', (w) => D.del(w, 'stash', {})],
+    ['Delete remote branch (confirm)', (w) => D.confirmRemoteBranch(w, {})],
+    ['Toasts · dialog-less ref actions', (w) => D.toastStrip(w, [['ok', 'Stashed local changes'], ['info', 'No local changes to stash'], ['ok', 'Applied stash@{0}'], ['ok', 'Popped stash@{0}'], ['ok', 'feat/palette now tracks origin/feat/palette'], ['error', 'There is no origin/feat/new yet. Push feat/new first to create it.']])],
+    ['Toasts · checkout (clean work tree)', (w) => D.toastStrip(w, [['ok', 'Switched to feat/palette'], ['ok', 'Checked out origin/fix/git-detect'], ['ok', 'Checked out tag v0.3.0 (detached HEAD)'], ['ok', 'Checked out 8d41f6e (detached HEAD)'], ['warn', 'The tag has no commit to check out']])],
+    ['Toasts · ref results', (w) => D.toastStrip(w, [['ok', 'Created feat/ssh-keys and switched to it'], ['ok', 'Created tag v0.3.1'], ['ok', 'Added remote fork'], ['ok', 'Deleted branch feat/idle-lanes'], ['warn', 'Create a commit before tagging'], ['warn', 'Cannot tell which remote origin/x belongs to']])]
   ]);
 })();
 </script>

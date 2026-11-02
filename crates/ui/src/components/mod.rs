@@ -9,6 +9,10 @@ use crate::metrics::FONT_UI;
 
 pub(crate) type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static>;
 pub(crate) type ToggleHandler = Box<dyn Fn(bool, &mut Window, &mut gpui::App) + 'static>;
+/// A click handler shared between the click and the Enter key.
+pub(crate) type SharedClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static>;
+/// A toggle handler shared between the click and the Enter key.
+pub(crate) type SharedToggleHandler = Rc<dyn Fn(bool, &mut Window, &mut gpui::App) + 'static>;
 pub(crate) type SelectHandler = Rc<dyn Fn(usize, &mut Window, &mut gpui::App) + 'static>;
 
 mod avatar;
@@ -19,6 +23,7 @@ mod counter;
 pub mod dialog;
 mod empty_state;
 mod file_row;
+mod heatmap;
 mod list_row;
 pub mod menu;
 mod progress;
@@ -47,6 +52,7 @@ pub use counter::{CountPill, Counter, Kbd};
 pub use dialog::{Dialog, DialogFocus, DialogFocusKind, DialogHost};
 pub use empty_state::EmptyState;
 pub use file_row::{fit_path_start, FileRow, FittedPath};
+pub use heatmap::{long_date, HeatLegend, Heatmap};
 pub use list_row::ListRow;
 pub use menu::{MenuEntry, MenuItem, MenuNav};
 pub use progress::Progress;

@@ -44,7 +44,7 @@ impl Probe {
 
     fn display_path(&self) -> String {
         if self.path.as_os_str().is_empty() {
-            "not shipped with this build".to_owned()
+            ui::t!("settings.git.not_shipped").to_string()
         } else {
             self.path.display().to_string()
         }
@@ -87,9 +87,9 @@ fn describe(error: &Error) -> (Option<GitVersion>, String) {
             found, required, ..
         } => (
             Some(found),
-            format!("git {found} is too old; GitWarp needs {required} or newer"),
+            ui::t!("settings.git.too_old", found = found, required = required).to_string(),
         ),
-        ErrorClass::GitNotFound => (None, "binary is missing (file not found)".to_owned()),
+        ErrorClass::GitNotFound => (None, ui::t!("settings.git.binary_missing").to_string()),
         _ => (None, error.to_string()),
     }
 }
@@ -99,7 +99,7 @@ fn bundled_missing() -> Probe {
         path: PathBuf::new(),
         version: None,
         source: GitSource::Bundled,
-        error: Some("no bundled git is shipped with this build".to_owned()),
+        error: Some(ui::t!("settings.git.no_bundled").to_string()),
     }
 }
 
@@ -108,7 +108,7 @@ fn system_missing() -> Probe {
         path: PathBuf::new(),
         version: None,
         source: GitSource::System,
-        error: Some("“git” was not found in PATH".to_owned()),
+        error: Some(ui::t!("settings.git.not_in_path").to_string()),
     }
 }
 
@@ -159,7 +159,7 @@ impl SettingsView {
                 path,
                 version: None,
                 source: GitSource::Custom,
-                error: Some("Enter or browse to a git executable.".to_owned()),
+                error: Some(ui::t!("settings.git.enter_executable").to_string()),
             });
             cx.notify();
             return;
@@ -206,7 +206,7 @@ fn version_label(probe: Option<&Probe>, colors: ui::ThemeColors) -> AnyElement {
             .text_size(FS_SM)
             .text_color(colors.error)
             .child(Icon::new(IconName::Err).size(px(12.)).color(colors.error))
-            .child("unusable")
+            .child(ui::t!("settings.git.unusable"))
             .into_any_element(),
         None => div()
             .text_size(FS_SM)
@@ -219,7 +219,7 @@ fn version_label(probe: Option<&Probe>, colors: ui::ThemeColors) -> AnyElement {
 fn option_card(
     mode: GitMode,
     selected: bool,
-    title: &'static str,
+    label: gpui::SharedString,
     description: AnyElement,
     version: AnyElement,
     extra: Option<AnyElement>,
@@ -228,7 +228,16 @@ fn option_card(
     let colors = cx.theme().colors;
     let entity = cx.entity();
     div()
-        .id(format!("settings-git-{title}"))
+        .id(format!(
+            "settings-git-{}",
+            // Stable element ids, independent of the translated label.
+            match mode {
+                GitMode::Auto => "Auto",
+                GitMode::Bundled => "Bundled",
+                GitMode::System => "System",
+                GitMode::Custom => "Custom path",
+            }
+        ))
         .w_full()
         .p(px(10.))
         .px(px(12.))
@@ -276,7 +285,7 @@ fn option_card(
                         .min_w_0()
                         .text_size(FS_BASE)
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(title),
+                        .child(label),
                 )
                 .child(version),
         )
@@ -329,39 +338,46 @@ pub(super) fn render(
                     .map(|probe| (probe.display_path(), probe.label()))
                     .unwrap_or_default();
                 banners.push(
-                    Banner::new(BannerKind::Warn, "Bundled git is broken — using system git")
-                        .body(format!(
-                            "Auto fell back to {path} ({version}). Bundled git is unusable: {}",
-                            bundled
-                                .as_ref()
-                                .and_then(|probe| probe.error.clone())
-                                .unwrap_or_else(|| "not available".to_owned())
-                        ))
-                        .into_any_element(),
+                    Banner::new(
+                        BannerKind::Warn,
+                        ui::t!("settings.git.banner.fallback_title"),
+                    )
+                    .body(ui::t!(
+                        "settings.git.banner.fallback_body",
+                        path = path,
+                        version = version,
+                        reason = bundled
+                            .as_ref()
+                            .and_then(|probe| probe.error.clone())
+                            .unwrap_or_else(|| ui::t!("settings.git.not_available").to_string())
+                    ))
+                    .into_any_element(),
                 );
             } else if !bundled_ok && !system_ok {
                 banners.push(
-                    Banner::new(BannerKind::Error, "No usable git found")
-                        .body("Both bundled and system git are unusable.")
+                    Banner::new(BannerKind::Error, ui::t!("settings.git.banner.none_title"))
+                        .body(ui::t!("settings.git.banner.none_body"))
                         .list([
-                            format!(
-                                "Bundled ({}): {}",
-                                bundled
+                            ui::t!(
+                                "settings.git.banner.none_bundled",
+                                path = bundled
                                     .as_ref()
                                     .map(Probe::display_path)
                                     .unwrap_or_else(|| "—".to_owned()),
-                                bundled
+                                error = bundled
                                     .as_ref()
                                     .and_then(|probe| probe.error.clone())
                                     .unwrap_or_default()
-                            ),
-                            format!(
-                                "System (PATH): {}",
-                                system
+                            )
+                            .to_string(),
+                            ui::t!(
+                                "settings.git.banner.none_system",
+                                error = system
                                     .as_ref()
                                     .and_then(|probe| probe.error.clone())
                                     .unwrap_or_default()
-                            ),
+                            )
+                            .to_string(),
                         ])
                         .into_any_element(),
                 );
@@ -371,13 +387,16 @@ pub(super) fn render(
             if let Some(probe) = &bundled {
                 if !probe.ok() {
                     banners.push(
-                        Banner::new(BannerKind::Error, "Bundled git is unusable")
-                            .body(format!(
-                                "{}: {}",
-                                probe.display_path(),
-                                probe.error.clone().unwrap_or_default()
-                            ))
-                            .into_any_element(),
+                        Banner::new(
+                            BannerKind::Error,
+                            ui::t!("settings.git.banner.bundled_title"),
+                        )
+                        .body(ui::t!(
+                            "settings.git.banner.path_error",
+                            path = probe.display_path(),
+                            error = probe.error.clone().unwrap_or_default()
+                        ))
+                        .into_any_element(),
                     );
                 }
             }
@@ -386,9 +405,12 @@ pub(super) fn render(
             if let Some(probe) = &system {
                 if !probe.ok() {
                     banners.push(
-                        Banner::new(BannerKind::Error, "System git is unusable")
-                            .body(probe.error.clone().unwrap_or_default())
-                            .into_any_element(),
+                        Banner::new(
+                            BannerKind::Error,
+                            ui::t!("settings.git.banner.system_title"),
+                        )
+                        .body(probe.error.clone().unwrap_or_default())
+                        .into_any_element(),
                     );
                 }
             }
@@ -396,20 +418,26 @@ pub(super) fn render(
         GitMode::Custom => {
             if settings.git_path.trim().is_empty() {
                 banners.push(
-                    Banner::new(BannerKind::Error, "No path chosen")
-                        .body("Enter or browse to a git executable.")
-                        .into_any_element(),
+                    Banner::new(
+                        BannerKind::Error,
+                        ui::t!("settings.git.banner.no_path_title"),
+                    )
+                    .body(ui::t!("settings.git.enter_executable"))
+                    .into_any_element(),
                 );
             } else if let Some(probe) = &custom {
                 if !probe.ok() {
                     banners.push(
-                        Banner::new(BannerKind::Error, "This file cannot be used as git")
-                            .body(format!(
-                                "{}: {}",
-                                probe.display_path(),
-                                probe.error.clone().unwrap_or_default()
-                            ))
-                            .into_any_element(),
+                        Banner::new(
+                            BannerKind::Error,
+                            ui::t!("settings.git.banner.custom_title"),
+                        )
+                        .body(ui::t!(
+                            "settings.git.banner.path_error",
+                            path = probe.display_path(),
+                            error = probe.error.clone().unwrap_or_default()
+                        ))
+                        .into_any_element(),
                     );
                 }
             }
@@ -452,7 +480,7 @@ pub(super) fn render(
                     .child(
                         Button::new("settings-git-validate")
                             .size(ButtonSize::Small)
-                            .label("Validate")
+                            .label(ui::t!("settings.git.validate"))
                             .on_click(validate),
                     ),
             )
@@ -469,12 +497,10 @@ pub(super) fn render(
         .child(option_card(
             GitMode::Auto,
             settings.git_mode == GitMode::Auto,
-            "Auto",
+            ui::t!("settings.git.mode.auto"),
             div()
                 .text_color(colors.muted)
-                .child(
-                    "Use the bundled git if present and working, otherwise the one from PATH. Recommended.",
-                )
+                .child(ui::t!("settings.git.mode.auto_desc"))
                 .into_any_element(),
             auto_version,
             None,
@@ -483,10 +509,10 @@ pub(super) fn render(
         .child(option_card(
             GitMode::Bundled,
             settings.git_mode == GitMode::Bundled,
-            "Bundled",
+            ui::t!("settings.git.mode.bundled"),
             div()
                 .text_color(colors.muted)
-                .child("Shipped with GitWarp.")
+                .child(ui::t!("settings.git.mode.bundled_desc"))
                 .when_some(bundled.as_ref(), |this, probe| {
                     this.child(
                         div()
@@ -503,10 +529,10 @@ pub(super) fn render(
         .child(option_card(
             GitMode::System,
             settings.git_mode == GitMode::System,
-            "System",
+            ui::t!("settings.git.mode.system"),
             div()
                 .text_color(colors.muted)
-                .child("From PATH.")
+                .child(ui::t!("settings.git.mode.system_desc"))
                 .when_some(system.as_ref(), |this, probe| {
                     this.child(
                         div()
@@ -523,10 +549,10 @@ pub(super) fn render(
         .child(option_card(
             GitMode::Custom,
             settings.git_mode == GitMode::Custom,
-            "Custom path",
+            ui::t!("settings.git.mode.custom"),
             div()
                 .text_color(colors.muted)
-                .child("Use a git you installed yourself.")
+                .child(ui::t!("settings.git.mode.custom_desc"))
                 .into_any_element(),
             custom_version,
             custom_extra,
@@ -545,13 +571,22 @@ pub(super) fn render(
             .flex_col()
             .gap(px(4.))
             .text_size(FS_SM)
-            .child(in_use_line("Executable", probe.display_path(), colors))
+            .child(in_use_line(
+                ui::t!("settings.git.in_use.executable"),
+                probe.display_path(),
+                colors,
+            ))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .child(div().w(px(90.)).text_color(colors.muted).child("Version"))
+                    .child(
+                        div()
+                            .w(px(90.))
+                            .text_color(colors.muted)
+                            .child(ui::t!("settings.git.in_use.version")),
+                    )
                     .child(div().font_family(FONT_MONO).child(probe.label()))
                     .when(probe.too_old(), |this| {
                         this.child(
@@ -561,7 +596,7 @@ pub(super) fn render(
                                 .gap(px(4.))
                                 .text_color(colors.error)
                                 .child(Icon::new(IconName::Err).size(px(12.)).color(colors.error))
-                                .child("below 2.31"),
+                                .child(ui::t!("settings.git.in_use.too_old")),
                         )
                     })
                     .when(probe.ok(), |this| {
@@ -576,21 +611,18 @@ pub(super) fn render(
                                         .size(px(12.))
                                         .color(colors.success),
                                 )
-                                .child("supported"),
+                                .child(ui::t!("settings.git.in_use.supported")),
                         )
                     }),
             )
             .child(in_use_line(
-                "Source",
-                format!(
-                    "{}{}",
-                    probe.source,
-                    if settings.git_mode == GitMode::Auto {
-                        " (auto)"
-                    } else {
-                        ""
-                    }
-                ),
+                ui::t!("settings.git.in_use.source"),
+                if settings.git_mode == GitMode::Auto {
+                    ui::t!("settings.git.in_use.source_auto", source = probe.source)
+                } else {
+                    probe.source.to_string().into()
+                }
+                .to_string(),
                 colors,
             ))
             .into_any_element(),
@@ -607,7 +639,7 @@ pub(super) fn render(
             .gap(px(6.))
             .text_color(colors.error)
             .child(Icon::new(IconName::Err).size(px(12.)).color(colors.error))
-            .child("none — repositories cannot be opened")
+            .child(ui::t!("settings.git.in_use.none"))
             .into_any_element(),
     };
 
@@ -618,15 +650,16 @@ pub(super) fn render(
         }
     };
     let status = match active {
-        Some(probe) => format!("Status bar shows: git {} · {}", probe.label(), probe.source),
-        None => "Status bar shows: git not found".to_owned(),
+        Some(probe) => ui::t!(
+            "settings.git.status_bar",
+            version = probe.label(),
+            source = probe.source
+        ),
+        None => ui::t!("settings.git.status_bar_none"),
     };
 
     let mut page = div().flex().flex_col();
-    page = page.child(heading(
-        "Git",
-        "Choose which git executable GitWarp runs. Changes apply to all repositories after a restart of background operations.",
-    ));
+    page = page.child(heading("Git", ui::t!("settings.git.subtitle")));
     for banner in banners {
         page = page.child(div().max_w(px(760.)).mb(px(12.)).child(banner));
     }
@@ -644,7 +677,7 @@ pub(super) fn render(
                 div()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child("In use"),
+                    .child(ui::t!("settings.git.in_use.heading")),
             )
             .child(in_use),
     );
@@ -658,7 +691,7 @@ pub(super) fn render(
             .child(
                 Button::new("settings-git-redetect")
                     .icon(IconName::Fetch)
-                    .label("Re-detect")
+                    .label(ui::t!("settings.git.redetect"))
                     .disabled(loading)
                     .on_click(redetect),
             )
@@ -676,7 +709,7 @@ pub(super) fn render(
     page.into_any_element()
 }
 
-fn in_use_line(label: &'static str, value: String, colors: ui::ThemeColors) -> AnyElement {
+fn in_use_line(label: gpui::SharedString, value: String, colors: ui::ThemeColors) -> AnyElement {
     div()
         .flex()
         .items_center()
@@ -692,7 +725,7 @@ fn custom_status(probe: Option<&Probe>, cx: &Context<SettingsView>) -> AnyElemen
         None => div()
             .text_size(FS_SM)
             .text_color(colors.muted)
-            .child("Pick the git executable (not a directory). It is validated by running git --version.")
+            .child(ui::t!("settings.git.pick_help"))
             .into_any_element(),
         Some(probe) if probe.ok() => div()
             .flex()
@@ -700,8 +733,12 @@ fn custom_status(probe: Option<&Probe>, cx: &Context<SettingsView>) -> AnyElemen
             .gap(px(4.))
             .text_size(FS_SM)
             .text_color(colors.success)
-            .child(Icon::new(IconName::Check).size(px(12.)).color(colors.success))
-            .child(format!("git version {} detected", probe.label()))
+            .child(
+                Icon::new(IconName::Check)
+                    .size(px(12.))
+                    .color(colors.success),
+            )
+            .child(ui::t!("settings.git.detected", version = probe.label()))
             .into_any_element(),
         Some(probe) => div()
             .flex()

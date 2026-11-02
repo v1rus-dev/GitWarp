@@ -9,6 +9,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window,
 };
 
+use crate::actions::Confirm;
 use crate::focus::{self, RingOffset};
 use crate::icon::{Icon, IconName};
 use crate::metrics::{FS_BASE, R_PILL, R_XS};
@@ -19,6 +20,7 @@ use crate::theme::ActiveTheme;
 pub struct Checkbox {
     id: ElementId,
     label: Option<SharedString>,
+    label_element: Option<AnyElement>,
     checked: bool,
     mixed: bool,
     disabled: bool,
@@ -31,6 +33,7 @@ impl Checkbox {
         Self {
             id: id.into(),
             label: None,
+            label_element: None,
             checked: false,
             mixed: false,
             disabled: false,
@@ -41,6 +44,13 @@ impl Checkbox {
 
     pub fn label(mut self, label: impl Into<SharedString>) -> Self {
         self.label = Some(label.into());
+        self
+    }
+
+    /// A label made of several parts (e.g. text with a mono name); wins over
+    /// [`label`](Self::label).
+    pub fn label_element(mut self, label: impl IntoElement) -> Self {
+        self.label_element = Some(label.into_any_element());
         self
     }
 
@@ -129,6 +139,14 @@ impl RenderOnce for Checkbox {
             .min_h(px(26.))
             .key_context("ui-checkbox")
             .child(box_)
+            .when_some(self.label_element, |this, label| {
+                this.child(
+                    div()
+                        .text_size(FS_BASE)
+                        .text_color(colors.text)
+                        .child(label),
+                )
+            })
             .when_some(self.label, |this, label| {
                 this.child(
                     div()
@@ -144,7 +162,16 @@ impl RenderOnce for Checkbox {
             root = root.cursor_pointer().track_focus(&focus);
             if let Some(listener) = self.on_toggle {
                 let next = !self.checked;
-                root = root.on_click(move |_, window, cx| listener(next, window, cx));
+                let listener: crate::components::SharedToggleHandler = std::rc::Rc::from(listener);
+                let on_enter = listener.clone();
+                root = root
+                    .on_click(move |_, window, cx| listener(next, window, cx))
+                    // Enter toggles the focused checkbox like Space (see `focus::activate_on_enter`).
+                    .on_action(move |_: &Confirm, window, cx| {
+                        focus::activate_on_enter(window, cx, |window, cx| {
+                            on_enter(next, window, cx)
+                        });
+                    });
             }
         }
         root

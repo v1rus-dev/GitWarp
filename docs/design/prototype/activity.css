@@ -1,0 +1,100 @@
+/* GitWarp — commit activity heatmap (design proposal).
+   Proposed NEW tokens (to move into tokens.css once accepted): --heat-0 … --heat-4, --heat-cell, --heat-gap.
+   Every value is derived from existing tokens; only the mix percentages are new. */
+:root,
+[data-theme="dark"] {
+  --heat-0: color-mix(in srgb, var(--text) 8%, var(--bg));      /* #272a30 · 1.20:1 on bg — empty day */
+  --heat-1: color-mix(in srgb, var(--accent) 30%, var(--bg));   /* #324460 · 1.75:1 */
+  --heat-2: color-mix(in srgb, var(--accent) 50%, var(--bg));   /* #43608c · 2.70:1 */
+  --heat-3: color-mix(in srgb, var(--accent) 75%, var(--bg));   /* #5882c1 · 4.42:1 */
+  --heat-4: var(--accent);                                      /* #6ea4f7 · 6.84:1 */
+}
+[data-theme="light"] {
+  --heat-0: color-mix(in srgb, var(--text) 8%, var(--bg));      /* #ededee · 1.17:1 */
+  --heat-1: color-mix(in srgb, var(--accent) 36%, var(--bg));   /* #b2c8f0 · 1.69:1 */
+  --heat-2: color-mix(in srgb, var(--accent) 56%, var(--bg));   /* #88a9e8 · 2.36:1 */
+  --heat-3: color-mix(in srgb, var(--accent) 78%, var(--bg));   /* #5988df · 3.49:1 */
+  --heat-4: var(--accent);                                      /* #2a66d6 · 5.29:1 */
+}
+/* The window is shrunk with transform: scale(--ui-scale) on narrow viewports. A 10px cell + 2px gap then lands on
+   fractional device pixels: edges blur and gaps come out uneven. Snap cell and gap to WHOLE rendered pixels
+   (round(base*scale) / scale) so the grid stays crisp and evenly spaced at any scale. */
+:root { --ui-scale: 1; --heat-base: 10px; --heat-gap-base: 2px; --heat-wd: 28px; --heat-cell: 10px; --heat-gap: 2px; /* defaults for legend/ramp swatches outside .heat */
+}
+
+/* ---------- heatmap component ---------- */
+.heat { --heat-cell: calc(max(4px, round(var(--heat-base) * var(--ui-scale), 1px)) / var(--ui-scale)); --heat-gap: calc(max(1px, round(var(--heat-gap-base) * var(--ui-scale), 1px)) / var(--ui-scale)); --pitch: calc(var(--heat-cell) + var(--heat-gap)); display: grid; grid-template-columns: var(--heat-wd) max-content; grid-template-rows: 14px auto; column-gap: 0; row-gap: var(--sp-2); }
+.heat.compact { --heat-base: 8px; }
+.heat-months { grid-column: 2; position: relative; height: 14px; font-size: var(--fs-xs); line-height: 14px; color: var(--muted); }
+.heat-months span { position: absolute; top: 0; white-space: nowrap; }
+.heat-wd { grid-column: 1; grid-row: 2; display: grid; grid-template-rows: repeat(7, var(--pitch)); font-size: var(--fs-xs); color: var(--muted); }
+.heat-wd span { line-height: var(--heat-cell); height: var(--heat-cell); }
+.heat-grid { grid-column: 2; grid-row: 2; display: grid; grid-template-columns: repeat(var(--cols, 53), var(--heat-cell)); grid-auto-rows: var(--heat-cell); gap: var(--heat-gap); outline: none; }
+.heat-grid [role="row"] { display: contents; }
+.hc { width: var(--heat-cell); height: var(--heat-cell); border-radius: var(--sp-1); background: var(--heat-0); cursor: default; outline: none; }
+.hc.l1 { background: var(--heat-1); } .hc.l2 { background: var(--heat-2); } .hc.l3 { background: var(--heat-3); } .hc.l4 { background: var(--heat-4); }
+.hc.future { background: transparent; pointer-events: none; }
+.hc:hover { box-shadow: 0 0 0 1px var(--border-strong); }
+.hc.sel { box-shadow: 0 0 0 1px var(--bg), 0 0 0 2px var(--text); }
+.heat-grid:focus-visible .hc.kf, .hc.kf:focus-visible { box-shadow: 0 0 0 1px var(--bg), 0 0 0 3px var(--focus); position: relative; z-index: 1; }
+.heat.loading .hc:not(.future) { background: linear-gradient(90deg, var(--heat-0), var(--hover), var(--heat-0)); background-size: 200% 100%; animation: shim 1.4s linear infinite; }
+.hc.pending { background: linear-gradient(90deg, var(--heat-0), var(--hover), var(--heat-0)) !important; background-size: 200% 100% !important; animation: shim 1.4s linear infinite; }
+.heat.muted-grid .hc { opacity: .55; }
+
+.heat-legend { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; }
+.heat-legend .hc { margin: 0; }
+.heat-legend .t { margin: 0 var(--sp-2); }
+.heat-total { font-size: var(--fs-sm); color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.heat-total b { color: var(--text); font-weight: 600; }
+.heat-msg { display: flex; align-items: center; gap: var(--sp-4); font-size: var(--fs-sm); color: var(--muted); }
+.heat-msg .od-icon { flex: none; }
+.heat-msg.err .od-icon { color: var(--error); }
+.heat-msg .mono { color: var(--text); }
+.heat-scroll { overflow-x: auto; overflow-y: hidden; min-width: 0; }
+
+/* ---------- Variant B: strip above History ---------- */
+.histcol { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+.act-strip { flex: none; background: var(--bg); border-bottom: 1px solid var(--border); }
+.act-head { display: flex; align-items: center; gap: var(--sp-4); height: 34px; padding: 0 var(--sp-4) 0 var(--sp-5); }
+.act-head .ttl { font-weight: 600; }
+.act-head .btn-xs .od-icon { transition: none; }
+.act-strip.collapsed .act-head .chev { transform: rotate(-90deg); }
+.act-body { display: flex; align-items: flex-start; gap: var(--sp-7); padding: 0 var(--sp-6) var(--sp-5); }
+.act-strip.collapsed .act-body { display: none; }
+.act-body .heat-scroll { flex: 0 1 auto; }
+.act-side { flex: 1 1 0; display: flex; flex-direction: column; gap: var(--sp-4); padding-top: 18px; min-width: 0; font-size: var(--fs-sm); color: var(--muted); }
+.act-side .kv b { color: var(--text); font-weight: 600; }
+.dayfilter { flex: none; display: flex; align-items: center; gap: var(--sp-4); height: 30px; padding: 0 var(--sp-4) 0 var(--sp-6); background: var(--accent-soft); border-bottom: 1px solid var(--border); font-size: var(--fs-sm); }
+.dayfilter .od-icon { color: var(--accent); }
+.select.sm { height: var(--ctl-sm); width: auto; font-size: var(--fs-sm); gap: var(--sp-2); padding: 0 var(--sp-3) 0 var(--sp-4); }
+
+/* ---------- Variant A: Welcome ---------- */
+.wl { display: grid; grid-template-columns: 300px minmax(0, 1fr); min-height: 0; }
+.wl aside { padding: 28px 24px; border-right: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; gap: 8px; }
+.logo { display: flex; align-items: center; gap: 10px; font-size: var(--fs-xl); font-weight: 700; margin-bottom: 4px; }
+.act { display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--bg); cursor: default; width: 100%; text-align: left; }
+.act:hover { background: var(--hover); } .act .kbd { margin-left: auto; }
+.wl main { padding: 20px 24px; display: flex; flex-direction: column; min-height: 0; gap: 12px; }
+.recent { overflow: auto; flex: 1; min-height: 0; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); outline: none; }
+.rrow { display: grid; grid-template-columns: 24px minmax(0, 1fr) 150px 110px; gap: 12px; align-items: center; height: 44px; padding: 0 12px; cursor: default; border-bottom: 1px solid var(--border); }
+.rrow:last-child { border-bottom: 0; }
+.rrow:hover { background: var(--hover); } .rrow.sel { background: var(--selection); }
+.rrow .n { font-weight: 600; } .rrow .p { color: var(--muted); font-size: var(--fs-sm); }
+.wact { flex: none; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); padding: var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-4); }
+.wact-foot { display: flex; align-items: center; gap: var(--sp-4); }
+
+/* ---------- page chrome (presentation only) ---------- */
+.ctrls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-5) var(--sp-7); margin: 12px 0 16px; }
+.ctrls .lab { font-size: var(--fs-sm); color: var(--muted); margin-right: var(--sp-4); }
+.rec { border-left: 3px solid var(--accent); }
+.rec p { margin: 0 0 6px; }
+.rec ul { margin: 4px 0 0; padding-left: 18px; color: var(--muted); }
+.panel h4 { margin: 0 0 8px; font-size: var(--fs-base); }
+.panel p, .panel li { color: var(--muted); font-size: var(--fs-sm); }
+.panel ul { margin: 0; padding-left: 18px; }
+.panel p { margin: 0 0 6px; }
+.ramp { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+.ramp td, .ramp th { padding: 3px 6px 3px 0; text-align: left; font-weight: 400; color: var(--muted); }
+.ramp th { color: var(--text); font-weight: 600; }
+.ramp .hc { display: inline-block; vertical-align: middle; }
+.stage-cap { max-width: 1240px; margin: 0 auto; padding: 0 16px; }

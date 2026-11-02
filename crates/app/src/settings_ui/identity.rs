@@ -65,14 +65,14 @@ impl SettingsView {
         let root = self.root.clone();
         if root.is_none() && scope == ConfigScope::Local {
             self.identity = None;
-            self.identity_error = Some("Open a repository to edit its identity.".into());
+            self.identity_error = Some(ui::t!("settings.identity.open_repo"));
             self.identity_busy = false;
             cx.notify();
             return;
         }
         let Ok(git) = self.git.clone() else {
             self.identity = None;
-            self.identity_error = Some("Git is not available.".into());
+            self.identity_error = Some(ui::t!("settings.identity.git_unavailable"));
             self.identity_busy = false;
             cx.notify();
             return;
@@ -168,21 +168,19 @@ impl SettingsView {
         let email = self.email_input.read(cx).text().trim().to_owned();
         if name.is_empty() {
             self.identity_touched = true;
-            self.identity_error =
-                Some("Name is required — git refuses to commit without it.".into());
+            self.identity_error = Some(ui::t!("settings.identity.name_required"));
             cx.notify();
             return;
         }
         if !valid_email(&email) {
             self.identity_touched = true;
-            self.identity_error =
-                Some("Enter a valid email address, like name@example.com.".into());
+            self.identity_error = Some(ui::t!("settings.identity.email_invalid"));
             cx.notify();
             return;
         }
         let root = self.root.clone();
         let Ok(git) = self.git.clone() else {
-            self.identity_error = Some("Git is not available.".into());
+            self.identity_error = Some(ui::t!("settings.identity.git_unavailable"));
             cx.notify();
             return;
         };
@@ -369,13 +367,13 @@ pub(super) fn render(
     let mut page = div().flex().flex_col();
 
     page = page.child(heading(
-        "Identity",
-        "Who your commits are attributed to, how they are signed, and which hosting accounts GitWarp can use.",
+        ui::t!("settings.page.identity"),
+        ui::t!("settings.identity.subtitle"),
     ));
     if let Some(error) = &view.identity_error {
         page = page.child(
             div().max_w(px(760.)).mb(px(12.)).child(
-                Banner::new(BannerKind::Error, "Could not read or save the identity")
+                Banner::new(BannerKind::Error, ui::t!("settings.identity.banner_title"))
                     .body(error.clone()),
             ),
         );
@@ -385,7 +383,10 @@ pub(super) fn render(
         let entity = cx.entity();
         let control = form::segmented(
             "settings-id-scope".into(),
-            ["All repositories", "This repository only"],
+            [
+                ui::t!("settings.identity.scope.global"),
+                ui::t!("settings.identity.scope.repo"),
+            ],
             usize::from(settings.identity_scope == IdentityScope::Repository),
             false,
             move |index, _, cx| {
@@ -403,22 +404,22 @@ pub(super) fn render(
         div().w(px(330.)).child(control).into_any_element()
     };
     let scope_help = if settings.identity_scope == IdentityScope::Global {
-        "Written to ~/.gitconfig. A repository can still override it."
+        ui::t!("settings.identity.scope.global_help")
     } else {
-        "Written to .git/config of the open repository."
+        ui::t!("settings.identity.scope.repo_help")
     };
 
     let name = div().w_full().h(px(26.)).child(view.name_input.clone());
     let email = div().w_full().h(px(26.)).child(view.email_input.clone());
     let name_empty = view.name_input.read(cx).text().trim().is_empty();
-    let name_error = (view.identity_touched && name_empty)
-        .then_some("Name is required — git refuses to commit without it.");
+    let name_error =
+        (view.identity_touched && name_empty).then(|| ui::t!("settings.identity.name_required"));
     let email_text = view.email_input.read(cx).text().trim().to_owned();
     let email_error = (view.identity_touched && !valid_email(&email_text))
-        .then_some("Enter a valid email address, like name@example.com.");
+        .then(|| ui::t!("settings.identity.email_invalid"));
 
     let mut author_rows = vec![
-        form::field_row("Apply to", None, scope).into_any_element(),
+        form::field_row(ui::t!("settings.identity.apply_to"), None, scope).into_any_element(),
         div()
             .px(px(12.))
             .pb(px(6.))
@@ -433,7 +434,11 @@ pub(super) fn render(
             .flex_col()
             .gap(px(4.))
             .border_t_1()
-            .child(div().text_size(FS_SM).child("Name"))
+            .child(
+                div()
+                    .text_size(FS_SM)
+                    .child(ui::t!("settings.identity.name")),
+            )
             .child(name)
             .when_some(name_error, |this, error| this.child(form::error(error, cx)))
             .into_any_element(),
@@ -444,13 +449,17 @@ pub(super) fn render(
             .flex_col()
             .gap(px(4.))
             .border_t_1()
-            .child(div().text_size(FS_SM).child("Email"))
+            .child(
+                div()
+                    .text_size(FS_SM)
+                    .child(ui::t!("settings.identity.email")),
+            )
             .child(email)
-            .when_some(email_error, |this, error| {
+            .when_some(email_error.clone(), |this, error| {
                 this.child(form::error(error, cx))
             })
             .when(view.identity_touched && email_error.is_none(), |this| {
-                this.child(form::help("Visible in every commit you create.", cx))
+                this.child(form::help(ui::t!("settings.identity.email_help"), cx))
             })
             .into_any_element(),
     ];
@@ -461,11 +470,11 @@ pub(super) fn render(
                 .pb(px(8.))
                 .text_size(FS_SM)
                 .text_color(colors.muted)
-                .child("Saving…")
+                .child(ui::t!("settings.identity.saving"))
                 .into_any_element(),
         );
     }
-    page = page.child(group("Commit author", author_rows));
+    page = page.child(group(ui::t!("settings.identity.group.author"), author_rows));
 
     let sign = {
         let entity = cx.entity();
@@ -493,7 +502,7 @@ pub(super) fn render(
         .position(|name| *name == settings.signing_key)
         .map(|index| index + 1)
         .unwrap_or(0);
-    let mut key_options = vec!["No signing key".to_owned()];
+    let mut key_options = vec![ui::t!("settings.identity.no_signing_key").to_string()];
     key_options.extend(key_names.clone());
     let signing_key = {
         let entity = cx.entity();
@@ -517,19 +526,19 @@ pub(super) fn render(
         )
     };
     page = page.child(group(
-        "Signing",
+        ui::t!("settings.identity.group.signing"),
         vec![
             form::row(
                 "settings-id-sign-row",
-                "Sign commits",
-                "Adds a verified badge on hosts that know your key.",
+                ui::t!("settings.identity.sign.title"),
+                ui::t!("settings.identity.sign.desc"),
                 sign,
                 false,
             ),
             form::row(
                 "settings-id-key-row",
-                "Signing key",
-                "Used for commits and tags.",
+                ui::t!("settings.identity.key.title"),
+                ui::t!("settings.identity.key.desc"),
                 signing_key,
                 !settings.sign_commits,
             ),
@@ -573,7 +582,6 @@ pub(super) fn render(
                 .flex()
                 .items_center()
                 .gap(px(12.))
-                .border_b_1()
                 .child(
                     div()
                         .w(px(32.))
@@ -620,19 +628,21 @@ pub(super) fn render(
                                     }),
                                 )
                                 .child(match &username {
-                                    Some(user) => format!("Connected as {user}"),
-                                    None => "Not connected".to_owned(),
+                                    Some(user) => {
+                                        ui::t!("settings.identity.account.connected", user = user)
+                                    }
+                                    None => ui::t!("settings.identity.account.not_connected"),
                                 }),
                         ),
                 )
                 .child(if connected {
                     Button::new(format!("settings-account-{key}"))
-                        .label("Disconnect")
+                        .label(ui::t!("settings.identity.account.disconnect"))
                         .size(ButtonSize::Small)
                         .on_click(disconnect)
                 } else {
                     Button::new(format!("settings-account-{key}"))
-                        .label("Connect")
+                        .label(ui::t!("settings.identity.account.connect"))
                         .size(ButtonSize::Small)
                         .on_click(connect)
                 })
@@ -655,13 +665,10 @@ pub(super) fn render(
                 div()
                     .text_size(ui::metrics::FS_XS)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("HOSTING ACCOUNTS"),
+                    .child(ui::t!("settings.identity.accounts_heading")),
             )
             .child(accounts)
-            .child(form::help(
-                "Used for cloning private repositories and for push credentials. Tokens are stored by your git credential helper, not in settings.json.",
-                cx,
-            )),
+            .child(form::help(ui::t!("settings.identity.accounts_help"), cx)),
     );
     page.into_any_element()
 }
@@ -698,12 +705,12 @@ pub(super) fn open_account_dialog(
     let dialog = cx.new(|cx| {
         let username = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder("Your user name", cx);
+            input.set_placeholder(ui::t!("settings.identity.dialog.username_placeholder"), cx);
             input
         });
         let token = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder("Personal access token", cx);
+            input.set_placeholder(ui::t!("settings.identity.dialog.token_placeholder"), cx);
             input.set_masked(true, cx);
             input
         });
@@ -746,7 +753,7 @@ impl AccountDialog {
         let username = self.username.read(cx).text().trim().to_owned();
         let token = self.token.read(cx).text().to_owned();
         if username.is_empty() || token.is_empty() {
-            self.error = Some("Enter both the user name and a token.".into());
+            self.error = Some(ui::t!("settings.identity.dialog.both_required"));
             cx.notify();
             return;
         }
@@ -783,10 +790,8 @@ impl AccountDialog {
                 if !stored {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |view, cx| {
-                            view.identity_error = Some(
-                                "Your git credential helper did not store the token. Configure one (for example `credential.helper=store`) and try again."
-                                    .into(),
-                            );
+                            view.identity_error =
+                                Some(ui::t!("settings.identity.dialog.not_stored"));
                             cx.notify();
                         });
                     }
@@ -856,11 +861,18 @@ fn build(state: &Entity<AccountDialog>, cx: &App) -> Dialog {
         .child(
             Banner::new(
                 BannerKind::Info,
-                format!("Connect {}", if dialog.key == "github" { "GitHub" } else { "GitLab" }),
+                ui::t!(
+                    "settings.identity.dialog.connect_title",
+                    provider = if dialog.key == "github" {
+                        "GitHub"
+                    } else {
+                        "GitLab"
+                    }
+                ),
             )
-            .body(format!(
-                "The token is handed to your git credential helper for {}. It is not written to settings.json.",
-                dialog.host
+            .body(ui::t!(
+                "settings.identity.dialog.token_help",
+                host = dialog.host
             )),
         )
         .child(
@@ -868,7 +880,11 @@ fn build(state: &Entity<AccountDialog>, cx: &App) -> Dialog {
                 .flex()
                 .flex_col()
                 .gap(px(4.))
-                .child(div().text_size(FS_SM).child("User name"))
+                .child(
+                    div()
+                        .text_size(FS_SM)
+                        .child(ui::t!("settings.identity.dialog.username")),
+                )
                 .child(dialog.username.clone()),
         )
         .child(
@@ -876,16 +892,15 @@ fn build(state: &Entity<AccountDialog>, cx: &App) -> Dialog {
                 .flex()
                 .flex_col()
                 .gap(px(4.))
-                .child(div().text_size(FS_SM).child("Personal access token"))
+                .child(
+                    div()
+                        .text_size(FS_SM)
+                        .child(ui::t!("settings.identity.dialog.token")),
+                )
                 .child(dialog.token.clone()),
         )
         .when_some(dialog.error.clone(), |this, error| {
-            this.child(
-                div()
-                    .text_size(FS_SM)
-                    .text_color(colors.error)
-                    .child(error),
-            )
+            this.child(div().text_size(FS_SM).text_color(colors.error).child(error))
         });
 
     let footer = div()
@@ -894,19 +909,19 @@ fn build(state: &Entity<AccountDialog>, cx: &App) -> Dialog {
         .gap(px(8.))
         .child(
             Button::new("account-cancel")
-                .label("Cancel")
+                .label(ui::t!("settings.identity.dialog.cancel"))
                 .focus_handle(dialog.cancel_focus.clone())
                 .on_click(cancel),
         )
         .child(
             Button::primary("account-connect")
-                .label("Connect")
+                .label(ui::t!("settings.identity.account.connect"))
                 .disabled(!can_submit)
                 .focus_handle(dialog.primary_focus.clone())
                 .on_click(submit),
         );
 
-    Dialog::new("Connect an account")
+    Dialog::new(ui::t!("settings.identity.dialog.title"))
         .icon(IconName::Cloud)
         .width(px(520.))
         .body(body)

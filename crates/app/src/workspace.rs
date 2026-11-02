@@ -26,17 +26,28 @@ use ui::metrics::{BAR, FONT_UI, FS_BASE, R_WINDOW};
 use ui::theme::ActiveTheme;
 use ui::{overlay, WindowControls};
 
+use crate::clone_dialog::CloneDialog;
 use crate::credential_dialog::CredentialDialog;
 use crate::host_key_dialog::HostKeyDialog;
 use crate::network_service::NetworkService;
 use crate::open_dialog::OpenRepoDialog;
+use crate::palette::OpenPalette;
 use crate::repo_view::{
-    FocusSearch, OpenBranchSwitcher, OpenRepoSwitcher, RepositoryView, ToggleDetails, ToggleSidebar,
+    FocusSearch, OpenBranchSwitcher, OpenRepoSwitcher, OpenWorktreeSwitcher, PullBranch,
+    PushBranch, RepositoryView, ToggleDetails, ToggleSidebar,
 };
-use crate::settings_ui::SettingsView;
+use crate::settings_ui::{Page, SettingsView};
 use crate::welcome::WelcomeView;
 
-actions!(workspace, [OpenRepositoryDialog, OpenSettings]);
+actions!(
+    workspace,
+    [
+        OpenRepositoryDialog,
+        OpenCloneDialog,
+        OpenSettings,
+        OpenGitSettings
+    ]
+);
 
 /// The shadow and resize border drawn around the client-side frame.
 const INSET: Pixels = px(10.);
@@ -65,6 +76,9 @@ pub struct Workspace {
     settings: Option<Entity<SettingsView>>,
     /// The Open-from-folder dialog, kept so its state survives the frames.
     dialog: Option<Entity<OpenRepoDialog>>,
+    /// The Clone dialog opened from a repository window; on the welcome
+    /// screen the welcome view owns it.
+    clone_dialog: Option<Entity<CloneDialog>>,
     /// A git credential question, while one is open.
     credential: Option<Entity<CredentialDialog>>,
     /// An SSH host-key question, while one is open.
@@ -95,6 +109,7 @@ impl Workspace {
             last_resize_edge: None,
             settings: None,
             dialog: None,
+            clone_dialog: None,
             credential: None,
             host_key: None,
             _network_poll: None,
@@ -161,11 +176,29 @@ impl Workspace {
 
     /// Switches to the repository at `path`.
     pub fn open_repository(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_repository_at_day(path, None, window, cx);
+    }
+
+    /// Switches to the repository at `path`, with its History already
+    /// filtered to `day` (the welcome screen's activity card).
+    pub fn open_repository_at_day(
+        &mut self,
+        path: PathBuf,
+        day: Option<crate::history_view::DayFilter>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let git = self.git.clone();
         let workspace = cx.weak_entity();
         let view = cx.new(|cx| RepositoryView::new(path.clone(), git, workspace, window, cx));
         let name = repo_name(&path);
         let focus = view.read(cx).focus_handle();
+        if day.is_some() {
+            // The day query runs on its own `git log`, so the filter does not
+            // have to wait for the history to load.
+            let history = view.read(cx).history();
+            history.update(cx, |history, cx| history.set_day_filter(day, cx));
+        }
         self.content = Content::Repository(view);
         window.set_window_title(&format!("{name} — GitWarp"));
         // The keyboard belongs to the new content at once, like the welcome
@@ -199,6 +232,7 @@ impl Workspace {
                     ..Default::default()
                 }),
                 app_id: Some("dev.v1rus.gitwarp".into()),
+                icon: crate::app_icon::window_icon(),
                 ..Default::default()
             },
             move |window, cx| {
@@ -231,17 +265,39 @@ impl Workspace {
     /// Opens Settings as a window over the current content. The repository or
     /// welcome screen stays underneath and keeps its title.
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if let Some(settings) = self.settings.clone() {
+            // Already open: keep the current page, just focus it.
+            let focus = settings.read(cx).focus_handle();
+            window.focus(&focus, cx);
+            cx.notify();
+            return;
+        }
+        self.open_settings_at(Page::General, window, cx);
+    }
+
+    /// Opens Settings on `page`; when Settings is already open, switches its
+    /// page instead of stacking a second window.
+    pub fn open_settings_at(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(settings) = self.settings.clone() {
+            settings.update(cx, |view, cx| view.set_page(page, window, cx));
+            let focus = settings.read(cx).focus_handle();
+            window.focus(&focus, cx);
+            cx.notify();
             return;
         }
         let root = self.with_repository(cx, |view, _| view.path().to_path_buf());
         let git = self.git.clone();
         let workspace = cx.weak_entity();
-        let view = cx.new(|cx| SettingsView::new(root, git, workspace, window, cx));
+        let view = cx.new(|cx| SettingsView::new(root, git, workspace, page, window, cx));
         let focus = view.read(cx).focus_handle();
         self.settings = Some(view);
         window.focus(&focus, cx);
         cx.notify();
+    }
+
+    /// Switches the open repository to its Local changes view.
+    pub fn show_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.with_repository(cx, |view, cx| view.show_changes(window, cx));
     }
 
     /// Closes the settings window, leaving the content it covered as it was.
@@ -288,6 +344,24 @@ impl Workspace {
         let git = self.git.clone();
         let workspace = cx.weak_entity();
         self.dialog = Some(crate::open_dialog::open(window, cx, git, workspace));
+        cx.notify();
+    }
+
+    /// Opens the Clone dialog (Ctrl Shift O). The welcome screen keeps its own
+    /// dialog state so its "Clone repository…" row and the key share one.
+    pub fn open_clone_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Content::Welcome(view) = &self.content {
+            view.update(cx, |view, cx| view.open_clone_dialog(window, cx));
+            return;
+        }
+        if let Some(dialog) = &self.clone_dialog {
+            if !dialog.update(cx, |dialog, cx| dialog.layer_gone(window, cx)) {
+                return;
+            }
+        }
+        let git = self.git.clone();
+        let workspace = cx.weak_entity();
+        self.clone_dialog = Some(crate::clone_dialog::open(git, workspace, window, cx));
         cx.notify();
     }
 
@@ -362,6 +436,15 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// The open repository's view, for the palette's tests.
+    #[cfg(test)]
+    pub(crate) fn repository_for_test(&self) -> Option<Entity<RepositoryView>> {
+        match &self.content {
+            Content::Repository(view) => Some(view.clone()),
+            Content::Welcome(_) | Content::Empty => None,
+        }
     }
 
     /// Runs `f` on the open repository, if there is one.
@@ -496,7 +579,7 @@ impl Render for Workspace {
             .cursor(CursorStyle::Arrow)
             .bg(colors.bg)
             .text_color(colors.text)
-            .font_family(FONT_UI)
+            .font(ui::fonts::ui_font())
             .text_size(FS_BASE)
             .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
                 // The frame covers the whole padded area, so this is where the
@@ -528,7 +611,6 @@ impl Render for Workspace {
             .overflow_hidden()
             .child(body);
         let content = if let Some(settings) = settings {
-            let colors = colors;
             content.child(
                 div()
                     .absolute()
@@ -538,9 +620,12 @@ impl Render for Workspace {
                     .justify_center()
                     .p(px(32.))
                     .bg(colors.overlay)
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                        this.close_settings(window, cx);
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.close_settings(window, cx);
+                        }),
+                    )
                     .child(
                         div()
                             .w_full()
@@ -560,7 +645,8 @@ impl Render for Workspace {
         } else {
             content
         };
-        let frame = frame.child(content)
+        let frame = frame
+            .child(content)
             // Menus, dialogs and toasts live inside the frame, above the
             // content, so they cannot spill over the window's shadow band.
             .child(ui::overlay::render_overlays(window, cx));
@@ -589,11 +675,32 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenBranchSwitcher, window, cx| {
                 this.with_repository(cx, |view, cx| view.open_branch_menu(window, cx));
             }))
+            .on_action(cx.listener(|this, _: &OpenWorktreeSwitcher, window, cx| {
+                this.with_repository(cx, |view, cx| view.open_worktree_switcher(window, cx));
+            }))
             .on_action(cx.listener(|this, _: &OpenRepositoryDialog, window, cx| {
                 this.open_repository_dialog(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &PullBranch, window, cx| {
+                this.with_repository(cx, |view, cx| view.pull_branch(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &PushBranch, window, cx| {
+                this.with_repository(cx, |view, cx| view.push_branch(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenCloneDialog, window, cx| {
+                this.open_clone_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
+                // The palette searches the open repository; settings cover it.
+                if this.settings.is_none() {
+                    this.with_repository(cx, |view, cx| view.open_palette(window, cx));
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenGitSettings, window, cx| {
+                this.open_settings_at(Page::Git, window, cx);
             }));
 
         ui::focus::track_pointer(ui::actions::tab_navigation(root))
@@ -676,8 +783,10 @@ pub fn git_label(git: &Result<Arc<Git>, Arc<Error>>) -> SharedString {
     match git {
         Ok(git) => format!("git {} · {}", git.version(), git.source()).into(),
         Err(error) => match error.class() {
-            git_core::ErrorClass::GitTooOld { found, .. } => format!("git {found} too old").into(),
-            _ => "git not found".into(),
+            git_core::ErrorClass::GitTooOld { found, .. } => {
+                ui::t!("repo.git.too_old", version = found)
+            }
+            _ => ui::t!("repo.git.not_found"),
         },
     }
 }

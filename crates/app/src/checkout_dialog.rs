@@ -6,7 +6,10 @@
 
 use std::rc::Rc;
 
-use gpui::{div, px, App, AppContext, ClickEvent, Context, Entity, ParentElement, SharedString, Styled, Window};
+use gpui::{
+    div, px, App, AppContext, ClickEvent, Context, Entity, ParentElement, SharedString, Styled,
+    Window,
+};
 
 use ui::theme::ActiveTheme;
 use ui::{dialog, overlay, Button, Dialog, DialogFocus, IconName};
@@ -66,7 +69,7 @@ pub(crate) fn open(
     let state = dialog.downgrade();
     let (layer, _host) = dialog::open_with_view(window, cx, move |_, cx| match state.upgrade() {
         Some(state) => build(&state, cx),
-        None => Dialog::new("Switch branch"),
+        None => Dialog::new(ui::t!("dialogs.checkout.title_fallback")),
     });
     dialog.update(cx, |dialog, _| dialog.layer = Some(layer));
     dialog
@@ -76,7 +79,7 @@ fn build(state: &Entity<CheckoutDialog>, cx: &App) -> Dialog {
     let colors = cx.theme().colors;
     let dialog = state.read(cx);
 
-    let button = |id: &'static str, label: &'static str, focus, choice: Choice, danger: bool| {
+    let button = |id: &'static str, label: SharedString, focus, choice: Choice, danger: bool| {
         let state = state.clone();
         let click = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             state.update(cx, |dialog, cx| dialog.choose(&choice, window, cx));
@@ -86,10 +89,7 @@ fn build(state: &Entity<CheckoutDialog>, cx: &App) -> Dialog {
         } else {
             Button::new(id)
         };
-        button
-            .label(label)
-            .focus_handle(focus)
-            .on_click(click)
+        button.label(label).focus_handle(focus).on_click(click)
     };
 
     let cancel = {
@@ -109,7 +109,7 @@ fn build(state: &Entity<CheckoutDialog>, cx: &App) -> Dialog {
             div()
                 .text_size(ui::metrics::FS_SM)
                 .text_color(colors.muted)
-                .child("Carrying the changes fails when the other branch edits the same lines."),
+                .child(ui::t!("dialogs.checkout.carry_hint")),
         );
 
     let footer = div()
@@ -118,27 +118,27 @@ fn build(state: &Entity<CheckoutDialog>, cx: &App) -> Dialog {
         .gap(px(8.))
         .child(
             Button::new("checkout-cancel")
-                .label("Cancel")
+                .label(ui::t!("dialogs.common.cancel"))
                 .focus_handle(dialog.cancel_focus.clone())
                 .on_click(cancel),
         )
         .child(button(
             "checkout-discard",
-            "Discard",
+            ui::t!("dialogs.checkout.discard"),
             dialog.discard_focus.clone(),
             dialog.discard.clone(),
             true,
         ))
         .child(button(
             "checkout-keep",
-            "Bring changes",
+            ui::t!("dialogs.checkout.bring_changes"),
             dialog.keep_focus.clone(),
             dialog.keep.clone(),
             false,
         ))
         .child(button(
             "checkout-stash",
-            "Stash and switch",
+            ui::t!("dialogs.checkout.stash_and_switch"),
             dialog.stash_focus.clone(),
             dialog.stash.clone(),
             false,

@@ -14,16 +14,22 @@ use super::{group, heading, SettingsView};
 use crate::format::{absolute_time, relative_time};
 use crate::settings::{DateFormat, Density, ThemePref, ACCENT_VALUES};
 
-const THEMES: [(ThemePref, &str); 3] = [
-    (ThemePref::Dark, "Dark"),
-    (ThemePref::Light, "Light"),
-    (ThemePref::System, "System"),
+/// Theme, the stable element-id suffix, and the catalog key of its label.
+const THEMES: [(ThemePref, &str, &str); 3] = [
+    (ThemePref::Dark, "Dark", "settings.appearance.theme.dark"),
+    (ThemePref::Light, "Light", "settings.appearance.theme.light"),
+    (
+        ThemePref::System,
+        "System",
+        "settings.appearance.theme.system",
+    ),
 ];
 
+/// Density and the catalog key of its label.
 const DENSITIES: [(Density, &str); 3] = [
-    (Density::Compact, "Compact"),
-    (Density::Normal, "Normal"),
-    (Density::Roomy, "Roomy"),
+    (Density::Compact, "settings.appearance.density.compact"),
+    (Density::Normal, "settings.appearance.density.normal"),
+    (Density::Roomy, "settings.appearance.density.roomy"),
 ];
 
 pub(super) fn render(
@@ -36,19 +42,20 @@ pub(super) fn render(
     let mut page = div().flex().flex_col();
 
     page = page.child(heading(
-        "Appearance",
-        "Theme, accent colour, density and type. Changes apply immediately.",
+        ui::t!("settings.page.appearance"),
+        ui::t!("settings.appearance.subtitle"),
     ));
 
     // Theme cards and accent swatches share one bordered list in the design.
     let cards = {
         let mut cards = div().w_full().flex().gap(px(12.)).p(px(12.));
-        for (theme, label) in THEMES {
+        for (theme, id_name, label_key) in THEMES {
+            let label = ui::i18n::t(label_key);
             let selected = settings.theme == theme;
             let entity = cx.entity();
             let thumb = theme_thumb(theme, selected, colors);
             let card = div()
-                .id(format!("settings-theme-{label}"))
+                .id(format!("settings-theme-{id_name}"))
                 .flex_1()
                 .min_w_0()
                 .flex()
@@ -152,8 +159,8 @@ pub(super) fn render(
         list = list.child(div().w_full().h(px(1.)).bg(colors.border));
         list = list.child(form::row(
             "settings-accent-row",
-            "Accent colour",
-            "Selection, focus ring and primary buttons.",
+            ui::t!("settings.appearance.accent.title"),
+            ui::t!("settings.appearance.accent.desc"),
             accents,
             false,
         ));
@@ -170,7 +177,7 @@ pub(super) fn render(
                 div()
                     .text_size(ui::metrics::FS_XS)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("THEME"),
+                    .child(ui::t!("settings.appearance.theme_heading")),
             )
             .child(accent_row),
     );
@@ -179,7 +186,7 @@ pub(super) fn render(
         let entity = cx.entity();
         form::segmented(
             "settings-density".into(),
-            DENSITIES.iter().map(|(_, label)| *label),
+            DENSITIES.iter().map(|(_, key)| ui::i18n::t(key)),
             DENSITIES
                 .iter()
                 .position(|(density, _)| *density == settings.density)
@@ -229,26 +236,26 @@ pub(super) fn render(
     );
 
     page = page.child(group(
-        "Lists and type",
+        ui::t!("settings.appearance.group.lists"),
         vec![
             form::row(
                 "settings-density-row",
-                "Row density",
-                "Height of rows in history, changes and the sidebar.",
+                ui::t!("settings.appearance.density.title"),
+                ui::t!("settings.appearance.density.desc"),
                 density,
                 false,
             ),
             form::row(
                 "settings-ui-size-row",
-                "Interface font size",
-                "Menus, toolbars and lists.",
+                ui::t!("settings.appearance.ui_size.title"),
+                ui::t!("settings.appearance.ui_size.desc"),
                 ui_size,
                 false,
             ),
             form::row(
                 "settings-mono-size-row",
-                "Code font size",
-                "Diffs and the commit editor, in px (9–20).",
+                ui::t!("settings.appearance.mono_size.title"),
+                ui::t!("settings.appearance.mono_size.desc"),
                 mono_size,
                 false,
             ),
@@ -272,7 +279,11 @@ pub(super) fn render(
         let entity = cx.entity();
         form::segmented(
             "settings-line-width".into(),
-            ["1 px", "2 px", "3 px"],
+            [
+                ui::t!("settings.appearance.px", n = 1),
+                ui::t!("settings.appearance.px", n = 2),
+                ui::t!("settings.appearance.px", n = 3),
+            ],
             usize::from(settings.graph_line_width.saturating_sub(1)),
             false,
             move |index, _, cx| {
@@ -288,7 +299,10 @@ pub(super) fn render(
         let selected = usize::from(settings.date_format == DateFormat::Absolute);
         form::segmented(
             "settings-date-format".into(),
-            ["Relative", "Absolute"],
+            [
+                ui::t!("settings.appearance.dates.relative"),
+                ui::t!("settings.appearance.dates.absolute"),
+            ],
             selected,
             false,
             move |index, _, cx| {
@@ -304,26 +318,26 @@ pub(super) fn render(
         )
     };
     page = page.child(group(
-        "Commit graph",
+        ui::t!("settings.appearance.group.graph"),
         vec![
             form::row(
                 "settings-colored-row",
-                "Colour branches",
-                "Off draws every lane in a single neutral colour.",
+                ui::t!("settings.appearance.colored.title"),
+                ui::t!("settings.appearance.colored.desc"),
                 colored,
                 false,
             ),
             form::row(
                 "settings-line-width-row",
-                "Line width",
+                ui::t!("settings.appearance.line_width.title"),
                 "",
                 line_width,
                 false,
             ),
             form::row(
                 "settings-dates-row",
-                "Dates",
-                "Hover always shows the exact timestamp.",
+                ui::t!("settings.appearance.dates.title"),
+                ui::t!("settings.appearance.dates.desc"),
                 dates,
                 false,
             ),
@@ -341,7 +355,7 @@ pub(super) fn render(
                 div()
                     .text_size(ui::metrics::FS_XS)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("PREVIEW"),
+                    .child(ui::t!("settings.diff.preview")),
             )
             .child(
                 div()
@@ -358,7 +372,7 @@ pub(super) fn render(
                             .bg(colors.surface)
                             .text_size(FS_SM)
                             .text_color(colors.muted)
-                            .child("History · graph, rows and type"),
+                            .child(ui::t!("settings.appearance.preview_header")),
                     )
                     .child(preview),
             ),

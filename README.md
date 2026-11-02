@@ -24,6 +24,20 @@ cargo test                                   # core crates only (fast, no GPUI)
 cargo run --release -p app -- /path/to/repo  # the app
 ```
 
+### Install on Linux (desktop entry)
+
+After `cargo build --release -p app`, install the binary, desktop entry and
+hicolor icons for the current user:
+
+```sh
+./packaging/linux/install.sh            # into ~/.local
+PREFIX=/some/prefix ./packaging/linux/install.sh
+```
+
+The desktop entry is named `dev.v1rus.gitwarp.desktop` so its basename matches
+the window's `app_id`; Wayland compositors use that to show the icon in the
+launcher and taskbar.
+
 ### Which git
 
 Opening a repository does not spawn `git`. [`GitRunner`](crates/git-core/src/runner.rs)
@@ -48,8 +62,10 @@ The bundled git is looked up next to the app binary:
 | macOS | `<app dir>/../Resources/git/bin/git` |
 | Linux | `<app dir>/git/bin/git`, then `<app dir>/../lib/gitwarp/git/bin/git` |
 
-Packaging the bundle is not done yet; only the lookup exists, so dev builds
-fall back to the system git.
+[`packaging/git/fetch-or-build.sh <linux|windows|macos> <out-dir>`](packaging/git/README.md)
+produces the `git/` directory to ship at those locations (a relocatable build
+on Linux/macOS, MinGit on Windows). Dev builds have no bundle and fall back to
+the system git.
 
 System packages for the app on Linux (Debian/Ubuntu names):
 

@@ -31,6 +31,7 @@ use crate::format::{display_path, expand_home, home_dir, relative_time};
 use crate::history_view::unix_now;
 use crate::init_flow::{banner_body, details, DialogKind, InitFlow, StatusKind};
 use crate::settings::RecentRepo;
+use crate::welcome_activity::WelcomeActivity;
 use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
@@ -85,10 +86,13 @@ pub struct WelcomeView {
     open_focus: FocusHandle,
     clone_focus: FocusHandle,
     init_focus: FocusHandle,
+    settings_focus: FocusHandle,
     /// The open Initialize dialog, if any.
     dialog: Option<Entity<InitDialog>>,
     /// The open Clone dialog, if any.
     clone_dialog: Option<Entity<CloneDialog>>,
+    /// The "Your activity" card above the recent list.
+    activity: Entity<WelcomeActivity>,
     _filter_events: Subscription,
 }
 
@@ -101,7 +105,7 @@ impl WelcomeView {
     ) -> Self {
         let filter = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder("Filter recent…", cx);
+            input.set_placeholder(ui::t!("welcome.recent.filter"), cx);
             input
         });
         let filter_events = cx.subscribe(&filter, |this, _, event: &TextInputEvent, cx| {
@@ -113,6 +117,10 @@ impl WelcomeView {
             }
         });
 
+        let activity = {
+            let (git, workspace) = (git.clone(), workspace.clone());
+            cx.new(|cx| WelcomeActivity::new(git, workspace, cx))
+        };
         Self {
             git,
             workspace,
@@ -127,8 +135,10 @@ impl WelcomeView {
             open_focus: cx.focus_handle().tab_stop(true),
             clone_focus: cx.focus_handle().tab_stop(false),
             init_focus: cx.focus_handle().tab_stop(true),
+            settings_focus: cx.focus_handle().tab_stop(true),
             dialog: None,
             clone_dialog: None,
+            activity,
             _filter_events: filter_events,
         }
     }
@@ -140,7 +150,9 @@ impl WelcomeView {
 
     /// Adopts a newly resolved git (after a Retry) and repaints the label.
     pub fn set_git(&mut self, git: Result<Arc<Git>, Arc<Error>>, cx: &mut Context<Self>) {
-        self.git = git;
+        self.git = git.clone();
+        self.activity
+            .update(cx, |activity, cx| activity.set_git(git, cx));
         cx.notify();
     }
 
@@ -161,6 +173,23 @@ impl WelcomeView {
             let len = self.filtered_len();
             self.selected = clamp_selection(self.selected, len);
         }
+    }
+
+    /// Tells the activity card the recent list and the selected row.
+    fn sync_activity(&self, cx: &mut Context<Self>) {
+        // Most recently opened first: worktrees of one repository are listed
+        // under the newest entry.
+        let mut by_recency: Vec<&RecentRepo> = self.recent.iter().collect();
+        by_recency.sort_by_key(|repo| std::cmp::Reverse(repo.last_opened));
+        let paths = by_recency.iter().map(|repo| repo.path.clone()).collect();
+        let selected = self
+            .recent
+            .iter()
+            .filter(|repo| self.matches(repo))
+            .nth(self.selected)
+            .map(|repo| repo.path.clone());
+        self.activity
+            .update(cx, |activity, cx| activity.sync(paths, selected, cx));
     }
 
     /// Starts one background HEAD read per row that has none yet.
@@ -298,7 +327,7 @@ impl WelcomeView {
 
     fn render_left(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
-        let git_icon = Icon::new(IconName::Git).size(px(26.)).color(colors.text);
+        let logo = crate::app_icon::logo(px(26.));
 
         let open = row_action(cx, |view, window, cx| {
             view.open_repository_dialog(window, cx)
@@ -307,6 +336,7 @@ impl WelcomeView {
 
         let open_ring = focus::focus_visible(&self.open_focus, window, cx);
         let init_ring = focus::focus_visible(&self.init_focus, window, cx);
+        let settings_ring = focus::focus_visible(&self.settings_focus, window, cx);
 
         div()
             .w(px(LEFT_W))
@@ -327,7 +357,7 @@ impl WelcomeView {
                     .items_center()
                     .gap(px(10.))
                     .mb(px(4.))
-                    .child(git_icon)
+                    .child(logo)
                     .child(
                         div()
                             .text_size(FS_XL)
@@ -340,16 +370,16 @@ impl WelcomeView {
                     .w_full()
                     .mb(px(16.))
                     .text_color(colors.muted)
-                    .child("A fast, keyboard-first git client."),
+                    .child(ui::t!("welcome.tagline")),
             )
             .child(action_row(
                 ActionSpec {
                     id: "welcome-open",
                     icon: IconName::Folder,
-                    label: "Open repository…",
-                    kbd: Some("Ctrl O"),
+                    label: ui::t!("welcome.action.open"),
+                    kbd: Some("Ctrl+O"),
                     disabled: false,
-                    tooltip: "Open an existing repository",
+                    tooltip: ui::t!("welcome.action.open_tooltip"),
                 },
                 self.open_focus.clone(),
                 open_ring,
@@ -360,11 +390,10 @@ impl WelcomeView {
                 ActionSpec {
                     id: "welcome-clone",
                     icon: IconName::Clone,
-                    label: "Clone repository…",
-                    // No shortcut, as in the design.
-                    kbd: None,
+                    label: ui::t!("welcome.action.clone"),
+                    kbd: Some("Ctrl+Shift+O"),
                     disabled: false,
-                    tooltip: "Clone a repository from a URL",
+                    tooltip: ui::t!("welcome.action.clone_tooltip"),
                 },
                 self.clone_focus.clone(),
                 false,
@@ -381,15 +410,37 @@ impl WelcomeView {
                 ActionSpec {
                     id: "welcome-init",
                     icon: IconName::Init,
-                    label: "Init new repository…",
-                    kbd: Some("Ctrl N"),
+                    label: ui::t!("welcome.action.init"),
+                    kbd: Some("Ctrl+N"),
                     disabled: false,
-                    tooltip: "Create a new repository",
+                    tooltip: ui::t!("welcome.action.init_tooltip"),
                 },
                 self.init_focus.clone(),
                 init_ring,
                 cx,
                 Some(init),
+            ))
+            // Spacer: pushes Settings to the bottom of the panel.
+            .child(div().flex_1())
+            .child(action_row(
+                ActionSpec {
+                    id: "welcome-settings",
+                    icon: IconName::Gear,
+                    label: ui::t!("repo.toolbar.settings"),
+                    kbd: Some("Ctrl+,"),
+                    disabled: false,
+                    tooltip: ui::t!("palette.command.open_settings"),
+                },
+                self.settings_focus.clone(),
+                settings_ring,
+                cx,
+                {
+                    let workspace = self.workspace.clone();
+                    Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+                        let _ = workspace
+                            .update(cx, |workspace, cx| workspace.open_settings(window, cx));
+                    }))
+                },
             ))
     }
 
@@ -408,7 +459,7 @@ impl WelcomeView {
                     .min_w_0()
                     .text_size(FS_LG)
                     .font_weight(FontWeight::BOLD)
-                    .child("Recent repositories"),
+                    .child(ui::t!("welcome.recent.title")),
             )
             .child(
                 div()
@@ -431,18 +482,18 @@ impl WelcomeView {
 
         let empty = if self.recent.is_empty() {
             Some(
-                EmptyState::new("No recent repositories")
+                EmptyState::new(ui::t!("welcome.recent.empty_title"))
                     .icon(IconName::Folder)
-                    .text("Open or clone a repository to see it here.")
+                    .text(ui::t!("welcome.recent.empty_text"))
                     .into_any_element(),
             )
         } else if rows.is_empty() {
             Some(
-                EmptyState::new("No matches")
+                EmptyState::new(ui::t!("welcome.recent.no_matches_title"))
                     .icon(IconName::Folder)
-                    .text(format!(
-                        "No recent repository matches “{}”.",
-                        self.filter_text
+                    .text(ui::t!(
+                        "welcome.recent.no_matches_text",
+                        filter = self.filter_text
                     ))
                     .into_any_element(),
             )
@@ -475,10 +526,16 @@ impl WelcomeView {
             .track_scroll(&self.list_scroll)
             .flex_1()
             .min_h_0();
-            panel.child(list).child(Scrollbar::uniform(
-                "recent-scrollbar",
-                self.list_scroll.clone(),
-            ))
+            // The scrollbar overlays the rows: as an in-flow sibling its 10px
+            // track stays even without overflow and cuts the row highlight short.
+            let scrollbar = div().absolute().top_0().bottom_0().right_0();
+            panel
+                .relative()
+                .child(list)
+                .child(scrollbar.child(Scrollbar::uniform(
+                    "recent-scrollbar",
+                    self.list_scroll.clone(),
+                )))
         };
 
         let hint = div()
@@ -490,11 +547,11 @@ impl WelcomeView {
             .text_color(colors.muted)
             .child(Kbd::new("↑"))
             .child(Kbd::new("↓"))
-            .child("select ·")
+            .child(ui::t!("welcome.recent.hint.select"))
             .child(Kbd::new("Enter"))
-            .child("open ·")
+            .child(ui::t!("welcome.recent.hint.open"))
             .child(Kbd::new("Del"))
-            .child("remove from list");
+            .child(ui::t!("welcome.recent.hint.remove"));
 
         div()
             .flex_1()
@@ -505,6 +562,7 @@ impl WelcomeView {
             .gap(px(12.))
             .px(px(24.))
             .py(px(20.))
+            .children(crate::activity_strip::enabled(cx).then(|| self.activity.clone()))
             .child(header)
             .child(panel)
             .child(hint)
@@ -531,7 +589,7 @@ impl WelcomeView {
 
     /// Opens the Clone repository dialog; brings an existing one back if its
     /// layer was closed with Esc.
-    fn open_clone_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_clone_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(dialog) = &self.clone_dialog {
             if !dialog.update(cx, |dialog, cx| dialog.layer_gone(window, cx)) {
                 return;
@@ -579,12 +637,17 @@ impl WelcomeView {
                     if created {
                         toast::show(
                             ToastKind::Ok,
-                            format!("Initialized repository in {label}"),
+                            ui::t!("welcome.open.toast_initialized", path = label),
                             window,
                             cx,
                         );
                     } else {
-                        toast::show(ToastKind::Ok, format!("Opened {name}"), window, cx);
+                        toast::show(
+                            ToastKind::Ok,
+                            ui::t!("welcome.open.toast_opened", name = name),
+                            window,
+                            cx,
+                        );
                     }
                 });
             }));
@@ -597,7 +660,7 @@ impl WelcomeView {
         let (layer, host) =
             dialog::open_with_view(window, cx, move |_, cx| match state.upgrade() {
                 Some(state) => build_init_dialog(&state, &view, cx),
-                None => Dialog::new("Initialize repository"),
+                None => Dialog::new(ui::t!("welcome.init.title")),
             });
 
         dialog.update(cx, |dialog, _| {
@@ -613,11 +676,16 @@ impl Render for WelcomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prune_dialog(window, cx);
         self.sync_recent(cx);
+        let show_activity = crate::activity_strip::enabled(cx);
+        self.activity
+            .update(cx, |activity, cx| activity.set_enabled(show_activity, cx));
+        self.sync_activity(cx);
         self.ensure_branches(cx);
 
         let client = matches!(window.window_decorations(), Decorations::Client { .. });
         let colors = cx.theme().colors;
         let git = git_label(&self.git);
+        let workspace = self.workspace.clone();
 
         let bar = titlebar(cx)
             .child(
@@ -627,7 +695,7 @@ impl Render for WelcomeView {
                     .gap(px(8.))
                     .pl(px(4.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(Icon::new(IconName::Git).size(px(16.)))
+                    .child(crate::app_icon::logo(px(16.)))
                     .child("GitWarp"),
             )
             .child(titlebar_fill());
@@ -676,7 +744,6 @@ impl Render for WelcomeView {
                     .px(px(8.))
                     .flex()
                     .items_center()
-                    .justify_end()
                     .gap(px(6.))
                     .bg(colors.sidebar)
                     .border_t_1()
@@ -685,11 +752,34 @@ impl Render for WelcomeView {
                     .text_color(colors.muted)
                     .child(
                         div()
+                            .id("welcome-status-version")
+                            .tooltip(Tooltip::text(ui::t!("welcome.status.version_tooltip")))
+                            .child(ui::t!(
+                                "welcome.status.version",
+                                version = env!("CARGO_PKG_VERSION")
+                            )),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
                             .id("welcome-status-git")
                             .flex()
                             .items_center()
                             .gap(px(4.))
+                            .cursor_pointer()
+                            .hover(|this| this.bg(colors.hover))
                             .tooltip(Tooltip::text(git_tooltip(&self.git)))
+                            .on_click(
+                                move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                                    let _ = workspace.update(cx, |workspace, cx| {
+                                        workspace.open_settings_at(
+                                            crate::settings_ui::Page::Git,
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                },
+                            )
                             .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
                             .child(git),
                     ),
@@ -897,7 +987,7 @@ impl InitDialog {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Choose a folder to initialize".into()),
+            prompt: Some(ui::t!("welcome.init.picker_prompt")),
         });
         cx.spawn_in(window, async move |this, cx| {
             let outcome = match receiver.await {
@@ -940,7 +1030,7 @@ impl InitDialog {
                 // No xdg portal, no picker: the same toast as the Open dialog.
                 toast::show(
                     ToastKind::Error,
-                    format!("Could not open the folder picker: {message}"),
+                    ui::t!("welcome.open.picker_failed", message = message),
                     window,
                     cx,
                 );
@@ -1010,7 +1100,7 @@ fn build_init_dialog(
         move |_: &ClickEvent, window: &mut Window, cx: &mut App| activate(window, cx)
     };
 
-    let label = |text: &'static str| div().text_size(FS_SM).text_color(colors.muted).child(text);
+    let label = |text: SharedString| div().text_size(FS_SM).text_color(colors.muted).child(text);
 
     let mut status = div().flex().flex_col().gap(px(8.));
     let mut has_status = false;
@@ -1027,9 +1117,8 @@ fn build_init_dialog(
         has_status = true;
     }
     if let Some(error) = error {
-        status = status.child(
-            Banner::new(BannerKind::Error, "Could not initialize the repository").body(error),
-        );
+        status = status
+            .child(Banner::new(BannerKind::Error, ui::t!("welcome.open.init_failed")).body(error));
         has_status = true;
     }
 
@@ -1038,7 +1127,7 @@ fn build_init_dialog(
             .flex()
             .flex_col()
             .gap(px(6.))
-            .child(label("Folder"))
+            .child(label(ui::t!("welcome.open.folder")))
             .child(
                 div()
                     .flex()
@@ -1047,7 +1136,7 @@ fn build_init_dialog(
                     .child(div().flex_1().min_w_0().child(dialog.folder.clone()))
                     .child(
                         Button::new("init-browse")
-                            .label("Browse…")
+                            .label(ui::t!("welcome.open.browse"))
                             .icon(IconName::Folder)
                             .disabled(busy)
                             .focus_handle(dialog.browse_focus.clone())
@@ -1064,12 +1153,12 @@ fn build_init_dialog(
                 .flex()
                 .flex_col()
                 .gap(px(6.))
-                .child(label("Default branch"))
+                .child(label(ui::t!("welcome.init.default_branch")))
                 .child(dialog.branch.clone()),
         )
         .child(
             Checkbox::new("init-initial-commit")
-                .label("Create an initial commit with a .gitignore")
+                .label(ui::t!("welcome.init.initial_commit"))
                 .checked(initial_commit)
                 .disabled(busy)
                 .focus_handle(dialog.checkbox_focus.clone())
@@ -1083,7 +1172,7 @@ fn build_init_dialog(
         .gap(px(8.))
         .child(
             Button::new("init-cancel")
-                .label("Cancel")
+                .label(ui::t!("welcome.common.cancel"))
                 .min_width(px(72.))
                 .disabled(busy)
                 .focus_handle(dialog.cancel_focus.clone())
@@ -1107,7 +1196,7 @@ fn build_init_dialog(
         DialogFocus::control(dialog.init_focus.clone()),
     ];
 
-    let mut panel = Dialog::new("Initialize repository")
+    let mut panel = Dialog::new(ui::t!("welcome.init.title"))
         .body(body)
         .footer(footer)
         .width(px(520.))
@@ -1126,11 +1215,11 @@ fn build_init_dialog(
 struct ActionSpec {
     id: &'static str,
     icon: IconName,
-    label: &'static str,
+    label: SharedString,
     /// Shown only for shortcuts that are actually bound.
     kbd: Option<&'static str>,
     disabled: bool,
-    tooltip: &'static str,
+    tooltip: SharedString,
 }
 
 type RowAction = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -1338,7 +1427,7 @@ fn read_recent(cx: &App) -> Vec<RecentRepo> {
 }
 
 /// The last path component, without touching the file system.
-fn recent_name(path: &Path) -> String {
+pub(crate) fn recent_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
@@ -1508,6 +1597,16 @@ mod tests {
             cx.update(|window, cx| overlay::layer_count(window, cx)),
             0,
             "Escape did not close the dialog"
+        );
+
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(crate::workspace::OpenCloneDialog), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|window, cx| overlay::layer_count(window, cx)),
+            1,
+            "Ctrl Shift O did not open the Clone dialog"
         );
     }
 }

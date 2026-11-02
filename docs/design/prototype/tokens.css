@@ -94,6 +94,10 @@
   --line-w: 2px;
 }
 
+/* Row density (Appearance settings): Compact 22 / Normal 26 (default) / Roomy 30. Set on <html data-density="…">. */
+[data-density="compact"] { --row: 22px; }
+[data-density="roomy"] { --row: 30px; }
+
 /* Light theme: near-white chrome, hairline borders, a pale-blue selection instead of solid blue; same semantic names as dark. */
 [data-theme="light"] {
   color-scheme: light;

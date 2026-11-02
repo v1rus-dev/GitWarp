@@ -27,12 +27,6 @@ use crate::workspace::repo_name;
 /// The field's debounce: a probe starts this long after the last keystroke.
 pub(crate) const PROBE_DEBOUNCE: Duration = Duration::from_millis(250);
 
-/// The primary button of a repository root (and of a missing folder in the
-/// Open dialog).
-const OPEN: &str = "Open";
-const INITIALIZE: &str = "Initialize and open";
-const INITIALIZE_SHORT: &str = "Initialize";
-
 /// Which dialog asks. The Open dialog offers to open an existing repository;
 /// the welcome dialog offers to create one, so a folder that already belongs
 /// to a repository has to be opened instead.
@@ -59,13 +53,13 @@ pub(crate) enum StatusKind {
 /// Everything the footer and the banner need for one status. `banner` is the
 /// kind and title; the body text is built separately because it contains mono
 /// spans and, for a plain folder, the initialize controls.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StatusSpec {
     pub kind: StatusKind,
-    pub banner: Option<(BannerKind, &'static str)>,
-    pub primary: &'static str,
+    pub banner: Option<(BannerKind, SharedString)>,
+    pub primary: SharedString,
     pub enabled: bool,
-    pub hint: Option<&'static str>,
+    pub hint: Option<SharedString>,
 }
 
 /// The outcome of a probe, with the message flattened for the banner and the
@@ -113,7 +107,7 @@ pub(crate) fn status_spec(
             banner: None,
             primary: primary_label(dialog),
             enabled: false,
-            hint: Some("Choose a folder to continue"),
+            hint: Some(ui::t!("welcome.init.hint.choose_folder")),
         };
     }
     let previous = |result: Option<&ProbeResult>| match result {
@@ -130,7 +124,7 @@ pub(crate) fn status_spec(
         let mut spec = previous(result);
         spec.kind = StatusKind::Probing;
         spec.enabled = false;
-        spec.hint = Some("Checking the folder…");
+        spec.hint = Some(ui::t!("welcome.init.hint.checking"));
         return spec;
     }
     previous(result)
@@ -141,20 +135,24 @@ fn result_spec(dialog: DialogKind, result: &ProbeResult, branch_blank: bool) -> 
         Ok(FolderProbe::Repo { .. }) => StatusSpec {
             kind: StatusKind::Repo,
             banner: Some(match dialog {
-                DialogKind::Open => (BannerKind::Ok, "Git repository found"),
-                DialogKind::Initialize => (BannerKind::Warn, "This folder is already a repository"),
+                DialogKind::Open => (BannerKind::Ok, ui::t!("welcome.init.banner.repo_found")),
+                DialogKind::Initialize => {
+                    (BannerKind::Warn, ui::t!("welcome.init.banner.already_repo"))
+                }
             }),
-            primary: OPEN,
+            primary: ui::t!("welcome.init.open"),
             enabled: true,
             hint: None,
         },
         Ok(FolderProbe::Nested { .. }) => StatusSpec {
             kind: StatusKind::Nested,
             banner: Some(match dialog {
-                DialogKind::Open => (BannerKind::Warn, "This folder is inside a repository"),
-                DialogKind::Initialize => (BannerKind::Warn, "This folder is already a repository"),
+                DialogKind::Open => (BannerKind::Warn, ui::t!("welcome.init.banner.inside_repo")),
+                DialogKind::Initialize => {
+                    (BannerKind::Warn, ui::t!("welcome.init.banner.already_repo"))
+                }
             }),
-            primary: OPEN,
+            primary: ui::t!("welcome.init.open"),
             enabled: true,
             hint: None,
         },
@@ -166,24 +164,27 @@ fn result_spec(dialog: DialogKind, result: &ProbeResult, branch_blank: bool) -> 
         }
         Ok(FolderProbe::Missing) => StatusSpec {
             kind: StatusKind::Missing,
-            banner: Some((BannerKind::Error, "Folder does not exist")),
-            primary: OPEN,
+            banner: Some((BannerKind::Error, ui::t!("welcome.init.banner.missing"))),
+            primary: ui::t!("welcome.init.open"),
             enabled: false,
-            hint: Some("Choose an existing folder"),
+            hint: Some(ui::t!("welcome.init.hint.choose_existing")),
         },
         Err(error) if error.git_unavailable => StatusSpec {
             kind: StatusKind::GitUnavailable,
-            banner: Some((BannerKind::Error, "Git is unavailable")),
-            primary: OPEN,
+            banner: Some((
+                BannerKind::Error,
+                ui::t!("welcome.init.banner.git_unavailable"),
+            )),
+            primary: ui::t!("welcome.init.open"),
             enabled: false,
-            hint: Some("Choose another folder"),
+            hint: Some(ui::t!("welcome.init.hint.choose_another")),
         },
         Err(_) => StatusSpec {
             kind: StatusKind::Failed,
-            banner: Some((BannerKind::Error, "Could not read this folder")),
-            primary: OPEN,
+            banner: Some((BannerKind::Error, ui::t!("welcome.init.banner.read_failed"))),
+            primary: ui::t!("welcome.init.open"),
             enabled: false,
-            hint: Some("Choose another folder"),
+            hint: Some(ui::t!("welcome.init.hint.choose_another")),
         },
     }
 }
@@ -191,35 +192,35 @@ fn result_spec(dialog: DialogKind, result: &ProbeResult, branch_blank: bool) -> 
 fn plain_spec(dialog: DialogKind, branch_blank: bool) -> StatusSpec {
     StatusSpec {
         kind: StatusKind::Plain,
-        banner: Some((BannerKind::Info, "Not a Git repository yet")),
+        banner: Some((BannerKind::Info, ui::t!("welcome.init.banner.not_repo"))),
         primary: plain_primary(dialog),
         enabled: !branch_blank,
-        hint: branch_blank.then_some("Enter a default branch name"),
+        hint: branch_blank.then(|| ui::t!("welcome.init.hint.branch_blank")),
     }
 }
 
-fn primary_label(dialog: DialogKind) -> &'static str {
+fn primary_label(dialog: DialogKind) -> SharedString {
     match dialog {
-        DialogKind::Open => OPEN,
-        DialogKind::Initialize => INITIALIZE_SHORT,
+        DialogKind::Open => ui::t!("welcome.init.open"),
+        DialogKind::Initialize => ui::t!("welcome.init.initialize"),
     }
 }
 
-fn plain_primary(dialog: DialogKind) -> &'static str {
+fn plain_primary(dialog: DialogKind) -> SharedString {
     match dialog {
-        DialogKind::Open => INITIALIZE,
-        DialogKind::Initialize => INITIALIZE_SHORT,
+        DialogKind::Open => ui::t!("welcome.init.initialize_and_open"),
+        DialogKind::Initialize => ui::t!("welcome.init.initialize"),
     }
 }
 
 /// The plain part of the banner body: the sentences without mono spans.
 pub(crate) fn banner_body(flow: &InitFlow, dialog: DialogKind) -> Option<SharedString> {
     match flow.result()? {
-        Ok(FolderProbe::Plain) => Some("You can initialize one here and open it.".into()),
+        Ok(FolderProbe::Plain) => Some(ui::t!("welcome.init.body.plain")),
         Ok(FolderProbe::Missing) if dialog == DialogKind::Open => {
-            Some("Check the path, or choose a folder with Browse.".into())
+            Some(ui::t!("welcome.init.body.missing_open"))
         }
-        Ok(FolderProbe::Missing) => Some("The folder will be created by git init.".into()),
+        Ok(FolderProbe::Missing) => Some(ui::t!("welcome.init.body.missing_init")),
         Err(error) => Some(error.message.clone()),
         _ => None,
     }
@@ -239,47 +240,50 @@ pub(crate) fn details(
             branch,
             commits,
         }) => {
-            let branch = branch.clone().unwrap_or_else(|| "detached HEAD".to_owned());
+            let branch = branch.clone().map_or_else(
+                || ui::t!("welcome.init.details.detached_head"),
+                SharedString::from,
+            );
             let commits = usize::try_from(*commits).unwrap_or(usize::MAX);
             Some(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(4.))
-                    .text_size(FS_BASE)
-                    .text_color(colors.muted)
-                    .child(
+                ui::i18n::sentence(
+                    ui::i18n::t_count_pieces(
+                        "welcome.init.details.repo",
+                        u64::try_from(commits).unwrap_or(u64::MAX),
+                        &[("n", &format_count(commits))],
+                        &["repo", "branch"],
+                    ),
+                    vec![
                         div()
                             .font_family(FONT_MONO)
-                            .child(repo_name(root.as_path())),
-                    )
-                    .child("· branch")
-                    .child(div().font_family(FONT_MONO).child(branch))
-                    .child(format!("· {} commits", format_count(commits)))
-                    .into_any_element(),
+                            .child(repo_name(root.as_path()))
+                            .into_any_element(),
+                        div()
+                            .font_family(FONT_MONO)
+                            .child(branch)
+                            .into_any_element(),
+                    ],
+                )
+                .text_size(FS_BASE)
+                .text_color(colors.muted)
+                .into_any_element(),
             )
         }
         Ok(FolderProbe::Nested { root }) => {
             let root = display_path(root.as_path(), home);
             Some(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(2.))
-                    .text_size(FS_BASE)
-                    .text_color(colors.muted)
-                    .child("The repository root is ")
-                    .child(
-                        div()
-                            .font_family(FONT_MONO)
-                            .max_w(px(420.))
-                            .truncate()
-                            .child(root),
-                    )
-                    .child(". GitWarp will open the root, not this subfolder.")
-                    .into_any_element(),
+                ui::i18n::sentence(
+                    ui::i18n::t_pieces("welcome.init.details.root", &[], &["root"]),
+                    vec![div()
+                        .font_family(FONT_MONO)
+                        .max_w(px(420.))
+                        .truncate()
+                        .child(root)
+                        .into_any_element()],
+                )
+                .text_size(FS_BASE)
+                .text_color(colors.muted)
+                .into_any_element(),
             )
         }
         _ => None,
@@ -486,15 +490,11 @@ impl InitFlow {
     fn fail(&mut self, message: String, cx: &mut Context<Self>) {
         let message = message.trim();
         self.busy = false;
-        self.error = Some(
-            if message.is_empty() {
-                "git failed without a message"
-            } else {
-                message
-            }
-            .to_owned()
-            .into(),
-        );
+        self.error = Some(if message.is_empty() {
+            ui::t!("welcome.init.error.no_message")
+        } else {
+            SharedString::from(message.to_owned())
+        });
         cx.notify();
     }
 
@@ -527,6 +527,13 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// The banner with its title as plain text, for comparing against English.
+    fn banner(spec: &StatusSpec) -> Option<(BannerKind, &str)> {
+        spec.banner
+            .as_ref()
+            .map(|(kind, title)| (*kind, title.as_ref()))
+    }
+
     fn repo() -> ProbeResult {
         Ok(FolderProbe::Repo {
             root: PathBuf::from("/home/user/gitwarp"),
@@ -542,7 +549,7 @@ mod tests {
         assert_eq!(spec.banner, None);
         assert_eq!(spec.primary, "Open");
         assert!(!spec.enabled);
-        assert_eq!(spec.hint, Some("Choose a folder to continue"));
+        assert_eq!(spec.hint.as_deref(), Some("Choose a folder to continue"));
     }
 
     #[test]
@@ -550,14 +557,14 @@ mod tests {
         let repo = repo();
         let ready = status_spec(DialogKind::Open, false, false, Some(&repo), false);
         assert_eq!(
-            (ready.kind, ready.banner),
+            (ready.kind, banner(&ready)),
             (
                 StatusKind::Repo,
                 Some((BannerKind::Ok, "Git repository found"))
             )
         );
         assert_eq!(
-            (ready.primary, ready.enabled, ready.hint),
+            (ready.primary.as_ref(), ready.enabled, ready.hint.as_deref()),
             ("Open", true, None)
         );
 
@@ -568,7 +575,7 @@ mod tests {
         assert_eq!(probing.banner, ready.banner);
         assert_eq!(probing.primary, "Open");
         assert!(!probing.enabled);
-        assert_eq!(probing.hint, Some("Checking the folder…"));
+        assert_eq!(probing.hint.as_deref(), Some("Checking the folder…"));
     }
 
     #[test]
@@ -579,11 +586,11 @@ mod tests {
         let spec = status_spec(DialogKind::Open, false, false, Some(&nested), false);
         assert_eq!(spec.kind, StatusKind::Nested);
         assert_eq!(
-            spec.banner,
+            banner(&spec),
             Some((BannerKind::Warn, "This folder is inside a repository"))
         );
         assert_eq!(
-            (spec.primary, spec.enabled, spec.hint),
+            (spec.primary.as_ref(), spec.enabled, spec.hint.as_deref()),
             ("Open", true, None)
         );
     }
@@ -594,18 +601,18 @@ mod tests {
         let ready = status_spec(DialogKind::Open, false, false, Some(&plain), false);
         assert_eq!(ready.kind, StatusKind::Plain);
         assert_eq!(
-            ready.banner,
+            banner(&ready),
             Some((BannerKind::Info, "Not a Git repository yet"))
         );
         assert_eq!(
-            (ready.primary, ready.enabled, ready.hint),
+            (ready.primary.as_ref(), ready.enabled, ready.hint.as_deref()),
             ("Initialize and open", true, None)
         );
 
         let blank = status_spec(DialogKind::Open, false, false, Some(&plain), true);
         assert_eq!(blank.primary, "Initialize and open");
         assert!(!blank.enabled);
-        assert_eq!(blank.hint, Some("Enter a default branch name"));
+        assert_eq!(blank.hint.as_deref(), Some("Enter a default branch name"));
     }
 
     #[test]
@@ -614,11 +621,11 @@ mod tests {
         let spec = status_spec(DialogKind::Open, false, false, Some(&missing), false);
         assert_eq!(spec.kind, StatusKind::Missing);
         assert_eq!(
-            spec.banner,
+            banner(&spec),
             Some((BannerKind::Error, "Folder does not exist"))
         );
-        assert_eq!((spec.primary, spec.enabled), ("Open", false));
-        assert_eq!(spec.hint, Some("Choose an existing folder"));
+        assert_eq!((spec.primary.as_ref(), spec.enabled), ("Open", false));
+        assert_eq!(spec.hint.as_deref(), Some("Choose an existing folder"));
     }
 
     #[test]
@@ -630,11 +637,11 @@ mod tests {
         let spec = status_spec(DialogKind::Open, false, false, Some(&failed), false);
         assert_eq!(spec.kind, StatusKind::Failed);
         assert_eq!(
-            spec.banner,
+            banner(&spec),
             Some((BannerKind::Error, "Could not read this folder"))
         );
-        assert_eq!((spec.primary, spec.enabled), ("Open", false));
-        assert_eq!(spec.hint, Some("Choose another folder"));
+        assert_eq!((spec.primary.as_ref(), spec.enabled), ("Open", false));
+        assert_eq!(spec.hint.as_deref(), Some("Choose another folder"));
     }
 
     #[test]
@@ -645,7 +652,10 @@ mod tests {
         });
         let spec = status_spec(DialogKind::Open, false, false, Some(&failed), false);
         assert_eq!(spec.kind, StatusKind::GitUnavailable);
-        assert_eq!(spec.banner, Some((BannerKind::Error, "Git is unavailable")));
+        assert_eq!(
+            banner(&spec),
+            Some((BannerKind::Error, "Git is unavailable"))
+        );
         assert!(!spec.enabled);
     }
 
@@ -655,11 +665,11 @@ mod tests {
         let spec = status_spec(DialogKind::Initialize, false, false, Some(&repo), false);
         assert_eq!(spec.kind, StatusKind::Repo);
         assert_eq!(
-            spec.banner,
+            banner(&spec),
             Some((BannerKind::Warn, "This folder is already a repository"))
         );
         assert_eq!(
-            (spec.primary, spec.enabled),
+            (spec.primary.as_ref(), spec.enabled),
             ("Open", true),
             "an existing repository must be opened, not initialized"
         );
@@ -669,7 +679,7 @@ mod tests {
         });
         let spec = status_spec(DialogKind::Initialize, false, false, Some(&nested), false);
         assert_eq!(
-            spec.banner,
+            banner(&spec),
             Some((BannerKind::Warn, "This folder is already a repository"))
         );
         assert_eq!(spec.primary, "Open");

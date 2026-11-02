@@ -4,8 +4,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, point, px, size, App, Bounds, ElementId, IntoElement, ParentElement, Pixels,
-    RenderOnce, SharedString, Styled, Window,
+    canvas, div, point, px, size, App, Bounds, ElementId, FocusHandle, IntoElement, ParentElement,
+    Pixels, RenderOnce, SharedString, Styled, Window,
 };
 use gpui::{InteractiveElement, StatefulInteractiveElement};
 
@@ -25,6 +25,7 @@ pub struct Select {
     options: Vec<SharedString>,
     selected: usize,
     disabled: bool,
+    focus_handle: Option<FocusHandle>,
     on_change: Option<crate::components::SelectHandler>,
 }
 
@@ -35,8 +36,16 @@ impl Select {
             options: Vec::new(),
             selected: 0,
             disabled: false,
+            focus_handle: None,
             on_change: None,
         }
+    }
+
+    /// Uses the caller's focus handle, e.g. to list the select in a
+    /// [`Dialog::focus_order`](crate::Dialog::focus_order).
+    pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
+        self.focus_handle = Some(handle);
+        self
     }
 
     pub fn options(mut self, options: impl IntoIterator<Item = impl Into<SharedString>>) -> Self {
@@ -86,10 +95,14 @@ impl RenderOnce for Select {
         let focus = match self.disabled {
             true => None,
             false => Some(
-                window
-                    .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
-                    .read(cx)
+                self.focus_handle
                     .clone()
+                    .unwrap_or_else(|| {
+                        window
+                            .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
+                            .read(cx)
+                            .clone()
+                    })
                     .tab_stop(true),
             ),
         };
@@ -107,6 +120,13 @@ impl RenderOnce for Select {
 
         let label = self.options.get(self.selected).cloned().unwrap_or_default();
         let entries = self.entries();
+        // The menu opens on the current value (a native `<select>` does), or on
+        // the first item when the value is not among the options.
+        let highlight = Some(if self.selected < self.options.len() {
+            self.selected
+        } else {
+            0
+        });
         let bounds_slot = bounds.clone();
         let open = {
             let bounds = bounds.clone();
@@ -114,7 +134,7 @@ impl RenderOnce for Select {
                 let anchor = bounds
                     .get()
                     .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), size(px(0.), px(0.))));
-                menu::open_dropdown(anchor, entries.clone(), window, cx);
+                menu::open_dropdown_at(anchor, entries.clone(), highlight, window, cx);
             }
         };
 
@@ -148,7 +168,7 @@ impl RenderOnce for Select {
                 .absolute()
                 .inset_0(),
             )
-            .child(div().flex_1().min_w_0().child(label))
+            .child(div().flex_1().min_w_0().truncate().child(label))
             .child(Icon::new(IconName::ChevD).size(px(12.)).color(colors.muted));
 
         if self.disabled {
@@ -163,6 +183,8 @@ impl RenderOnce for Select {
                 .track_focus(focus.as_ref().expect("enabled select has a focus handle"))
                 .hover(move |style| style.border_color(hover_border))
                 .on_click(move |_, window, cx| open_click(window, cx))
+                // Enter and Space open the menu through the click handler;
+                // Down opens it too. The menu takes over arrows, Enter, Esc.
                 .on_action(move |_: &SelectNext, window, cx| open_key(window, cx));
         }
 

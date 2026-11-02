@@ -57,6 +57,24 @@ pub(crate) fn add_new_branch(repo: &Repo, path: &Path, branch: &str, start: Oid)
     check_output(out, "worktree add -b").map(drop)
 }
 
+/// Creates the local branch `local` tracking `remote_branch` (e.g.
+/// `origin/feature`) and checks it out in a new worktree at `path`.
+pub(crate) fn add_tracking(
+    repo: &Repo,
+    path: &Path,
+    local_branch: &str,
+    remote_branch: &str,
+) -> Result<()> {
+    let out = repo
+        .command()
+        .args(["worktree", "add", "--track", "-b", local_branch, "--"])
+        .arg(path)
+        .arg(remote_branch)
+        .output()
+        .map_err(Error::Spawn)?;
+    check_output(out, "worktree add --track").map(drop)
+}
+
 /// Removes the worktree at `path`. `force` discards staged, unstaged and
 /// untracked files in it; without it git refuses to touch a dirty worktree.
 /// A worktree whose folder is already gone is removed without `force`.

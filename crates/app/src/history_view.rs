@@ -5,34 +5,36 @@
 //! The view also owns the repository metadata the shell needs — HEAD and the
 //! refs — because it is the view that opens the [`Repo`].
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use gpui::prelude::*;
 use gpui::{
-    actions, canvas, container_query, div, px, uniform_list, AnyElement, App, AsyncApp,
-    ClickEvent, ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, FocusHandle,
-    FontWeight,
+    actions, canvas, container_query, div, px, uniform_list, AnyElement, App, AsyncApp, ClickEvent,
+    ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, FocusHandle, FontWeight,
     IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, ScrollStrategy,
     SharedString, StyledText, Task, TextRun, TextStyle, UniformListScrollHandle, WeakEntity,
     Window,
 };
 
-use git_core::{CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo};
+use git_core::{
+    BranchLog, CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo,
+};
 use git_graph::{ColumnGeometry, GraphBuilder, IdleLanes, Row};
-use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
+use ui::actions::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrev};
 use ui::focus::{self, RingOffset};
-use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD};
+use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD, R_SM};
 use ui::theme::ThemeColors;
 use ui::{
     menu, ActiveTheme, Avatar, Button, ButtonSize, EmptyState, Icon, IconName, ListRow, MenuEntry,
-    MenuItem, Progress, RefBadge, RefKind, Skeleton, Spinner, Tooltip,
+    MenuItem, Progress, RefBadge, RefKind, Skeleton, Spinner, ToastKind, Tooltip,
 };
 
 use crate::format::{format_count, relative_time};
-use crate::graph_paint::paint_row;
+use crate::graph_paint::{content_width, lane_centre, overdraw_mask_bounds, paint_row};
 use crate::history_search::{self, Query};
 use crate::history_state::{
     percent_text, progress_fraction, skeleton_percent, source_label, Failure, LoadState,
@@ -42,9 +44,19 @@ use crate::ref_ops::{CardRefKind, CommitCard, RefAction};
 
 /// What the history row menu asks the shell to do.
 pub(crate) type RefActionHandler = Rc<dyn Fn(RefAction, &mut Window, &mut App)>;
+
+/// What the shell does with a sidebar action chosen from a ref's menu.
+pub(crate) type SidebarActionHandler = Rc<dyn Fn(SidebarAction, &mut Window, &mut App)>;
+
+/// Sets (`Some`) or clears (`None`) the History's branch filter.
+type FilterSetter = Rc<dyn Fn(Option<String>, &mut App)>;
+
+/// A sidebar node key's context-menu model.
+type RefMenuSource = Rc<dyn Fn(&str) -> Vec<SidebarMenuEntry>>;
 use crate::settings::{GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MAX, GRAPH_WIDTH_MIN};
+use crate::sidebar::{sidebar_menu, SidebarAction, SidebarMenuEntry};
 use crate::theme;
-use crate::workspace::Workspace;
+use crate::workspace::{OpenGitSettings, Workspace};
 
 /// Rows are delivered to the UI in pages of this size.
 const PAGE: usize = 2_000;
@@ -89,6 +101,8 @@ const SKELETON_ROWS: usize = 10;
 /// The gap between a row's ref badges and the summary text (the summary cell's
 /// flex gap).
 const BADGE_GAP: f32 = 6.;
+/// How faint the branch filter's fork-point row is drawn.
+const FORK_ROW_OPACITY: f32 = 0.62;
 /// The widest a badge label may get; a longer ref name is ellipsized.
 const BADGE_LABEL_MAX: f32 = 160.;
 /// A badge's label is wrapped in 6 px padding and a 1 px border on each side;
@@ -101,6 +115,15 @@ const BADGE_TEXT_MIN: f32 = 80.;
 /// Relative dates are recomputed at this interval while the view is open.
 const CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The starter file the empty history's "Add .gitignore" writes.
+const STARTER_GITIGNORE: &str = "# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+";
+
 actions!(
     gitwarp,
     [
@@ -108,7 +131,8 @@ actions!(
         PrevCommit,
         PageDownCommits,
         PageUpCommits,
-        CopyCommitHash
+        CopyCommitHash,
+        CreateBranchHere
     ]
 );
 
@@ -137,6 +161,7 @@ pub(crate) fn bind_history_keys(cx: &mut App, settings: &crate::settings::Settin
         ui::actions::key_binding(cx, "pagedown", PageDownCommits, Some("history-list")),
         ui::actions::key_binding(cx, "pageup", PageUpCommits, Some("history-list")),
         ui::actions::key_binding(cx, "secondary-c", CopyCommitHash, Some("history-list")),
+        ui::actions::key_binding(cx, "b", CreateBranchHere, Some("history-list")),
     ]);
 }
 
@@ -405,7 +430,11 @@ pub fn fit_width(graph_width: f32) -> f32 {
 /// the `N` of the header's "+N" pill. `column_width` is the effective column
 /// width, not the raw user setting (the pane's share may have narrowed it).
 pub fn clipped_lanes(geometry: &ColumnGeometry, column_width: f32) -> usize {
-    geometry.xs.iter().filter(|&&x| x > column_width).count()
+    geometry
+        .xs
+        .iter()
+        .filter(|&&x| lane_centre(x) > column_width)
+        .count()
 }
 
 struct Item {
@@ -505,6 +534,83 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The History list narrowed to the commits authored on one local calendar
+/// day (the activity strip's day filter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayFilter {
+    /// Days since the Unix epoch of the local calendar date.
+    pub day: i32,
+    /// `Some(email)` keeps only that author (the strip's "Me").
+    pub me: Option<String>,
+}
+
+#[derive(Debug)]
+enum DayState {
+    Loading,
+    Ready,
+    Failed(String),
+}
+
+/// The rows a [`DayFilter`] shows. They replace the live `items` for display,
+/// selection and search while the filter is on; the streaming load keeps
+/// filling `items` underneath, so clearing the filter is instant.
+struct DayRows {
+    filter: DayFilter,
+    state: DayState,
+    items: Vec<Item>,
+    idle_lanes: IdleLanes,
+    geometry: Rc<ColumnGeometry>,
+    /// The one-off `git log` for the day; dropping it drops the answer.
+    _task: Option<Task<()>>,
+}
+
+/// The most commits the branch filter lists for one branch.
+const BRANCH_FILTER_LIMIT: usize = 50_000;
+
+/// What [`HistoryView::set_branch_filter`] found for a branch.
+struct BranchData {
+    log: BranchLog,
+    /// The main line's name, for the "Merged into {main}" button.
+    main: Option<String>,
+    rows: Vec<(CommitInfo, Row<Oid>)>,
+}
+
+/// The rows the History branch filter shows: the branch's own commits
+/// (`git log --first-parent`), cut at the fork point. Like [`DayRows`] they
+/// replace the live `items` for display, selection and search while the filter
+/// is on.
+struct BranchRows {
+    branch: String,
+    state: DayState,
+    items: Vec<Item>,
+    idle_lanes: IdleLanes,
+    geometry: Rc<ColumnGeometry>,
+    /// The fork-point commit: its row is dimmed and carries a "fork point" note.
+    fork: Option<Oid>,
+    /// Merge rows: the branch each one merged in (the "from {x}" chip).
+    merged_from: HashMap<Oid, String>,
+    /// The merge on main that brought the whole branch in, with main's name.
+    merged_into: Option<(Oid, String)>,
+    /// The one-off query; dropping it drops the answer.
+    _task: Option<Task<()>>,
+}
+
+impl BranchRows {
+    fn new(branch: String, state: DayState, collapse: bool, task: Option<Task<()>>) -> Self {
+        Self {
+            branch,
+            state,
+            items: Vec::new(),
+            idle_lanes: IdleLanes::new(),
+            geometry: Rc::new(IdleLanes::new().geometry(collapse)),
+            fork: None,
+            merged_from: HashMap::new(),
+            merged_into: None,
+            _task: task,
+        }
+    }
+}
+
 /// What the sidebar knows about the repository's refs.
 #[derive(Debug, Default)]
 enum RefsState {
@@ -523,6 +629,13 @@ pub struct HistoryView {
     workspace: WeakEntity<Workspace>,
     /// What the shell does with a row action (branch/tag/reset dialogs).
     on_action: RefActionHandler,
+    /// What the shell does with a sidebar action chosen from a ref's menu
+    /// (a branch submenu of the row menu, or a badge's menu); `None` until the
+    /// shell installs it, and then those items do nothing.
+    sidebar_action: Option<SidebarActionHandler>,
+    /// The branch last picked in a row-menu picker, for the whole session. It
+    /// is listed first in the next picker and never applied by itself.
+    last_picked_branch: Rc<RefCell<Option<String>>>,
     /// The repository root, once `Repo::open` succeeded.
     root: Option<PathBuf>,
     items: Vec<Item>,
@@ -620,6 +733,14 @@ pub struct HistoryView {
     /// Whether the next finished scan should select the first match. Cleared
     /// once the selection jumped, or with the query.
     search_jump: bool,
+    /// The active day filter, if any.
+    day_rows: Option<DayRows>,
+    /// Bumped on every filter change; an older answer is dropped.
+    day_generation: u64,
+    /// The active branch filter, if any. Exclusive with the day filter.
+    branch_rows: Option<BranchRows>,
+    /// Bumped on every branch filter change; an older answer is dropped.
+    branch_generation: u64,
 }
 
 /// Adds one row-menu item that asks the shell to open a ref dialog.
@@ -628,7 +749,7 @@ fn push_row_action(
     entries: &mut Vec<MenuEntry>,
     card: &CommitCard,
     on_action: &RefActionHandler,
-    label: String,
+    label: SharedString,
     icon: IconName,
     shortcut: Option<&str>,
     build: fn(CommitCard) -> RefAction,
@@ -646,6 +767,437 @@ fn push_row_action(
     entries.push(MenuEntry::Item(item.action(move |window, cx| {
         on_action(build(card.clone()), window, cx);
     })));
+}
+
+/// What kind of branch a row action can target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowBranchKind {
+    /// The checked-out branch.
+    Head,
+    Local,
+    Remote,
+}
+
+/// A branch on a row's commit that a row action can target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RowBranch {
+    /// The short name: `main`, or `origin/main` for a remote branch.
+    name: String,
+    kind: RowBranchKind,
+}
+
+impl RowBranch {
+    /// The sidebar node key whose menu belongs to this branch.
+    fn menu_key(&self) -> String {
+        match self.kind {
+            RowBranchKind::Remote => format!("rbranch:{}", self.name),
+            RowBranchKind::Head | RowBranchKind::Local => format!("local:{}", self.name),
+        }
+    }
+}
+
+/// The branches a row's actions work on, for the commit `commit`:
+/// `(other local branches, all targetable branches)`.
+///
+/// The first list is what "Switch to" offers: local branches other than HEAD,
+/// A–Z. The second is for the filter and "Branch" items: the HEAD branch
+/// first, then local A–Z, then remote A–Z. A remote branch is dropped when a
+/// local branch of the same name sits on the same commit (a duplicate for this
+/// purpose), and the symbolic `origin/HEAD` is never offered.
+fn row_branches(commit: Oid, head: Option<&Head>, refs: &[Ref]) -> (Vec<String>, Vec<RowBranch>) {
+    let head_name = match head {
+        Some(Head::Branch { name, .. }) => Some(name.as_str()),
+        _ => None,
+    };
+    let on_commit = |kind: git_core::RefKind| {
+        let mut names: Vec<&str> = refs
+            .iter()
+            .filter(|reference| reference.kind == kind && reference.target == commit)
+            .map(|reference| reference.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    let locals = on_commit(git_core::RefKind::LocalBranch);
+    let others: Vec<String> = locals
+        .iter()
+        .filter(|name| Some(**name) != head_name)
+        .map(|name| (*name).to_owned())
+        .collect();
+
+    let mut branches: Vec<RowBranch> = Vec::new();
+    if let Some(name) = locals.iter().find(|name| Some(**name) == head_name) {
+        branches.push(RowBranch {
+            name: (*name).to_owned(),
+            kind: RowBranchKind::Head,
+        });
+    }
+    branches.extend(others.iter().map(|name| RowBranch {
+        name: name.clone(),
+        kind: RowBranchKind::Local,
+    }));
+    for name in on_commit(git_core::RefKind::RemoteBranch) {
+        let local_name = name.split_once('/').map_or(name, |(_, rest)| rest);
+        if name.ends_with("/HEAD") || locals.contains(&local_name) {
+            continue;
+        }
+        branches.push(RowBranch {
+            name: name.to_owned(),
+            kind: RowBranchKind::Remote,
+        });
+    }
+    (others, branches)
+}
+
+/// The picker's order: `list` as given, with the last-picked branch moved to
+/// the front when it is in the list.
+fn picker_order(mut list: Vec<RowBranch>, last_picked: Option<&str>) -> Vec<RowBranch> {
+    if let Some(index) = list
+        .iter()
+        .position(|branch| Some(branch.name.as_str()) == last_picked)
+    {
+        let picked = list.remove(index);
+        list.insert(0, picked);
+    }
+    list
+}
+
+/// The sidebar node key a badge's right-click opens, or `None` for a badge
+/// that has no menu (a detached HEAD, the "+N" overflow).
+fn badge_menu_key(spec: &BadgeSpec) -> Option<String> {
+    match spec.kind {
+        RefKind::Head if spec.label.as_ref() == "HEAD" => None,
+        RefKind::Head | RefKind::Local => Some(format!("local:{}", spec.label)),
+        RefKind::Remote => Some(format!("rbranch:{}", spec.label)),
+        RefKind::Tag => Some(format!("tag:{}", spec.label)),
+        _ => None,
+    }
+}
+
+/// A sidebar menu model as menu entries; the items dispatch their
+/// [`SidebarAction`] through `handler`, and a disabled item (no action) stays
+/// shown but off.
+fn sidebar_menu_entries(
+    model: Vec<SidebarMenuEntry>,
+    handler: Option<SidebarActionHandler>,
+) -> Vec<MenuEntry> {
+    model
+        .into_iter()
+        .map(|entry| match entry {
+            SidebarMenuEntry::Separator => MenuEntry::Separator,
+            SidebarMenuEntry::Item(item) => {
+                let mut menu_item = MenuItem::new(item.label)
+                    .icon(item.icon)
+                    .disabled(!item.enabled);
+                if let Some(shortcut) = item.shortcut {
+                    menu_item = menu_item.shortcut(shortcut);
+                }
+                if item.danger {
+                    menu_item = menu_item.danger();
+                }
+                if let Some(handler) = handler.clone() {
+                    let action = item.action;
+                    menu_item = menu_item.action(move |window, cx| {
+                        handler(action.clone(), window, cx);
+                    });
+                }
+                MenuEntry::Item(menu_item)
+            }
+        })
+        .collect()
+}
+
+/// What picking a branch in a row-menu picker does.
+#[derive(Clone, Copy)]
+enum Pick {
+    /// Check the branch out.
+    Switch,
+    /// Narrow the History to the branch.
+    Filter,
+    /// Show the branch's full sidebar menu in place.
+    Menu,
+}
+
+/// Everything the history row menu is built from. The menu is pure data plus
+/// callbacks, so its shape is testable without a window; the pickers and the
+/// "Branch" view replace the open menu's rows in place ([`MenuItem::submenu`]),
+/// and "Back" is a submenu item that returns the root rows.
+#[derive(Clone)]
+struct RowMenu {
+    hash: String,
+    card: CommitCard,
+    /// The branch "Reset … to here…" names; `HEAD` when detached.
+    reset_branch: String,
+    /// Targetable branches, HEAD first, local A–Z, remote A–Z.
+    branches: Vec<RowBranch>,
+    /// Local branches other than HEAD, for "Switch to".
+    switchable: Vec<String>,
+    /// The branch this row merged in, while a branch filter is on.
+    merged: Option<String>,
+    /// The branch the History is narrowed to.
+    filter: Option<String>,
+    last_picked: Rc<RefCell<Option<String>>>,
+    on_action: RefActionHandler,
+    on_sidebar: Option<SidebarActionHandler>,
+    on_filter: FilterSetter,
+    /// A sidebar key's menu model.
+    branch_menu: RefMenuSource,
+}
+
+impl RowMenu {
+    fn entries(&self) -> Vec<MenuEntry> {
+        let hash = self.hash.clone();
+        let mut entries = vec![MenuEntry::Item(
+            MenuItem::new(ui::t!("history.menu.copy_hash"))
+                .icon(IconName::Copy)
+                .shortcut("Ctrl+C")
+                .action(move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(hash.clone()));
+                }),
+        )];
+        self.push_switch(&mut entries);
+        self.push_filter_items(&mut entries);
+        self.push_branch_items(&mut entries);
+        if let Some(merged) = &self.merged {
+            entries.push(MenuEntry::Separator);
+            entries.push(MenuEntry::Item(self.filter_item(merged, IconName::Branch)));
+        }
+        let (card, on_action) = (&self.card, &self.on_action);
+        push_row_action(
+            &mut entries,
+            card,
+            on_action,
+            ui::t!("history.menu.create_branch_here"),
+            IconName::Branch,
+            Some("B"),
+            RefAction::CreateBranch,
+            false,
+        );
+        push_row_action(
+            &mut entries,
+            card,
+            on_action,
+            ui::t!("history.menu.create_tag_here"),
+            IconName::Tag,
+            None,
+            RefAction::CreateTag,
+            false,
+        );
+        entries.push(MenuEntry::Separator);
+        push_row_action(
+            &mut entries,
+            card,
+            on_action,
+            ui::t!("history.menu.cherry_pick"),
+            IconName::Undo,
+            None,
+            RefAction::CherryPick,
+            false,
+        );
+        push_row_action(
+            &mut entries,
+            card,
+            on_action,
+            ui::t!("history.menu.revert_commit"),
+            IconName::Undo,
+            None,
+            RefAction::Revert,
+            false,
+        );
+        push_row_action(
+            &mut entries,
+            card,
+            on_action,
+            ui::t!("history.menu.reset_to_here", branch = self.reset_branch),
+            IconName::Undo,
+            None,
+            RefAction::Reset,
+            true,
+        );
+        entries
+    }
+
+    /// "Switch to {b}" for one other local branch, "Switch to…" for several,
+    /// "Checkout this commit" for none.
+    fn push_switch(&self, entries: &mut Vec<MenuEntry>) {
+        match self.switchable.as_slice() {
+            [] => {
+                let (on_action, card) = (self.on_action.clone(), self.card.clone());
+                entries.push(MenuEntry::Item(
+                    MenuItem::new(ui::t!("history.menu.checkout_commit"))
+                        .icon(IconName::Check)
+                        .action(move |window, cx| {
+                            on_action(RefAction::CheckoutCommit(card.clone()), window, cx);
+                        }),
+                ));
+            }
+            [name] => entries.push(MenuEntry::Item(self.switch_item(name))),
+            names => {
+                let list = names
+                    .iter()
+                    .map(|name| RowBranch {
+                        name: name.clone(),
+                        kind: RowBranchKind::Local,
+                    })
+                    .collect();
+                entries.push(MenuEntry::Item(self.picker_item(
+                    ui::t!("history.menu.switch_to_picker"),
+                    IconName::Check,
+                    list,
+                    Pick::Switch,
+                )));
+            }
+        }
+    }
+
+    fn push_filter_items(&self, entries: &mut Vec<MenuEntry>) {
+        if self.filter.is_some() {
+            let on_filter = self.on_filter.clone();
+            entries.push(MenuEntry::Item(
+                MenuItem::new(ui::t!("history.menu.show_all_commits"))
+                    .icon(IconName::X)
+                    .action(move |_, cx| on_filter(None, cx)),
+            ));
+        }
+        match self.branches.as_slice() {
+            [] => {}
+            [branch] => entries.push(MenuEntry::Item(
+                self.filter_item(&branch.name, IconName::Branch),
+            )),
+            _ => entries.push(MenuEntry::Item(self.picker_item(
+                ui::t!("history.menu.show_all_commits_of_picker"),
+                IconName::Branch,
+                self.branches.clone(),
+                Pick::Filter,
+            ))),
+        }
+    }
+
+    fn push_branch_items(&self, entries: &mut Vec<MenuEntry>) {
+        match self.branches.as_slice() {
+            [] => {}
+            [branch] => {
+                let this = self.clone();
+                let branch = branch.clone();
+                entries.push(MenuEntry::Item(
+                    MenuItem::new(ui::t!("history.menu.branch", name = branch.name))
+                        .icon(branch_icon(&branch))
+                        .shortcut("›")
+                        .submenu(move || this.branch_view(&branch)),
+                ));
+            }
+            _ => entries.push(MenuEntry::Item(self.picker_item(
+                ui::t!("history.menu.branch_picker"),
+                IconName::Branch,
+                self.branches.clone(),
+                Pick::Menu,
+            ))),
+        }
+    }
+
+    fn switch_item(&self, name: &str) -> MenuItem {
+        let (on_action, branch) = (self.on_action.clone(), name.to_owned());
+        MenuItem::new(ui::t!("history.menu.switch_to", name = name))
+            .icon(IconName::Check)
+            .action(move |window, cx| {
+                on_action(RefAction::CheckoutBranch(branch.clone()), window, cx);
+            })
+    }
+
+    /// "Show all commits of {name}"; disabled with a check while it is the
+    /// active filter.
+    fn filter_item(&self, name: &str, icon: IconName) -> MenuItem {
+        let active = self.filter.as_deref() == Some(name);
+        let (on_filter, branch) = (self.on_filter.clone(), name.to_owned());
+        MenuItem::new(ui::t!("history.menu.show_all_commits_of", name = name))
+            .icon(if active { IconName::Check } else { icon })
+            .disabled(active)
+            .action(move |_, cx| on_filter(Some(branch.clone()), cx))
+    }
+
+    /// An item that swaps the menu for a picker over `list`.
+    fn picker_item(
+        &self,
+        label: SharedString,
+        icon: IconName,
+        list: Vec<RowBranch>,
+        pick: Pick,
+    ) -> MenuItem {
+        let this = self.clone();
+        MenuItem::new(label)
+            .icon(icon)
+            .shortcut("›")
+            .submenu(move || this.picker(list.clone(), pick))
+    }
+
+    /// "Back" plus a rule, then the branches: the last-picked one first. It
+    /// replaces the menu; nothing is applied until a branch is chosen.
+    fn picker(&self, list: Vec<RowBranch>, pick: Pick) -> Vec<MenuEntry> {
+        let mut entries = vec![self.back_item(), MenuEntry::Separator];
+        for branch in picker_order(list, self.last_picked.borrow().as_deref()) {
+            let mut item = MenuItem::new(branch.name.clone()).icon(branch_icon(&branch));
+            match branch.kind {
+                RowBranchKind::Head => item = item.shortcut("HEAD"),
+                RowBranchKind::Remote => item = item.shortcut(ui::t!("history.menu.remote_tag")),
+                RowBranchKind::Local => {}
+            }
+            let last_picked = self.last_picked.clone();
+            let name = branch.name.clone();
+            item = match pick {
+                Pick::Switch => {
+                    let (on_action, name) = (self.on_action.clone(), name);
+                    item.action(move |window, cx| {
+                        last_picked.replace(Some(name.clone()));
+                        on_action(RefAction::CheckoutBranch(name.clone()), window, cx);
+                    })
+                }
+                Pick::Filter => {
+                    let (on_filter, name) = (self.on_filter.clone(), name);
+                    item.action(move |_, cx| {
+                        last_picked.replace(Some(name.clone()));
+                        on_filter(Some(name.clone()), cx);
+                    })
+                }
+                Pick::Menu => {
+                    let this = self.clone();
+                    item.submenu(move || {
+                        last_picked.replace(Some(name.clone()));
+                        this.branch_view(&branch)
+                    })
+                }
+            };
+            entries.push(MenuEntry::Item(item));
+        }
+        entries
+    }
+
+    /// A branch's full sidebar menu, under "Back".
+    fn branch_view(&self, branch: &RowBranch) -> Vec<MenuEntry> {
+        let mut entries = vec![self.back_item(), MenuEntry::Separator];
+        entries.extend(sidebar_menu_entries(
+            (self.branch_menu)(&branch.menu_key()),
+            self.on_sidebar.clone(),
+        ));
+        entries
+    }
+
+    /// "Back": the row menu's root rows again.
+    fn back_item(&self) -> MenuEntry {
+        let this = self.clone();
+        MenuEntry::Item(
+            MenuItem::new(ui::t!("history.menu.back"))
+                .icon(IconName::Undo)
+                .shortcut("‹")
+                .submenu(move || this.entries()),
+        )
+    }
+}
+
+fn branch_icon(branch: &RowBranch) -> IconName {
+    match branch.kind {
+        RowBranchKind::Remote => IconName::Cloud,
+        RowBranchKind::Head | RowBranchKind::Local => IconName::Branch,
+    }
 }
 
 impl HistoryView {
@@ -677,6 +1229,8 @@ impl HistoryView {
             git,
             workspace,
             on_action,
+            sidebar_action: None,
+            last_picked_branch: Rc::new(RefCell::new(None)),
             root: None,
             items: Vec::new(),
             pending_rows: false,
@@ -717,6 +1271,10 @@ impl HistoryView {
             search_debounce: None,
             search_task: None,
             search_jump: false,
+            day_rows: None,
+            branch_rows: None,
+            branch_generation: 0,
+            day_generation: 0,
         };
         view.start(cx);
         // Relative dates are derived at render time from the clock, so the
@@ -950,7 +1508,11 @@ impl HistoryView {
         self.scan_more(cx);
         // A sidebar reveal that was waiting for this page lands now, and only
         // the rows that just arrived are scanned for it.
-        if let Some(index) = self.pending_reveal.check(&self.items, start) {
+        if let Some(index) = self
+            .pending_reveal
+            .check(&self.items, start)
+            .filter(|_| self.day_rows.is_none() && self.branch_rows.is_none())
+        {
             self.reveal_row(index, cx);
         }
         cx.notify();
@@ -960,18 +1522,294 @@ impl HistoryView {
     /// collapse toggle changed, not while rendering.
     fn refresh_geometry(&mut self) {
         self.geometry = Rc::new(self.idle_lanes.geometry(self.collapse));
+        if let Some(day) = &mut self.day_rows {
+            day.geometry = Rc::new(day.idle_lanes.geometry(self.collapse));
+        }
+        if let Some(branch) = &mut self.branch_rows {
+            branch.geometry = Rc::new(branch.idle_lanes.geometry(self.collapse));
+        }
+    }
+
+    /// The rows on screen: the day or branch filter's while one is on, else
+    /// the history.
+    fn rows(&self) -> &[Item] {
+        match (&self.day_rows, &self.branch_rows) {
+            (Some(day), _) => &day.items,
+            (None, Some(branch)) => &branch.items,
+            (None, None) => &self.items,
+        }
+    }
+
+    /// The graph geometry that belongs to [`Self::rows`].
+    fn geometry(&self) -> &Rc<ColumnGeometry> {
+        match (&self.day_rows, &self.branch_rows) {
+            (Some(day), _) => &day.geometry,
+            (None, Some(branch)) => &branch.geometry,
+            (None, None) => &self.geometry,
+        }
+    }
+
+    /// The active day filter.
+    pub fn day_filter(&self) -> Option<&DayFilter> {
+        self.day_rows.as_ref().map(|day| &day.filter)
+    }
+
+    /// How many commits the active filter found, once its query finished.
+    pub fn day_filter_count(&self) -> Option<usize> {
+        let day = self.day_rows.as_ref()?;
+        matches!(day.state, DayState::Ready).then_some(day.items.len())
+    }
+
+    /// Turns the day filter on, changes it or (with `None`) clears it.
+    ///
+    /// The commits come from a one-off `git log` for that day instead of the
+    /// loaded rows: the day may be older than what has streamed in, and the
+    /// strip counts the same way (author date, local day, mailmapped email),
+    /// so the list always matches the number the strip showed. The list code
+    /// is untouched: it reads [`Self::rows`], which is either this day's rows
+    /// or the history.
+    pub fn set_day_filter(&mut self, filter: Option<DayFilter>, cx: &mut Context<Self>) {
+        self.day_generation = self.day_generation.wrapping_add(1);
+        let generation = self.day_generation;
+        let Some(filter) = filter else {
+            if self.day_rows.take().is_some() {
+                self.reset_rows_view(cx);
+            }
+            return;
+        };
+        if self.day_rows.as_ref().map(|day| &day.filter) == Some(&filter) {
+            return;
+        }
+        // The day and branch filters are exclusive: the new one replaces the
+        // other.
+        self.branch_generation = self.branch_generation.wrapping_add(1);
+        self.branch_rows = None;
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                self.day_rows = Some(DayRows {
+                    filter,
+                    state: DayState::Failed(error.to_string()),
+                    items: Vec::new(),
+                    idle_lanes: IdleLanes::new(),
+                    geometry: Rc::new(IdleLanes::new().geometry(self.collapse)),
+                    _task: None,
+                });
+                self.reset_rows_view(cx);
+                return;
+            }
+        };
+        let path = self.path.clone();
+        let (day, me) = (filter.day, filter.me.clone());
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &path).map_err(|e| e.to_string())?;
+                    let commits = git_core::commits_on_day(&repo, day, me.as_deref())
+                        .map_err(|e| e.to_string())?;
+                    Ok(layout_day(commits))
+                })
+                .await;
+            this.update(cx, |view, cx| view.finish_day_rows(generation, result, cx))
+                .ok();
+        });
+        self.day_rows = Some(DayRows {
+            filter,
+            state: DayState::Loading,
+            items: Vec::new(),
+            idle_lanes: IdleLanes::new(),
+            geometry: Rc::new(IdleLanes::new().geometry(self.collapse)),
+            _task: Some(task),
+        });
+        self.reset_rows_view(cx);
+    }
+
+    /// The day query answered.
+    fn finish_day_rows(
+        &mut self,
+        generation: u64,
+        result: Result<Vec<(CommitInfo, Row<Oid>)>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.day_generation {
+            return;
+        }
+        let collapse = self.collapse;
+        let Some(day) = &mut self.day_rows else {
+            return;
+        };
+        match result {
+            Ok(page) => {
+                for (commit, row) in page {
+                    day.idle_lanes.push(&row);
+                    day.items.push(Item {
+                        commit: Arc::new(commit),
+                        row: Rc::new(row),
+                    });
+                }
+                day.geometry = Rc::new(day.idle_lanes.geometry(collapse));
+                day.state = DayState::Ready;
+            }
+            Err(message) => {
+                log::warn!("could not list the commits of the day: {message}");
+                day.state = DayState::Failed(message);
+            }
+        }
+        self.reset_rows_view(cx);
+    }
+
+    /// The branch the History is narrowed to, if any.
+    pub fn branch_filter(&self) -> Option<&str> {
+        self.branch_rows.as_ref().map(|rows| rows.branch.as_str())
+    }
+
+    /// Turns the branch filter on ("Show all commits of {branch}"), changes it
+    /// or (with `None`) clears it.
+    ///
+    /// The rows are the branch's own commits (`git log --first-parent`) down
+    /// to its fork point, from a one-off query like the day filter's, laid out
+    /// with the parents that are in the list only. Turning it on replaces the
+    /// day filter, clears the search, and puts the selection on the first row
+    /// at the top of the list.
+    pub fn set_branch_filter(&mut self, branch: Option<String>, cx: &mut Context<Self>) {
+        self.branch_generation = self.branch_generation.wrapping_add(1);
+        let generation = self.branch_generation;
+        let Some(branch) = branch else {
+            if self.branch_rows.take().is_some() {
+                self.reset_rows_view(cx);
+            }
+            return;
+        };
+        // The filters are exclusive, and the search belongs to the rows it ran
+        // over (the shell empties the field when it sees the query is gone).
+        self.day_generation = self.day_generation.wrapping_add(1);
+        self.day_rows = None;
+        self.clear_search(cx);
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                self.branch_rows = Some(BranchRows::new(
+                    branch,
+                    DayState::Failed(error.to_string()),
+                    self.collapse,
+                    None,
+                ));
+                self.reset_rows_view(cx);
+                self.select_first_row(cx);
+                return;
+            }
+        };
+        let path = self.path.clone();
+        let name = branch.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &path).map_err(|e| e.to_string())?;
+                    let main = repo.main_line().map_err(|e| e.to_string())?;
+                    let log = match repo.branch_log(&name, main.as_deref(), BRANCH_FILTER_LIMIT) {
+                        Ok(log) => log,
+                        // A branch that is gone (or not fetched yet) is the
+                        // empty state, not an error.
+                        Err(Error::Parse("branch not found")) => BranchLog {
+                            commits: Vec::new(),
+                            fork_point: None,
+                            merged_into: None,
+                            merged_from: HashMap::new(),
+                        },
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    let rows = layout_branch(&log);
+                    Ok(BranchData { log, main, rows })
+                })
+                .await;
+            this.update(cx, |view, cx| {
+                view.finish_branch_rows(generation, result, cx)
+            })
+            .ok();
+        });
+        self.branch_rows = Some(BranchRows::new(
+            branch,
+            DayState::Loading,
+            self.collapse,
+            Some(task),
+        ));
+        self.reset_rows_view(cx);
+        self.select_first_row(cx);
+    }
+
+    /// The branch query answered.
+    fn finish_branch_rows(
+        &mut self,
+        generation: u64,
+        result: Result<BranchData, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.branch_generation {
+            return;
+        }
+        let collapse = self.collapse;
+        let Some(rows) = &mut self.branch_rows else {
+            return;
+        };
+        match result {
+            Ok(data) => {
+                for (commit, row) in data.rows {
+                    rows.idle_lanes.push(&row);
+                    rows.items.push(Item {
+                        commit: Arc::new(commit),
+                        row: Rc::new(row),
+                    });
+                }
+                rows.geometry = Rc::new(rows.idle_lanes.geometry(collapse));
+                rows.fork = data.log.fork_point;
+                rows.merged_from = data.log.merged_from;
+                rows.merged_into = data.log.merged_into.zip(data.main);
+                rows.state = DayState::Ready;
+            }
+            Err(message) => {
+                log::warn!("could not list the commits of {}: {message}", rows.branch);
+                rows.state = DayState::Failed(message);
+            }
+        }
+        self.reset_rows_view(cx);
+        self.select_first_row(cx);
+    }
+
+    /// Selects the first row (once there is one) as a user pick, so the
+    /// selection does not follow HEAD inside a filtered list.
+    fn select_first_row(&mut self, cx: &mut Context<Self>) {
+        if !self.rows().is_empty() {
+            self.select_row(0, cx);
+        }
+    }
+
+    /// The rows on screen changed wholesale: back to the top, selection and
+    /// search over the new rows.
+    fn reset_rows_view(&mut self, cx: &mut Context<Self>) {
+        self.selected = None;
+        self.user_selected = false;
+        self.hovered = None;
+        self.scroll.0.borrow().base_handle.set_offset(Point {
+            x: px(0.),
+            y: px(0.),
+        });
+        self.restart_search(cx);
+        self.settle_initial_selection(cx);
+        cx.notify();
     }
 
     /// The row of the HEAD commit, once it is among the loaded rows.
     fn head_index(&self) -> Option<usize> {
         let head = self.head_oid()?;
-        self.items.iter().position(|item| item.commit.id == head)
+        self.rows().iter().position(|item| item.commit.id == head)
     }
 
     /// The row a key press lands on when nothing is selected: the HEAD row
     /// when it is loaded, else row 0.
     fn initial_row(&self) -> Option<usize> {
-        if self.items.is_empty() {
+        if self.rows().is_empty() {
             None
         } else {
             Some(self.head_index().unwrap_or(0))
@@ -982,7 +1820,7 @@ impl HistoryView {
     /// as it arrives, else row 0. Selecting is not focusing: this never moves
     /// the keyboard focus or scrolls the list.
     fn settle_initial_selection(&mut self, cx: &mut Context<Self>) {
-        if self.user_selected || self.items.is_empty() {
+        if self.user_selected || self.rows().is_empty() {
             return;
         }
         let target = self.initial_row().unwrap_or(0);
@@ -1012,7 +1850,7 @@ impl HistoryView {
     /// Selects `index`, scrolls it minimally into view and repaints. Any pick
     /// stops the initial selection from following the load.
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.items.len() || self.selected == Some(index) {
+        if index >= self.rows().len() || self.selected == Some(index) {
             self.user_selected = true;
             return;
         }
@@ -1028,7 +1866,15 @@ impl HistoryView {
     /// arrived yet; then it is remembered and applied when its page lands.
     pub fn reveal_commit(&mut self, oid: Oid, cx: &mut Context<Self>) {
         self.pending_reveal.clear();
-        if let Some(index) = self.items.iter().position(|item| item.commit.id == oid) {
+        // The sidebar target may not be on the filtered day: show the whole
+        // history again, then reveal it there.
+        if (self.day_rows.is_some() || self.branch_rows.is_some())
+            && !self.rows().iter().any(|item| item.commit.id == oid)
+        {
+            self.set_day_filter(None, cx);
+            self.set_branch_filter(None, cx);
+        }
+        if let Some(index) = self.rows().iter().position(|item| item.commit.id == oid) {
             self.reveal_row(index, cx);
         } else if self.is_loading() {
             self.pending_reveal.set(oid);
@@ -1054,7 +1900,7 @@ impl HistoryView {
         let next = if self.selected.is_none() {
             current
         } else {
-            let last = self.items.len().saturating_sub(1) as isize;
+            let last = self.rows().len().saturating_sub(1) as isize;
             (current as isize + delta).clamp(0, last) as usize
         };
         self.select_row(next, cx);
@@ -1062,7 +1908,7 @@ impl HistoryView {
 
     /// Home / End: the first or the last loaded row (`usize::MAX` for End).
     fn jump_selection(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(last) = self.items.len().checked_sub(1) else {
+        let Some(last) = self.rows().len().checked_sub(1) else {
             return;
         };
         self.select_row(index.min(last), cx);
@@ -1079,7 +1925,7 @@ impl HistoryView {
         }
         let delta = page_rows(self.viewport_height(), f32::from(cx.theme().row_height)) as isize;
         let delta = if down { delta } else { -delta };
-        let last = self.items.len().saturating_sub(1) as isize;
+        let last = self.rows().len().saturating_sub(1) as isize;
         let next = (current as isize + delta).clamp(0, last) as usize;
         self.select_row(next, cx);
     }
@@ -1102,15 +1948,34 @@ impl HistoryView {
             return;
         };
         self.select_row(index, cx);
-        if let Some(item) = self.items.get(index) {
+        if let Some(item) = self.rows().get(index) {
             cx.write_to_clipboard(ClipboardItem::new_string(item.commit.id.to_string()));
         }
+    }
+
+    /// `B` on the focused list: "Create branch here…" on the selected commit,
+    /// the same request the row menu makes.
+    fn create_branch_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected.or_else(|| self.initial_row()) else {
+            return;
+        };
+        self.select_row(index, cx);
+        let Some(item) = self.rows().get(index) else {
+            return;
+        };
+        let card = CommitCard::from_commit(&item.commit, self.refs().unwrap_or(&[]), self.head());
+        // The shell's handler reads this view back for the dialog's context, so
+        // it must run after the current update has finished.
+        let on_action = self.on_action.clone();
+        window.defer(cx, move |window, cx| {
+            on_action(RefAction::CreateBranch(card), window, cx);
+        });
     }
 
     /// Double-click: switch to the row's first local branch that is not HEAD,
     /// or check the commit out detached when the row has no such branch.
     fn checkout_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.items.get(index) else {
+        let Some(item) = self.rows().get(index) else {
             return;
         };
         let card = CommitCard::from_commit(&item.commit, self.refs().unwrap_or(&[]), self.head());
@@ -1137,6 +2002,12 @@ impl HistoryView {
         (self.on_action)(action, window, cx);
     }
 
+    /// Installs what the shell does with a sidebar action chosen from a ref's
+    /// menu, so the row menu's "Branch" view and the badge menus work.
+    pub(crate) fn set_sidebar_action_handler(&mut self, handler: SidebarActionHandler) {
+        self.sidebar_action = Some(handler);
+    }
+
     /// Right-clicking a row selects it and opens the row menu at the pointer.
     fn open_row_menu(
         &mut self,
@@ -1145,117 +2016,65 @@ impl HistoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let hash = self.items.get(index).map(|item| item.commit.id.to_string());
-        let card = self.items.get(index).map(|item| {
-            CommitCard::from_commit(&item.commit, self.refs().unwrap_or(&[]), self.head())
-        });
-        let branch = match self.head() {
-            Some(Head::Branch { name, .. }) => name.clone(),
-            _ => "HEAD".to_owned(),
+        let Some(item) = self.rows().get(index) else {
+            return;
         };
-        let mut entries = vec![MenuEntry::Item(
-            MenuItem::new("Copy commit hash")
-                .icon(IconName::Copy)
-                .shortcut("Ctrl+C")
-                .disabled(hash.is_none())
-                .action(move |_, cx| {
-                    if let Some(hash) = hash.clone() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(hash));
-                    }
-                }),
-        )];
-        if let Some(card) = card {
-            let on_action = self.on_action.clone();
-            let head_branch = match self.head() {
-                Some(Head::Branch { name, .. }) => Some(name.clone()),
-                _ => None,
-            };
-            let locals: Vec<String> = card
-                .refs
-                .iter()
-                .filter(|reference| reference.kind == CardRefKind::Local)
-                .map(|reference| reference.name.clone())
-                .filter(|name| Some(name) != head_branch.as_ref())
-                .collect();
-            if locals.is_empty() {
-                let checkout = on_action.clone();
-                let checkout_card = card.clone();
-                entries.push(MenuEntry::Item(
-                    MenuItem::new("Checkout this commit")
-                        .icon(IconName::Check)
-                        .action(move |window, cx| {
-                            checkout(
-                                RefAction::CheckoutCommit(checkout_card.clone()),
-                                window,
-                                cx,
-                            );
-                        }),
-                ));
-            }
-            for name in locals {
-                let checkout = on_action.clone();
-                let branch = name.clone();
-                entries.push(MenuEntry::Item(
-                    MenuItem::new(format!("Switch to {name}"))
-                        .icon(IconName::Check)
-                        .action(move |window, cx| {
-                            checkout(RefAction::CheckoutBranch(branch.clone()), window, cx);
-                        }),
-                ));
-            }
-            push_row_action(
-                &mut entries,
-                &card,
-                &on_action,
-                "Create branch here…".to_owned(),
-                IconName::Branch,
-                Some("B"),
-                RefAction::CreateBranch,
-                false,
-            );
-            push_row_action(
-                &mut entries,
-                &card,
-                &on_action,
-                "Create tag here…".to_owned(),
-                IconName::Tag,
-                None,
-                RefAction::CreateTag,
-                false,
-            );
-            entries.push(MenuEntry::Separator);
-            push_row_action(
-                &mut entries,
-                &card,
-                &on_action,
-                "Cherry-pick".to_owned(),
-                IconName::Undo,
-                None,
-                RefAction::CherryPick,
-                false,
-            );
-            push_row_action(
-                &mut entries,
-                &card,
-                &on_action,
-                "Revert commit".to_owned(),
-                IconName::Undo,
-                None,
-                RefAction::Revert,
-                false,
-            );
-            push_row_action(
-                &mut entries,
-                &card,
-                &on_action,
-                format!("Reset {branch} to here…"),
-                IconName::Undo,
-                None,
-                RefAction::Reset,
-                true,
-            );
+        let commit = item.commit.id;
+        let refs = self.refs().unwrap_or(&[]);
+        let card = CommitCard::from_commit(&item.commit, refs, self.head());
+        let (switchable, branches) = row_branches(commit, self.head(), refs);
+        let view = cx.entity();
+        let menu = RowMenu {
+            hash: commit.to_string(),
+            card,
+            reset_branch: match self.head() {
+                Some(Head::Branch { name, .. }) => name.clone(),
+                _ => "HEAD".to_owned(),
+            },
+            branches,
+            switchable,
+            merged: self
+                .branch_rows
+                .as_ref()
+                .and_then(|rows| rows.merged_from.get(&commit).cloned()),
+            filter: self.branch_filter().map(str::to_owned),
+            last_picked: self.last_picked_branch.clone(),
+            on_action: self.on_action.clone(),
+            on_sidebar: self.sidebar_action.clone(),
+            on_filter: Rc::new(move |branch, cx| {
+                view.update(cx, |view, cx| view.set_branch_filter(branch, cx));
+            }),
+            branch_menu: self.ref_menu_source(),
+        };
+        menu::open_context_menu(position, menu.entries(), window, cx);
+    }
+
+    /// Where a ref's own sidebar menu comes from: the sidebar's model for a
+    /// sidebar key, over a snapshot of HEAD and the refs.
+    fn ref_menu_source(&self) -> RefMenuSource {
+        let head = self.head().cloned();
+        let refs: Rc<[Ref]> = self.refs().unwrap_or(&[]).into();
+        // No worktree extras: only the worktree rows' menus read them.
+        Rc::new(move |key| sidebar_menu(key, head.as_ref(), None, Some(&refs)))
+    }
+
+    /// Right-clicking a branch, tag or remote badge opens that ref's own
+    /// sidebar menu in place of the row menu.
+    fn open_badge_menu(
+        &mut self,
+        spec: &BadgeSpec,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = badge_menu_key(spec) else {
+            return;
+        };
+        let source = self.ref_menu_source();
+        let entries = sidebar_menu_entries(source(&key), self.sidebar_action.clone());
+        if !entries.is_empty() {
+            menu::open_context_menu(position, entries, window, cx);
         }
-        menu::open_context_menu(position, entries, window, cx);
     }
 
     /// The commit card a dialog shows for `oid`; a commit outside the loaded
@@ -1270,8 +2089,19 @@ impl HistoryView {
             .unwrap_or_else(|| CommitCard::bare(oid))
     }
 
+    /// Whether idle lanes fold into gap lanes.
+    pub(crate) fn idle_lanes_collapsed(&self) -> bool {
+        self.collapse
+    }
+
+    /// Every loaded commit, newest first, for the palette's Commits group.
+    /// The whole history, whatever the day filter shows.
+    pub(crate) fn loaded_commits(&self) -> Vec<Arc<CommitInfo>> {
+        self.items.iter().map(|item| item.commit.clone()).collect()
+    }
+
     /// Sets the idle-lane collapse, recomputes the geometry and persists it.
-    fn set_collapse(&mut self, collapse: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_collapse(&mut self, collapse: bool, cx: &mut Context<Self>) {
         if self.collapse == collapse {
             return;
         }
@@ -1285,8 +2115,8 @@ impl HistoryView {
 
     /// Fits the graph column to the current geometry and persists the width.
     /// Used by the grip's double-click, the "+N" pill and the context menu.
-    fn fit_graph(&mut self, cx: &mut Context<Self>) {
-        let width = fit_width(self.geometry.width);
+    pub(crate) fn fit_graph(&mut self, cx: &mut Context<Self>) {
+        let width = fit_width(content_width(self.geometry()));
         self.graph_width = width;
         crate::update_settings(cx, move |settings| settings.graph_width = width);
         cx.notify();
@@ -1319,7 +2149,7 @@ impl HistoryView {
         let checked = self.collapse;
         let entries = vec![
             MenuEntry::Item(
-                MenuItem::new("Collapse idle lanes")
+                MenuItem::new(ui::t!("history.graph_menu.collapse_idle"))
                     // The kit menu has no checked state: the icon says it.
                     .icon(if checked {
                         IconName::Check
@@ -1333,7 +2163,7 @@ impl HistoryView {
                     }),
             ),
             MenuEntry::Item(
-                MenuItem::new("Fit graph to content")
+                MenuItem::new(ui::t!("history.graph_menu.fit"))
                     .icon(IconName::Split)
                     .action(move |_, cx| {
                         fit.update(cx, |view, cx| view.fit_graph(cx)).ok();
@@ -1422,6 +2252,11 @@ impl HistoryView {
         cx.notify();
     }
 
+    /// The query the search field last reported.
+    pub fn search_query(&self) -> &str {
+        &self.search_text
+    }
+
     /// Esc: no query, no matches, and the next query starts a fresh scan.
     pub fn clear_search(&mut self, cx: &mut Context<Self>) {
         self.search_text.clear();
@@ -1444,12 +2279,12 @@ impl HistoryView {
         // While rows are still arriving or unscanned, the count is a lower
         // bound: "No matches" would be a lie about a scan that is not done.
         let pending =
-            self.is_loading() || self.search_scanning || self.search_scanned < self.items.len();
+            self.is_loading() || self.search_scanning || self.search_scanned < self.rows().len();
         if self.search_matches.is_empty() {
             return Some(if pending {
                 "– / 0+".into()
             } else {
-                "No matches".into()
+                ui::t!("history.search.no_matches")
             });
         }
         let total = self.search_matches.len();
@@ -1516,12 +2351,12 @@ impl HistoryView {
         let Some(query) = self.search.clone() else {
             return;
         };
-        if self.search_scanning || self.search_scanned >= self.items.len() {
+        if self.search_scanning || self.search_scanned >= self.rows().len() {
             return;
         }
         let start = self.search_scanned;
-        let end = self.items.len();
-        let rows: Vec<Arc<CommitInfo>> = self.items[start..end]
+        let end = self.rows().len();
+        let rows: Vec<Arc<CommitInfo>> = self.rows()[start..end]
             .iter()
             .map(|item| item.commit.clone())
             .collect();
@@ -1636,6 +2471,14 @@ impl HistoryView {
         // The query stays in the field; its matches belong to the old rows.
         self.restart_search(cx);
         self.start(cx);
+        // The day's commits may have changed too (a new commit today).
+        if let Some(filter) = self.day_rows.take().map(|day| day.filter) {
+            self.set_day_filter(Some(filter), cx);
+        }
+        // So may the branch's.
+        if let Some(branch) = self.branch_rows.take().map(|rows| rows.branch) {
+            self.set_branch_filter(Some(branch), cx);
+        }
         cx.notify();
     }
 
@@ -1716,17 +2559,19 @@ impl HistoryView {
 
     /// The short hash of the selected commit, for the details header.
     pub fn selected_short(&self) -> Option<SharedString> {
-        self.selected.and_then(|ix| self.items.get(ix)).map(|item| {
-            let mut hash = item.commit.id.to_string();
-            hash.truncate(7);
-            hash.into()
-        })
+        self.selected
+            .and_then(|ix| self.rows().get(ix))
+            .map(|item| {
+                let mut hash = item.commit.id.to_string();
+                hash.truncate(7);
+                hash.into()
+            })
     }
 
     /// The selected commit, for the details dock.
     pub fn selected_commit(&self) -> Option<Arc<CommitInfo>> {
         self.selected
-            .and_then(|ix| self.items.get(ix))
+            .and_then(|ix| self.rows().get(ix))
             .map(|item| item.commit.clone())
     }
 
@@ -1735,7 +2580,7 @@ impl HistoryView {
     fn render_graph_header(&self, columns: Columns, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         let accent = colors.accent;
-        let clipped = clipped_lanes(&self.geometry, columns.graph);
+        let clipped = clipped_lanes(self.geometry(), columns.graph);
         let dragging = self.grip_drag.as_ref().is_some_and(|drag| drag.dragging);
 
         let mut cell = div()
@@ -1754,7 +2599,7 @@ impl HistoryView {
                     view.open_graph_menu(event.position, window, cx);
                 }),
             )
-            .child("Graph");
+            .child(ui::t!("history.header.graph"));
         if clipped > 0 {
             cell = cell.child(
                 div()
@@ -1767,8 +2612,10 @@ impl HistoryView {
                     .font_weight(FontWeight::BOLD)
                     .text_color(accent)
                     .cursor_pointer()
-                    .tooltip(Tooltip::text(format!(
-                        "{clipped} lanes are clipped. Click to widen the column."
+                    .tooltip(Tooltip::text(ui::i18n::t_count(
+                        "history.header.lanes_clipped",
+                        clipped as u64,
+                        &[],
                     )))
                     .on_click(cx.listener(|view, _, _, cx| view.fit_graph(cx)))
                     .child(format!("+{clipped}")),
@@ -1786,9 +2633,19 @@ impl HistoryView {
             .cursor_col_resize()
             .hover(move |style| style.bg(accent.opacity(0.7)))
             .when(dragging, |this| this.bg(accent.opacity(0.7)))
-            .tooltip(Tooltip::text(
-                "Drag to resize the graph column · double-click to fit",
-            ))
+            // A resting 1px divider, so the grip is visible before hover.
+            .when(!dragging, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(3.))
+                        .w(px(1.))
+                        .bg(colors.border_strong),
+                )
+            })
+            .tooltip(Tooltip::text(ui::t!("history.header.grip_tooltip")))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, event: &MouseDownEvent, _, cx| {
@@ -1848,15 +2705,135 @@ impl HistoryView {
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(colors.muted)
             .child(self.render_graph_header(columns, cx))
-            .child(div().flex_1().min_w_0().truncate().child("Summary"));
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(ui::t!("history.header.summary")),
+            );
         if let Some(author) = columns.author {
-            head = head.child(div().w(px(author)).flex_none().child("Author"));
+            head = head.child(
+                div()
+                    .w(px(author))
+                    .flex_none()
+                    .child(ui::t!("history.header.author")),
+            );
         }
-        head = head.child(div().w(px(columns.date)).flex_none().child("Date"));
+        head = head.child(
+            div()
+                .w(px(columns.date))
+                .flex_none()
+                .child(ui::t!("history.header.date")),
+        );
         if let Some(hash) = columns.hash {
-            head = head.child(div().w(px(hash)).flex_none().child("Hash"));
+            head = head.child(
+                div()
+                    .w(px(hash))
+                    .flex_none()
+                    .child(ui::t!("history.header.hash")),
+            );
         }
         div().w_full().px(px(SIDE_MARGIN)).child(head)
+    }
+
+    /// The accent-soft bar under the header while the branch filter is on.
+    fn render_branch_bar(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let colors = cx.theme().colors;
+        let rows = self.branch_rows.as_ref()?;
+        let ready = matches!(rows.state, DayState::Ready);
+        let commits = rows.items.len();
+        let merges = rows.merged_from.len();
+        let counts = if !ready {
+            "…".to_owned()
+        } else if merges > 0 {
+            ui::t!(
+                "history.branch_bar.with_merges",
+                commits = ui::i18n::t_count("history.branch_bar.commits", commits as u64, &[]),
+                merges = ui::i18n::t_count("history.branch_bar.merges", merges as u64, &[])
+            )
+            .to_string()
+        } else {
+            ui::i18n::t_count("history.branch_bar.commits", commits as u64, &[]).to_string()
+        };
+        let into = rows.merged_into.as_ref().map(|(oid, main)| {
+            let hash = short_hash(oid);
+            let oid = *oid;
+            Button::new("branch-filter-into")
+                .size(ButtonSize::Small)
+                .label(ui::t!(
+                    "history.branch_bar.merged_into",
+                    main = main,
+                    hash = hash
+                ))
+                .tooltip(ui::t!("history.branch_bar.select_merge", hash = hash))
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    // Back to the whole history, on that merge.
+                    view.set_branch_filter(None, cx);
+                    view.reveal_commit(oid, cx);
+                }))
+        });
+        Some(
+            div()
+                .id("history-branch-filter")
+                .w_full()
+                .min_h(px(32.))
+                .flex_none()
+                .py(px(4.))
+                .pl(px(8.))
+                .pr(px(12.))
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .bg(colors.accent_soft)
+                .border_b_1()
+                .border_color(colors.border)
+                .text_size(FS_SM)
+                .text_color(colors.text)
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_color(colors.muted)
+                        .child(
+                            Icon::new(IconName::Branch)
+                                .size(px(13.))
+                                .color(colors.muted),
+                        )
+                        .child(div().min_w_0().flex().items_center().children(
+                            ui::i18n::pieces_children(
+                                ui::i18n::t_pieces(
+                                    "history.branch_bar.commits_of",
+                                    &[],
+                                    &["branch"],
+                                ),
+                                vec![div()
+                                .id("history-branch-filter-name")
+                                .min_w_0()
+                                // The design caps the name at 40ch.
+                                .max_w(px(320.))
+                                .truncate()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(colors.text)
+                                .tooltip(Tooltip::text(rows.branch.clone()))
+                                .child(rows.branch.clone())
+                                .into_any_element()],
+                            ),
+                        )),
+                )
+                .child(div().flex_none().text_color(colors.muted).child(counts))
+                .children(into)
+                .child(div().flex_1())
+                .child(
+                    Button::new("branch-filter-clear")
+                        .size(ButtonSize::Small)
+                        .icon(IconName::X)
+                        .label(ui::t!("history.branch_bar.show_all"))
+                        .on_click(cx.listener(|view, _, _, cx| view.set_branch_filter(None, cx))),
+                ),
+        )
     }
 
     /// The one-line load bar under the header.
@@ -1868,10 +2845,23 @@ impl HistoryView {
         };
         // The folded lanes are part of the history's own progress line: say
         // how many the graph is hiding while the rows stream in.
-        let folded = if self.collapse && self.geometry.folded_count > 0 {
-            format!(" · {} idle lanes folded", self.geometry.folded_count)
+        let loading_text = ui::i18n::t_count(
+            "history.load.loading",
+            loaded,
+            &[("n", &format_count(loaded as usize))],
+        );
+        let loading_text = if self.collapse && self.geometry().folded_count > 0 {
+            ui::t!(
+                "history.load.with_folded",
+                loading = loading_text,
+                folded = ui::i18n::t_count(
+                    "history.load.lanes_folded",
+                    self.geometry.folded_count as u64,
+                    &[]
+                )
+            )
         } else {
-            String::new()
+            loading_text
         };
         div()
             .w_full()
@@ -1890,10 +2880,7 @@ impl HistoryView {
                     .flex_none()
                     .font_weight(FontWeight::BOLD)
                     .text_color(colors.text)
-                    .child(format!(
-                        "Loading… {} commits{folded}",
-                        format_count(loaded as usize)
-                    )),
+                    .child(loading_text),
             )
             .child(
                 div()
@@ -1908,7 +2895,7 @@ impl HistoryView {
             })
             .child(
                 Button::new("history-cancel")
-                    .label("Cancel")
+                    .label(ui::t!("history.load.cancel"))
                     .size(ButtonSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
             )
@@ -1979,7 +2966,7 @@ impl HistoryView {
             .map(|state| state.settings.clone())
             .unwrap_or_default();
         let columns = self.columns;
-        let geometry = self.geometry.clone();
+        let geometry = self.geometry().clone();
         let hovered = self.hovered;
         let head = self.head_oid();
         let selected_index = self.selected;
@@ -1990,7 +2977,15 @@ impl HistoryView {
         let ring_visible = focus::focus_visible(&self.focus, window, cx);
         let now = unix_now();
         let summary_width = self.summary_width;
-        let items = &self.items;
+        let items: &[Item] = match (&self.day_rows, &self.branch_rows) {
+            (Some(day), _) => &day.items,
+            (None, Some(branch)) => &branch.items,
+            (None, None) => &self.items,
+        };
+        let branch_rows = self
+            .branch_rows
+            .as_ref()
+            .filter(|_| self.day_rows.is_none());
         let badges = &self.badges;
         let badge_widths = &mut self.badge_widths;
         let search_matches = &self.search_matches;
@@ -2023,6 +3018,11 @@ impl HistoryView {
                 };
                 let secondary = ListRow::secondary_color(colors, selected, list_focused);
                 let is_head = head == Some(c.id);
+                // Branch filter: the fork-point row, and the branch a merge
+                // row brought in (its stub and "from {x}" chip).
+                let is_fork = branch_rows.is_some_and(|rows| rows.fork == Some(c.id));
+                let merged_from = branch_rows.and_then(|rows| rows.merged_from.get(&c.id));
+                let stub = merged_from.is_some();
                 let row_theme = ui_theme.clone();
                 let row_geometry = geometry.clone();
                 let summary_ranges = fields.map(|f| f.summary.as_slice()).unwrap_or(&[]);
@@ -2044,6 +3044,7 @@ impl HistoryView {
                     .text_size(row_font)
                     .rounded(R_MD)
                     .debug_selector(move || format!("history-row-{ix}"))
+                    .when(is_fork, |row| row.opacity(FORK_ROW_OPACITY))
                     .bg(background)
                     .on_hover(cx.listener(move |view, entered: &bool, _, cx| {
                         // A leave only clears the row it belongs to: the next
@@ -2089,7 +3090,12 @@ impl HistoryView {
                             move |bounds, _, window, _| {
                                 // Clip to the graph column so lanes past its
                                 // edge are cut instead of drawn over Summary.
-                                window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                // The mask is 1 px taller at top and bottom so
+                                // the lanes' vertical overdraw survives.
+                                let mask = ContentMask {
+                                    bounds: overdraw_mask_bounds(bounds),
+                                };
+                                window.with_content_mask(Some(mask), |window| {
                                     paint_row(
                                         &row,
                                         ix,
@@ -2097,6 +3103,7 @@ impl HistoryView {
                                         background,
                                         &row_geometry,
                                         is_head,
+                                        stub,
                                         &row_theme,
                                         settings.graph_colored,
                                         px(f32::from(settings.graph_line_width)),
@@ -2133,7 +3140,14 @@ impl HistoryView {
                         RefKind::Overflow,
                         badge_widths,
                     ));
-                    badge_overflow(&widths, summary_width, BADGE_GAP, plus_width)
+                    // The "from {x}" chip is not a ref of the row but takes
+                    // room beside the badges.
+                    let chip_width = merged_from.map_or(0., |name| {
+                        let label = ui::t!("history.badge.from", name = name);
+                        f32::from(measure_badge(window, &label, RefKind::Local, badge_widths))
+                            + BADGE_GAP
+                    });
+                    badge_overflow(&widths, summary_width - chip_width, BADGE_GAP, plus_width)
                 };
 
                 let mut summary = div()
@@ -2144,11 +3158,40 @@ impl HistoryView {
                     .items_center()
                     .gap(px(BADGE_GAP));
                 for (index, spec) in specs.iter().take(fit.shown).enumerate() {
+                    // The wrapper takes the right-click: `RefBadge` has no
+                    // mouse hooks, and the row's own menu must not also open.
+                    let menu_spec = spec.clone();
                     summary = summary.child(
-                        RefBadge::new(format!("history-badge-{ix}-{index}"), spec.label.clone())
-                            .kind(spec.kind)
-                            .max_label_width(px(BADGE_LABEL_MAX))
-                            .tooltip(spec.tooltip.clone()),
+                        div()
+                            .id(format!("history-badge-menu-{ix}-{index}"))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .debug_selector(|| format!("history-badge-menu-{ix}-{index}"))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                                    if badge_menu_key(&menu_spec).is_none() {
+                                        return;
+                                    }
+                                    cx.stop_propagation();
+                                    let focus = view.focus.clone();
+                                    window.focus(&focus, cx);
+                                    view.select_row(ix, cx);
+                                    view.open_badge_menu(&menu_spec, event.position, window, cx);
+                                    // Keep the menu that just took focus.
+                                    window.prevent_default();
+                                }),
+                            )
+                            .child(
+                                RefBadge::new(
+                                    format!("history-badge-{ix}-{index}"),
+                                    spec.label.clone(),
+                                )
+                                .kind(spec.kind)
+                                .max_label_width(px(BADGE_LABEL_MAX))
+                                .tooltip(spec.tooltip.clone()),
+                            ),
                     );
                 }
                 if fit.collapsed {
@@ -2164,41 +3207,63 @@ impl HistoryView {
                             .tooltip(hidden),
                     );
                 }
-                row_div = row_div.child(summary.child({
-                    let mut cell = div()
-                        .id(format!("history-summary-{ix}"))
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(FS_BASE)
-                        .text_color(summary_color)
-                        .when(is_head, |text| text.font_weight(FontWeight::BOLD))
-                        .tooltip(Tooltip::text(c.summary.clone()));
-                    // Only a matching cell pays for styled runs; the plain
-                    // path keeps the cheap shared string.
-                    cell = if summary_ranges.is_empty() {
-                        cell.child(c.summary.clone())
-                    } else {
-                        let style = TextStyle {
-                            color: summary_color,
-                            font_family: FONT_UI.into(),
-                            font_size: FS_BASE.into(),
-                            font_weight: if is_head {
-                                FontWeight::BOLD
+                if let Some(name) = merged_from {
+                    let target = name.clone();
+                    summary = summary.child(
+                        RefBadge::new(
+                            format!("history-from-{ix}"),
+                            ui::t!("history.badge.from", name = name),
+                        )
+                        .dashed()
+                        .max_label_width(px(BADGE_LABEL_MAX))
+                        .tooltip(ui::t!("history.badge.from_tooltip", name = name))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            // The row's own click must not also select a
+                            // row of the list that is about to change.
+                            cx.stop_propagation();
+                            view.set_branch_filter(Some(target.clone()), cx);
+                        })),
+                    );
+                }
+                row_div = row_div.child(
+                    summary
+                        .child({
+                            let mut cell = div()
+                                .id(format!("history-summary-{ix}"))
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(FS_BASE)
+                                .text_color(summary_color)
+                                .when(is_head, |text| text.font_weight(FontWeight::BOLD))
+                                .tooltip(Tooltip::text(c.summary.clone()));
+                            // Only a matching cell pays for styled runs; the plain
+                            // path keeps the cheap shared string.
+                            cell = if summary_ranges.is_empty() {
+                                cell.child(c.summary.clone())
                             } else {
-                                FontWeight::NORMAL
-                            },
-                            ..TextStyle::default()
-                        };
-                        cell.child(highlighted_text(
-                            &c.summary,
-                            summary_ranges,
-                            &style,
-                            colors.accent_soft,
-                        ))
-                    };
-                    cell
-                }));
+                                let style = TextStyle {
+                                    color: summary_color,
+                                    font_family: FONT_UI.into(),
+                                    font_size: FS_BASE.into(),
+                                    font_weight: if is_head {
+                                        FontWeight::BOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    },
+                                    ..TextStyle::default()
+                                };
+                                cell.child(highlighted_text(
+                                    &c.summary,
+                                    summary_ranges,
+                                    &style,
+                                    colors.accent_soft,
+                                ))
+                            };
+                            cell
+                        })
+                        .when(is_fork, |summary| summary.child(fork_note(colors))),
+                );
                 if let Some(author) = columns.author {
                     row_div = row_div.child(
                         div()
@@ -2300,7 +3365,7 @@ impl HistoryView {
     fn render_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
         uniform_list(
             "history",
-            self.items.len(),
+            self.rows().len(),
             cx.processor(|view, range, window, cx| view.render_rows(range, window, cx)),
         )
         .track_scroll(&self.scroll)
@@ -2320,12 +3385,79 @@ impl HistoryView {
         .on_action(cx.listener(|view, _: &PageDownCommits, _, cx| view.page_selection(true, cx)))
         .on_action(cx.listener(|view, _: &PageUpCommits, _, cx| view.page_selection(false, cx)))
         .on_action(cx.listener(|view, _: &CopyCommitHash, _, cx| view.copy_selected_hash(cx)))
+        .on_action(cx.listener(|view, _: &CreateBranchHere, window, cx| {
+            view.create_branch_selected(window, cx);
+        }))
         .into_any_element()
     }
 
     fn render_body(&mut self, columns: Columns, cx: &mut Context<Self>) -> AnyElement {
         // The state is small and cloned so the render helpers can take `&mut
         // self` for their click listeners.
+        if let Some(day) = &self.day_rows {
+            return match &day.state {
+                DayState::Loading => self.render_skeletons(columns, cx).into_any_element(),
+                DayState::Failed(message) => {
+                    let message = SharedString::from(message.clone());
+                    let actions = div().flex().gap(px(8.)).child(
+                        Button::primary("empty-day-retry")
+                            .label(ui::t!("history.action.retry"))
+                            .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+                    );
+                    centred(
+                        EmptyState::new(ui::t!("history.empty.day_failed"))
+                            .icon(IconName::Warn)
+                            .icon_color(cx.theme().colors.warning)
+                            .text(message)
+                            .actions(actions),
+                    )
+                }
+                DayState::Ready if day.items.is_empty() => centred(
+                    EmptyState::new(ui::t!("history.empty.day_none"))
+                        .icon(IconName::Git)
+                        .icon_color(cx.theme().colors.muted),
+                ),
+                DayState::Ready => self.render_list(cx),
+            };
+        }
+        if let Some(branch) = &self.branch_rows {
+            let name = SharedString::from(branch.branch.clone());
+            return match &branch.state {
+                DayState::Loading => self.render_skeletons(columns, cx).into_any_element(),
+                DayState::Failed(message) => {
+                    let message = SharedString::from(message.clone());
+                    let actions = div().flex().gap(px(8.)).child(
+                        Button::primary("empty-branch-retry")
+                            .label(ui::t!("history.action.retry"))
+                            .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+                    );
+                    centred(
+                        EmptyState::new(ui::t!("history.empty.branch_failed"))
+                            .icon(IconName::Warn)
+                            .icon_color(cx.theme().colors.warning)
+                            .text(message)
+                            .actions(actions),
+                    )
+                }
+                DayState::Ready if branch.items.is_empty() => {
+                    let actions = div().flex().gap(px(8.)).child(
+                        Button::new("empty-branch-clear")
+                            .label(ui::t!("history.action.show_all_commits"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_branch_filter(None, cx);
+                            })),
+                    );
+                    centred(
+                        EmptyState::new(ui::t!("history.empty.branch_none"))
+                            .icon(IconName::Branch)
+                            .icon_color(cx.theme().colors.muted)
+                            .text(ui::t!("history.empty.branch_none_detail", name = name))
+                            .actions(actions),
+                    )
+                }
+                DayState::Ready => self.render_list(cx),
+            };
+        }
         let state = self.state.clone();
         match state {
             LoadState::Loading { total } => {
@@ -2355,7 +3487,7 @@ impl HistoryView {
                     // possible instead of showing the full empty state.
                     let colors = cx.theme().colors;
                     let strip = self.status_strip(
-                        "History is incomplete — loading was cancelled".into(),
+                        ui::t!("history.strip.cancelled"),
                         IconName::Warn,
                         colors.warning,
                         false,
@@ -2376,29 +3508,63 @@ impl HistoryView {
         }
     }
 
+    /// Switches the repository view to Local changes, as the toolbar segment does.
+    fn show_local_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| workspace.show_changes(window, cx));
+        }
+    }
+
+    /// Writes the starter `.gitignore` when it is missing, then shows it as an
+    /// untracked file in Local changes.
+    fn add_gitignore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.root.clone().unwrap_or_else(|| self.path.clone());
+        let path = root.join(".gitignore");
+        if path.exists() {
+            ui::toast::show(
+                ToastKind::Info,
+                ui::t!("history.gitignore.exists"),
+                window,
+                cx,
+            );
+        } else if let Err(error) = std::fs::write(&path, STARTER_GITIGNORE) {
+            ui::toast::show(
+                ToastKind::Error,
+                ui::t!("history.gitignore.failed", error = error),
+                window,
+                cx,
+            );
+            return;
+        } else {
+            ui::toast::show(ToastKind::Ok, ui::t!("history.gitignore.added"), window, cx);
+        }
+        self.show_local_changes(window, cx);
+    }
+
     /// Empty repository: an invitation to make the first commit.
     fn render_no_commits(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
         let style = body_style(colors);
-        let body = BodyText::new()
-            .plain("This repository is empty. Stage some files and make your first commit to see history here.");
+        let body = BodyText::new().plain(&ui::t!("history.empty.no_commits_body"));
         let actions = div()
             .flex()
             .gap(px(8.))
             .child(
                 Button::primary("empty-no-commits-primary")
-                    .label("Go to Local changes")
-                    .disabled(true)
-                    .tooltip("Local changes arrive in a later version"),
+                    .label(ui::t!("history.empty.go_to_changes"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.show_local_changes(window, cx);
+                    })),
             )
             .child(
                 Button::new("empty-no-commits-secondary")
-                    .label("Add .gitignore…")
-                    .disabled(true)
-                    .tooltip("Local changes arrive in a later version"),
+                    .label(ui::t!("history.empty.add_gitignore"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_gitignore(window, cx);
+                    })),
             );
         centred(
-            EmptyState::new("No commits yet")
+            EmptyState::new(ui::t!("history.empty.no_commits"))
                 .icon(IconName::Git)
                 .icon_color(colors.muted)
                 .body(body.element(&style))
@@ -2410,14 +3576,14 @@ impl HistoryView {
     fn render_cancelled(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let actions = div().flex().gap(px(8.)).child(
             Button::primary("empty-cancelled-retry")
-                .label("Retry")
+                .label(ui::t!("history.action.retry"))
                 .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
         );
         centred(
-            EmptyState::new("Loading cancelled")
+            EmptyState::new(ui::t!("history.empty.cancelled"))
                 .icon(IconName::Fetch)
                 .icon_color(cx.theme().colors.muted)
-                .text("The history was not loaded completely.")
+                .text(ui::t!("history.empty.cancelled_detail"))
                 .actions(actions),
         )
     }
@@ -2428,21 +3594,22 @@ impl HistoryView {
         match failure {
             Failure::NotARepository(path) => {
                 let path = path.display().to_string();
-                let body = BodyText::new()
-                    .code(&path)
-                    .plain(" is not inside a git working tree.");
+                let body = BodyText::templated(
+                    &ui::t!("history.empty.not_a_repository_body"),
+                    &[("path", &path)],
+                );
                 let actions = div()
                     .flex()
                     .gap(px(8.))
                     .child(
                         Button::primary("empty-not-a-repo-init")
                             .icon(IconName::Init)
-                            .label("Initialize repository here")
+                            .label(ui::t!("history.empty.init_here"))
                             .on_click(cx.listener(|this, _, _, cx| this.init_repository(cx))),
                     )
                     .child(
                         Button::new("empty-not-a-repo-open")
-                            .label("Open another…")
+                            .label(ui::t!("history.action.open_another"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if let Some(workspace) = this.workspace.upgrade() {
                                     workspace.update(cx, |workspace, cx| {
@@ -2452,7 +3619,7 @@ impl HistoryView {
                             })),
                     );
                 centred(
-                    EmptyState::new("Not a git repository")
+                    EmptyState::new(ui::t!("history.failure.not_a_repository"))
                         .icon(IconName::Folder)
                         .icon_color(colors.muted)
                         .body(body.element(&style))
@@ -2462,7 +3629,10 @@ impl HistoryView {
             Failure::PathNotFound(path) => {
                 let shown = path.display().to_string();
                 let remove_path = path.clone();
-                let body = BodyText::new().code(&shown).plain(" does not exist.");
+                let body = BodyText::templated(
+                    &ui::t!("history.empty.folder_missing_body"),
+                    &[("path", &shown)],
+                );
                 // Removing the dead entry is the way out: the welcome screen
                 // shows the rest of the recent list again. Retry only repeats
                 // the same answer.
@@ -2471,7 +3641,7 @@ impl HistoryView {
                     .gap(px(8.))
                     .child(
                         Button::primary("empty-path-missing-remove")
-                            .label("Remove from recent")
+                            .label(ui::t!("history.empty.remove_from_recent"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 crate::update_settings(cx, |settings| {
                                     settings.remove_recent(&remove_path)
@@ -2485,7 +3655,7 @@ impl HistoryView {
                     )
                     .child(
                         Button::new("empty-path-missing-open")
-                            .label("Open another…")
+                            .label(ui::t!("history.action.open_another"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if let Some(workspace) = this.workspace.upgrade() {
                                     workspace.update(cx, |workspace, cx| {
@@ -2495,7 +3665,7 @@ impl HistoryView {
                             })),
                     );
                 centred(
-                    EmptyState::new("Folder not found")
+                    EmptyState::new(ui::t!("history.failure.folder_not_found"))
                         .icon(IconName::Folder)
                         .icon_color(colors.muted)
                         .body(body.element(&style))
@@ -2503,23 +3673,24 @@ impl HistoryView {
                 )
             }
             Failure::GitNotFound => {
-                let body = BodyText::new()
-                    .plain("GitWarp could not find a usable git. The bundled copy is missing and there is no ")
-                    .code("git")
-                    .plain(" in PATH.");
+                let body = BodyText::templated(
+                    &ui::t!("history.empty.git_not_found_body"),
+                    &[("git", "git")],
+                );
                 let actions = div()
                     .flex()
                     .gap(px(8.))
                     .child(
                         Button::primary("empty-git-not-found-settings")
                             .icon(IconName::Gear)
-                            .label("Open Git settings")
-                            .disabled(true)
-                            .tooltip("Settings arrive in a later version"),
+                            .label(ui::t!("history.empty.open_git_settings"))
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                window.dispatch_action(Box::new(OpenGitSettings), cx);
+                            })),
                     )
                     .child(self.retry_git_button("empty-git-not-found-retry", cx));
                 centred(
-                    EmptyState::new("git was not found")
+                    EmptyState::new(ui::t!("history.failure.git_not_found"))
                         .body(body.element(&style))
                         .icon(IconName::Err)
                         .icon_color(colors.error)
@@ -2532,25 +3703,26 @@ impl HistoryView {
                 source,
                 path,
             } => {
-                let body = BodyText::new()
-                    .plain("GitWarp needs git ")
-                    .plain(&required.to_string())
-                    .plain(" or newer. ")
-                    .plain(source_label(*source))
-                    .plain(" git at ")
-                    .code(&path.display().to_string())
-                    .plain(" reports ")
-                    .plain(&found.to_string())
-                    .plain(".");
+                // `{path}` stays in the template: it becomes a code run.
+                let body = BodyText::templated(
+                    &ui::t!(
+                        "history.empty.git_too_old_body",
+                        required = required,
+                        source = source_label(*source),
+                        found = found
+                    ),
+                    &[("path", &path.display().to_string())],
+                );
                 let actions = div()
                     .flex()
                     .gap(px(8.))
                     .child(
                         Button::primary("empty-git-too-old-settings")
                             .icon(IconName::Gear)
-                            .label("Open Git settings")
-                            .disabled(true)
-                            .tooltip("Settings arrive in a later version"),
+                            .label(ui::t!("history.empty.open_git_settings"))
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                window.dispatch_action(Box::new(OpenGitSettings), cx);
+                            })),
                     )
                     .child(self.retry_git_button("empty-git-too-old-retry", cx));
                 centred(
@@ -2566,26 +3738,25 @@ impl HistoryView {
                 code,
                 stderr,
             } => {
-                let body = BodyText::new()
-                    .plain("The command ")
-                    .code(&format!("git {command}"));
-                let body = match code {
-                    Some(code) => body.plain(&format!(" failed with exit code {code}.")),
-                    None => body.plain(" was stopped."),
+                let template = match code {
+                    Some(code) => ui::t!("history.empty.git_failed_body", code = code),
+                    None => ui::t!("history.empty.git_stopped_body"),
                 };
+                let body =
+                    BodyText::templated(&template, &[("command", &format!("git {command}"))]);
                 let actions = div()
                     .flex()
                     .gap(px(8.))
                     .child(
                         Button::primary("empty-git-error-retry")
                             .icon(IconName::Fetch)
-                            .label("Retry")
+                            .label(ui::t!("history.action.retry"))
                             .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
                     )
                     .child(
                         Button::new("empty-git-error-copy")
                             .icon(IconName::Copy)
-                            .label("Copy details")
+                            .label(ui::t!("history.action.copy_details"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let LoadState::Failed(failure) = &this.state {
                                     if let Some(details) = failure.copy_details() {
@@ -2615,13 +3786,13 @@ impl HistoryView {
                     .child(
                         Button::primary("empty-other-retry")
                             .icon(IconName::Fetch)
-                            .label("Retry")
+                            .label(ui::t!("history.action.retry"))
                             .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
                     )
                     .child(
                         Button::new("empty-other-copy")
                             .icon(IconName::Copy)
-                            .label("Copy details")
+                            .label(ui::t!("history.action.copy_details"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let LoadState::Failed(failure) = &this.state {
                                     if let Some(details) = failure.copy_details() {
@@ -2646,7 +3817,7 @@ impl HistoryView {
     fn retry_git_button(&self, id: &'static str, cx: &mut Context<Self>) -> Button {
         let workspace = self.workspace.clone();
         Button::new(id)
-            .label("Retry")
+            .label(ui::t!("history.action.retry"))
             .on_click(cx.listener(move |_, _, window, cx| {
                 workspace
                     .update(cx, |workspace, cx| workspace.retry_git(window, cx))
@@ -2659,10 +3830,10 @@ impl HistoryView {
     fn render_incomplete(&mut self, failure: &Failure, cx: &mut Context<Self>) -> AnyElement {
         let text: SharedString = match failure {
             Failure::Git { command, .. } => {
-                format!("History is incomplete: git {command} failed").into()
+                ui::t!("history.strip.git_failed", command = command)
             }
-            Failure::Other { message } => format!("History is incomplete: {message}").into(),
-            _ => "History is incomplete".into(),
+            Failure::Other { message } => ui::t!("history.strip.generic", message = message),
+            _ => ui::t!("history.strip.incomplete"),
         };
         let colors = cx.theme().colors;
         let strip = self.status_strip(text, IconName::Err, colors.error, true, cx);
@@ -2699,14 +3870,14 @@ impl HistoryView {
             .child(div().flex_1())
             .child(
                 Button::new("history-strip-retry")
-                    .label("Retry")
+                    .label(ui::t!("history.action.retry"))
                     .size(ButtonSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
             );
         if copy_details {
             strip = strip.child(
                 Button::new("history-strip-copy")
-                    .label("Copy details")
+                    .label(ui::t!("history.action.copy_details"))
                     .size(ButtonSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let LoadState::Failed(failure) = &this.state {
@@ -2740,7 +3911,19 @@ impl HistoryView {
             .bg(colors.bg)
             .text_color(colors.text)
             .font_family(FONT_UI)
+            // Esc with the list (or anything under it) focused clears the
+            // day filter; without one it goes on to the next handler.
+            .on_action(cx.listener(|view, _: &Cancel, _, cx| {
+                if view.day_rows.is_some() {
+                    view.set_day_filter(None, cx);
+                } else if view.branch_rows.is_some() {
+                    view.set_branch_filter(None, cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
             .child(self.render_header(columns, cx))
+            .children(self.render_branch_bar(cx))
             .child(body)
             .into_any_element()
     }
@@ -2795,6 +3978,19 @@ impl BodyText {
         self.text.push_str(text);
         self.code.push(start..self.text.len());
         self
+    }
+
+    /// A whole translated sentence whose `{name}` placeholders become code runs
+    /// with the matching value; the rest is plain. Translators see one
+    /// sentence, so word order can differ per language.
+    fn templated(template: &str, code: &[(&str, &str)]) -> Self {
+        let names: Vec<&str> = code.iter().map(|(name, _)| *name).collect();
+        ui::i18n::split_template(template, &names)
+            .into_iter()
+            .fold(Self::new(), |body, piece| match piece {
+                ui::i18n::Piece::Text(text) => body.plain(&text),
+                ui::i18n::Piece::Slot(index) => body.code(code[index].1),
+            })
     }
 
     /// The styled runs for [`Self::element`]: one per plain or code stretch.
@@ -2911,6 +4107,57 @@ fn next_page(
                 .collect()
         });
     (stream, graph, page)
+}
+
+/// Lays out the commits of one day as a graph of their own: only parents that
+/// are on the same day are drawn, like the design's filtered history.
+fn layout_day(commits: Vec<CommitInfo>) -> Vec<(CommitInfo, Row<Oid>)> {
+    let ids: HashSet<Oid> = commits.iter().map(|c| c.id).collect();
+    let mut graph = GraphBuilder::new();
+    commits
+        .into_iter()
+        .map(|c| {
+            let parents: Vec<Oid> = c
+                .parents
+                .iter()
+                .copied()
+                .filter(|p| ids.contains(p))
+                .collect();
+            let row = graph.push(c.id, &parents);
+            (c, row)
+        })
+        .collect()
+}
+
+/// The dashed "fork point" note after the fork-point row's summary.
+fn fork_note(colors: ThemeColors) -> impl IntoElement {
+    div()
+        .flex_none()
+        .ml(px(8.))
+        .px(px(6.))
+        .h(px(16.))
+        .flex()
+        .items_center()
+        .rounded(R_SM)
+        .border_1()
+        .border_dashed()
+        .border_color(colors.border_strong)
+        .text_color(colors.muted)
+        .text_size(FS_XS)
+        .child(ui::t!("history.badge.fork_point"))
+}
+
+/// Lays out a branch's commits as a graph of their own: only parents in the
+/// list are drawn. A merge keeps a hollow dot even when its merged-in parent is
+/// outside the list; its stub is painted from `merged_from`.
+fn layout_branch(log: &BranchLog) -> Vec<(CommitInfo, Row<Oid>)> {
+    layout_day(log.commits.clone())
+        .into_iter()
+        .map(|(commit, mut row)| {
+            row.is_merge |= log.merged_from.contains_key(&commit.id);
+            (commit, row)
+        })
+        .collect()
 }
 
 /// Seconds since the unix epoch; 0 if the clock is before it.
@@ -3032,6 +4279,398 @@ mod tests {
             behind: 0,
             upstream_gone: false,
         }
+    }
+
+    fn local(name: &str, target: Oid) -> Ref {
+        reference(
+            git_core::RefKind::LocalBranch,
+            &format!("refs/heads/{name}"),
+            name,
+            target,
+        )
+    }
+
+    fn remote(name: &str, target: Oid) -> Ref {
+        reference(
+            git_core::RefKind::RemoteBranch,
+            &format!("refs/remotes/{name}"),
+            name,
+            target,
+        )
+    }
+
+    fn branch_names(branches: &[RowBranch]) -> Vec<&str> {
+        branches.iter().map(|branch| branch.name.as_str()).collect()
+    }
+
+    #[test]
+    fn row_branches_put_head_first_then_local_then_remote_and_drop_duplicates() {
+        let commit = oid(1);
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: Some(commit),
+        };
+        let refs = vec![
+            remote("origin/zed", commit),
+            local("feat/b", commit),
+            remote("origin/main", commit),
+            local("main", commit),
+            remote("origin/HEAD", commit),
+            local("feat/a", commit),
+            remote("origin/alpha", commit),
+            local("elsewhere", oid(2)),
+            // Same short name as a local branch, but on another commit: kept.
+            remote("origin/feat/a", oid(3)),
+        ];
+
+        let (others, branches) = row_branches(commit, Some(&head), &refs);
+
+        assert_eq!(others, ["feat/a", "feat/b"]);
+        assert_eq!(
+            branch_names(&branches),
+            ["main", "feat/a", "feat/b", "origin/alpha", "origin/zed"]
+        );
+        assert_eq!(branches[0].kind, RowBranchKind::Head);
+        assert_eq!(branches[1].kind, RowBranchKind::Local);
+        assert_eq!(branches[3].kind, RowBranchKind::Remote);
+    }
+
+    #[test]
+    fn row_branches_keep_a_remote_whose_local_twin_sits_on_another_commit() {
+        let commit = oid(1);
+        let refs = vec![local("feat", oid(2)), remote("origin/feat", commit)];
+
+        let (others, branches) = row_branches(commit, None, &refs);
+
+        assert!(others.is_empty());
+        assert_eq!(branch_names(&branches), ["origin/feat"]);
+    }
+
+    #[test]
+    fn the_picker_lists_the_last_picked_branch_first() {
+        let list = |names: &[&str]| -> Vec<RowBranch> {
+            names
+                .iter()
+                .map(|name| RowBranch {
+                    name: (*name).to_owned(),
+                    kind: RowBranchKind::Local,
+                })
+                .collect()
+        };
+        let ordered = picker_order(list(&["main", "a", "b"]), Some("b"));
+        assert_eq!(branch_names(&ordered), ["b", "main", "a"]);
+        let ordered = picker_order(list(&["main", "a", "b"]), Some("gone"));
+        assert_eq!(branch_names(&ordered), ["main", "a", "b"]);
+        let ordered = picker_order(list(&["main", "a", "b"]), None);
+        assert_eq!(branch_names(&ordered), ["main", "a", "b"]);
+    }
+
+    fn row_menu(
+        commit: Oid,
+        head: Option<Head>,
+        refs: Vec<Ref>,
+        filter: Option<&str>,
+        merged: Option<&str>,
+    ) -> RowMenu {
+        let (switchable, branches) = row_branches(commit, head.as_ref(), &refs);
+        let refs: Rc<[Ref]> = refs.into();
+        let head_for_menu = head.clone();
+        RowMenu {
+            hash: commit.to_string(),
+            card: CommitCard::bare(commit),
+            reset_branch: match &head {
+                Some(Head::Branch { name, .. }) => name.clone(),
+                _ => "HEAD".to_owned(),
+            },
+            branches,
+            switchable,
+            merged: merged.map(str::to_owned),
+            filter: filter.map(str::to_owned),
+            last_picked: Rc::new(RefCell::new(None)),
+            on_action: Rc::new(|_, _, _| {}),
+            on_sidebar: None,
+            on_filter: Rc::new(|_, _| {}),
+            branch_menu: Rc::new(move |key| {
+                sidebar_menu(key, head_for_menu.as_ref(), None, Some(&refs))
+            }),
+        }
+    }
+
+    /// Labels of the items; a rule is `---`.
+    fn labels(entries: &[MenuEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                MenuEntry::Item(item) => item.label.to_string(),
+                MenuEntry::Separator => "---".to_owned(),
+            })
+            .collect()
+    }
+
+    fn find<'a>(entries: &'a [MenuEntry], label: &str) -> &'a MenuItem {
+        entries
+            .iter()
+            .find_map(|entry| match entry {
+                MenuEntry::Item(item) if item.label.as_ref() == label => Some(item),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no item {label:?} in {:?}", labels(entries)))
+    }
+
+    /// The rows the item swaps the menu for.
+    fn open(entries: &[MenuEntry], label: &str) -> Vec<MenuEntry> {
+        let submenu = find(entries, label)
+            .submenu
+            .clone()
+            .unwrap_or_else(|| panic!("{label:?} is not a submenu"));
+        submenu()
+    }
+
+    const ROW_TAIL: [&str; 6] = [
+        "Create branch here…",
+        "Create tag here…",
+        "---",
+        "Cherry-pick",
+        "Revert commit",
+        "Reset main to here…",
+    ];
+
+    fn tail(labels: Vec<String>) -> Vec<String> {
+        labels[labels.len() - ROW_TAIL.len()..].to_vec()
+    }
+
+    fn main_head(commit: Oid) -> Option<Head> {
+        Some(Head::Branch {
+            name: "main".to_owned(),
+            target: Some(commit),
+        })
+    }
+
+    #[test]
+    fn a_row_without_branches_offers_to_check_out_the_commit() {
+        let commit = oid(1);
+        let menu = row_menu(commit, main_head(oid(9)), vec![], None, None);
+        let entries = menu.entries();
+
+        assert_eq!(
+            labels(&entries)[..2],
+            ["Copy commit hash", "Checkout this commit"]
+        );
+        // No branch on the commit: no filter or branch items either.
+        assert_eq!(labels(&entries).len(), 2 + ROW_TAIL.len());
+        assert_eq!(tail(labels(&entries)), ROW_TAIL);
+    }
+
+    #[test]
+    fn a_row_with_head_and_one_other_branch_switches_directly_but_picks_the_rest() {
+        let commit = oid(1);
+        let refs = vec![local("main", commit), local("feat", commit)];
+        let menu = row_menu(commit, main_head(commit), refs, None, None);
+        let entries = menu.entries();
+
+        let head = labels(&entries);
+        assert_eq!(
+            head[..5],
+            [
+                "Copy commit hash",
+                "Switch to feat",
+                // Two branches on the commit (HEAD and feat): the pickers.
+                "Show all commits of…",
+                "Branch…",
+                "Create branch here…",
+            ]
+        );
+        assert_eq!(tail(head), ROW_TAIL);
+    }
+
+    #[test]
+    fn a_row_with_a_single_branch_uses_the_direct_items() {
+        let commit = oid(1);
+        let refs = vec![local("feat", commit)];
+        let menu = row_menu(commit, main_head(oid(9)), refs, None, None);
+        let entries = menu.entries();
+
+        assert_eq!(
+            labels(&entries)[..4],
+            [
+                "Copy commit hash",
+                "Switch to feat",
+                "Show all commits of feat",
+                "Branch feat",
+            ]
+        );
+        assert!(!find(&entries, "Show all commits of feat").disabled);
+        assert!(find(&entries, "Branch feat").submenu.is_some());
+    }
+
+    #[test]
+    fn a_row_with_several_branches_uses_the_pickers() {
+        let commit = oid(1);
+        let refs = vec![
+            local("b", commit),
+            local("a", commit),
+            remote("origin/c", commit),
+        ];
+        let menu = row_menu(commit, main_head(oid(9)), refs, None, None);
+        let entries = menu.entries();
+
+        assert_eq!(
+            labels(&entries)[..4],
+            [
+                "Copy commit hash",
+                "Switch to…",
+                "Show all commits of…",
+                "Branch…",
+            ]
+        );
+        // "Switch to…" lists local branches only; the others also remotes.
+        let switch = labels(&open(&entries, "Switch to…"));
+        assert_eq!(switch, ["Back", "---", "a", "b"]);
+        let filter = labels(&open(&entries, "Show all commits of…"));
+        assert_eq!(filter, ["Back", "---", "a", "b", "origin/c"]);
+    }
+
+    #[test]
+    fn the_active_filter_adds_show_all_and_disables_its_own_branch() {
+        let commit = oid(1);
+        let refs = vec![local("feat", commit)];
+        let menu = row_menu(commit, main_head(oid(9)), refs, Some("feat"), None);
+        let entries = menu.entries();
+
+        assert_eq!(
+            labels(&entries)[..5],
+            [
+                "Copy commit hash",
+                "Switch to feat",
+                "Show all commits",
+                "Show all commits of feat",
+                "Branch feat",
+            ]
+        );
+        let item = find(&entries, "Show all commits of feat");
+        assert!(item.disabled);
+        assert_eq!(item.icon, Some(IconName::Check));
+    }
+
+    #[test]
+    fn a_merge_row_in_filter_mode_adds_the_merged_branch_after_a_rule() {
+        let commit = oid(1);
+        let menu = row_menu(
+            commit,
+            main_head(oid(9)),
+            vec![],
+            Some("feat"),
+            Some("topic"),
+        );
+        let entries = menu.entries();
+
+        assert_eq!(
+            labels(&entries)[..5],
+            [
+                "Copy commit hash",
+                "Checkout this commit",
+                "Show all commits",
+                "---",
+                "Show all commits of topic",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_branch_item_opens_the_branch_sidebar_menu_and_back_returns_to_the_root() {
+        let commit = oid(1);
+        let refs = vec![local("feat", commit)];
+        let menu = row_menu(commit, main_head(oid(9)), refs, None, None);
+        let root = menu.entries();
+
+        let view = open(&root, "Branch feat");
+        let names = labels(&view);
+        assert_eq!(names[..3], ["Back", "---", "Checkout"]);
+        assert!(names.contains(&"Rename…".to_owned()));
+        assert!(names.contains(&"Copy branch name".to_owned()));
+
+        assert_eq!(labels(&open(&view, "Back")), labels(&root));
+    }
+
+    #[test]
+    fn a_remote_branch_opens_the_remote_branch_menu() {
+        let commit = oid(1);
+        let refs = vec![remote("origin/feat", commit)];
+        let menu = row_menu(commit, main_head(oid(9)), refs, None, None);
+        let root = menu.entries();
+
+        assert_eq!(
+            find(&root, "Branch origin/feat").icon,
+            Some(IconName::Cloud)
+        );
+        let names = labels(&open(&root, "Branch origin/feat"));
+        assert_eq!(names[2], "Checkout as local branch");
+        assert!(names.contains(&"Delete remote branch…".to_owned()));
+    }
+
+    #[test]
+    fn picking_a_branch_is_remembered_and_listed_first_without_being_applied() {
+        let commit = oid(1);
+        let refs = vec![local("a", commit), local("b", commit), local("c", commit)];
+        let menu = row_menu(commit, main_head(oid(9)), refs, None, None);
+        let root = menu.entries();
+
+        let picker = open(&root, "Branch…");
+        assert_eq!(labels(&picker), ["Back", "---", "a", "b", "c"]);
+        // Choosing "c" shows its menu and remembers it.
+        let view = open(&picker, "c");
+        assert_eq!(labels(&view)[..3], ["Back", "---", "Checkout"]);
+        assert_eq!(menu.last_picked.borrow().as_deref(), Some("c"));
+
+        // Next time "c" is first, and the other pickers list it first too.
+        assert_eq!(
+            labels(&open(&root, "Branch…")),
+            ["Back", "---", "c", "a", "b"]
+        );
+        assert_eq!(
+            labels(&open(&root, "Show all commits of…")),
+            ["Back", "---", "c", "a", "b"]
+        );
+    }
+
+    #[test]
+    fn the_branch_view_keeps_the_sidebar_enabled_state() {
+        let commit = oid(1);
+        let refs = vec![local("feat", commit)];
+        let menu = row_menu(commit, main_head(oid(9)), refs, None, None);
+
+        let view = open(&menu.entries(), "Branch feat");
+
+        assert!(!find(&view, "Checkout").disabled);
+        // Merge is not wired yet in the sidebar either.
+        assert!(find(&view, "Merge feat into main").disabled);
+    }
+
+    #[test]
+    fn badges_open_their_ref_menu_but_overflow_and_detached_head_do_not() {
+        let spec = |kind, label: &str| BadgeSpec {
+            kind,
+            label: label.to_owned().into(),
+            tooltip: "".into(),
+        };
+        assert_eq!(
+            badge_menu_key(&spec(RefKind::Head, "main")).as_deref(),
+            Some("local:main")
+        );
+        assert_eq!(badge_menu_key(&spec(RefKind::Head, "HEAD")), None);
+        assert_eq!(
+            badge_menu_key(&spec(RefKind::Local, "feat/x")).as_deref(),
+            Some("local:feat/x")
+        );
+        assert_eq!(
+            badge_menu_key(&spec(RefKind::Remote, "origin/main")).as_deref(),
+            Some("rbranch:origin/main")
+        );
+        assert_eq!(
+            badge_menu_key(&spec(RefKind::Tag, "v1.0")).as_deref(),
+            Some("tag:v1.0")
+        );
+        assert_eq!(badge_menu_key(&spec(RefKind::Overflow, "+3")), None);
     }
 
     #[test]
@@ -3281,10 +4920,12 @@ mod tests {
             folded_count: 0,
         };
         // A centre exactly on the edge is not clipped.
+        // (the painted centres are 9, 23, 37, 51 with the 2 px inset).
         assert_eq!(clipped_lanes(&geometry, 56.), 0);
+        assert_eq!(clipped_lanes(&geometry, 51.), 0);
         assert_eq!(clipped_lanes(&geometry, 28.), 2);
-        assert_eq!(clipped_lanes(&geometry, 21.), 2);
-        assert_eq!(clipped_lanes(&geometry, 7.), 3);
+        assert_eq!(clipped_lanes(&geometry, 23.), 2);
+        assert_eq!(clipped_lanes(&geometry, 9.), 3);
     }
 
     #[test]
@@ -3705,6 +5346,58 @@ mod tests {
         });
     }
 
+    /// Right-clicking a branch badge opens that branch's own sidebar menu (not
+    /// the row menu), and its items go to the sidebar action handler.
+    #[gpui::test]
+    fn right_clicking_a_branch_badge_opens_the_branch_menu(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, Modifiers, MouseButton};
+
+        let repo = crate::test_support::TempRepo::new("history-badge-menu");
+        commit(repo.path(), "a.txt", "A");
+        commit(repo.path(), "b.txt", "B");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        let seen: Rc<RefCell<Vec<SidebarAction>>> = Rc::default();
+        let sink = seen.clone();
+        history.update(&mut cx, |view, _| {
+            view.set_sidebar_action_handler(Rc::new(move |action, _, _| {
+                sink.borrow_mut().push(action);
+            }));
+        });
+        let branch = history.read_with(&cx, |view, _| match view.head() {
+            Some(Head::Branch { name, .. }) => name.clone(),
+            other => panic!("expected a branch HEAD, got {other:?}"),
+        });
+
+        let badge = cx
+            .debug_bounds("history-badge-menu-0-0")
+            .expect("the HEAD badge of the first row was not drawn");
+        let position = badge.center();
+        cx.simulate_mouse_down(position, MouseButton::Right, Modifiers::default());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(
+                ui::overlay::layer_count(window, cx),
+                1,
+                "right-clicking a badge must open exactly one menu"
+            );
+        });
+
+        // Item 1 of the branch menu, "Show all commits of {branch}", sits 48 px
+        // below the menu's corner (6 px padding, one 28 px row, half a row).
+        cx.simulate_click(
+            point(position.x + px(40.), position.y + px(48.)),
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            *seen.borrow(),
+            [SidebarAction::ShowBranchCommits(branch)],
+            "the badge menu is not the branch's sidebar menu"
+        );
+    }
+
     /// The status only says "No matches" once the whole history was scanned; a
     /// running or unfinished scan shows the partial count with a "+".
     #[gpui::test]
@@ -3966,5 +5659,216 @@ mod tests {
                 "a search jump must clear the pending reveal"
             );
         });
+    }
+    fn git_in(repo: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `main`: c1, then `feat` (f1, f2) forks off, main goes on (m1), merges
+    /// `feat` with a merge commit and adds m2. Returns the merge commit's hash.
+    fn branch_filter_repo(name: &str) -> (crate::test_support::TempRepo, String) {
+        let repo = crate::test_support::TempRepo::new(name);
+        let path = repo.path();
+        git_in(path, &["checkout", "-q", "-B", "main"]);
+        commit(path, "c1", "c1");
+        git_in(path, &["checkout", "-q", "-b", "feat"]);
+        commit(path, "f1", "f1");
+        commit(path, "f2", "f2");
+        git_in(path, &["checkout", "-q", "main"]);
+        commit(path, "m1", "m1");
+        git_in(
+            path,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "Merge branch 'feat'",
+                "feat",
+            ],
+        );
+        commit(path, "m2", "m2");
+        // The merge commit is m2's parent.
+        let parent = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD~1"])
+            .output()
+            .expect("git runs");
+        assert!(parent.status.success());
+        (
+            repo,
+            String::from_utf8_lossy(&parent.stdout).trim().to_owned(),
+        )
+    }
+
+    fn summaries(history: &HistoryView) -> Vec<String> {
+        history
+            .rows()
+            .iter()
+            .map(|item| item.commit.summary.to_string())
+            .collect()
+    }
+
+    /// A branch off main lists its own commits down to the fork point, flags
+    /// the fork row, and knows the merge that brought it into main.
+    #[gpui::test]
+    fn a_feature_branch_filter_stops_at_the_fork_point(cx: &mut gpui::TestAppContext) {
+        let (repo, merge) = branch_filter_repo("branch-filter-feature");
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, cx| {
+            view.set_branch_filter(Some("feat".to_owned()), cx)
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert_eq!(view.branch_filter(), Some("feat"));
+            assert_eq!(summaries(view), ["f2", "f1", "c1"]);
+            let rows = view.branch_rows.as_ref().expect("the filter is on");
+            let fork = rows.fork.expect("the branch has a fork point");
+            let fork_row = view.rows().iter().find(|item| item.commit.id == fork);
+            assert_eq!(fork_row.expect("fork row").commit.summary, "c1");
+            let (into, main) = rows.merged_into.clone().expect("feat is merged");
+            assert_eq!(into.to_string(), merge);
+            assert_eq!(main, "main");
+            assert!(rows.merged_from.is_empty());
+            // The first row is selected, at the top.
+            assert_eq!(view.selected, Some(0));
+        });
+    }
+
+    /// The main line keeps its merge commits, each flagged with the branch it
+    /// brought in and drawn as a merge; it has no fork point or merged-into.
+    #[gpui::test]
+    fn the_main_line_filter_flags_merges_with_their_branch(cx: &mut gpui::TestAppContext) {
+        let (repo, merge) = branch_filter_repo("branch-filter-main");
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, cx| {
+            view.set_branch_filter(Some("main".to_owned()), cx)
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert_eq!(summaries(view), ["m2", "Merge branch 'feat'", "m1", "c1"]);
+            let rows = view.branch_rows.as_ref().expect("the filter is on");
+            assert!(rows.fork.is_none() && rows.merged_into.is_none());
+            let merged: Vec<(String, &String)> = rows
+                .merged_from
+                .iter()
+                .map(|(id, from)| (id.to_string(), from))
+                .collect();
+            assert_eq!(merged, [(merge.clone(), &"feat".to_owned())]);
+            // The merge keeps its hollow dot though only one parent is listed.
+            let merge_row = view
+                .rows()
+                .iter()
+                .find(|item| item.commit.id.to_string() == merge)
+                .expect("merge row");
+            assert!(merge_row.row.is_merge);
+        });
+    }
+
+    /// Esc on the focused list clears the filter; a branch that is gone shows
+    /// the empty state's rows (none) instead of failing.
+    #[gpui::test]
+    fn escape_clears_the_branch_filter(cx: &mut gpui::TestAppContext) {
+        let (repo, _) = branch_filter_repo("branch-filter-esc");
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, cx| {
+            view.set_branch_filter(Some("nope".to_owned()), cx)
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert!(matches!(
+                view.branch_rows.as_ref().map(|rows| &rows.state),
+                Some(DayState::Ready)
+            ));
+            assert!(view.rows().is_empty());
+        });
+        history.update(&mut cx, |view, cx| {
+            view.set_branch_filter(Some("feat".to_owned()), cx)
+        });
+        cx.run_until_parked();
+        let focus = history.read_with(&cx, |view, _| view.list_focus());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert!(view.branch_filter().is_none(), "Esc left the filter on");
+            assert_eq!(view.commit_count(), 6);
+        });
+    }
+
+    /// The day and branch filters replace each other, and the branch filter
+    /// clears the search.
+    #[gpui::test]
+    fn the_day_and_branch_filters_are_exclusive(cx: &mut gpui::TestAppContext) {
+        let (repo, _) = branch_filter_repo("branch-filter-exclusive");
+        let (mut cx, history) = open_history(&repo, cx);
+        let today = days_today();
+        history.update(&mut cx, |view, cx| {
+            view.set_search_query("m1".to_owned(), cx);
+            view.set_day_filter(
+                Some(DayFilter {
+                    day: today,
+                    me: None,
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| assert!(view.day_filter().is_some()));
+
+        history.update(&mut cx, |view, cx| {
+            view.set_branch_filter(Some("feat".to_owned()), cx)
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert!(
+                view.day_filter().is_none(),
+                "the branch filter kept the day"
+            );
+            assert_eq!(view.branch_filter(), Some("feat"));
+            assert_eq!(view.search_query(), "", "the branch filter kept the search");
+        });
+
+        history.update(&mut cx, |view, cx| {
+            view.set_day_filter(
+                Some(DayFilter {
+                    day: today,
+                    me: None,
+                }),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert!(
+                view.branch_filter().is_none(),
+                "the day filter kept the branch"
+            );
+            assert!(view.day_filter().is_some());
+        });
+    }
+
+    /// Today's local calendar day, the day the test commits were made on.
+    fn days_today() -> i32 {
+        let now = unix_now() as i64;
+        // Commits land within seconds of now; the local offset is ignored,
+        // which only matters within hours of local midnight, and then the day
+        // filter is merely empty — the test checks exclusivity, not its rows.
+        (now / 86_400) as i32
     }
 }

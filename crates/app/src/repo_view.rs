@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
@@ -32,6 +32,7 @@ use ui::{
     TextInputEvent, Tooltip, Tree, TreeNodeData,
 };
 
+use crate::activity_strip::ActivityStrip;
 use crate::changes_view::{ChangesEvent, ChangesView};
 use crate::details::{read_details, read_diff, DetailsState, DiffState};
 use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
@@ -40,6 +41,7 @@ use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
 use crate::network_ops::{self, Job};
 use crate::network_service::NetworkService;
+use crate::palette::{self, Command};
 use crate::ref_dialog::{self, RefDialog, RefDialogContext, RefDialogKind, RemoteEdit};
 use crate::ref_ops::{CommitCard, RefAction};
 use crate::settings::{
@@ -47,14 +49,17 @@ use crate::settings::{
     SIDEBAR_WIDTH_MIN,
 };
 use crate::sidebar::{
-    commit_for, read_sidebar_extras, sidebar_menu, sidebar_nodes, Expansion, SidebarAction,
-    SidebarExtras, SidebarMenuEntry,
+    commit_for, read_sidebar_extras, shortcut_action, sidebar_menu, sidebar_nodes, worktree_menu,
+    worktree_panel_rows, Expansion, PanelEvent, PanelState, SidebarAction, SidebarExtras,
+    SidebarMenuEntry, WorktreeAction, WorktreePanel,
 };
 use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
 use crate::worktree_dialog::SelectedCommit;
+use crate::worktree_switcher;
+use crate::worktrees_model::{WorktreeEntry, WorktreesModel, WorktreesModelEvent};
 use crate::worktrees_view::{WorktreesEvent, WorktreesView};
 
 actions!(
@@ -69,14 +74,16 @@ actions!(
         SearchFocusList,
         OpenRepoSwitcher,
         OpenBranchSwitcher,
+        OpenWorktreeSwitcher,
         StashChanges,
-        FetchAll
+        FetchAll,
+        PullBranch,
+        PushBranch
     ]
 );
 
-/// The centre views the sidebar and toolbar switch between. `Worktrees` is
-/// opened from the sidebar's Worktrees section, so the toolbar's History /
-/// Changes switch stays on History while it shows.
+/// The centre views the toolbar's segment switches between. `Worktrees` also
+/// swaps the sidebar tree for the worktree panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewMode {
     History,
@@ -99,7 +106,7 @@ pub(crate) fn bind_search_keys(cx: &mut App) {
 }
 
 /// Height of a toolbar tool button.
-const TOOL_H: f32 = 28.;
+pub(crate) const TOOL_H: f32 = 28.;
 
 /// What the toolbar shows at a given window width.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -112,6 +119,10 @@ pub struct ToolbarLayout {
     pub repo_name: Option<f32>,
     /// Widest the branch name may get; `None` hides it.
     pub branch_name: Option<f32>,
+    /// The worktree switcher button is shown.
+    pub worktree_button: bool,
+    /// Widest the worktree switcher's name may get; `None` hides it.
+    pub worktree_name: Option<f32>,
     /// The search field's flex basis.
     pub search_basis: f32,
     /// The search field's minimum width.
@@ -131,6 +142,8 @@ impl ToolbarLayout {
             search_kbd: true,
             repo_name: Some(96.),
             branch_name: Some(96.),
+            worktree_button: true,
+            worktree_name: Some(96.),
             search_basis: 270.,
             search_min: 150.,
             gap: 6.,
@@ -146,6 +159,12 @@ impl ToolbarLayout {
             ..self
         }
     }
+
+    /// One more step at the narrowest window: the three view tabs took the
+    /// room the search and the gaps kept.
+    fn tighter(self) -> Self {
+        Self { gap: 3., ..self }
+    }
 }
 
 /// The toolbar steps, measured against the real text widths of every item.
@@ -154,64 +173,94 @@ impl ToolbarLayout {
 /// each side, so a window of `width` has `width - 22` of content. Every item
 /// except the search field is `flex-none`, so the search is the only item that
 /// can shrink; the steps below keep the worst case (names at their maximum,
-/// `Fetch`/`Pull`/`Push`/`Stash`/`History`/`Changes` labelled) inside the bar.
+/// `Fetch`/`Pull`/`Push`/`Stash`/`History`/`Changes` labelled, the worktree
+/// button with its warning dot) inside the bar.
 ///
-/// The labels are dropped from 1360 down: at 1200 a long repository name plus
+/// The labels are dropped from 1460 down: at 1200 a long repository name plus
 /// the segmented labels do not fit even with the search at its minimum, which
-/// clipped "Changes".
-pub fn toolbar_layout(width: f32) -> ToolbarLayout {
+/// clipped "Changes". The third view tab ("Worktrees") and the worktree
+/// switcher button widen the bar, so the steps start higher than with the two
+/// switchers alone. Below 740 the worktree button is dropped: Ctrl Alt W still
+/// opens the switcher, under the branch switcher then.
+///
+/// The two labelled steps (1580 and 1460) were tuned to the English labels.
+/// `label_extra` is how much wider the labels are in the active language
+/// ([`label_extra_width`], 0 for English); both thresholds move up by it, so a
+/// longer translation drops its labels earlier instead of clipping them.
+pub fn toolbar_layout(width: f32, label_extra: f32) -> ToolbarLayout {
     let full = ToolbarLayout::full();
-    if width >= 1360. {
-        // The design's own 140px cap on both names.
+    if width >= 1580. + label_extra {
+        // The design's own 140px cap on the repository and branch names.
         ToolbarLayout {
             repo_name: Some(140.),
             branch_name: Some(140.),
             ..full
         }
-    } else if width >= 1000. {
+    } else if width >= 1460. + label_extra {
+        ToolbarLayout {
+            worktree_name: Some(64.),
+            ..full
+        }
+    } else if width >= 1080. {
         // Icon-only tools and view switch, so the bar fits at 1200.
         ToolbarLayout {
             labels: false,
             search_kbd: false,
+            worktree_name: Some(64.),
             ..full
         }
-    } else if width >= 870. {
+    } else if width >= 990. {
         ToolbarLayout {
             labels: false,
             search_kbd: false,
             repo_name: Some(64.),
             branch_name: Some(64.),
+            worktree_name: Some(64.),
             search_basis: 180.,
             search_min: 120.,
+            ..full
+        }
+    } else if width >= 970. {
+        ToolbarLayout {
+            labels: false,
+            search_kbd: false,
+            repo_name: Some(64.),
+            branch_name: Some(64.),
+            worktree_name: Some(64.),
+            search_basis: 96.,
+            search_min: 96.,
+            ..full
+        }
+    } else if width >= 900. {
+        ToolbarLayout {
+            labels: false,
+            search_kbd: false,
+            repo_name: Some(64.),
+            branch_name: Some(64.),
+            worktree_name: None,
+            search_basis: 96.,
+            search_min: 96.,
             ..full
         }
     } else if width >= 810. {
         ToolbarLayout {
             labels: false,
             search_kbd: false,
-            repo_name: Some(64.),
-            branch_name: Some(64.),
-            search_basis: 96.,
-            search_min: 96.,
-            ..full
-        }
-    } else if width >= 760. {
-        ToolbarLayout {
-            labels: false,
-            search_kbd: false,
             repo_name: None,
             branch_name: Some(64.),
+            worktree_name: None,
             search_basis: 96.,
             search_min: 96.,
             ..full
         }
         .compact()
-    } else if width >= 700. {
+    } else if width >= 740. {
         ToolbarLayout {
             labels: false,
             search_kbd: false,
             repo_name: None,
             branch_name: None,
+            worktree_name: None,
             search_basis: 96.,
             search_min: 96.,
             ..full
@@ -223,13 +272,73 @@ pub fn toolbar_layout(width: f32) -> ToolbarLayout {
             search_kbd: false,
             repo_name: None,
             branch_name: None,
-            search_basis: 72.,
-            search_min: 72.,
-            padding: 8.,
+            worktree_button: false,
+            worktree_name: None,
+            search_basis: 60.,
+            search_min: 60.,
+            padding: 6.,
             ..full
         }
         .compact()
+        .tighter()
     }
+}
+
+/// Catalog keys of the labels the toolbar shows while `ToolbarLayout::labels` is on:
+/// the four tool buttons and the three view tabs.
+const TOOLBAR_LABELS: [&str; 7] = [
+    "repo.toolbar.fetch",
+    "repo.toolbar.pull",
+    "repo.toolbar.push",
+    "repo.toolbar.stash",
+    "repo.toolbar.view_history",
+    "repo.toolbar.view_changes",
+    "repo.toolbar.view_worktrees",
+];
+
+/// How much wider the toolbar labels are in `lang` than in English, given a text
+/// `measure`; never negative, so English (and any shorter language) keeps the
+/// English steps.
+pub fn label_extra_width(lang: &str, measure: impl Fn(&str) -> f32) -> f32 {
+    let total = |lang: &str| -> f32 {
+        TOOLBAR_LABELS
+            .iter()
+            .map(|key| measure(&ui::i18n::t_in(lang, key)))
+            .sum()
+    };
+    (total(lang) - total("en")).max(0.)
+}
+
+/// [`label_extra_width`] for the active language, measured with the window's text
+/// system at the toolbar font.
+fn toolbar_label_extra(window: &Window) -> f32 {
+    // Language and fonts are fixed for the process, so measure once; English needs no
+    // measuring (the extra is 0 by definition).
+    static EXTRA: OnceLock<f32> = OnceLock::new();
+    if ui::i18n::language() == "en" {
+        return 0.;
+    }
+    *EXTRA.get_or_init(|| measure_label_extra(window))
+}
+
+fn measure_label_extra(window: &Window) -> f32 {
+    let font = ui::fonts::ui_font();
+    label_extra_width(ui::i18n::language(), |text| {
+        let run = TextRun {
+            len: text.len(),
+            font: font.clone(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        f32::from(
+            window
+                .text_system()
+                .shape_line(SharedString::from(text.to_owned()), FS_BASE, &[run], None)
+                .width,
+        )
+    })
 }
 
 /// Where the details dock sits: the stored choice, else by window width.
@@ -289,6 +398,22 @@ pub fn effective_details_width(stored: f32, window_width: f32, sidebar_width: f3
     clamp_details(stored, Dock::Right).min(details_width_limit(window_width, sidebar_width))
 }
 
+/// The tallest a bottom-docked details panel may render: half of the window
+/// height (the same share the right dock gets of the width), within the panel's
+/// own 220–560 range, so History keeps its rows in a short window.
+pub fn details_height_limit(window_height: f32) -> f32 {
+    let (min, max) = dock_bounds(Dock::Bottom);
+    (DETAILS_MAX_SHARE * window_height).clamp(min, max)
+}
+
+/// The height a bottom-docked details panel renders at: its stored size,
+/// capped by [`details_height_limit`] and never below its 220 px minimum.
+///
+/// The stored size is not rewritten; only the rendered height shrinks.
+pub fn effective_details_height(stored: f32, window_height: f32) -> f32 {
+    clamp_details(stored, Dock::Bottom).min(details_height_limit(window_height))
+}
+
 /// The width the sidebar renders at: its stored width, capped to half the
 /// visible area and never below its own 160 px minimum.
 ///
@@ -309,10 +434,21 @@ pub struct RepositoryView {
     git_tooltip: SharedString,
     history: Entity<HistoryView>,
     _history_observer: Subscription,
+    /// The commit heatmap above the history table.
+    activity: Entity<ActivityStrip>,
     changes: Entity<ChangesView>,
     _changes_observer: Subscription,
     worktrees: Entity<WorktreesView>,
+    /// The worktree list shared by the Worktrees page, the sidebar panel and,
+    /// next, the titlebar switcher.
+    worktrees_model: Entity<WorktreesModel>,
     _worktrees_observer: Subscription,
+    /// Redraws the sidebar's worktree panel when the model changes.
+    _worktrees_redraw: Subscription,
+    _worktrees_leave: Subscription,
+    /// The worktree panel's keyboard focus and list scroll.
+    worktree_panel_focus: FocusHandle,
+    worktree_panel_scroll: ScrollHandle,
     view: ViewMode,
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
@@ -370,6 +506,12 @@ pub struct RepositoryView {
     /// Window bounds of the two dropdown anchors, captured while painting.
     repo_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     branch_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Window bounds of the worktree switcher button.
+    worktree_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The worktree switcher popover while it is open; the button is pressed
+    /// then.
+    worktree_switcher: Option<worktree_switcher::Handle>,
+    _worktree_switcher_release: Option<Subscription>,
     /// The stage 7 dialog currently open, if any.
     ref_dialog: Option<Entity<RefDialog>>,
     /// A ref operation without a dialog (checkout, stash apply, …) is running.
@@ -390,7 +532,7 @@ pub struct RepositoryView {
 
 /// What the status bar and the toolbar show while git is talking to a remote.
 struct NetworkActivity {
-    verb: &'static str,
+    verb: SharedString,
     detail: SharedString,
     progress: Option<f32>,
 }
@@ -439,6 +581,12 @@ impl RepositoryView {
                 cx,
             )
         });
+        let sidebar_view = cx.entity();
+        history.update(cx, |history, _| {
+            history.set_sidebar_action_handler(Rc::new(move |action, window, cx| {
+                sidebar_view.update(cx, |view, cx| view.run_sidebar_action(action, window, cx));
+            }));
+        });
         let observer = cx.observe(&history, |this, history, cx| {
             // A repository opened from a subdirectory is remembered by its
             // root, so the switcher's "current" marker must follow it.
@@ -461,28 +609,63 @@ impl RepositoryView {
                 this.ensure_sidebar(cx);
             }
             this.sync_details(selected, cx);
+            // The branch filter clears the history's search from inside the
+            // list (chip, row menu); the field must not keep the dead query.
+            if history.read(cx).search_query().is_empty() && !this.search.read(cx).text().is_empty()
+            {
+                this.search.update(cx, |input, cx| input.set_text("", cx));
+            }
             cx.notify();
+        });
+        let activity = cx.new(|cx| {
+            ActivityStrip::new(
+                path.clone(),
+                git.clone(),
+                workspace.clone(),
+                history.clone(),
+                cx,
+            )
         });
         let changes = cx.new(|cx| ChangesView::new(path.clone(), git.clone(), window, cx));
-        let changes_observer = cx.subscribe(&changes, |this, _, event: &ChangesEvent, cx| {
-            if *event == ChangesEvent::Committed {
-                this.history.update(cx, |history, cx| history.reload(cx));
-            }
-        });
-        let worktrees = cx
-            .new(|cx| WorktreesView::new(path.clone(), git.clone(), workspace.clone(), window, cx));
-        let worktrees_observer = cx.subscribe(&worktrees, |this, _, _: &WorktreesEvent, cx| {
-            // A branch was created or deleted, or a worktree changed: the
-            // sidebar, the history's ref labels and the local changes all
-            // read the same repository.
-            this.history.update(cx, |history, cx| history.reload(cx));
-            this.changes.update(cx, |changes, cx| changes.refresh(cx));
-            this.refresh(cx);
-            cx.notify();
-        });
+        let changes_observer = cx.subscribe_in(
+            &changes,
+            window,
+            |this, _, event: &ChangesEvent, window, cx| match event {
+                ChangesEvent::Committed => {
+                    this.reload_history(cx);
+                }
+                ChangesEvent::PushAfterCommit => this.push_branch(window, cx),
+            },
+        );
+        let worktrees_model =
+            cx.new(|cx| WorktreesModel::new(path.clone(), git.clone(), workspace.clone(), cx));
+        let worktrees = cx.new(|cx| WorktreesView::new(worktrees_model.clone(), window, cx));
+        let worktrees_observer = cx.subscribe(
+            &worktrees_model,
+            |this, _, event: &WorktreesModelEvent, cx| {
+                if *event == WorktreesModelEvent::Changed {
+                    // A branch was created or deleted, or a worktree changed:
+                    // the sidebar, the history's ref labels and the local
+                    // changes all read the same repository.
+                    this.reload_history(cx);
+                    this.changes.update(cx, |changes, cx| changes.refresh(cx));
+                    this.refresh(cx);
+                    cx.notify();
+                }
+            },
+        );
+        let worktrees_redraw = cx.observe(&worktrees_model, |_, _, cx| cx.notify());
+        let worktrees_leave = cx.subscribe_in(
+            &worktrees,
+            window,
+            |this, _, _: &WorktreesEvent, window, cx| {
+                // Esc on the Worktrees page goes back to History.
+                this.set_view(ViewMode::History, window, cx);
+            },
+        );
         let search = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder("Search commits, authors, hashes", cx);
+            input.set_placeholder(ui::t!("repo.search.placeholder"), cx);
             input
         });
         let search_focus = search.read(cx).focus_handle().clone();
@@ -501,7 +684,7 @@ impl RepositoryView {
         });
         let sidebar_filter = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder("Filter branches, tags…", cx);
+            input.set_placeholder(ui::t!("repo.sidebar.filter_refs"), cx);
             input
         });
         let sidebar_filter_events =
@@ -531,10 +714,16 @@ impl RepositoryView {
             git_tooltip,
             history,
             _history_observer: observer,
+            activity,
             changes,
             _changes_observer: changes_observer,
             worktrees,
+            worktrees_model,
             _worktrees_observer: worktrees_observer,
+            _worktrees_redraw: worktrees_redraw,
+            _worktrees_leave: worktrees_leave,
+            worktree_panel_focus: cx.focus_handle().tab_stop(true),
+            worktree_panel_scroll: ScrollHandle::new(),
             view: ViewMode::History,
             workspace,
             focus: focus.clone(),
@@ -579,6 +768,9 @@ impl RepositoryView {
             files_focus: cx.focus_handle().tab_stop(true),
             repo_bounds: Rc::new(Cell::new(None)),
             branch_bounds: Rc::new(Cell::new(None)),
+            worktree_bounds: Rc::new(Cell::new(None)),
+            worktree_switcher: None,
+            _worktree_switcher_release: None,
             ref_dialog: None,
             ref_action_running: false,
             network: None,
@@ -615,6 +807,12 @@ impl RepositoryView {
         cx.notify();
     }
 
+    /// The worktree list shared with the sidebar panel and the switcher.
+    #[allow(dead_code)] // read by the switcher (W5)
+    pub(crate) fn worktrees_model(&self) -> Entity<WorktreesModel> {
+        self.worktrees_model.clone()
+    }
+
     pub(crate) fn toggle_details(&mut self, cx: &mut Context<Self>) {
         self.details_open = !self.details_open;
         cx.notify();
@@ -633,7 +831,11 @@ impl RepositoryView {
             }
             return;
         }
+        let was_worktrees = self.view == ViewMode::Worktrees;
         self.view = mode;
+        if was_worktrees != (mode == ViewMode::Worktrees) {
+            self.sync_sidebar_filter(cx);
+        }
         match mode {
             ViewMode::Changes => {
                 self.changes.update(cx, |changes, cx| changes.refresh(cx));
@@ -654,8 +856,167 @@ impl RepositoryView {
         cx.notify();
     }
 
-    /// The history view, for the search's focus hand-off and the tests.
-    #[cfg(test)]
+    /// The sidebar filter belongs to whatever the sidebar lists: branches and
+    /// tags, or (in the Worktrees view) worktrees. Switching between them
+    /// starts a fresh, empty filter with the matching placeholder.
+    fn sync_sidebar_filter(&mut self, cx: &mut Context<Self>) {
+        let placeholder = if self.view == ViewMode::Worktrees {
+            ui::t!("repo.sidebar.filter_worktrees")
+        } else {
+            ui::t!("repo.sidebar.filter_refs")
+        };
+        self.filter.clear();
+        self.sidebar_filter.update(cx, |input, cx| {
+            input.set_placeholder(placeholder, cx);
+            input.set_text("", cx);
+        });
+    }
+
+    /// The worktree panel's rows, in the order they are drawn.
+    fn worktree_panel_paths(&self, cx: &App) -> Vec<PathBuf> {
+        worktree_panel_rows(self.worktrees_model.read(cx).entries(), &self.filter)
+            .into_iter()
+            .map(|entry| entry.path().to_path_buf())
+            .collect()
+    }
+
+    /// Everything the worktree panel reports: clicks, keys, the menu.
+    fn worktree_panel_event(
+        &mut self,
+        event: PanelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let model = self.worktrees_model.clone();
+        let selected = model.read(cx).selected().map(|e| e.path().to_path_buf());
+        match event {
+            PanelEvent::Select(path) => model.update(cx, |model, cx| model.select(&path, cx)),
+            PanelEvent::Switch(path) => {
+                model.update(cx, |model, cx| model.switch_to(&path, window, cx));
+            }
+            PanelEvent::Menu(path, position) => {
+                model.update(cx, |model, cx| model.select(&path, cx));
+                self.open_worktree_menu(&path, position, window, cx);
+            }
+            PanelEvent::Move(delta) => {
+                let paths = self.worktree_panel_paths(cx);
+                if paths.is_empty() {
+                    return;
+                }
+                let at = selected.and_then(|path| paths.iter().position(|p| *p == path));
+                let next = match at {
+                    Some(at) => at.saturating_add_signed(delta).min(paths.len() - 1),
+                    None if delta < 0 => paths.len() - 1,
+                    None => 0,
+                };
+                self.worktree_panel_scroll.scroll_to_item(next);
+                model.update(cx, |model, cx| model.select(&paths[next], cx));
+            }
+            PanelEvent::Confirm => {
+                if let Some(path) = selected {
+                    model.update(cx, |model, cx| model.switch_to(&path, window, cx));
+                }
+            }
+            PanelEvent::Delete => {
+                // The main worktree cannot be removed.
+                let removable = selected.filter(|path| {
+                    model
+                        .read(cx)
+                        .entry(path)
+                        .is_some_and(|entry| !entry.is_main())
+                });
+                if let Some(path) = removable {
+                    self.worktrees
+                        .update(cx, |worktrees, cx| worktrees.open_remove(&path, window, cx));
+                }
+            }
+            PanelEvent::Leave => self.set_view(ViewMode::History, window, cx),
+            PanelEvent::NewWorktree => {
+                self.worktrees
+                    .update(cx, |worktrees, cx| worktrees.focus_quick(window, cx));
+            }
+        }
+    }
+
+    /// The right-click menu of a worktree row.
+    fn open_worktree_menu(
+        &mut self,
+        path: &Path,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.worktrees_model.read(cx).entry(path).cloned() else {
+            return;
+        };
+        let view = cx.entity();
+        let model = self.worktrees_model.clone();
+        let entries: Vec<MenuEntry> = worktree_menu(&entry)
+            .into_iter()
+            .map(|item| {
+                let Some(item) = item else {
+                    return MenuEntry::Separator;
+                };
+                let mut menu_item = MenuItem::new(item.label)
+                    .icon(item.icon)
+                    .disabled(item.disabled);
+                if item.danger {
+                    menu_item = menu_item.danger();
+                }
+                let (view, model, path) = (view.clone(), model.clone(), path.to_path_buf());
+                MenuEntry::Item(menu_item.action(move |window, cx| {
+                    run_worktree_action(item.action, &path, &model, &view, window, cx);
+                }))
+            })
+            .collect();
+        menu::open_context_menu(position, entries, window, cx);
+    }
+
+    /// The panel that replaces the sidebar tree in the Worktrees view.
+    fn worktree_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let model = self.worktrees_model.read(cx);
+        let state = if model.error().is_some() {
+            PanelState::Error
+        } else if !model.is_loaded() {
+            PanelState::Loading
+        } else {
+            PanelState::Ready
+        };
+        let rows: Vec<WorktreeEntry> = worktree_panel_rows(model.entries(), &self.filter)
+            .into_iter()
+            .cloned()
+            .collect();
+        let total = model.entries().len();
+        let selected = model.selected().map(|entry| entry.path().to_path_buf());
+        let view = cx.entity();
+        WorktreePanel::new(
+            state,
+            rows,
+            total,
+            self.filter.clone(),
+            selected,
+            self.worktree_panel_focus.clone(),
+            self.worktree_panel_scroll.clone(),
+            move |event, window, cx| {
+                view.update(cx, |view, cx| view.worktree_panel_event(event, window, cx));
+            },
+        )
+        .into_any_element()
+    }
+
+    /// Reloads the history and the activity counts that depend on it.
+    fn reload_history(&mut self, cx: &mut Context<Self>) {
+        self.history.update(cx, |history, cx| history.reload(cx));
+        self.activity.update(cx, |activity, cx| activity.reload(cx));
+    }
+
+    /// Switches to Local changes, as the toolbar's segment does.
+    pub(crate) fn show_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view(ViewMode::Changes, window, cx);
+    }
+
+    /// The history view, for the search's focus hand-off, the welcome screen's
+    /// day filter and the tests.
     pub(crate) fn history(&self) -> Entity<HistoryView> {
         self.history.clone()
     }
@@ -764,6 +1125,7 @@ impl RepositoryView {
             // Worktrees page is left when one of its rows is selected.
             if self.view == ViewMode::Worktrees {
                 self.view = ViewMode::History;
+                self.sync_sidebar_filter(cx);
             }
             self.history
                 .update(cx, |history, cx| history.reveal_commit(oid, cx));
@@ -782,13 +1144,40 @@ impl RepositoryView {
             Some(SidebarAction::CheckoutBranch(name.to_owned()))
         } else if let Some(name) = key.strip_prefix("rbranch:") {
             Some(SidebarAction::CheckoutRemoteBranch(name.to_owned()))
-        } else if let Some(name) = key.strip_prefix("tag:") {
-            Some(SidebarAction::CheckoutTag(name.to_owned()))
         } else {
-            None
+            key.strip_prefix("tag:")
+                .map(|name| SidebarAction::CheckoutTag(name.to_owned()))
         };
         if let Some(action) = action {
             self.run_sidebar_action(action, window, cx);
+        }
+    }
+
+    /// Enter / F2 / Delete on a sidebar row: runs the menu item carrying that
+    /// shortcut hint. Returns whether the row has one (and so took the key).
+    fn run_sidebar_shortcut(
+        &mut self,
+        key: &str,
+        hint: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let action = {
+            let history = self.history.read(cx);
+            shortcut_action(
+                key,
+                hint,
+                history.head(),
+                self.sidebar_extras.as_ref(),
+                history.refs(),
+            )
+        };
+        match action {
+            Some(action) => {
+                self.run_sidebar_action(action, window, cx);
+                true
+            }
+            None => false,
         }
     }
 
@@ -870,10 +1259,13 @@ impl RepositoryView {
             SidebarAction::CheckoutRemoteBranch(remote) => {
                 let label = remote.clone();
                 self.checkout_guarded(
-                    format!("Check out {label}?"),
+                    ui::t!("repo.checkout.title", name = label).to_string(),
                     move |repo| {
                         repo.checkout_remote(&remote)?;
-                        Ok((ui::ToastKind::Ok, format!("Checked out {label}")))
+                        Ok((
+                            ui::ToastKind::Ok,
+                            ui::t!("repo.checkout.done", name = label).to_string(),
+                        ))
                     },
                     window,
                     cx,
@@ -891,7 +1283,7 @@ impl RepositoryView {
                 let Some(target) = target else {
                     toast::show(
                         ui::ToastKind::Warn,
-                        "The tag has no commit to check out",
+                        ui::t!("repo.toast.tag_no_commit"),
                         window,
                         cx,
                     );
@@ -899,12 +1291,12 @@ impl RepositoryView {
                 };
                 let label = name.clone();
                 self.checkout_guarded(
-                    format!("Check out tag {label}?"),
+                    ui::t!("repo.checkout.tag_title", name = label).to_string(),
                     move |repo| {
                         repo.checkout_detached(target)?;
                         Ok((
                             ui::ToastKind::Ok,
-                            format!("Checked out tag {label} (detached HEAD)"),
+                            ui::t!("repo.checkout.tag_done", name = label).to_string(),
                         ))
                     },
                     window,
@@ -934,14 +1326,66 @@ impl RepositoryView {
             SidebarAction::ApplyStash(index) => {
                 self.run_repo_action(window, cx, move |repo| {
                     repo.stash_apply(index)?;
-                    Ok((ui::ToastKind::Ok, format!("Applied stash@{{{index}}}")))
+                    Ok((
+                        ui::ToastKind::Ok,
+                        ui::t!(
+                            "repo.toast.stash_applied",
+                            stash = format!("stash@{{{index}}}")
+                        )
+                        .to_string(),
+                    ))
                 });
             }
             SidebarAction::PopStash(index) => {
                 self.run_repo_action(window, cx, move |repo| {
                     repo.stash_pop(index)?;
-                    Ok((ui::ToastKind::Ok, format!("Popped stash@{{{index}}}")))
+                    Ok((
+                        ui::ToastKind::Ok,
+                        ui::t!(
+                            "repo.toast.stash_popped",
+                            stash = format!("stash@{{{index}}}")
+                        )
+                        .to_string(),
+                    ))
                 });
+            }
+            SidebarAction::ViewStash(index) => {
+                let oid = self
+                    .sidebar_extras
+                    .as_ref()
+                    .and_then(|extras| extras.stashes.iter().find(|stash| stash.index == index))
+                    .map(|stash| stash.oid);
+                match oid {
+                    Some(oid) => self.start_details(oid, cx),
+                    None => {
+                        toast::show(
+                            ui::ToastKind::Warn,
+                            ui::t!(
+                                "repo.toast.stash_gone",
+                                stash = format!("stash@{{{index}}}")
+                            ),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
+            SidebarAction::UpdateSubmodule(path) => {
+                self.start_network_job(Job::UpdateSubmodule { path }, window, cx);
+            }
+            SidebarAction::OpenSubmodule(path) => {
+                let folder = self.root.join(&path);
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.open_repository_window(folder, window, cx);
+                    })
+                    .ok();
+                toast::show(
+                    ui::ToastKind::Ok,
+                    ui::t!("repo.toast.opened_in_window", name = path),
+                    window,
+                    cx,
+                );
             }
             SidebarAction::DropStash(index) => {
                 let label = self
@@ -969,7 +1413,7 @@ impl RepositoryView {
                 let Some(oid) = oid else {
                     toast::show(
                         ui::ToastKind::Warn,
-                        "Create a commit before tagging",
+                        ui::t!("repo.toast.commit_before_tag"),
                         window,
                         cx,
                     );
@@ -1039,7 +1483,7 @@ impl RepositoryView {
                 let Some((remote, branch)) = name.split_once('/') else {
                     toast::show(
                         ui::ToastKind::Warn,
-                        format!("Cannot tell which remote {name} belongs to"),
+                        ui::t!("repo.toast.unknown_remote", name = name),
                         window,
                         cx,
                     );
@@ -1064,9 +1508,13 @@ impl RepositoryView {
                     return;
                 }
                 crate::confirm_dialog::open(
-                    format!("Delete {name}?"),
-                    format!("This deletes the branch “{branch}” on {remote}. It cannot be undone."),
-                    "Delete branch",
+                    ui::t!("repo.delete_remote_branch.title", name = name),
+                    ui::t!(
+                        "repo.delete_remote_branch.body",
+                        branch = branch,
+                        remote = remote
+                    ),
+                    ui::t!("repo.delete_remote_branch.confirm"),
                     move |window, cx| {
                         view.update(cx, |view, cx| {
                             view.start_network_job(
@@ -1096,14 +1544,24 @@ impl RepositoryView {
                         return Err(Error::Git {
                             command: "branch --set-upstream-to",
                             code: None,
-                            stderr: format!(
-                                "There is no {upstream} yet. Push {branch} first to create it."
-                            ),
+                            stderr: ui::t!(
+                                "repo.upstream.missing",
+                                upstream = upstream,
+                                branch = branch
+                            )
+                            .to_string(),
                         });
                     }
                     git_core::network::set_upstream(repo, &branch, &remote, &branch)?;
-                    Ok((ui::ToastKind::Ok, format!("{branch} now tracks {upstream}")))
+                    Ok((
+                        ui::ToastKind::Ok,
+                        ui::t!("repo.upstream.tracks", branch = branch, upstream = upstream)
+                            .to_string(),
+                    ))
                 });
+            }
+            SidebarAction::ShowBranchCommits(name) => {
+                self.show_branch_commits(name, window, cx);
             }
             SidebarAction::ShowWorktrees => {
                 self.set_view(ViewMode::Worktrees, window, cx);
@@ -1121,7 +1579,7 @@ impl RepositoryView {
                     .ok();
                 toast::show(
                     ui::ToastKind::Ok,
-                    format!("Opened {label} in a new window"),
+                    ui::t!("repo.toast.opened_in_window", name = label),
                     window,
                     cx,
                 );
@@ -1130,14 +1588,20 @@ impl RepositoryView {
                 let path = PathBuf::from(path);
                 self.run_repo_action(window, cx, move |repo| {
                     repo.lock_worktree(&path, Some("locked manually"))?;
-                    Ok((ui::ToastKind::Ok, format!("Locked {}", path.display())))
+                    Ok((
+                        ui::ToastKind::Ok,
+                        ui::t!("repo.toast.worktree_locked", path = path.display()).to_string(),
+                    ))
                 });
             }
             SidebarAction::UnlockWorktree(path) => {
                 let path = PathBuf::from(path);
                 self.run_repo_action(window, cx, move |repo| {
                     repo.unlock_worktree(&path)?;
-                    Ok((ui::ToastKind::Ok, format!("Unlocked {}", path.display())))
+                    Ok((
+                        ui::ToastKind::Ok,
+                        ui::t!("repo.toast.worktree_unlocked", path = path.display()).to_string(),
+                    ))
                 });
             }
             SidebarAction::RenameWorktree(path) => {
@@ -1159,7 +1623,7 @@ impl RepositoryView {
                     repo.prune_worktrees()?;
                     Ok((
                         ui::ToastKind::Ok,
-                        "Pruned stale worktree records".to_owned(),
+                        ui::t!("repo.toast.worktrees_pruned").to_string(),
                     ))
                 });
             }
@@ -1199,12 +1663,12 @@ impl RepositoryView {
             RefAction::CheckoutCommit(card) => {
                 let short = card.short.clone();
                 self.checkout_guarded(
-                    format!("Check out {short}?"),
+                    ui::t!("repo.checkout.title", name = short).to_string(),
                     move |repo| {
                         repo.checkout_detached(card.oid)?;
                         Ok((
                             ui::ToastKind::Ok,
-                            format!("Checked out {short} (detached HEAD)"),
+                            ui::t!("repo.checkout.commit_done", name = short).to_string(),
                         ))
                     },
                     window,
@@ -1239,7 +1703,7 @@ impl RepositoryView {
     }
 
     /// The refs, remotes and HEAD a ref dialog needs.
-    fn ref_dialog_context(&self, cx: &Context<Self>) -> RefDialogContext {
+    fn ref_dialog_context(&self, kind: &RefDialogKind, cx: &Context<Self>) -> RefDialogContext {
         let (refs, head_oid, branch) = {
             let history = self.history.read(cx);
             let refs = history.refs().unwrap_or(&[]).to_vec();
@@ -1263,6 +1727,21 @@ impl RepositoryView {
             .sidebar_extras
             .as_ref()
             .and_then(|extras| extras.signing_key.clone());
+        // Only the Create tag dialog pushes to a remote; other dialogs skip the
+        // git spawn on the UI thread.
+        let default_remote = if matches!(kind, RefDialogKind::CreateTag { .. }) {
+            self.git
+                .as_ref()
+                .ok()
+                .and_then(|git| Repo::open(git.clone(), &self.root).ok())
+                .and_then(|repo| git_core::network::default_remote(&repo).ok().flatten())
+        } else {
+            None
+        };
+        let view = cx.entity();
+        let network: crate::ref_dialog::NetworkAction = Rc::new(move |job, window, cx| {
+            view.update(cx, |view, cx| view.start_network_job(job, window, cx));
+        });
         let changes = self.changes.read(cx);
         let dirty = changes.staged_count() + changes.unstaged_count();
         RefDialogContext {
@@ -1270,6 +1749,8 @@ impl RepositoryView {
             git: self.git.clone(),
             refs,
             remotes,
+            default_remote,
+            network: Some(network),
             signing_key,
             head_oid,
             branch,
@@ -1288,7 +1769,7 @@ impl RepositoryView {
         if let Some(previous) = self.ref_dialog.clone() {
             previous.update(cx, |dialog, cx| dialog.close(window, cx));
         }
-        let context = self.ref_dialog_context(cx);
+        let context = self.ref_dialog_context(&kind, cx);
         let view = cx.entity();
         let on_done = Rc::new(move |window: &mut Window, cx: &mut App| {
             view.update(cx, |view, cx| {
@@ -1307,10 +1788,13 @@ impl RepositoryView {
     fn checkout_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let label = name.clone();
         self.checkout_guarded(
-            format!("Switch to {label}?"),
+            ui::t!("repo.checkout.switch_title", name = label).to_string(),
             move |repo| {
                 repo.checkout_branch(&name)?;
-                Ok((ui::ToastKind::Ok, format!("Switched to {label}")))
+                Ok((
+                    ui::ToastKind::Ok,
+                    ui::t!("repo.checkout.switch_done", name = label).to_string(),
+                ))
             },
             window,
             cx,
@@ -1342,11 +1826,7 @@ impl RepositoryView {
             self.run_repo_action(window, cx, checkout);
             return;
         }
-        let files = if dirty == 1 {
-            "1 uncommitted change".to_owned()
-        } else {
-            format!("{dirty} uncommitted changes")
-        };
+        let body = ui::i18n::t_count("repo.checkout.dirty_body", dirty as u64, &[]);
         let view = cx.entity();
         // Each button may fire, but only one does. `Rc` lets every closure
         // hold the checkout and the chosen one take it.
@@ -1356,7 +1836,7 @@ impl RepositoryView {
         };
         crate::checkout_dialog::open(
             title,
-            format!("{files} in the working tree. What should happen to them?"),
+            body,
             {
                 let view = view.clone();
                 let checkout = checkout.clone();
@@ -1401,7 +1881,7 @@ impl RepositoryView {
     /// Reloads everything a ref operation can have changed: the history and
     /// its badges, the sidebar's lists, the local-changes view and HEAD.
     fn after_ref_change(&mut self, cx: &mut Context<Self>) {
-        self.history.update(cx, |history, cx| history.reload(cx));
+        self.reload_history(cx);
         self.changes.update(cx, |changes, cx| changes.refresh(cx));
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.refresh(cx));
@@ -1456,9 +1936,12 @@ impl RepositoryView {
     fn stash_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.run_repo_action(window, cx, |repo| {
             if repo.stash_save(None)? {
-                Ok((ui::ToastKind::Ok, "Stashed local changes".to_owned()))
+                Ok((ui::ToastKind::Ok, ui::t!("repo.toast.stashed").to_string()))
             } else {
-                Ok((ui::ToastKind::Info, "No local changes to stash".to_owned()))
+                Ok((
+                    ui::ToastKind::Info,
+                    ui::t!("repo.toast.nothing_to_stash").to_string(),
+                ))
             }
         });
     }
@@ -1583,7 +2066,7 @@ impl RepositoryView {
         let generation = self.network_generation;
         self.network = Some(NetworkActivity {
             verb: job.verb(),
-            detail: "Connecting…".into(),
+            detail: ui::t!("repo.network.connecting"),
             progress: None,
         });
         cx.notify();
@@ -1674,7 +2157,7 @@ impl RepositoryView {
 
     /// Reloads everything a remote change can affect.
     fn reload_after_network(&mut self, cx: &mut Context<Self>) {
-        self.history.update(cx, |history, cx| history.reload(cx));
+        self.reload_history(cx);
         self.changes.update(cx, |changes, cx| changes.refresh(cx));
         self.refresh(cx);
         cx.notify();
@@ -1692,11 +2175,11 @@ impl RepositoryView {
         );
     }
 
-    fn pull_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn pull_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.start_network_job(Job::Pull, window, cx);
     }
 
-    fn push_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn push_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.start_network_job(Job::Push, window, cx);
     }
 
@@ -2008,6 +2491,255 @@ impl RepositoryView {
         menu::open_dropdown(anchor, entries, window, cx);
     }
 
+    /// The worktree switcher popover is open (its button is pressed).
+    pub(crate) fn worktree_switcher_open(&self) -> bool {
+        self.worktree_switcher
+            .as_ref()
+            .is_some_and(|weak| weak.upgrade().is_some())
+    }
+
+    /// Opens the worktree switcher (Ctrl Alt W) under its titlebar button; a
+    /// second call closes it.
+    pub(crate) fn open_worktree_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(open) = self
+            .worktree_switcher
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+        {
+            open.update(cx, |switcher, cx| switcher.close(window, cx));
+            return;
+        }
+        // Without the button (narrow bar) the popover opens under the branch
+        // switcher instead.
+        let anchor = self
+            .worktree_bounds
+            .get()
+            .or(self.branch_bounds.get())
+            .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), size(px(200.), px(28.))));
+        let repo = cx.entity().downgrade();
+        let add: worktree_switcher::OpenAdd = Rc::new(move |window, cx| {
+            repo.update(cx, |view, cx| {
+                view.worktrees
+                    .update(cx, |worktrees, cx| worktrees.open_add(window, cx));
+            })
+            .ok();
+        });
+        let switcher =
+            worktree_switcher::open(self.worktrees_model.clone(), anchor, add, window, cx);
+        // Any way of closing it (Esc, a click outside, a pick) releases the
+        // popover; the button un-presses then.
+        self._worktree_switcher_release = Some(cx.observe_release(&switcher, |view, _, cx| {
+            view.worktree_switcher = None;
+            cx.notify();
+        }));
+        self.worktree_switcher = Some(switcher.downgrade());
+        cx.notify();
+    }
+
+    /// Opens the command palette (Ctrl P) over this repository.
+    pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let history = self.history.read(cx);
+        let state = palette::ViewState {
+            idle_lanes_collapsed: history.idle_lanes_collapsed(),
+            activity_collapsed: self.activity.read(cx).is_collapsed(),
+        };
+        let sources = palette::Sources::new(
+            state,
+            history.head(),
+            history.refs().unwrap_or(&[]),
+            &history.loaded_commits(),
+        );
+        let init = palette::Init {
+            repo: cx.weak_entity(),
+            workspace: self.workspace.clone(),
+            sources,
+            git: self.git.clone(),
+            root: self.root.clone(),
+        };
+        palette::open(init, window, cx);
+    }
+
+    /// Runs a palette command that belongs to the repository view. The ones
+    /// the workspace owns (settings, open, clone, close) never get here.
+    pub(crate) fn run_palette_command(
+        &mut self,
+        command: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            Command::FetchAll => self.fetch_remotes(window, cx),
+            Command::Pull => self.pull_branch(window, cx),
+            Command::Push => self.push_branch(window, cx),
+            Command::StashChanges => self.stash_changes(window, cx),
+            Command::SwitchBranch => self.open_branch_menu(window, cx),
+            Command::CreateBranchHere => {
+                // "Here" is the selected commit, with HEAD as the fallback,
+                // as for "Create tag here".
+                let oid = self
+                    .history
+                    .read(cx)
+                    .selected_commit()
+                    .map(|commit| commit.id)
+                    .or_else(|| self.head_oid(cx));
+                match oid {
+                    Some(oid) => {
+                        self.run_sidebar_action(SidebarAction::CreateBranchAt(oid), window, cx);
+                    }
+                    None => {
+                        toast::show(
+                            ui::ToastKind::Warn,
+                            ui::t!("repo.toast.commit_before_branch"),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
+            Command::CreateTagHere => self.run_sidebar_action(SidebarAction::CreateTag, window, cx),
+            Command::ShowBranchCommits => match self.history.read(cx).head() {
+                Some(Head::Branch { name, .. }) => {
+                    let name = name.clone();
+                    self.show_branch_commits(name, window, cx);
+                }
+                _ => {
+                    ui::toast::show(
+                        ui::ToastKind::Info,
+                        ui::t!("repo.toast.detached_no_branch"),
+                        window,
+                        cx,
+                    );
+                }
+            },
+            Command::AddRemote => self.run_sidebar_action(SidebarAction::AddRemote, window, cx),
+            Command::AddWorktree => self.run_sidebar_action(SidebarAction::AddWorktree, window, cx),
+            Command::Refresh => self.run_sidebar_action(SidebarAction::Refresh, window, cx),
+            Command::ToggleSidebar => self.toggle_sidebar(cx),
+            Command::ToggleDetails => self.toggle_details(cx),
+            Command::ToggleActivity if !crate::activity_strip::enabled(cx) => {}
+            Command::ToggleActivity => {
+                let collapsed = self.activity.read(cx).is_collapsed();
+                self.activity
+                    .update(cx, |activity, cx| activity.set_collapsed(!collapsed, cx));
+            }
+            Command::FocusSearch => {
+                let focus = self.search_focus();
+                window.focus(&focus, cx);
+            }
+            Command::ShowHistory => self.set_view(ViewMode::History, window, cx),
+            Command::ShowChanges => self.set_view(ViewMode::Changes, window, cx),
+            Command::ShowWorktrees => self.set_view(ViewMode::Worktrees, window, cx),
+            Command::CollapseIdleLanes => self.history.update(cx, |history, cx| {
+                let collapsed = history.idle_lanes_collapsed();
+                history.set_collapse(!collapsed, cx);
+            }),
+            Command::FitGraph => self.history.update(cx, |history, cx| history.fit_graph(cx)),
+            Command::OpenSettings(_)
+            | Command::OpenRepository
+            | Command::Clone
+            | Command::CloseRepository => {
+                debug_assert!(false, "{command:?} is run by the workspace");
+            }
+        }
+    }
+
+    /// A palette branch pick: the sidebar's checkout, with its dialog for
+    /// uncommitted changes.
+    pub(crate) fn palette_checkout(
+        &mut self,
+        name: String,
+        remote: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let action = if remote {
+            SidebarAction::CheckoutRemoteBranch(name)
+        } else {
+            SidebarAction::CheckoutBranch(name)
+        };
+        self.run_sidebar_action(action, window, cx);
+    }
+
+    /// Shows the History narrowed to `branch`'s own commits and empties the
+    /// search field the filter replaces.
+    fn show_branch_commits(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view(ViewMode::History, window, cx);
+        self.search.update(cx, |input, cx| input.set_text("", cx));
+        self.history.update(cx, |history, cx| {
+            history.set_branch_filter(Some(branch), cx)
+        });
+        let focus = self.history.read(cx).list_focus();
+        window.focus(&focus, cx);
+    }
+
+    /// A palette commit pick: shows the History and selects the commit.
+    pub(crate) fn palette_reveal_commit(
+        &mut self,
+        oid: Oid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_view(ViewMode::History, window, cx);
+        self.history
+            .update(cx, |history, cx| history.reveal_commit(oid, cx));
+        let focus = self.history.read(cx).list_focus();
+        window.focus(&focus, cx);
+    }
+
+    /// A palette file pick. A file with local changes opens Local changes;
+    /// any other file selects the latest commit that touched it in History.
+    pub(crate) fn palette_reveal_file(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+                return;
+            }
+        };
+        let root = self.root.clone();
+        let file = path.clone();
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &root)?;
+                    if repo.changed_paths()?.contains(&file) {
+                        return Ok(None);
+                    }
+                    let options = git_core::LogOptions {
+                        paths: vec![file],
+                        max_count: Some(1),
+                        ..git_core::LogOptions::default()
+                    };
+                    let latest = repo.log(&options)?.next_chunk(1)?.into_iter().next();
+                    Ok::<_, Error>(Some(latest.map(|commit| commit.id)))
+                })
+                .await;
+            this.update_in(cx, |view, window, cx| match found {
+                Ok(None) => view.set_view(ViewMode::Changes, window, cx),
+                Ok(Some(Some(oid))) => view.palette_reveal_commit(oid, window, cx),
+                Ok(Some(None)) => {
+                    toast::show(
+                        ui::ToastKind::Info,
+                        ui::t!("repo.toast.no_commits_yet", path = path),
+                        window,
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn repo_menu_entries(&self, cx: &Context<Self>) -> Vec<MenuEntry> {
         let recent = cx
             .try_global::<crate::AppSettings>()
@@ -2044,9 +2776,9 @@ impl RepositoryView {
         }
         let workspace = self.workspace.clone();
         entries.push(MenuEntry::Item(
-            MenuItem::new("Open repository…")
+            MenuItem::new(ui::t!("repo.menu.open_repository"))
                 .icon(IconName::Folder)
-                .shortcut("Ctrl O")
+                .shortcut("Ctrl+O")
                 .action(move |window, cx| {
                     workspace
                         .update(cx, |workspace, cx| {
@@ -2057,7 +2789,7 @@ impl RepositoryView {
         ));
         let view = cx.entity();
         entries.push(MenuEntry::Item(
-            MenuItem::new("Worktrees…")
+            MenuItem::new(ui::t!("repo.menu.worktrees"))
                 .icon(IconName::Worktree)
                 .action(move |window, cx| {
                     view.update(cx, |view, cx| {
@@ -2067,7 +2799,7 @@ impl RepositoryView {
         ));
         let workspace = self.workspace.clone();
         entries.push(MenuEntry::Item(
-            MenuItem::new("Close repository")
+            MenuItem::new(ui::t!("repo.menu.close_repository"))
                 .icon(IconName::X)
                 .action(move |window, cx| {
                     workspace
@@ -2080,9 +2812,9 @@ impl RepositoryView {
         let view = cx.entity();
         entries.push(MenuEntry::Item(
             MenuItem::new(if enabled {
-                "Fetch in the background"
+                ui::t!("repo.menu.fetch_background_on")
             } else {
-                "Background fetch is off"
+                ui::t!("repo.menu.fetch_background_off")
             })
             .icon(if enabled {
                 IconName::Check
@@ -2104,7 +2836,7 @@ impl RepositoryView {
         };
         let Some(refs) = history.refs() else {
             return vec![MenuEntry::Item(
-                MenuItem::new("Loading branches…")
+                MenuItem::new(ui::t!("repo.menu.loading_branches"))
                     .icon(IconName::Branch)
                     .disabled(true),
             )];
@@ -2138,7 +2870,7 @@ impl RepositoryView {
         }
         if count == 0 {
             entries.push(MenuEntry::Item(
-                MenuItem::new("No local branches")
+                MenuItem::new(ui::t!("repo.menu.no_local_branches"))
                     .icon(IconName::Branch)
                     .disabled(true),
             ));
@@ -2150,7 +2882,7 @@ impl RepositoryView {
             None => None,
         };
         let card = head_oid.map(CommitCard::bare);
-        let mut create = MenuItem::new("Create branch…").icon(IconName::Plus);
+        let mut create = MenuItem::new(ui::t!("repo.menu.create_branch")).icon(IconName::Plus);
         if let Some(card) = card {
             let view = cx.entity();
             let card = history.card_for(card.oid);
@@ -2173,7 +2905,7 @@ impl RepositoryView {
     fn branch_label(&self, cx: &Context<Self>) -> SharedString {
         match self.history.read(cx).head() {
             Some(Head::Branch { name, .. }) => name.clone().into(),
-            Some(Head::Detached(oid)) => oid.short().into(),
+            Some(Head::Detached(_)) => ui::t!("repo.toolbar.detached_head"),
             None => "…".into(),
         }
     }
@@ -2189,7 +2921,7 @@ impl RepositoryView {
 
         let sidebar_toggle = Button::ghost("sidebar-toggle")
             .icon_only(IconName::Sidebar)
-            .tooltip_kbd("Toggle sidebar", "Ctrl B")
+            .tooltip_kbd(ui::t!("repo.toolbar.toggle_sidebar"), "Ctrl+B")
             .on_click(cx.listener(|view, _, _, cx| view.toggle_sidebar(cx)));
 
         let repo_click = {
@@ -2204,7 +2936,7 @@ impl RepositoryView {
             Some(self.repo_name.clone()),
             layout.repo_name,
             layout.item_pad,
-            ("Switch repository", None),
+            (ui::t!("repo.toolbar.switch_repository"), None),
             self.repo_bounds.clone(),
             repo_click,
             colors,
@@ -2222,9 +2954,37 @@ impl RepositoryView {
             Some(branch),
             layout.branch_name,
             layout.item_pad,
-            ("Switch branch", Some("Ctrl Shift B")),
+            (ui::t!("repo.toolbar.switch_branch"), Some("Ctrl+Shift+B")),
             self.branch_bounds.clone(),
             branch_click,
+            colors,
+        );
+
+        if !layout.worktree_button {
+            self.worktree_bounds.set(None);
+        }
+        let worktree_click = {
+            let view = cx.entity();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                view.update(cx, |view, cx| view.open_worktree_switcher(window, cx));
+            }
+        };
+        let (worktree_name, worktree_changed) = {
+            let model = self.worktrees_model.read(cx);
+            match model.current() {
+                Some(entry) => (entry.name().into(), entry.changes.len()),
+                None => (self.repo_name.clone(), 0),
+            }
+        };
+        let worktree_switcher = worktree_switcher::titlebar_button(
+            worktree_name,
+            layout.worktree_name,
+            layout.item_pad,
+            worktree_changed,
+            self.worktree_switcher_open(),
+            crate::settings_ui::keybindings::key_cap(cx, "worktree_switcher"),
+            self.worktree_bounds.clone(),
+            worktree_click,
             colors,
         );
 
@@ -2236,12 +2996,12 @@ impl RepositoryView {
         let stash_view = cx.entity();
         let mut stash_button = Button::tool("toolbar-stash")
             .icon(IconName::Stash)
-            .tooltip_kbd("Stash local changes", "Ctrl Shift S")
+            .tooltip_kbd(ui::t!("repo.toolbar.stash_tip"), "Ctrl+Shift+S")
             .on_click(move |_, window, cx| {
                 stash_view.update(cx, |view, cx| view.stash_changes(window, cx));
             });
         if layout.labels {
-            stash_button = stash_button.label("Stash");
+            stash_button = stash_button.label(ui::t!("repo.toolbar.stash"));
         }
         if stash_count > 0 {
             stash_button = stash_button.counter(Counter::new(stash_count.to_string()));
@@ -2269,17 +3029,29 @@ impl RepositoryView {
         let fetch_button = network_tool(
             "toolbar-fetch",
             IconName::Fetch,
-            "Fetch",
-            "Fetch all remotes, tags and pruned branches",
+            ui::t!("repo.toolbar.fetch"),
+            ui::t!("repo.toolbar.fetch_tip").to_string(),
+            crate::settings_ui::keybindings::key_cap(cx, "fetch"),
+            None,
             layout.labels,
             busy,
             fetch,
         );
+        let hints = {
+            let history = self.history.read(cx);
+            let remotes = self
+                .sidebar_extras
+                .as_ref()
+                .map_or(&[][..], |extras| extras.remotes.as_slice());
+            network_hints(history.head(), history.refs(), remotes)
+        };
         let pull_button = network_tool(
             "toolbar-pull",
             IconName::Down,
-            "Pull",
-            "Pull the current branch (fast-forward only)",
+            ui::t!("repo.toolbar.pull"),
+            hints.pull_tip,
+            crate::settings_ui::keybindings::key_cap(cx, "pull"),
+            (hints.behind > 0).then(|| Counter::new(format!("↓{}", hints.behind))),
             layout.labels,
             busy,
             pull,
@@ -2287,8 +3059,10 @@ impl RepositoryView {
         let push_button = network_tool(
             "toolbar-push",
             IconName::Up,
-            "Push",
-            "Push the current branch",
+            ui::t!("repo.toolbar.push"),
+            hints.push_tip,
+            crate::settings_ui::keybindings::key_cap(cx, "push"),
+            (hints.ahead > 0).then(|| Counter::new(format!("↑{}", hints.ahead)).accent()),
             layout.labels,
             busy,
             push,
@@ -2300,6 +3074,7 @@ impl RepositoryView {
             .child(no_shrink(sidebar_toggle))
             .child(repo_switcher)
             .child(branch_switcher)
+            .when(layout.worktree_button, |bar| bar.child(worktree_switcher))
             .child(no_shrink(
                 div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(colors.border),
             ))
@@ -2310,30 +3085,36 @@ impl RepositoryView {
             .child(titlebar_fill());
 
         let history_item = if layout.labels {
-            SegmentItem::new("History").with_icon(IconName::Lanes)
+            SegmentItem::new(ui::t!("repo.toolbar.view_history")).with_icon(IconName::Lanes)
         } else {
             SegmentItem::icon(IconName::Lanes)
         };
         let changes_item = if layout.labels {
-            SegmentItem::new("Changes").with_icon(IconName::Edit)
+            SegmentItem::new(ui::t!("repo.toolbar.view_changes")).with_icon(IconName::Edit)
         } else {
             SegmentItem::icon(IconName::Edit)
+        };
+        let worktrees_item = if layout.labels {
+            SegmentItem::new(ui::t!("repo.toolbar.view_worktrees")).with_icon(IconName::Worktree)
+        } else {
+            SegmentItem::icon(IconName::Worktree)
         };
         let switch_view = cx.entity();
         bar = bar.child(no_shrink(
             Segmented::new("view-switch")
                 .item(history_item)
-                .item(changes_item.tooltip("Local changes"))
-                .selected(match self.view {
-                    ViewMode::History | ViewMode::Worktrees => 0,
-                    ViewMode::Changes => 1,
-                })
+                .item(changes_item.tooltip(ui::t!("repo.toolbar.local_changes")))
+                .item(
+                    match crate::settings_ui::keybindings::key_cap(cx, "worktree_switcher") {
+                        Some(cap) => {
+                            worktrees_item.tooltip_kbd(ui::t!("repo.toolbar.view_worktrees"), cap)
+                        }
+                        None => worktrees_item.tooltip(ui::t!("repo.toolbar.view_worktrees")),
+                    },
+                )
+                .selected(segment_for_view(self.view))
                 .on_select(move |index, window, cx| {
-                    let mode = if index == 1 {
-                        ViewMode::Changes
-                    } else {
-                        ViewMode::History
-                    };
+                    let mode = view_for_segment(index);
                     switch_view.update(cx, |view, cx| view.set_view(mode, window, cx));
                 }),
         ));
@@ -2342,7 +3123,7 @@ impl RepositoryView {
         match self.history.read(cx).search_status() {
             // A query replaces the key hint with its count (or "No matches").
             Some(status) => field = field.trailing_text(status),
-            None if layout.search_kbd => field = field.hint("Ctrl K"),
+            None if layout.search_kbd => field = field.hint("Ctrl+K"),
             None => {}
         }
         bar = bar.child(
@@ -2363,8 +3144,8 @@ impl RepositoryView {
                     view.search_focus_list(window, cx);
                 }))
                 .tooltip(Tooltip::with_kbd(
-                    "Search commits, authors, hashes",
-                    "Ctrl K",
+                    ui::t!("repo.search.placeholder"),
+                    "Ctrl+K",
                 ))
                 .child(field),
         );
@@ -2378,7 +3159,7 @@ impl RepositoryView {
         bar = bar.child(no_shrink(
             Button::ghost("settings-button")
                 .icon_only(IconName::Gear)
-                .tooltip_kbd("Settings", "Ctrl ,")
+                .tooltip_kbd(ui::t!("repo.toolbar.settings"), "Ctrl+,")
                 .on_click(settings_click),
         ));
 
@@ -2387,14 +3168,21 @@ impl RepositoryView {
 
     fn render_sidebar(&mut self, width: f32, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
-        let nodes = self.tree_nodes(cx);
+        let worktrees_mode = self.view == ViewMode::Worktrees;
+        let panel = worktrees_mode.then(|| self.worktree_panel(cx));
+        // The tree is not built while the worktree panel stands in for it.
+        let nodes = if worktrees_mode {
+            Vec::new()
+        } else {
+            self.tree_nodes(cx)
+        };
         if let Some(index) = nodes.iter().position(|node| node.current) {
             // ScrollHandle applies this during prepaint, so asking during
             // render lands on the rows that are about to be laid out.
             self.sidebar_scroll.scroll_to_item(index);
         }
         let filtering = !self.filter.trim().is_empty();
-        let no_matches = filtering && nodes.is_empty();
+        let no_matches = !worktrees_mode && filtering && nodes.is_empty();
         // Every row's identity and expansion, so a click, Enter/Space or
         // ←/→ can toggle any expandable node, not only the sections.
         let rows: Vec<(SharedString, bool, bool)> = nodes
@@ -2419,6 +3207,40 @@ impl RepositoryView {
                 });
             }
         };
+        // Enter checks out a branch or tag row; every other row keeps the
+        // activation Space gives (select, reveal, or toggle a folder).
+        let confirm = {
+            let activate = activate.clone();
+            let rows = rows.clone();
+            let view = view.clone();
+            move |index: usize, window: &mut Window, cx: &mut App| {
+                let Some((key, has_children, _)) = rows.get(index).cloned() else {
+                    return;
+                };
+                let handled = !has_children
+                    && view.update(cx, |view, cx| {
+                        view.run_sidebar_shortcut(&key, "Enter", window, cx)
+                    });
+                if !handled {
+                    activate(index, window, cx);
+                }
+            }
+        };
+        // F2 and Delete run the row menu's Rename / Delete item.
+        let shortcut = |hint: &'static str| {
+            let rows = rows.clone();
+            let view = view.clone();
+            move |index: usize, window: &mut Window, cx: &mut App| {
+                let Some((key, _, _)) = rows.get(index).cloned() else {
+                    return;
+                };
+                view.update(cx, |view, cx| {
+                    view.run_sidebar_shortcut(&key, hint, window, cx);
+                });
+            }
+        };
+        let rename = shortcut("F2");
+        let delete = shortcut("Del");
         // A right-click selects the row and opens its kind's menu at the
         // pointer; the sidebar keeps the keyboard focus.
         let context_menu = {
@@ -2479,6 +3301,7 @@ impl RepositoryView {
                     .min_h_0()
                     .flex()
                     .flex_col()
+                    .when_some(panel, |this, panel| this.child(panel))
                     .when(no_matches, |this| {
                         this.child(
                             div()
@@ -2490,10 +3313,10 @@ impl RepositoryView {
                                 .items_center()
                                 .text_size(FS_SM)
                                 .text_color(colors.muted)
-                                .child("No matches"),
+                                .child(ui::t!("repo.sidebar.no_matches")),
                         )
                     })
-                    .when(!no_matches, |this| {
+                    .when(!no_matches && !worktrees_mode, |this| {
                         this.child(
                             div().w_full().flex_1().min_w_0().min_h_0().child(
                                 Tree::new("sidebar-tree", nodes)
@@ -2503,6 +3326,9 @@ impl RepositoryView {
                                     .on_expand(node_toggler(rows.clone(), view.clone()))
                                     .on_collapse(node_toggler(rows.clone(), view.clone()))
                                     .on_activate(activate)
+                                    .on_confirm(confirm)
+                                    .on_rename(rename)
+                                    .on_delete(delete)
                                     .on_open(open)
                                     .on_context_menu(context_menu),
                             ),
@@ -2608,12 +3434,12 @@ impl RepositoryView {
             .item(
                 SegmentItem::icon(IconName::PanelR)
                     .id("dock-right")
-                    .tooltip("Dock details to the right"),
+                    .tooltip(ui::t!("repo.details.dock_right")),
             )
             .item(
                 SegmentItem::icon(IconName::PanelB)
                     .id("dock-bottom")
-                    .tooltip("Dock details to the bottom"),
+                    .tooltip(ui::t!("repo.details.dock_bottom")),
             )
             .selected(if dock == Dock::Right { 0 } else { 1 })
             .on_select(move |index, _, cx| {
@@ -2637,7 +3463,7 @@ impl RepositoryView {
             .border_b_1()
             .border_color(colors.border)
             .font_weight(FontWeight::SEMIBOLD)
-            .child("Commit")
+            .child(ui::t!("repo.details.title"))
             .when_some(short, |this, hash| {
                 this.child(
                     div()
@@ -2749,7 +3575,9 @@ impl RepositoryView {
 
     fn render_info_content(&self, colors: ThemeColors, cx: &mut Context<Self>) -> AnyElement {
         match &self.details {
-            DetailsState::Empty => muted_note("Select a commit", colors).into_any_element(),
+            DetailsState::Empty => {
+                muted_note(ui::t!("repo.details.select_commit"), colors).into_any_element()
+            }
             DetailsState::Loading => div()
                 .flex()
                 .flex_col()
@@ -2769,7 +3597,7 @@ impl RepositoryView {
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Could not load the commit"),
+                        .child(ui::t!("repo.details.load_failed")),
                 )
                 .child(div().text_color(colors.error).child(message.clone()))
                 .into_any_element(),
@@ -2846,7 +3674,9 @@ impl RepositoryView {
             .child(hash);
 
         let parents = if details.parents.is_empty() {
-            div().text_color(colors.muted).child("none (root commit)")
+            div()
+                .text_color(colors.muted)
+                .child(ui::t!("repo.details.root_commit"))
         } else {
             let view = cx.entity();
             let mut row = div().flex().items_center().gap(px(6.));
@@ -2885,11 +3715,15 @@ impl RepositoryView {
                     .flex_col()
                     .gap(px(6.))
                     .text_size(FS_SM)
-                    .child(meta_row("Author", author, colors))
-                    .child(meta_row("Authored", authored, colors))
-                    .child(meta_row("Committer", committer, colors))
-                    .child(meta_row("Hash", hash, colors))
-                    .child(meta_row("Parents", parents, colors)),
+                    .child(meta_row(ui::t!("repo.details.author"), author, colors))
+                    .child(meta_row(ui::t!("repo.details.authored"), authored, colors))
+                    .child(meta_row(
+                        ui::t!("repo.details.committer"),
+                        committer,
+                        colors,
+                    ))
+                    .child(meta_row(ui::t!("repo.details.hash"), hash, colors))
+                    .child(meta_row(ui::t!("repo.details.parents"), parents, colors)),
             )
             .into_any_element()
     }
@@ -2917,7 +3751,7 @@ impl RepositoryView {
                 div()
                     .font_weight(FontWeight::BOLD)
                     .text_color(colors.text)
-                    .child("Changed files"),
+                    .child(ui::t!("repo.details.changed_files")),
             );
         if let Some(count) = count {
             header = header.child(CountPill::new(count.to_string()));
@@ -2927,8 +3761,8 @@ impl RepositoryView {
             header = header.child(
                 div()
                     .id("details-vs-parent")
-                    .tooltip(Tooltip::text("Combined diff against first parent"))
-                    .child("vs parent 1"),
+                    .tooltip(Tooltip::text(ui::t!("repo.details.vs_parent_tip")))
+                    .child(ui::t!("repo.details.vs_parent")),
             );
         }
 
@@ -2963,11 +3797,11 @@ impl RepositoryView {
                     .p(px(12.))
                     .text_color(colors.error)
                     .child(message.clone()),
-                _ => muted_note("No files changed", colors),
+                _ => muted_note(ui::t!("repo.details.no_files"), colors),
             };
         };
         if files.is_empty() {
-            return muted_note("No files changed", colors);
+            return muted_note(ui::t!("repo.details.no_files"), colors);
         }
 
         let view = cx.entity();
@@ -3060,12 +3894,12 @@ impl RepositoryView {
         let switch = Segmented::new("diff-layout")
             .small()
             .item(
-                SegmentItem::new("Unified")
+                SegmentItem::new(ui::t!("repo.diff.unified"))
                     .with_icon(IconName::Unified)
                     .id("diff-unified"),
             )
             .item(
-                SegmentItem::new("Side-by-side")
+                SegmentItem::new(ui::t!("repo.diff.side_by_side"))
                     .with_icon(IconName::Split)
                     .id("diff-split"),
             )
@@ -3081,7 +3915,7 @@ impl RepositoryView {
         toolbar = toolbar.child(no_shrink(switch));
 
         let body = match &self.diff {
-            DiffState::Empty => diff_note("Select a file", colors),
+            DiffState::Empty => diff_note(ui::t!("repo.diff.select_file"), colors),
             DiffState::Loading => div()
                 .flex_1()
                 .min_h_0()
@@ -3093,7 +3927,7 @@ impl RepositoryView {
                 .child(Skeleton::new("diff-skeleton-2", px(260.)))
                 .child(Skeleton::new("diff-skeleton-3", px(290.))),
             DiffState::Failed(message) if message.contains("too large") => {
-                diff_note("Diff too large to display", colors)
+                diff_note(ui::t!("repo.diff.too_large"), colors)
             }
             DiffState::Failed(message) => div()
                 .flex_1()
@@ -3103,13 +3937,13 @@ impl RepositoryView {
                 .child(message.clone()),
             DiffState::Loaded(data) => {
                 if data.diff.binary {
-                    diff_note("Binary file", colors)
+                    diff_note(ui::t!("repo.diff.binary"), colors)
                 } else if data.rows.is_empty() {
-                    diff_note("No changes", colors)
+                    diff_note(ui::t!("repo.diff.no_changes"), colors)
                 } else {
                     let data = data.clone();
                     let list = if layout == DiffLayout::Split {
-                        let row_width = split_width(self.mono_cell, data.columns, width);
+                        let row_width = split_width(width);
                         uniform_list(
                             "details-diff",
                             data.split_rows.len(),
@@ -3269,7 +4103,7 @@ impl RepositoryView {
                     .items_center()
                     .gap(px(8.))
                     .child(Spinner::new("network-status-spinner", px(12.)))
-                    .child(network.verb)
+                    .child(network.verb.clone())
                     .child(div().max_w(px(260.)).truncate().child(detail)),
             );
             bar = bar.child(match network.progress {
@@ -3287,7 +4121,7 @@ impl RepositoryView {
                         .items_center()
                         .gap(px(8.))
                         .child(Spinner::new("status-spinner", px(12.)))
-                        .child("Loading changes…"),
+                        .child(ui::t!("repo.status.loading_changes")),
                 );
             } else if let Some(error) = changes.failure() {
                 bar = bar.child(
@@ -3300,10 +4134,10 @@ impl RepositoryView {
                 );
             }
             bar = bar.child(div().flex_1());
-            bar = bar.child(format!(
-                "{} unstaged · {} staged",
-                changes.unstaged_count(),
-                changes.staged_count()
+            bar = bar.child(ui::t!(
+                "repo.status.unstaged_staged",
+                unstaged = changes.unstaged_count(),
+                staged = changes.staged_count()
             ));
         } else {
             let history = self.history.read(cx);
@@ -3316,11 +4150,15 @@ impl RepositoryView {
                             .items_center()
                             .gap(px(8.))
                             .child(Spinner::new("status-spinner", px(12.)))
-                            .child("Loading history…"),
+                            .child(ui::t!("repo.status.loading_history")),
                     );
                 }
                 LoadState::Cancelled => {
-                    bar = bar.child(div().text_color(colors.muted).child("Loading cancelled"));
+                    bar = bar.child(
+                        div()
+                            .text_color(colors.muted)
+                            .child(ui::t!("repo.status.loading_cancelled")),
+                    );
                 }
                 LoadState::Failed(failure) => {
                     bar = bar.child(
@@ -3338,12 +4176,14 @@ impl RepositoryView {
             if fill {
                 bar = bar.child(div().flex_1());
             }
-            bar = bar.child(format!(
-                "{} commits loaded",
-                format_count(history.commit_count())
+            bar = bar.child(ui::i18n::t_count(
+                "repo.status.commits_loaded",
+                history.commit_count() as u64,
+                &[("n", &format_count(history.commit_count()))],
             ));
         }
 
+        let workspace = self.workspace.clone();
         bar.child(
             div()
                 .id("status-git")
@@ -3354,7 +4194,16 @@ impl RepositoryView {
                 .gap(px(4.))
                 .rounded(R_SM)
                 .text_color(colors.muted)
+                .cursor_pointer()
+                .hover(|this| this.bg(colors.hover))
                 .tooltip(Tooltip::text(self.git_tooltip.clone()))
+                .on_click(
+                    move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                        let _ = workspace.update(cx, |workspace, cx| {
+                            workspace.open_settings_at(crate::settings_ui::Page::Git, window, cx)
+                        });
+                    },
+                )
                 .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
                 .child(self.git_label.clone()),
         )
@@ -3366,7 +4215,8 @@ impl Render for RepositoryView {
         let client = matches!(window.window_decorations(), Decorations::Client { .. });
         let colors = cx.theme().colors;
         let width = f32::from(window.viewport_size().width);
-        let layout = toolbar_layout(width);
+        let height = f32::from(window.viewport_size().height);
+        let layout = toolbar_layout(width, toolbar_label_extra(window));
 
         // Until the user picks a side, the dock follows the window width, so
         // a window resized past the breakpoint docks the details right. The
@@ -3394,12 +4244,12 @@ impl Render for RepositoryView {
         };
         let details_limit = match self.dock {
             Dock::Right => details_width_limit(width, sidebar_width),
-            Dock::Bottom => dock_bounds(Dock::Bottom).1,
+            Dock::Bottom => details_height_limit(height),
         };
         let details_width = if self.details_open {
             match self.dock {
                 Dock::Right => effective_details_width(self.details_size, width, sidebar_width),
-                Dock::Bottom => clamp_details(self.details_size, Dock::Bottom),
+                Dock::Bottom => effective_details_height(self.details_size, height),
             }
         } else {
             0.
@@ -3423,8 +4273,24 @@ impl Render for RepositoryView {
             .then(|| self.render_details(details_width, width - sidebar_width - 5., cx));
         let status = self.render_status_bar(cx);
 
+        // The strip is off with the Settings switch; its day filter would
+        // otherwise leave History narrowed with no visible reason.
+        let show_activity = crate::activity_strip::enabled(cx);
+        self.activity
+            .update(cx, |activity, cx| activity.set_enabled(show_activity, cx));
+        if !show_activity && self.history.read(cx).day_filter().is_some() {
+            self.history
+                .update(cx, |history, cx| history.set_day_filter(None, cx));
+        }
+
         let content = match self.view {
-            ViewMode::History => self.history.clone().into_any_element(),
+            ViewMode::History => div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .children(show_activity.then(|| self.activity.clone()))
+                .child(div().flex_1().min_h_0().child(self.history.clone()))
+                .into_any_element(),
             ViewMode::Changes => self.changes.clone().into_any_element(),
             ViewMode::Worktrees => self.worktrees.clone().into_any_element(),
         };
@@ -3489,11 +4355,20 @@ impl Render for RepositoryView {
             .on_action(cx.listener(|view, _: &OpenBranchSwitcher, window, cx| {
                 view.open_branch_menu(window, cx);
             }))
+            .on_action(cx.listener(|view, _: &OpenWorktreeSwitcher, window, cx| {
+                view.open_worktree_switcher(window, cx);
+            }))
             .on_action(cx.listener(|view, _: &StashChanges, window, cx| {
                 view.stash_changes(window, cx);
             }))
             .on_action(cx.listener(|view, _: &FetchAll, window, cx| {
                 view.fetch_remotes(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &PullBranch, window, cx| {
+                view.pull_branch(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &PushBranch, window, cx| {
+                view.push_branch(window, cx);
             }))
             .child(toolbar)
             .child(body)
@@ -3513,7 +4388,7 @@ fn switcher(
     name: Option<SharedString>,
     name_max: Option<f32>,
     padding: f32,
-    tooltip: (&'static str, Option<&'static str>),
+    tooltip: (SharedString, Option<&'static str>),
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     colors: ThemeColors,
@@ -3534,8 +4409,8 @@ fn switcher(
         .on_click(on_click)
         .child(Icon::new(icon).size(px(14.)).color(colors.muted));
     row = match tooltip.1 {
-        Some(kbd) => row.tooltip(Tooltip::with_kbd(tooltip.0, kbd)),
-        None => row.tooltip(Tooltip::text(tooltip.0)),
+        Some(kbd) => row.tooltip(Tooltip::with_kbd(tooltip.0.clone(), kbd)),
+        None => row.tooltip(Tooltip::text(tooltip.0.clone())),
     };
     if let (Some(name), Some(max)) = (name, name_max) {
         row = row.child(
@@ -3563,24 +4438,106 @@ fn no_shrink(child: impl IntoElement) -> Div {
 }
 
 /// A working toolbar tool button: the label is dropped on narrow windows.
+#[allow(clippy::too_many_arguments)]
 fn network_tool(
     id: &'static str,
     icon: IconName,
-    label: &'static str,
-    tooltip: &'static str,
+    label: SharedString,
+    tooltip: String,
+    kbd: Option<String>,
+    counter: Option<Counter>,
     labels: bool,
     busy: bool,
     action: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Button {
-    let button = Button::tool(id)
-        .icon(icon)
-        .disabled(busy)
-        .tooltip(tooltip)
-        .on_click(action);
+    let mut button = Button::tool(id).icon(icon).disabled(busy).on_click(action);
+    button = match kbd {
+        Some(kbd) => button.tooltip_kbd(tooltip, kbd),
+        None => button.tooltip(tooltip),
+    };
+    if let Some(counter) = counter {
+        button = button.counter(counter);
+    }
     if labels {
         button.label(label)
     } else {
         button
+    }
+}
+
+/// What the Pull and Push toolbar buttons say about the current branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NetworkHints {
+    pull_tip: String,
+    push_tip: String,
+    ahead: usize,
+    behind: usize,
+}
+
+/// The Pull / Push tooltips and counters, from the ahead/behind the refs
+/// already carry (as of the last fetch) — no git command runs per frame.
+fn network_hints(
+    head: Option<&Head>,
+    refs: Option<&[git_core::Ref]>,
+    remotes: &[String],
+) -> NetworkHints {
+    let branch = match head {
+        Some(Head::Branch { name, .. }) => Some(name.as_str()),
+        _ => None,
+    };
+    let local = branch.and_then(|name| {
+        refs.unwrap_or(&[])
+            .iter()
+            .find(|r| r.kind == RefKind::LocalBranch && r.name == name)
+    });
+    let upstream = local
+        .filter(|local| !local.upstream_gone)
+        .and_then(|local| local.upstream.as_deref());
+    let (ahead, behind) = match (local, upstream) {
+        (Some(local), Some(_)) => (local.ahead, local.behind),
+        _ => (0, 0),
+    };
+    let pull_tip = match upstream {
+        _ if ahead > 0 && behind > 0 => ui::t!("repo.network.pull_diverged").to_string(),
+        Some(upstream) if behind > 0 => ui::i18n::t_count(
+            "repo.network.pull_from",
+            behind as u64,
+            &[("upstream", &upstream)],
+        )
+        .to_string(),
+        Some(_) => ui::t!("repo.network.pull_nothing").to_string(),
+        None => ui::t!("repo.network.pull_no_upstream").to_string(),
+    };
+    let push_tip = match (upstream, branch) {
+        (Some(upstream), _) if ahead > 0 => ui::i18n::t_count(
+            "repo.network.push_to",
+            ahead as u64,
+            &[("upstream", &upstream)],
+        )
+        .to_string(),
+        (None, Some(branch)) => {
+            // Same remote the push itself picks: `origin`, else the first.
+            let remote = remotes
+                .iter()
+                .find(|remote| remote.as_str() == "origin")
+                .or_else(|| remotes.first());
+            match remote {
+                Some(remote) => ui::t!(
+                    "repo.network.push_set_upstream",
+                    remote = remote,
+                    branch = branch
+                )
+                .to_string(),
+                None => ui::t!("repo.network.push_current").to_string(),
+            }
+        }
+        _ => ui::t!("repo.network.push_current").to_string(),
+    };
+    NetworkHints {
+        pull_tip,
+        push_tip,
+        ahead,
+        behind,
     }
 }
 
@@ -3601,7 +4558,7 @@ const DIFF_GUTTER: f32 = 44.;
 const DIFF_MARKER: f32 = 16.;
 
 /// A muted, centred message for a diff that has nothing to paint.
-fn diff_note(text: &'static str, colors: ThemeColors) -> Div {
+fn diff_note(text: SharedString, colors: ThemeColors) -> Div {
     div()
         .flex_1()
         .min_h_0()
@@ -3741,9 +4698,10 @@ fn diff_marker(kind: RowKind, background: Option<Hsla>, colors: ThemeColors) -> 
 }
 
 /// The width of one side-by-side row: two gutters and two equal text halves.
-fn split_width(cell: Pixels, columns: usize, pane: f32) -> Pixels {
-    let half = columns as f32 * f32::from(cell) + 12.;
-    px((2. * DIFF_GUTTER + 2. * half).max(pane))
+fn split_width(pane: f32) -> Pixels {
+    // Two equal halves that fill the pane whatever the content width; each
+    // half clips its own lines (design: `.sbs { overflow: hidden }`).
+    px(pane)
 }
 
 /// One side-by-side row: a hunk header, a note, or an old/new cell pair.
@@ -3924,7 +4882,7 @@ fn diff_text_run(len: usize, font: &gpui::Font, color: Hsla, background: Option<
 }
 
 /// A muted one-line note, for an empty pane or a cleared selection.
-fn muted_note(label: &'static str, colors: ThemeColors) -> Div {
+fn muted_note(label: SharedString, colors: ThemeColors) -> Div {
     div()
         .flex()
         .items_center()
@@ -3936,7 +4894,7 @@ fn muted_note(label: &'static str, colors: ThemeColors) -> Div {
 }
 
 /// One label/value row of the details metadata grid.
-fn meta_row(label: &'static str, value: impl IntoElement, colors: ThemeColors) -> Div {
+fn meta_row(label: SharedString, value: impl IntoElement, colors: ThemeColors) -> Div {
     div()
         .flex()
         .items_center()
@@ -3949,6 +4907,50 @@ fn meta_row(label: &'static str, value: impl IntoElement, colors: ThemeColors) -
                 .child(label),
         )
         .child(div().flex_1().min_w_0().child(value))
+}
+
+/// The toolbar segment that shows `view`: History, Changes, Worktrees.
+fn segment_for_view(view: ViewMode) -> usize {
+    match view {
+        ViewMode::History => 0,
+        ViewMode::Changes => 1,
+        ViewMode::Worktrees => 2,
+    }
+}
+
+/// The view the toolbar segment at `index` opens.
+fn view_for_segment(index: usize) -> ViewMode {
+    match index {
+        1 => ViewMode::Changes,
+        2 => ViewMode::Worktrees,
+        _ => ViewMode::History,
+    }
+}
+
+/// Runs one item of a worktree's context menu.
+fn run_worktree_action(
+    action: WorktreeAction,
+    path: &Path,
+    model: &Entity<WorktreesModel>,
+    view: &Entity<RepositoryView>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match action {
+        WorktreeAction::Switch => model.update(cx, |model, cx| model.switch_to(path, window, cx)),
+        WorktreeAction::OpenInWindow => {
+            model.update(cx, |model, cx| model.open_in_window(path, window, cx))
+        }
+        WorktreeAction::Reveal => model.update(cx, |model, cx| model.reveal(path, window, cx)),
+        WorktreeAction::CopyPath => model.update(cx, |model, cx| model.copy_path(path, window, cx)),
+        WorktreeAction::ToggleLock => {
+            model.update(cx, |model, cx| model.toggle_lock(path, window, cx))
+        }
+        WorktreeAction::Remove => view.update(cx, |view, cx| {
+            view.worktrees
+                .update(cx, |worktrees, cx| worktrees.open_remove(path, window, cx));
+        }),
+    }
 }
 
 /// A click, Enter/Space or ←/→ on an expandable row flips its expansion.
@@ -4031,84 +5033,131 @@ mod tests {
     #[test]
     fn toolbar_keeps_the_window_controls_visible_at_every_width() {
         // Inter 13px, generously rounded up per character: the prototype's own
-        // measurement is 51px for "gitwarp" (7.3px/char).
-        fn text(chars: usize) -> f32 {
-            chars as f32 * 8.
+        // measurement is 51px for "gitwarp" (7.3px/char). Wide (CJK) characters
+        // take 13px.
+        fn text(label: &str) -> f32 {
+            label
+                .chars()
+                .map(|c| match c as u32 {
+                    0..=0x7f => 8.,
+                    // Accented Latin and Cyrillic run a little wider than ASCII.
+                    0x80..=0x2e7f => 9.,
+                    _ => 13.,
+                })
+                .sum()
         }
-        // Every item at its worst case, in the same terms as the toolbar.
-        fn needed(layout: ToolbarLayout) -> f32 {
+        // Every item at its worst case, in the same terms as the toolbar;
+        // `labels_width` is the summed width of the seven toolbar labels.
+        fn needed(layout: ToolbarLayout, labels_width: f32) -> f32 {
             let name_item = |name: Option<f32>| {
                 let name = name.unwrap_or(0.);
                 2. * layout.item_pad + 14. + 6. + name + 6. + 12.
             };
-            // Button: 8px padding each side, 14px icon, 6px gap.
-            let tools = if layout.labels {
-                4. * (16. + 14. + 6.)
-                    + text("Fetch".len())
-                    + text("Pull".len())
-                    + text("Push".len())
-                    + text("Stash".len())
+            // Button: 8px padding each side, 14px icon, 6px gap; the segment adds
+            // 10px padding each side, 14px icon, 6px gap and a 1px border.
+            let labelled = 4. * (16. + 14. + 6.) + 3. * (20. + 14. + 6.) + 2.;
+            let controls = if layout.labels {
+                labelled + labels_width
             } else {
-                // Icon-only tool buttons are 28 wide (`Button` squares them).
-                112.
+                // Icon-only tool buttons are 28 wide (`Button` squares them), and
+                // three 34px icon segments plus the border.
+                112. + 104.
             };
-            // Segment: 10px padding each side, 14px icon, 6px gap, 1px border.
-            let segmented = if layout.labels {
-                2. * (20. + 14. + 6.) + text("History".len()) + text("Changes".len()) + 2.
+            // The worktree button: icon, name, the warning dot (6px + gap),
+            // chevron.
+            let worktree_item = if layout.worktree_button {
+                6. + name_item(layout.worktree_name) + layout.gap
             } else {
-                70.
+                0.
             };
             let fixed = 26. // sidebar toggle
                 + name_item(layout.repo_name)
                 + name_item(layout.branch_name)
+                + worktree_item
                 + 9. // separator
-                + tools
-                + segmented
+                + controls
                 + 26. // settings
                 + 104.; // window controls
             fixed + layout.search_min + 2. * layout.padding + 12. * layout.gap
         }
+        let labels_width = |lang: &str| -> f32 {
+            TOOLBAR_LABELS
+                .iter()
+                .map(|key| text(&ui::i18n::t_in(lang, key)))
+                .sum()
+        };
 
-        for width in [
-            620., 700., 760., 810., 870., 1000., 1200., 1360., 1400., 1600.,
-        ] {
-            let layout = toolbar_layout(width);
-            // The client-side frame keeps a 10px shadow band and a 1px border
-            // on each side.
-            let content = width - 22.;
-            assert!(
-                needed(layout) <= content,
-                "toolbar overflows at {width}: needs {} of {content}",
-                needed(layout)
-            );
+        // Every language, not just English: `t_in` reads the catalogs without
+        // touching the process-wide active language.
+        for lang in ui::i18n::LANGUAGES {
+            let extra = label_extra_width(lang, text);
+            let labels = labels_width(lang);
+            for width in [
+                620., 699., 700., 760., 839., 840., 869., 870., 1000., 1200., 1340., 1419., 1420.,
+                1459., 1460., 1579., 1580., 1600., 1700., 1800., 2000.,
+            ] {
+                let layout = toolbar_layout(width, extra);
+                // The client-side frame keeps a 10px shadow band and a 1px border
+                // on each side.
+                let content = width - 22.;
+                assert!(
+                    needed(layout, labels) <= content,
+                    "{lang}: toolbar overflows at {width}: needs {} of {content}",
+                    needed(layout, labels)
+                );
+            }
         }
     }
 
     #[test]
+    fn longer_labels_move_the_labelled_steps_up_and_english_keeps_its_own() {
+        assert_eq!(label_extra_width("en", |t| t.chars().count() as f32), 0.);
+        let extra = label_extra_width("fr", |t| t.chars().count() as f32);
+        assert!(extra > 0.);
+        assert!(toolbar_layout(1460., 0.).labels);
+        assert!(!toolbar_layout(1460., extra).labels);
+        assert!(toolbar_layout(1460. + extra, extra).labels);
+        assert_eq!(toolbar_layout(1580., 0.).repo_name, Some(140.));
+        assert_eq!(toolbar_layout(1580., extra).repo_name, Some(96.));
+    }
+
+    #[test]
     fn toolbar_steps_hide_labels_and_names_in_order() {
-        assert!(toolbar_layout(1600.).labels);
-        assert!(toolbar_layout(1360.).labels);
-        assert!(!toolbar_layout(1359.).labels);
-        assert!(!toolbar_layout(1200.).labels);
-        assert_eq!(toolbar_layout(1600.).repo_name, Some(140.));
-        assert_eq!(toolbar_layout(1200.).repo_name, Some(96.));
-        assert_eq!(toolbar_layout(1000.).repo_name, Some(96.));
-        assert_eq!(toolbar_layout(900.).repo_name, Some(64.));
-        assert_eq!(toolbar_layout(820.).repo_name, Some(64.));
-        assert_eq!(toolbar_layout(800.).repo_name, None);
-        assert_eq!(toolbar_layout(800.).branch_name, Some(64.));
-        assert_eq!(toolbar_layout(720.).branch_name, None);
-        assert_eq!(toolbar_layout(650.).search_min, 72.);
-        assert_eq!(toolbar_layout(650.).padding, 8.);
-        assert_eq!(toolbar_layout(720.).search_min, 96.);
-        assert_eq!(toolbar_layout(1200.).search_min, 150.);
-        assert!(!toolbar_layout(900.).search_kbd);
-        assert!(!toolbar_layout(1200.).search_kbd);
-        assert!(toolbar_layout(1600.).search_kbd);
-        assert_eq!(toolbar_layout(1200.).gap, 6.);
-        assert_eq!(toolbar_layout(800.).gap, 4.);
-        assert_eq!(toolbar_layout(1200.).item_pad, 8.);
-        assert_eq!(toolbar_layout(800.).item_pad, 7.);
+        assert!(toolbar_layout(1600., 0.).labels);
+        assert!(toolbar_layout(1460., 0.).labels);
+        assert!(!toolbar_layout(1459., 0.).labels);
+        assert_eq!(toolbar_layout(1579., 0.).repo_name, Some(96.));
+        assert!(!toolbar_layout(1200., 0.).labels);
+        assert_eq!(toolbar_layout(1600., 0.).repo_name, Some(140.));
+        assert_eq!(toolbar_layout(1200., 0.).repo_name, Some(96.));
+        assert_eq!(toolbar_layout(1080., 0.).repo_name, Some(96.));
+        assert_eq!(toolbar_layout(1000., 0.).repo_name, Some(64.));
+        assert_eq!(toolbar_layout(900., 0.).repo_name, Some(64.));
+        assert_eq!(toolbar_layout(899., 0.).repo_name, None);
+        assert_eq!(toolbar_layout(810., 0.).repo_name, None);
+        assert_eq!(toolbar_layout(810., 0.).branch_name, Some(64.));
+        assert_eq!(toolbar_layout(809., 0.).branch_name, None);
+        assert_eq!(toolbar_layout(650., 0.).search_min, 60.);
+        assert_eq!(toolbar_layout(650., 0.).padding, 6.);
+        assert_eq!(toolbar_layout(760., 0.).search_min, 96.);
+        assert_eq!(toolbar_layout(1200., 0.).search_min, 150.);
+        assert!(!toolbar_layout(900., 0.).search_kbd);
+        assert!(!toolbar_layout(1200., 0.).search_kbd);
+        assert!(toolbar_layout(1600., 0.).search_kbd);
+        assert_eq!(toolbar_layout(1200., 0.).gap, 6.);
+        assert_eq!(toolbar_layout(800., 0.).gap, 4.);
+        assert_eq!(toolbar_layout(1200., 0.).item_pad, 8.);
+        assert_eq!(toolbar_layout(800., 0.).item_pad, 7.);
+    }
+
+    #[test]
+    fn the_worktree_button_loses_its_name_then_the_button_as_the_bar_narrows() {
+        assert_eq!(toolbar_layout(1600., 0.).worktree_name, Some(96.));
+        assert_eq!(toolbar_layout(1200., 0.).worktree_name, Some(64.));
+        assert_eq!(toolbar_layout(899., 0.).worktree_name, None);
+        assert!(toolbar_layout(740., 0.).worktree_button);
+        assert!(!toolbar_layout(739., 0.).worktree_button);
+        assert!(!toolbar_layout(620., 0.).worktree_button);
     }
 
     #[test]
@@ -4142,6 +5191,17 @@ mod tests {
         // On a tiny window the 220 px minimum beats the half rule.
         assert_eq!(effective_details_width(900., 500., 300.), 220.);
         assert_eq!(details_width_limit(500., 300.), 220.);
+    }
+
+    #[test]
+    fn the_bottom_dock_is_capped_to_half_the_window_height() {
+        // A stored 560 in an 800 px window renders at 400.
+        assert_eq!(effective_details_height(560., 800.), 400.);
+        // A tall window keeps the stored size, within the 220–560 range.
+        assert_eq!(effective_details_height(300., 1386.), 300.);
+        assert_eq!(effective_details_height(900., 1386.), 560.);
+        // Never below the minimum.
+        assert_eq!(effective_details_height(560., 300.), 220.);
     }
 
     #[test]
@@ -4294,8 +5354,8 @@ mod tests {
         view.read_with(&cx, |view, _| assert_eq!(view.view, ViewMode::Worktrees));
         assert!(cx.debug_bounds("worktrees-view").is_some());
         assert!(
-            cx.debug_bounds("worktree-row-0").is_some(),
-            "the main worktree row was not drawn"
+            cx.debug_bounds("worktree-detail").is_some(),
+            "the current worktree's details were not drawn"
         );
 
         cx.update(|window, cx| {
@@ -4845,5 +5905,681 @@ mod tests {
             Head::Branch { name, .. } => assert_eq!(name, "feature"),
             Head::Detached(_) => panic!("checkout left a detached HEAD"),
         }
+    }
+
+    /// Clicks the sidebar row with `key` so the tree holds the keyboard.
+    fn click_sidebar_row(
+        cx: &mut gpui::VisualTestContext,
+        view: &Entity<RepositoryView>,
+        key: &str,
+    ) {
+        let index = view
+            .update(cx, |view, cx| {
+                view.tree_nodes(cx)
+                    .iter()
+                    .position(|node| node.key.as_ref() == key)
+            })
+            .unwrap_or_else(|| panic!("no sidebar row {key}"));
+        // `debug_bounds` wants a `'static` name; a leak in a test is harmless.
+        let name: &'static str = Box::leak(format!("sidebar-tree-node-{index}").into_boxed_str());
+        let row = cx
+            .debug_bounds(name)
+            .expect("the sidebar row was not drawn");
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    fn branch_names(repo: &crate::test_support::TempRepo) -> Vec<String> {
+        git_core::Repo::open(crate::test_support::git(), repo.path())
+            .unwrap()
+            .refs()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == git_core::RefKind::LocalBranch)
+            .map(|r| r.name)
+            .collect()
+    }
+
+    fn repo_with_feature_branch(name: &str) -> crate::test_support::TempRepo {
+        let repo = crate::test_support::TempRepo::new(name);
+        commit(repo.path(), "a.txt", "one\n");
+        let git = crate::test_support::git();
+        let repo_handle = git_core::Repo::open(git, repo.path()).unwrap();
+        let oid = repo_handle.head_commit().unwrap().unwrap().id;
+        repo_handle.create_branch("feature", oid, false).unwrap();
+        repo
+    }
+
+    /// F2 on a focused sidebar branch row opens the Rename dialog.
+    #[gpui::test]
+    fn f2_on_a_sidebar_branch_row_opens_rename(cx: &mut gpui::TestAppContext) {
+        let repo = repo_with_feature_branch("sidebar-f2");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        click_sidebar_row(&mut cx, &view, "local:feature");
+
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        let dialog = view
+            .read_with(&cx, |view, _| view.ref_dialog.clone())
+            .expect("F2 did not open the rename dialog");
+        dialog.update(&mut cx, |dialog, cx| {
+            dialog.set_name_for_test("renamed", cx)
+        });
+        cx.update(|window, cx| {
+            dialog.update(cx, |dialog, cx| dialog.submit_for_test(window, cx));
+        });
+        cx.run_until_parked();
+        cx.run_until_parked();
+        let names = branch_names(&repo);
+        assert!(names.iter().any(|n| n == "renamed"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "feature"), "{names:?}");
+    }
+
+    /// Enter on a focused sidebar branch row checks the branch out.
+    #[gpui::test]
+    fn enter_on_a_sidebar_branch_row_checks_it_out(cx: &mut gpui::TestAppContext) {
+        let repo = repo_with_feature_branch("sidebar-enter");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        click_sidebar_row(&mut cx, &view, "local:feature");
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.run_until_parked();
+        let repo = git_core::Repo::open(crate::test_support::git(), repo.path()).unwrap();
+        match repo.head().unwrap() {
+            Head::Branch { name, .. } => assert_eq!(name, "feature"),
+            Head::Detached(_) => panic!("Enter left a detached HEAD"),
+        }
+    }
+
+    /// B on the focused history list opens "Create branch here…".
+    #[gpui::test]
+    fn b_on_the_history_list_opens_create_branch(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-b");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.update(|_, cx| {
+            crate::history_view::bind_history_keys(cx, &crate::settings::Settings::default());
+        });
+        cx.run_until_parked();
+        let history = view.read_with(&cx, |view, _| view.history());
+        cx.update(|window, cx| {
+            let focus = history.read(cx).list_focus();
+            window.focus(&focus, cx);
+        });
+
+        cx.simulate_keystrokes("b");
+        cx.run_until_parked();
+        let dialog = view
+            .read_with(&cx, |view, _| view.ref_dialog.clone())
+            .expect("B did not open the create-branch dialog");
+        dialog.update(&mut cx, |dialog, cx| dialog.set_name_for_test("from-b", cx));
+        cx.update(|window, cx| {
+            dialog.update(cx, |dialog, cx| dialog.submit_for_test(window, cx));
+        });
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(branch_names(&repo).iter().any(|n| n == "from-b"));
+    }
+
+    fn local_ref(name: &str, upstream: Option<&str>, ahead: usize, behind: usize) -> git_core::Ref {
+        git_core::Ref {
+            full_name: format!("refs/heads/{name}"),
+            name: name.to_owned(),
+            kind: RefKind::LocalBranch,
+            target: Oid::from_hex(&"1".repeat(40)).unwrap(),
+            upstream: upstream.map(str::to_owned),
+            ahead,
+            behind,
+            upstream_gone: false,
+        }
+    }
+
+    #[test]
+    fn pull_and_push_tooltips_follow_ahead_and_behind() {
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        let remotes = vec!["origin".to_owned()];
+        let hints = |refs: &[git_core::Ref]| network_hints(Some(&head), Some(refs), &remotes);
+
+        let idle = hints(&[local_ref("main", Some("origin/main"), 0, 0)]);
+        assert_eq!(idle.pull_tip, "Pull — nothing to pull");
+        assert_eq!(idle.push_tip, "Push the current branch");
+        assert_eq!((idle.ahead, idle.behind), (0, 0));
+
+        let ahead = hints(&[local_ref("main", Some("origin/main"), 3, 0)]);
+        assert_eq!(ahead.push_tip, "Push 3 commits to origin/main");
+        assert_eq!(ahead.ahead, 3);
+
+        let behind = hints(&[local_ref("main", Some("origin/main"), 0, 1)]);
+        assert_eq!(behind.pull_tip, "Pull 1 commit from origin/main");
+
+        let diverged = hints(&[local_ref("main", Some("origin/main"), 2, 2)]);
+        assert_eq!(
+            diverged.pull_tip,
+            "Pull — branches diverged; fast-forward only"
+        );
+
+        let fresh = hints(&[local_ref("main", None, 0, 0)]);
+        assert_eq!(fresh.push_tip, "Push and set upstream to origin/main");
+        assert_eq!(fresh.ahead, 0);
+    }
+
+    /// Makes one commit authored by `email` at `date` (ISO, UTC).
+    fn commit_at(repo: &Path, file: &str, message: &str, date: &str, email: &str) {
+        std::fs::write(repo.join(file), message).expect("write the committed file");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test User")
+                .env("GIT_AUTHOR_EMAIL", email)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_NAME", "Test User")
+                .env("GIT_COMMITTER_EMAIL", email)
+                .env("GIT_COMMITTER_DATE", date)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["add", file]);
+        run(&["commit", "-q", "-m", message]);
+    }
+
+    /// Three commits: two by different authors on 10 March 2026 (noon UTC, so
+    /// the same local day in nearly every timezone) and one on the 12th. The
+    /// repository's own `user.email` is the first author.
+    fn day_filter_repo(name: &str) -> (crate::test_support::TempRepo, i32) {
+        let repo = crate::test_support::TempRepo::new(name);
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["config", "user.email", "a@x.io"])
+            .status()
+            .expect("git runs");
+        assert!(status.success());
+        commit_at(repo.path(), "a", "c1", "2026-03-10T12:00:00Z", "a@x.io");
+        commit_at(repo.path(), "b", "c2", "2026-03-10T13:00:00Z", "b@x.io");
+        commit_at(repo.path(), "c", "c3", "2026-03-12T12:00:00Z", "a@x.io");
+        (repo, git_core::days_from_civil(2026, 3, 10))
+    }
+
+    /// A day filter narrows the History list to that day's commits (honouring
+    /// Me / Everyone), and Esc on the focused list clears it again.
+    #[gpui::test]
+    fn the_day_filter_lists_one_days_commits_and_escape_clears_it(cx: &mut gpui::TestAppContext) {
+        use crate::history_view::DayFilter;
+        let (repo, day) = day_filter_repo("day-filter");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        let history = view.read_with(&cx, |view, _| view.history.clone());
+
+        history.update(&mut cx, |history, cx| {
+            history.set_day_filter(Some(DayFilter { day, me: None }), cx)
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert_eq!(history.day_filter_count(), Some(2));
+            // Newest first: the filtered list selects its first row.
+            assert_eq!(history.selected_commit().expect("a row").summary, "c2");
+        });
+
+        // Me keeps only the repository's own email.
+        history.update(&mut cx, |history, cx| {
+            history.set_day_filter(
+                Some(DayFilter {
+                    day,
+                    me: Some("A@X.io".to_owned()),
+                }),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert_eq!(history.day_filter_count(), Some(1));
+            assert_eq!(history.selected_commit().expect("a row").summary, "c1");
+        });
+
+        // A day without commits is an empty list, not the whole history.
+        history.update(&mut cx, |history, cx| {
+            history.set_day_filter(
+                Some(DayFilter {
+                    day: day + 1,
+                    me: None,
+                }),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert_eq!(history.day_filter_count(), Some(0));
+            assert!(history.selected_commit().is_none());
+        });
+
+        // Esc with the list focused clears the filter and re-selects HEAD.
+        history.update(&mut cx, |history, cx| {
+            history.set_day_filter(Some(DayFilter { day, me: None }), cx)
+        });
+        cx.run_until_parked();
+        let focus = history.read_with(&cx, |history, _| history.list_focus());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert!(history.day_filter().is_none(), "Esc left the filter on");
+            assert_eq!(history.commit_count(), 3);
+            assert_eq!(history.selected_commit().expect("HEAD").summary, "c3");
+        });
+    }
+
+    /// The strip counts the repository's days; clicking a day filters to it
+    /// and clicking it again clears the filter.
+    #[gpui::test]
+    fn the_activity_strip_picks_and_unpicks_a_day(cx: &mut gpui::TestAppContext) {
+        let (repo, day) = day_filter_repo("strip-pick");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        let (strip, history) =
+            view.read_with(&cx, |view, _| (view.activity.clone(), view.history.clone()));
+        strip.read_with(&cx, |strip, _| assert!(strip.is_ready()));
+
+        // Me is the default author here (user.email is set): c1 and c3 are
+        // a@x.io's. They all fall in the last 12 months only while the clock
+        // is before March 2027, so only the day pick is checked, not a total.
+        strip.update(&mut cx, |strip, cx| strip.pick_day(day, cx));
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            let filter = history.day_filter().expect("the day is filtered");
+            assert_eq!(filter.day, day);
+            assert_eq!(filter.me.as_deref(), Some("a@x.io"));
+            assert_eq!(history.day_filter_count(), Some(1));
+        });
+        strip.update(&mut cx, |strip, cx| strip.pick_day(day, cx));
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| assert!(history.day_filter().is_none()));
+
+        // A day nobody committed on is not pickable.
+        strip.update(&mut cx, |strip, cx| strip.pick_day(day + 1, cx));
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| assert!(history.day_filter().is_none()));
+    }
+
+    /// When the window is too narrow for the whole grid it scrolls, and it
+    /// opens (and stays after a resize) at the newest week, not the oldest.
+    #[gpui::test]
+    fn the_activity_grid_opens_at_the_newest_week(cx: &mut gpui::TestAppContext) {
+        let (repo, _day) = day_filter_repo("strip-scroll-end");
+        let (cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        let strip = view.read_with(&cx, |view, _| view.activity.clone());
+        let scroll = strip.read_with(&cx, |strip, _| strip.scroll_handle());
+
+        cx.simulate_resize(gpui::size(px(560.), px(900.)));
+        cx.run_until_parked();
+        let max = scroll.max_offset().x;
+        assert!(max > px(0.), "the grid should overflow at 560 px");
+        assert_eq!(scroll.offset().x, -max, "scroll starts at the newest week");
+
+        // A resize keeps the end while the user did not scroll away.
+        cx.simulate_resize(gpui::size(px(480.), px(900.)));
+        cx.run_until_parked();
+        assert_eq!(scroll.offset().x, -scroll.max_offset().x);
+    }
+
+    /// Enter on a keyboard-selected day filters History; Esc then clears the
+    /// filter and the heatmap keeps the focus (a second Enter picks again).
+    #[gpui::test]
+    fn escape_after_a_keyboard_pick_clears_the_filter_and_keeps_the_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (repo, day) = day_filter_repo("strip-esc");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        let (strip, history) =
+            view.read_with(&cx, |view, _| (view.activity.clone(), view.history.clone()));
+        let today = strip.read_with(&cx, |strip, _| strip.today());
+
+        // Tab to the grid: its keyboard ring (and tooltip) shows once it has
+        // the focus.
+        for _ in 0..60 {
+            if cx.debug_bounds("activity-heatmap-tip").is_some() {
+                break;
+            }
+            cx.simulate_keystrokes("tab");
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("activity-heatmap-tip").is_some(),
+            "Tab never reached the heatmap"
+        );
+
+        // End jumps to today; ← steps a week back, ↑ a day back.
+        let back = today - day;
+        cx.simulate_keystrokes("end");
+        for _ in 0..back / 7 {
+            cx.simulate_keystrokes("left");
+        }
+        for _ in 0..back % 7 {
+            cx.simulate_keystrokes("up");
+        }
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert_eq!(history.day_filter().expect("Enter picked the day").day, day);
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert!(history.day_filter().is_none(), "Esc left the filter on");
+        });
+
+        // The focus stayed on the grid: its ring is still drawn, and Enter
+        // picks the same day again.
+        assert!(
+            cx.debug_bounds("activity-heatmap-tip").is_some(),
+            "the heatmap lost the focus after Esc"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert!(
+                history.day_filter().is_some(),
+                "the heatmap lost the focus after Esc"
+            );
+        });
+    }
+
+    /// The strip starts collapsed when the settings say so, and collapsing it
+    /// writes the preference back.
+    #[gpui::test]
+    fn the_activity_strip_remembers_collapsing(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("strip-collapse");
+        // `commit` authors as test@example.com; "Me" counts that email.
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .expect("git runs");
+        assert!(status.success());
+        commit(repo.path(), "a.txt", "one\n");
+        cx.update(|cx| {
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings: crate::settings::Settings {
+                    activity_collapsed: true,
+                    ..crate::settings::Settings::default()
+                },
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        let strip = view.read_with(&cx, |view, _| view.activity.clone());
+        strip.read_with(&cx, |strip, _| {
+            assert!(strip.is_collapsed(), "the saved state was ignored");
+            assert_eq!(strip.total(), Some(1));
+        });
+
+        strip.update(&mut cx, |strip, cx| strip.set_collapsed(false, cx));
+        cx.update(|_, cx| {
+            assert!(
+                !cx.global::<crate::AppSettings>()
+                    .settings
+                    .activity_collapsed
+            );
+        });
+    }
+
+    #[test]
+    fn the_view_segment_has_a_third_tab_for_worktrees() {
+        for (index, view) in [
+            (0, ViewMode::History),
+            (1, ViewMode::Changes),
+            (2, ViewMode::Worktrees),
+        ] {
+            assert_eq!(view_for_segment(index), view);
+            assert_eq!(segment_for_view(view), index);
+        }
+    }
+
+    /// A repository with a linked worktree on branch `extra`, opened in a real
+    /// window. Returns the folder of the linked worktree.
+    fn open_with_linked_worktree(
+        repo: &crate::test_support::TempRepo,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::VisualTestContext,
+        Entity<Workspace>,
+        Entity<RepositoryView>,
+        PathBuf,
+    ) {
+        commit(repo.path(), "a.txt", "one\n");
+        let git = crate::test_support::git();
+        let linked = repo.path().parent().unwrap().join(format!(
+            "{}-linked",
+            repo.path().file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&linked);
+        let opened = Repo::open(git.clone(), repo.path()).expect("open the repository");
+        let tip = match opened.head().expect("read HEAD") {
+            Head::Branch {
+                target: Some(oid), ..
+            }
+            | Head::Detached(oid) => oid,
+            Head::Branch { target: None, .. } => panic!("no commit"),
+        };
+        opened
+            .create_branch("extra", tip, false)
+            .expect("create the branch");
+        opened
+            .add_worktree(&linked, "extra")
+            .expect("add the worktree");
+
+        let (mut cx, workspace) = crate::test_support::open_workspace(git, cx);
+        let path = repo.path().to_path_buf();
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_repository(path, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        let view = cx.update(|_, cx| {
+            workspace
+                .read(cx)
+                .repository_for_test()
+                .expect("the repository is open")
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_view(ViewMode::Worktrees, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        (cx, workspace, view, linked)
+    }
+
+    /// The Worktrees view replaces the sidebar tree with the worktree panel;
+    /// History brings the tree back.
+    #[gpui::test]
+    fn the_worktrees_view_swaps_the_sidebar_tree_for_the_panel(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktree-panel-swap");
+        let (mut cx, _workspace, view, linked) = open_with_linked_worktree(&repo, cx);
+        assert!(cx.debug_bounds("worktree-panel").is_some());
+        assert!(cx.debug_bounds("sidebar-tree-node-0").is_none());
+        // The main worktree is pinned first; the linked one follows.
+        assert!(cx.debug_bounds("worktree-row-0").is_some());
+        assert!(cx.debug_bounds("worktree-row-1").is_some());
+        assert!(cx.debug_bounds("worktree-row-2").is_none());
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.set_view(ViewMode::History, window, cx));
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("worktree-panel").is_none());
+        assert!(cx.debug_bounds("sidebar-tree-node-0").is_some());
+        let _ = std::fs::remove_dir_all(linked);
+    }
+
+    /// ↑/↓ move and select, Enter switches the window to the selected
+    /// worktree.
+    #[gpui::test]
+    fn arrows_select_and_enter_switches_the_worktree(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktree-panel-enter");
+        let (mut cx, workspace, view, linked) = open_with_linked_worktree(&repo, cx);
+        let model = view.read_with(&cx, |view, _| view.worktrees_model());
+        let selected_branch = |cx: &gpui::VisualTestContext| {
+            model.read_with(cx, |model, _| {
+                model.selected().and_then(|e| e.branch()).map(str::to_owned)
+            })
+        };
+        let focus = view.read_with(&cx, |view, _| view.worktree_panel_focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        assert_eq!(selected_branch(&cx).as_deref(), Some("main"));
+
+        cx.simulate_keystrokes("down");
+        assert_eq!(selected_branch(&cx).as_deref(), Some("extra"));
+        cx.simulate_keystrokes("down");
+        assert_eq!(
+            selected_branch(&cx).as_deref(),
+            Some("extra"),
+            "stays on the last row"
+        );
+        cx.simulate_keystrokes("up");
+        assert_eq!(selected_branch(&cx).as_deref(), Some("main"));
+
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        let opened = cx.update(|_, cx| {
+            workspace
+                .read(cx)
+                .repository_for_test()
+                .expect("a repository is open")
+        });
+        let root = opened.read_with(&cx, |view, cx| {
+            view.worktrees_model().read(cx).root().to_path_buf()
+        });
+        assert_eq!(root.canonicalize().unwrap(), linked.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(linked);
+    }
+
+    /// The worktree panel is a Tab stop, reachable like the branch tree.
+    #[gpui::test]
+    fn the_worktree_panel_is_reachable_with_tab(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktree-panel-tab");
+        let (mut cx, _workspace, view, linked) = open_with_linked_worktree(&repo, cx);
+        let focus = view.read_with(&cx, |view, _| view.worktree_panel_focus.clone());
+        let mut reached = false;
+        for _ in 0..40 {
+            cx.simulate_keystrokes("tab");
+            if cx.update(|window, _| focus.is_focused(window)) {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "Tab never reached the worktree panel");
+        let _ = std::fs::remove_dir_all(linked);
+    }
+
+    /// The Remove dialog of a dirty worktree has a disabled primary button;
+    /// it must still own the keyboard: Esc closes it.
+    #[gpui::test]
+    fn escape_closes_the_remove_dialog_of_a_dirty_worktree(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktree-remove-esc");
+        let (mut cx, _workspace, view, linked) = open_with_linked_worktree(&repo, cx);
+        std::fs::write(linked.join("dirty.txt"), "uncommitted").expect("dirty the worktree");
+        let model = view.read_with(&cx, |view, _| view.worktrees_model());
+        cx.update(|_, cx| model.update(cx, |model, cx| model.reload(cx)));
+        cx.run_until_parked();
+        let layers = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| ui::overlay::layer_count(window, cx))
+        };
+        let focus = view.read_with(&cx, |view, _| view.worktree_panel_focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+
+        cx.simulate_keystrokes("down delete");
+        cx.run_until_parked();
+        assert_eq!(
+            layers(&mut cx),
+            1,
+            "Remove should open for a linked worktree"
+        );
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(layers(&mut cx), 0, "Esc did not close the Remove dialog");
+        let _ = std::fs::remove_dir_all(linked);
+    }
+
+    /// `git worktree remove` can fail after the fact (here: the folder turned
+    /// dirty while the dialog was open): the list is reloaded anyway, so it no
+    /// longer shows the stale state. Enter on the focused primary button runs it.
+    #[gpui::test]
+    fn a_failed_remove_still_reloads_the_worktree_list(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktree-remove-fails");
+        let (mut cx, _workspace, view, linked) = open_with_linked_worktree(&repo, cx);
+        let model = view.read_with(&cx, |view, _| view.worktrees_model());
+        let focus = view.read_with(&cx, |view, _| view.worktree_panel_focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_keystrokes("down delete");
+        cx.run_until_parked();
+        assert!(view.read_with(&cx, |view, cx| view.worktrees.read(cx).has_dialog()));
+        let dirty = |cx: &gpui::VisualTestContext| {
+            model.read_with(cx, |model, _| {
+                model.entry(&linked).map(|entry| entry.changes.len())
+            })
+        };
+        assert_eq!(dirty(&cx), Some(0), "the worktree starts clean");
+
+        // An untracked file makes plain `git worktree remove` refuse.
+        std::fs::write(linked.join("late.txt"), "late").expect("dirty the worktree");
+        // Tab: delete-branch box, Cancel, Remove. Enter runs the focused button.
+        cx.simulate_keystrokes("tab tab tab enter");
+        cx.run_until_parked();
+        assert_eq!(
+            dirty(&cx),
+            Some(1),
+            "the list was not reloaded after the failed remove"
+        );
+        assert!(view.read_with(&cx, |view, cx| view.worktrees.read(cx).has_dialog()));
+        let _ = std::fs::remove_dir_all(linked);
+    }
+
+    /// Del opens the Remove dialog for a linked worktree and does nothing on
+    /// the main one.
+    #[gpui::test]
+    fn delete_opens_remove_only_for_a_non_main_worktree(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktree-panel-delete");
+        let (mut cx, _workspace, view, linked) = open_with_linked_worktree(&repo, cx);
+        let model = view.read_with(&cx, |view, _| view.worktrees_model());
+        let focus = view.read_with(&cx, |view, _| view.worktree_panel_focus.clone());
+        let has_dialog = |cx: &gpui::VisualTestContext| {
+            view.read_with(cx, |view, cx| view.worktrees.read(cx).has_dialog())
+        };
+        cx.update(|window, cx| window.focus(&focus, cx));
+
+        // The main worktree is selected first.
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
+        assert!(!has_dialog(&cx), "the main worktree cannot be removed");
+
+        cx.simulate_keystrokes("down delete");
+        cx.run_until_parked();
+        model.read_with(&cx, |model, _| {
+            assert_eq!(model.selected().and_then(|e| e.branch()), Some("extra"));
+        });
+        assert!(has_dialog(&cx), "Remove should open for a linked worktree");
+        let _ = std::fs::remove_dir_all(linked);
     }
 }
