@@ -56,6 +56,54 @@ pub fn my_email(repo: &Repo) -> Result<Option<String>> {
     }
 }
 
+/// The current local calendar day, as days since the Unix epoch.
+///
+/// There is no timezone code in this crate, so the local offset comes from
+/// git itself: `git var GIT_COMMITTER_IDENT` ends with the current timestamp
+/// and the local UTC offset. A placeholder identity is passed so the call
+/// works when `user.name` / `user.email` are not configured.
+pub fn today(repo: &Repo) -> Result<i32> {
+    let out = repo
+        .command()
+        .args([
+            "-c",
+            "user.name=gitwarp",
+            "-c",
+            "user.email=gitwarp@localhost",
+            "var",
+            "GIT_COMMITTER_IDENT",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(Error::Spawn)?;
+    if !out.status.success() {
+        return Err(Error::Git {
+            command: "var GIT_COMMITTER_IDENT",
+            code: out.status.code(),
+            stderr: decode_bytes(out.stderr),
+        });
+    }
+    parse_ident_day(String::from_utf8_lossy(&out.stdout).trim())
+        .ok_or(Error::Parse("GIT_COMMITTER_IDENT timestamp"))
+}
+
+/// The local day of `Name <email> 1730000000 +0530`.
+fn parse_ident_day(ident: &str) -> Option<i32> {
+    let mut tail = ident.rsplit(' ');
+    let offset = tail.next()?;
+    let timestamp: i64 = tail.next()?.parse().ok()?;
+    let sign = match offset.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits = offset.get(1..)?;
+    let hours: i64 = digits.get(..2)?.parse().ok()?;
+    let minutes: i64 = digits.get(2..4)?.parse().ok()?;
+    let local = timestamp + sign * (hours * 3600 + minutes * 60);
+    i32::try_from(local.div_euclid(86_400)).ok()
+}
+
 /// Counts commits per local calendar day between two Unix timestamps.
 ///
 /// Merges count too, like GitHub. `--since`/`--until` filter on the committer
@@ -150,7 +198,7 @@ pub(crate) fn activity_in(
 }
 
 /// `YYYY-MM-DD` to days since the Unix epoch.
-fn parse_day(date: &str) -> Option<i32> {
+pub(crate) fn parse_day(date: &str) -> Option<i32> {
     let mut parts = date.splitn(3, '-');
     let year: i32 = parts.next()?.parse().ok()?;
     let month: u32 = parts.next()?.parse().ok()?;
@@ -162,7 +210,7 @@ fn parse_day(date: &str) -> Option<i32> {
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date (Hinnant's algorithm).
-fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
+pub fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
     let yoe = y.rem_euclid(400); // [0, 399]
@@ -170,6 +218,19 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
     let doy = (153 * mp + 2) / 5 + day as i32 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+/// The proleptic Gregorian `(year, month, day)` of a day since 1970-01-01.
+pub fn civil_from_days(day: i32) -> (i32, u32, u32) {
+    let z = day + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + i32::from(m <= 2), m, d)
 }
 
 /// Heat thresholds for the non-zero counts in view: a count `c > 0` is level
@@ -221,6 +282,27 @@ mod tests {
 
     use super::*;
     use crate::{Git, GitChoice};
+
+    #[test]
+    fn the_ident_timestamp_becomes_a_local_day() {
+        // 2026-03-10T22:30:00Z is the 11th at UTC+3 and still the 10th at UTC-5.
+        let tenth = parse_day("2026-03-10").unwrap();
+        assert_eq!(
+            parse_ident_day("A B <a@x.io> 1773181800 +0300"),
+            Some(tenth + 1)
+        );
+        assert_eq!(parse_ident_day("A <a@x.io> 1773181800 -0500"), Some(tenth));
+        assert_eq!(parse_ident_day("no timestamp"), None);
+    }
+
+    #[test]
+    fn civil_dates_round_trip() {
+        for day in [-1, 0, 11_017, 19_782, 20_740] {
+            let (y, m, d) = civil_from_days(day);
+            assert_eq!(days_from_civil(y, m, d), day);
+        }
+        assert_eq!(civil_from_days(20_740), (2026, 10, 14));
+    }
 
     #[test]
     fn civil_dates_convert_to_epoch_days() {

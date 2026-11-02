@@ -32,6 +32,7 @@ use ui::{
     TextInputEvent, Tooltip, Tree, TreeNodeData,
 };
 
+use crate::activity_strip::ActivityStrip;
 use crate::changes_view::{ChangesEvent, ChangesView};
 use crate::details::{read_details, read_diff, DetailsState, DiffState};
 use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
@@ -311,6 +312,8 @@ pub struct RepositoryView {
     git_tooltip: SharedString,
     history: Entity<HistoryView>,
     _history_observer: Subscription,
+    /// The commit heatmap above the history table.
+    activity: Entity<ActivityStrip>,
     changes: Entity<ChangesView>,
     _changes_observer: Subscription,
     worktrees: Entity<WorktreesView>,
@@ -465,13 +468,22 @@ impl RepositoryView {
             this.sync_details(selected, cx);
             cx.notify();
         });
+        let activity = cx.new(|cx| {
+            ActivityStrip::new(
+                path.clone(),
+                git.clone(),
+                workspace.clone(),
+                history.clone(),
+                cx,
+            )
+        });
         let changes = cx.new(|cx| ChangesView::new(path.clone(), git.clone(), window, cx));
         let changes_observer = cx.subscribe_in(
             &changes,
             window,
             |this, _, event: &ChangesEvent, window, cx| match event {
                 ChangesEvent::Committed => {
-                    this.history.update(cx, |history, cx| history.reload(cx));
+                    this.reload_history(cx);
                 }
                 ChangesEvent::PushAfterCommit => this.push_branch(window, cx),
             },
@@ -482,7 +494,7 @@ impl RepositoryView {
             // A branch was created or deleted, or a worktree changed: the
             // sidebar, the history's ref labels and the local changes all
             // read the same repository.
-            this.history.update(cx, |history, cx| history.reload(cx));
+            this.reload_history(cx);
             this.changes.update(cx, |changes, cx| changes.refresh(cx));
             this.refresh(cx);
             cx.notify();
@@ -538,6 +550,7 @@ impl RepositoryView {
             git_tooltip,
             history,
             _history_observer: observer,
+            activity,
             changes,
             _changes_observer: changes_observer,
             worktrees,
@@ -659,6 +672,12 @@ impl RepositoryView {
             }
         }
         cx.notify();
+    }
+
+    /// Reloads the history and the activity counts that depend on it.
+    fn reload_history(&mut self, cx: &mut Context<Self>) {
+        self.history.update(cx, |history, cx| history.reload(cx));
+        self.activity.update(cx, |activity, cx| activity.reload(cx));
     }
 
     /// Switches to Local changes, as the toolbar's segment does.
@@ -1492,7 +1511,7 @@ impl RepositoryView {
     /// Reloads everything a ref operation can have changed: the history and
     /// its badges, the sidebar's lists, the local-changes view and HEAD.
     fn after_ref_change(&mut self, cx: &mut Context<Self>) {
-        self.history.update(cx, |history, cx| history.reload(cx));
+        self.reload_history(cx);
         self.changes.update(cx, |changes, cx| changes.refresh(cx));
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.refresh(cx));
@@ -1765,7 +1784,7 @@ impl RepositoryView {
 
     /// Reloads everything a remote change can affect.
     fn reload_after_network(&mut self, cx: &mut Context<Self>) {
-        self.history.update(cx, |history, cx| history.reload(cx));
+        self.reload_history(cx);
         self.changes.update(cx, |changes, cx| changes.refresh(cx));
         self.refresh(cx);
         cx.notify();
@@ -3576,7 +3595,13 @@ impl Render for RepositoryView {
         let status = self.render_status_bar(cx);
 
         let content = match self.view {
-            ViewMode::History => self.history.clone().into_any_element(),
+            ViewMode::History => div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(self.activity.clone())
+                .child(div().flex_1().min_h_0().child(self.history.clone()))
+                .into_any_element(),
             ViewMode::Changes => self.changes.clone().into_any_element(),
             ViewMode::Worktrees => self.worktrees.clone().into_any_element(),
         };
@@ -5237,5 +5262,192 @@ mod tests {
         let fresh = hints(&[local_ref("main", None, 0, 0)]);
         assert_eq!(fresh.push_tip, "Push and set upstream to origin/main");
         assert_eq!(fresh.ahead, 0);
+    }
+
+    /// Makes one commit authored by `email` at `date` (ISO, UTC).
+    fn commit_at(repo: &Path, file: &str, message: &str, date: &str, email: &str) {
+        std::fs::write(repo.join(file), message).expect("write the committed file");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test User")
+                .env("GIT_AUTHOR_EMAIL", email)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_NAME", "Test User")
+                .env("GIT_COMMITTER_EMAIL", email)
+                .env("GIT_COMMITTER_DATE", date)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["add", file]);
+        run(&["commit", "-q", "-m", message]);
+    }
+
+    /// Three commits: two by different authors on 10 March 2026 (noon UTC, so
+    /// the same local day in nearly every timezone) and one on the 12th. The
+    /// repository's own `user.email` is the first author.
+    fn day_filter_repo(name: &str) -> (crate::test_support::TempRepo, i32) {
+        let repo = crate::test_support::TempRepo::new(name);
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["config", "user.email", "a@x.io"])
+            .status()
+            .expect("git runs");
+        assert!(status.success());
+        commit_at(repo.path(), "a", "c1", "2026-03-10T12:00:00Z", "a@x.io");
+        commit_at(repo.path(), "b", "c2", "2026-03-10T13:00:00Z", "b@x.io");
+        commit_at(repo.path(), "c", "c3", "2026-03-12T12:00:00Z", "a@x.io");
+        (repo, git_core::days_from_civil(2026, 3, 10))
+    }
+
+    /// A day filter narrows the History list to that day's commits (honouring
+    /// Me / Everyone), and Esc on the focused list clears it again.
+    #[gpui::test]
+    fn the_day_filter_lists_one_days_commits_and_escape_clears_it(cx: &mut gpui::TestAppContext) {
+        use crate::history_view::DayFilter;
+        let (repo, day) = day_filter_repo("day-filter");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        let history = view.read_with(&cx, |view, _| view.history.clone());
+
+        history.update(&mut cx, |history, cx| {
+            history.set_day_filter(Some(DayFilter { day, me: None }), cx)
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert_eq!(history.day_filter_count(), Some(2));
+            // Newest first: the filtered list selects its first row.
+            assert_eq!(history.selected_commit().expect("a row").summary, "c2");
+        });
+
+        // Me keeps only the repository's own email.
+        history.update(&mut cx, |history, cx| {
+            history.set_day_filter(
+                Some(DayFilter {
+                    day,
+                    me: Some("A@X.io".to_owned()),
+                }),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert_eq!(history.day_filter_count(), Some(1));
+            assert_eq!(history.selected_commit().expect("a row").summary, "c1");
+        });
+
+        // A day without commits is an empty list, not the whole history.
+        history.update(&mut cx, |history, cx| {
+            history.set_day_filter(
+                Some(DayFilter {
+                    day: day + 1,
+                    me: None,
+                }),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert_eq!(history.day_filter_count(), Some(0));
+            assert!(history.selected_commit().is_none());
+        });
+
+        // Esc with the list focused clears the filter and re-selects HEAD.
+        history.update(&mut cx, |history, cx| {
+            history.set_day_filter(Some(DayFilter { day, me: None }), cx)
+        });
+        cx.run_until_parked();
+        let focus = history.read_with(&cx, |history, _| history.list_focus());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert!(history.day_filter().is_none(), "Esc left the filter on");
+            assert_eq!(history.commit_count(), 3);
+            assert_eq!(history.selected_commit().expect("HEAD").summary, "c3");
+        });
+    }
+
+    /// The strip counts the repository's days; clicking a day filters to it
+    /// and clicking it again clears the filter.
+    #[gpui::test]
+    fn the_activity_strip_picks_and_unpicks_a_day(cx: &mut gpui::TestAppContext) {
+        let (repo, day) = day_filter_repo("strip-pick");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        let (strip, history) =
+            view.read_with(&cx, |view, _| (view.activity.clone(), view.history.clone()));
+        strip.read_with(&cx, |strip, _| assert!(strip.is_ready()));
+
+        // Me is the default author here (user.email is set): c1 and c3 are
+        // a@x.io's. They all fall in the last 12 months only while the clock
+        // is before March 2027, so only the day pick is checked, not a total.
+        strip.update(&mut cx, |strip, cx| strip.pick_day(day, cx));
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            let filter = history.day_filter().expect("the day is filtered");
+            assert_eq!(filter.day, day);
+            assert_eq!(filter.me.as_deref(), Some("a@x.io"));
+            assert_eq!(history.day_filter_count(), Some(1));
+        });
+        strip.update(&mut cx, |strip, cx| strip.pick_day(day, cx));
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| assert!(history.day_filter().is_none()));
+
+        // A day nobody committed on is not pickable.
+        strip.update(&mut cx, |strip, cx| strip.pick_day(day + 1, cx));
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| assert!(history.day_filter().is_none()));
+    }
+
+    /// The strip starts collapsed when the settings say so, and collapsing it
+    /// writes the preference back.
+    #[gpui::test]
+    fn the_activity_strip_remembers_collapsing(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("strip-collapse");
+        // `commit` authors as test@example.com; "Me" counts that email.
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .expect("git runs");
+        assert!(status.success());
+        commit(repo.path(), "a.txt", "one\n");
+        cx.update(|cx| {
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings: crate::settings::Settings {
+                    activity_collapsed: true,
+                    ..crate::settings::Settings::default()
+                },
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        let strip = view.read_with(&cx, |view, _| view.activity.clone());
+        strip.read_with(&cx, |strip, _| {
+            assert!(strip.is_collapsed(), "the saved state was ignored");
+            assert_eq!(strip.total(), Some(1));
+        });
+
+        strip.update(&mut cx, |strip, cx| strip.set_collapsed(false, cx));
+        cx.update(|_, cx| {
+            assert!(
+                !cx.global::<crate::AppSettings>()
+                    .settings
+                    .activity_collapsed
+            );
+        });
     }
 }

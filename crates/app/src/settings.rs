@@ -69,6 +69,8 @@ pub struct Settings {
     pub graph_width: f32,
     /// Whether idle lanes fold into gap lanes.
     pub collapse_idle_lanes: bool,
+    /// Whether the History pane's Activity strip is collapsed to its header.
+    pub activity_collapsed: bool,
     /// How the commit diff pane lays out a file.
     pub diff_layout: DiffLayout,
     /// Fetch the remotes in the background while a repository is open.
@@ -147,6 +149,7 @@ impl Default for Settings {
             details_size: None,
             graph_width: GRAPH_WIDTH_DEFAULT,
             collapse_idle_lanes: false,
+            activity_collapsed: false,
             diff_layout: DiffLayout::default(),
             background_fetch: true,
             accent: Accent::default(),
@@ -635,6 +638,11 @@ fn settings_from_value(value: Value) -> Settings {
             "collapse_idle_lanes",
             defaults.collapse_idle_lanes,
         ),
+        activity_collapsed: take(
+            &mut object,
+            "activity_collapsed",
+            defaults.activity_collapsed,
+        ),
         diff_layout: take(&mut object, "diff_layout", defaults.diff_layout),
         background_fetch: take(&mut object, "background_fetch", defaults.background_fetch),
         accent: take(&mut object, "accent", defaults.accent),
@@ -785,6 +793,7 @@ mod tests {
             details_size: Some(180.0),
             graph_width: 176.0,
             collapse_idle_lanes: true,
+            activity_collapsed: true,
             diff_layout: DiffLayout::Split,
             background_fetch: false,
             ..Settings::default()
@@ -880,6 +889,16 @@ mod tests {
             GRAPH_WIDTH_DEFAULT
         );
         assert!(load_json(dir.path(), r#"{"collapse_idle_lanes":true}"#).collapse_idle_lanes);
+    }
+
+    #[test]
+    fn the_activity_strip_is_expanded_by_default_and_remembers_collapsing() {
+        assert!(!Settings::default().activity_collapsed);
+        let dir = TempDir::new("activity-collapsed");
+        assert!(!load_json(dir.path(), r#"{"theme":"dark"}"#).activity_collapsed);
+        assert!(load_json(dir.path(), r#"{"activity_collapsed":true}"#).activity_collapsed);
+        // The round trip above (`missing_file_loads_defaults_and_round_trips`)
+        // saves and reloads it with the other prefs.
     }
 
     #[test]

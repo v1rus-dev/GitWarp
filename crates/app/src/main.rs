@@ -1,3 +1,4 @@
+mod activity_strip;
 mod app_icon;
 mod changes_view;
 mod checkout_dialog;

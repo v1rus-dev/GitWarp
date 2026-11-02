@@ -31,7 +31,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-pub use activity::{activity, level, levels, my_email, Activity, DayCount};
+pub use activity::{
+    activity, civil_from_days, days_from_civil, level, levels, my_email, today, Activity, DayCount,
+};
 pub use config::{
     global_get, global_identity, set_global_identity, set_global_signing, ConfigScope, Identity,
 };
@@ -42,7 +44,7 @@ pub use diff::{
 };
 pub use error::{Error, ErrorClass, Result};
 pub use git::{Git, GitChoice, GitEngine, GitSource, GitVersion, Resolution};
-pub use log::{CommitCount, CommitInfo, LogKiller, LogOptions, LogStream};
+pub use log::{commits_on_day, CommitCount, CommitInfo, LogKiller, LogOptions, LogStream};
 pub use oid::Oid;
 pub use ops::ResetMode;
 pub use refs::{Head, Ref, RefKind};

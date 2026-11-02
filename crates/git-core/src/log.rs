@@ -354,6 +354,89 @@ impl Drop for CommitCount {
     }
 }
 
+/// Commits whose author date falls on the local calendar day `day` (days since
+/// the Unix epoch), newest first in topological order, over the same history
+/// the list shows (all refs, stash excluded). With `me`, only commits whose
+/// author email equals it (case-insensitive, mailmap applied), which is how
+/// the activity heatmap counts "mine".
+///
+/// Synchronous; callers run it on a background executor. It walks the whole
+/// history once, like [`crate::activity::activity`].
+pub fn commits_on_day(repo: &Repo, day: i32, me: Option<&str>) -> Result<Vec<CommitInfo>> {
+    commits_on_day_in(repo, day, me, None)
+}
+
+/// [`commits_on_day`] with an optional `TZ` override for git, so tests can pin
+/// the local timezone without touching the process environment.
+pub(crate) fn commits_on_day_in(
+    repo: &Repo,
+    day: i32,
+    me: Option<&str>,
+    tz: Option<&str>,
+) -> Result<Vec<CommitInfo>> {
+    let mut cmd = repo.command();
+    // The two leading fields (local author day, mailmapped email) are only for
+    // filtering; the rest is the list's own record.
+    cmd.args([
+        "log",
+        "--topo-order",
+        "--no-decorate",
+        "--exclude=refs/stash",
+        "--all",
+        "--date=format-local:%Y-%m-%d",
+        "--format=%ad%x1f%aE%x1f%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1e",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    if let Some(tz) = tz {
+        cmd.env("TZ", tz);
+    }
+    let mut child = cmd.spawn().map_err(Error::Spawn)?;
+    let stdout = child.stdout.take().ok_or(Error::Parse("git log stdout"))?;
+    let me = me.map(str::to_lowercase);
+    let mut reader = BufReader::with_capacity(256 * 1024, stdout);
+    let mut buf = Vec::new();
+    let mut found = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(RECORD, &mut buf).map_err(Error::Io)? == 0 {
+            break;
+        }
+        let record = trim_record(&buf);
+        if record.is_empty() {
+            continue;
+        }
+        let mut head = record.splitn(3, |&b| b == FIELD);
+        let (Some(date), Some(email), Some(rest)) = (head.next(), head.next(), head.next()) else {
+            continue;
+        };
+        if std::str::from_utf8(date)
+            .ok()
+            .and_then(crate::activity::parse_day)
+            != Some(day)
+        {
+            continue;
+        }
+        if let Some(me) = &me {
+            if String::from_utf8_lossy(email).to_lowercase() != *me {
+                continue;
+            }
+        }
+        found.push(parse_record(rest)?);
+    }
+    drop(reader);
+    let out = child.wait_with_output().map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Git {
+            command: "log --all",
+            code: out.status.code(),
+            stderr: crate::decode_bytes(out.stderr),
+        });
+    }
+    Ok(found)
+}
+
 fn trim_record(raw: &[u8]) -> &[u8] {
     let raw = raw.strip_suffix(&[RECORD]).unwrap_or(raw);
     let start = raw
@@ -405,6 +488,70 @@ fn lossy(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Git, GitChoice};
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str], date: Option<&str>, email: &str) {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                &format!("user.email={email}"),
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        if let Some(date) = date {
+            cmd.env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date);
+        }
+        assert!(cmd.status().expect("git is installed").success());
+    }
+
+    #[test]
+    fn commits_on_a_local_day_honour_the_timezone_and_the_author() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        git(d, &["init", "-q"], None, "a@x.io");
+        for (msg, date, email) in [
+            ("a", "2026-03-10T20:30:00Z", "a@x.io"),
+            ("b", "2026-03-10T22:30:00Z", "b@x.io"),
+            ("c", "2026-03-12T09:00:00Z", "a@x.io"),
+        ] {
+            git(
+                d,
+                &["commit", "-q", "--allow-empty", "-m", msg],
+                Some(date),
+                email,
+            );
+        }
+        let repo = Repo::open(Arc::new(Git::resolve(GitChoice::System).unwrap().git), d).unwrap();
+        let tenth = crate::activity::parse_day("2026-03-10").unwrap();
+        let summaries =
+            |commits: Vec<CommitInfo>| commits.into_iter().map(|c| c.summary).collect::<Vec<_>>();
+        // UTC: both the 10th commits; newest first.
+        let both = commits_on_day_in(&repo, tenth, None, Some("UTC0")).unwrap();
+        assert_eq!(summaries(both), ["b", "a"]);
+        // Only the author's own commits, matched case-insensitively.
+        let mine = commits_on_day_in(&repo, tenth, Some("A@X.io"), Some("UTC0")).unwrap();
+        assert_eq!(summaries(mine), ["a"]);
+        // UTC+3: "b" moved to the 11th.
+        let shifted = commits_on_day_in(&repo, tenth, None, Some("XXX-3")).unwrap();
+        assert_eq!(summaries(shifted), ["a"]);
+        let eleventh = commits_on_day_in(&repo, tenth + 1, None, Some("XXX-3")).unwrap();
+        assert_eq!(summaries(eleventh), ["b"]);
+        assert!(commits_on_day_in(&repo, tenth + 5, None, None)
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn parses_a_record() {

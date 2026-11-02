@@ -5,7 +5,7 @@
 //! The view also owns the repository metadata the shell needs — HEAD and the
 //! refs — because it is the view that opens the [`Repo`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -21,7 +21,7 @@ use gpui::{
 
 use git_core::{CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo};
 use git_graph::{ColumnGeometry, GraphBuilder, IdleLanes, Row};
-use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
+use ui::actions::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrev};
 use ui::focus::{self, RingOffset};
 use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD};
 use ui::theme::ThemeColors;
@@ -519,6 +519,36 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The History list narrowed to the commits authored on one local calendar
+/// day (the activity strip's day filter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayFilter {
+    /// Days since the Unix epoch of the local calendar date.
+    pub day: i32,
+    /// `Some(email)` keeps only that author (the strip's "Me").
+    pub me: Option<String>,
+}
+
+#[derive(Debug)]
+enum DayState {
+    Loading,
+    Ready,
+    Failed(String),
+}
+
+/// The rows a [`DayFilter`] shows. They replace the live `items` for display,
+/// selection and search while the filter is on; the streaming load keeps
+/// filling `items` underneath, so clearing the filter is instant.
+struct DayRows {
+    filter: DayFilter,
+    state: DayState,
+    items: Vec<Item>,
+    idle_lanes: IdleLanes,
+    geometry: Rc<ColumnGeometry>,
+    /// The one-off `git log` for the day; dropping it drops the answer.
+    _task: Option<Task<()>>,
+}
+
 /// What the sidebar knows about the repository's refs.
 #[derive(Debug, Default)]
 enum RefsState {
@@ -634,6 +664,10 @@ pub struct HistoryView {
     /// Whether the next finished scan should select the first match. Cleared
     /// once the selection jumped, or with the query.
     search_jump: bool,
+    /// The active day filter, if any.
+    day_rows: Option<DayRows>,
+    /// Bumped on every filter change; an older answer is dropped.
+    day_generation: u64,
 }
 
 /// Adds one row-menu item that asks the shell to open a ref dialog.
@@ -731,6 +765,8 @@ impl HistoryView {
             search_debounce: None,
             search_task: None,
             search_jump: false,
+            day_rows: None,
+            day_generation: 0,
         };
         view.start(cx);
         // Relative dates are derived at render time from the clock, so the
@@ -964,7 +1000,11 @@ impl HistoryView {
         self.scan_more(cx);
         // A sidebar reveal that was waiting for this page lands now, and only
         // the rows that just arrived are scanned for it.
-        if let Some(index) = self.pending_reveal.check(&self.items, start) {
+        if let Some(index) = self
+            .pending_reveal
+            .check(&self.items, start)
+            .filter(|_| self.day_rows.is_none())
+        {
             self.reveal_row(index, cx);
         }
         cx.notify();
@@ -974,18 +1014,158 @@ impl HistoryView {
     /// collapse toggle changed, not while rendering.
     fn refresh_geometry(&mut self) {
         self.geometry = Rc::new(self.idle_lanes.geometry(self.collapse));
+        if let Some(day) = &mut self.day_rows {
+            day.geometry = Rc::new(day.idle_lanes.geometry(self.collapse));
+        }
+    }
+
+    /// The rows on screen: the day filter's while it is on, else the history.
+    fn rows(&self) -> &[Item] {
+        match &self.day_rows {
+            Some(day) => &day.items,
+            None => &self.items,
+        }
+    }
+
+    /// The graph geometry that belongs to [`Self::rows`].
+    fn geometry(&self) -> &Rc<ColumnGeometry> {
+        match &self.day_rows {
+            Some(day) => &day.geometry,
+            None => &self.geometry,
+        }
+    }
+
+    /// The active day filter.
+    pub fn day_filter(&self) -> Option<&DayFilter> {
+        self.day_rows.as_ref().map(|day| &day.filter)
+    }
+
+    /// How many commits the active filter found, once its query finished.
+    pub fn day_filter_count(&self) -> Option<usize> {
+        let day = self.day_rows.as_ref()?;
+        matches!(day.state, DayState::Ready).then_some(day.items.len())
+    }
+
+    /// Turns the day filter on, changes it or (with `None`) clears it.
+    ///
+    /// The commits come from a one-off `git log` for that day instead of the
+    /// loaded rows: the day may be older than what has streamed in, and the
+    /// strip counts the same way (author date, local day, mailmapped email),
+    /// so the list always matches the number the strip showed. The list code
+    /// is untouched: it reads [`Self::rows`], which is either this day's rows
+    /// or the history.
+    pub fn set_day_filter(&mut self, filter: Option<DayFilter>, cx: &mut Context<Self>) {
+        self.day_generation = self.day_generation.wrapping_add(1);
+        let generation = self.day_generation;
+        let Some(filter) = filter else {
+            if self.day_rows.take().is_some() {
+                self.reset_rows_view(cx);
+            }
+            return;
+        };
+        if self.day_rows.as_ref().map(|day| &day.filter) == Some(&filter) {
+            return;
+        }
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                self.day_rows = Some(DayRows {
+                    filter,
+                    state: DayState::Failed(error.to_string()),
+                    items: Vec::new(),
+                    idle_lanes: IdleLanes::new(),
+                    geometry: Rc::new(IdleLanes::new().geometry(self.collapse)),
+                    _task: None,
+                });
+                self.reset_rows_view(cx);
+                return;
+            }
+        };
+        let path = self.path.clone();
+        let (day, me) = (filter.day, filter.me.clone());
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &path).map_err(|e| e.to_string())?;
+                    let commits = git_core::commits_on_day(&repo, day, me.as_deref())
+                        .map_err(|e| e.to_string())?;
+                    Ok(layout_day(commits))
+                })
+                .await;
+            this.update(cx, |view, cx| view.finish_day_rows(generation, result, cx))
+                .ok();
+        });
+        self.day_rows = Some(DayRows {
+            filter,
+            state: DayState::Loading,
+            items: Vec::new(),
+            idle_lanes: IdleLanes::new(),
+            geometry: Rc::new(IdleLanes::new().geometry(self.collapse)),
+            _task: Some(task),
+        });
+        self.reset_rows_view(cx);
+    }
+
+    /// The day query answered.
+    fn finish_day_rows(
+        &mut self,
+        generation: u64,
+        result: Result<Vec<(CommitInfo, Row<Oid>)>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.day_generation {
+            return;
+        }
+        let collapse = self.collapse;
+        let Some(day) = &mut self.day_rows else {
+            return;
+        };
+        match result {
+            Ok(page) => {
+                for (commit, row) in page {
+                    day.idle_lanes.push(&row);
+                    day.items.push(Item {
+                        commit: Arc::new(commit),
+                        row: Rc::new(row),
+                    });
+                }
+                day.geometry = Rc::new(day.idle_lanes.geometry(collapse));
+                day.state = DayState::Ready;
+            }
+            Err(message) => {
+                log::warn!("could not list the commits of the day: {message}");
+                day.state = DayState::Failed(message);
+            }
+        }
+        self.reset_rows_view(cx);
+    }
+
+    /// The rows on screen changed wholesale: back to the top, selection and
+    /// search over the new rows.
+    fn reset_rows_view(&mut self, cx: &mut Context<Self>) {
+        self.selected = None;
+        self.user_selected = false;
+        self.hovered = None;
+        self.scroll.0.borrow().base_handle.set_offset(Point {
+            x: px(0.),
+            y: px(0.),
+        });
+        self.restart_search(cx);
+        self.settle_initial_selection(cx);
+        cx.notify();
     }
 
     /// The row of the HEAD commit, once it is among the loaded rows.
     fn head_index(&self) -> Option<usize> {
         let head = self.head_oid()?;
-        self.items.iter().position(|item| item.commit.id == head)
+        self.rows().iter().position(|item| item.commit.id == head)
     }
 
     /// The row a key press lands on when nothing is selected: the HEAD row
     /// when it is loaded, else row 0.
     fn initial_row(&self) -> Option<usize> {
-        if self.items.is_empty() {
+        if self.rows().is_empty() {
             None
         } else {
             Some(self.head_index().unwrap_or(0))
@@ -996,7 +1176,7 @@ impl HistoryView {
     /// as it arrives, else row 0. Selecting is not focusing: this never moves
     /// the keyboard focus or scrolls the list.
     fn settle_initial_selection(&mut self, cx: &mut Context<Self>) {
-        if self.user_selected || self.items.is_empty() {
+        if self.user_selected || self.rows().is_empty() {
             return;
         }
         let target = self.initial_row().unwrap_or(0);
@@ -1026,7 +1206,7 @@ impl HistoryView {
     /// Selects `index`, scrolls it minimally into view and repaints. Any pick
     /// stops the initial selection from following the load.
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.items.len() || self.selected == Some(index) {
+        if index >= self.rows().len() || self.selected == Some(index) {
             self.user_selected = true;
             return;
         }
@@ -1042,7 +1222,12 @@ impl HistoryView {
     /// arrived yet; then it is remembered and applied when its page lands.
     pub fn reveal_commit(&mut self, oid: Oid, cx: &mut Context<Self>) {
         self.pending_reveal.clear();
-        if let Some(index) = self.items.iter().position(|item| item.commit.id == oid) {
+        // The sidebar target may not be on the filtered day: show the whole
+        // history again, then reveal it there.
+        if self.day_rows.is_some() && !self.rows().iter().any(|item| item.commit.id == oid) {
+            self.set_day_filter(None, cx);
+        }
+        if let Some(index) = self.rows().iter().position(|item| item.commit.id == oid) {
             self.reveal_row(index, cx);
         } else if self.is_loading() {
             self.pending_reveal.set(oid);
@@ -1068,7 +1253,7 @@ impl HistoryView {
         let next = if self.selected.is_none() {
             current
         } else {
-            let last = self.items.len().saturating_sub(1) as isize;
+            let last = self.rows().len().saturating_sub(1) as isize;
             (current as isize + delta).clamp(0, last) as usize
         };
         self.select_row(next, cx);
@@ -1076,7 +1261,7 @@ impl HistoryView {
 
     /// Home / End: the first or the last loaded row (`usize::MAX` for End).
     fn jump_selection(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(last) = self.items.len().checked_sub(1) else {
+        let Some(last) = self.rows().len().checked_sub(1) else {
             return;
         };
         self.select_row(index.min(last), cx);
@@ -1093,7 +1278,7 @@ impl HistoryView {
         }
         let delta = page_rows(self.viewport_height(), f32::from(cx.theme().row_height)) as isize;
         let delta = if down { delta } else { -delta };
-        let last = self.items.len().saturating_sub(1) as isize;
+        let last = self.rows().len().saturating_sub(1) as isize;
         let next = (current as isize + delta).clamp(0, last) as usize;
         self.select_row(next, cx);
     }
@@ -1116,7 +1301,7 @@ impl HistoryView {
             return;
         };
         self.select_row(index, cx);
-        if let Some(item) = self.items.get(index) {
+        if let Some(item) = self.rows().get(index) {
             cx.write_to_clipboard(ClipboardItem::new_string(item.commit.id.to_string()));
         }
     }
@@ -1128,7 +1313,7 @@ impl HistoryView {
             return;
         };
         self.select_row(index, cx);
-        let Some(item) = self.items.get(index) else {
+        let Some(item) = self.rows().get(index) else {
             return;
         };
         let card = CommitCard::from_commit(&item.commit, self.refs().unwrap_or(&[]), self.head());
@@ -1143,7 +1328,7 @@ impl HistoryView {
     /// Double-click: switch to the row's first local branch that is not HEAD,
     /// or check the commit out detached when the row has no such branch.
     fn checkout_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.items.get(index) else {
+        let Some(item) = self.rows().get(index) else {
             return;
         };
         let card = CommitCard::from_commit(&item.commit, self.refs().unwrap_or(&[]), self.head());
@@ -1178,8 +1363,11 @@ impl HistoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let hash = self.items.get(index).map(|item| item.commit.id.to_string());
-        let card = self.items.get(index).map(|item| {
+        let hash = self
+            .rows()
+            .get(index)
+            .map(|item| item.commit.id.to_string());
+        let card = self.rows().get(index).map(|item| {
             CommitCard::from_commit(&item.commit, self.refs().unwrap_or(&[]), self.head())
         });
         let branch = match self.head() {
@@ -1315,7 +1503,7 @@ impl HistoryView {
     /// Fits the graph column to the current geometry and persists the width.
     /// Used by the grip's double-click, the "+N" pill and the context menu.
     fn fit_graph(&mut self, cx: &mut Context<Self>) {
-        let width = fit_width(content_width(&self.geometry));
+        let width = fit_width(content_width(self.geometry()));
         self.graph_width = width;
         crate::update_settings(cx, move |settings| settings.graph_width = width);
         cx.notify();
@@ -1473,7 +1661,7 @@ impl HistoryView {
         // While rows are still arriving or unscanned, the count is a lower
         // bound: "No matches" would be a lie about a scan that is not done.
         let pending =
-            self.is_loading() || self.search_scanning || self.search_scanned < self.items.len();
+            self.is_loading() || self.search_scanning || self.search_scanned < self.rows().len();
         if self.search_matches.is_empty() {
             return Some(if pending {
                 "– / 0+".into()
@@ -1545,12 +1733,12 @@ impl HistoryView {
         let Some(query) = self.search.clone() else {
             return;
         };
-        if self.search_scanning || self.search_scanned >= self.items.len() {
+        if self.search_scanning || self.search_scanned >= self.rows().len() {
             return;
         }
         let start = self.search_scanned;
-        let end = self.items.len();
-        let rows: Vec<Arc<CommitInfo>> = self.items[start..end]
+        let end = self.rows().len();
+        let rows: Vec<Arc<CommitInfo>> = self.rows()[start..end]
             .iter()
             .map(|item| item.commit.clone())
             .collect();
@@ -1665,6 +1853,10 @@ impl HistoryView {
         // The query stays in the field; its matches belong to the old rows.
         self.restart_search(cx);
         self.start(cx);
+        // The day's commits may have changed too (a new commit today).
+        if let Some(filter) = self.day_rows.take().map(|day| day.filter) {
+            self.set_day_filter(Some(filter), cx);
+        }
         cx.notify();
     }
 
@@ -1745,17 +1937,19 @@ impl HistoryView {
 
     /// The short hash of the selected commit, for the details header.
     pub fn selected_short(&self) -> Option<SharedString> {
-        self.selected.and_then(|ix| self.items.get(ix)).map(|item| {
-            let mut hash = item.commit.id.to_string();
-            hash.truncate(7);
-            hash.into()
-        })
+        self.selected
+            .and_then(|ix| self.rows().get(ix))
+            .map(|item| {
+                let mut hash = item.commit.id.to_string();
+                hash.truncate(7);
+                hash.into()
+            })
     }
 
     /// The selected commit, for the details dock.
     pub fn selected_commit(&self) -> Option<Arc<CommitInfo>> {
         self.selected
-            .and_then(|ix| self.items.get(ix))
+            .and_then(|ix| self.rows().get(ix))
             .map(|item| item.commit.clone())
     }
 
@@ -1764,7 +1958,7 @@ impl HistoryView {
     fn render_graph_header(&self, columns: Columns, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         let accent = colors.accent;
-        let clipped = clipped_lanes(&self.geometry, columns.graph);
+        let clipped = clipped_lanes(self.geometry(), columns.graph);
         let dragging = self.grip_drag.as_ref().is_some_and(|drag| drag.dragging);
 
         let mut cell = div()
@@ -1897,7 +2091,7 @@ impl HistoryView {
         };
         // The folded lanes are part of the history's own progress line: say
         // how many the graph is hiding while the rows stream in.
-        let folded = if self.collapse && self.geometry.folded_count > 0 {
+        let folded = if self.collapse && self.geometry().folded_count > 0 {
             format!(" · {} idle lanes folded", self.geometry.folded_count)
         } else {
             String::new()
@@ -2008,7 +2202,7 @@ impl HistoryView {
             .map(|state| state.settings.clone())
             .unwrap_or_default();
         let columns = self.columns;
-        let geometry = self.geometry.clone();
+        let geometry = self.geometry().clone();
         let hovered = self.hovered;
         let head = self.head_oid();
         let selected_index = self.selected;
@@ -2019,7 +2213,10 @@ impl HistoryView {
         let ring_visible = focus::focus_visible(&self.focus, window, cx);
         let now = unix_now();
         let summary_width = self.summary_width;
-        let items = &self.items;
+        let items: &[Item] = match &self.day_rows {
+            Some(day) => &day.items,
+            None => &self.items,
+        };
         let badges = &self.badges;
         let badge_widths = &mut self.badge_widths;
         let search_matches = &self.search_matches;
@@ -2334,7 +2531,7 @@ impl HistoryView {
     fn render_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
         uniform_list(
             "history",
-            self.items.len(),
+            self.rows().len(),
             cx.processor(|view, range, window, cx| view.render_rows(range, window, cx)),
         )
         .track_scroll(&self.scroll)
@@ -2363,6 +2560,32 @@ impl HistoryView {
     fn render_body(&mut self, columns: Columns, cx: &mut Context<Self>) -> AnyElement {
         // The state is small and cloned so the render helpers can take `&mut
         // self` for their click listeners.
+        if let Some(day) = &self.day_rows {
+            return match &day.state {
+                DayState::Loading => self.render_skeletons(columns, cx).into_any_element(),
+                DayState::Failed(message) => {
+                    let message = SharedString::from(message.clone());
+                    let actions = div().flex().gap(px(8.)).child(
+                        Button::primary("empty-day-retry")
+                            .label("Retry")
+                            .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+                    );
+                    centred(
+                        EmptyState::new("Could not list the commits of this day")
+                            .icon(IconName::Warn)
+                            .icon_color(cx.theme().colors.warning)
+                            .text(message)
+                            .actions(actions),
+                    )
+                }
+                DayState::Ready if day.items.is_empty() => centred(
+                    EmptyState::new("No commits on this day")
+                        .icon(IconName::Git)
+                        .icon_color(cx.theme().colors.muted),
+                ),
+                DayState::Ready => self.render_list(cx),
+            };
+        }
         let state = self.state.clone();
         match state {
             LoadState::Loading { total } => {
@@ -2809,6 +3032,15 @@ impl HistoryView {
             .bg(colors.bg)
             .text_color(colors.text)
             .font_family(FONT_UI)
+            // Esc with the list (or anything under it) focused clears the
+            // day filter; without one it goes on to the next handler.
+            .on_action(cx.listener(|view, _: &Cancel, _, cx| {
+                if view.day_rows.is_some() {
+                    view.set_day_filter(None, cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
             .child(self.render_header(columns, cx))
             .child(body)
             .into_any_element()
@@ -2980,6 +3212,26 @@ fn next_page(
                 .collect()
         });
     (stream, graph, page)
+}
+
+/// Lays out the commits of one day as a graph of their own: only parents that
+/// are on the same day are drawn, like the design's filtered history.
+fn layout_day(commits: Vec<CommitInfo>) -> Vec<(CommitInfo, Row<Oid>)> {
+    let ids: HashSet<Oid> = commits.iter().map(|c| c.id).collect();
+    let mut graph = GraphBuilder::new();
+    commits
+        .into_iter()
+        .map(|c| {
+            let parents: Vec<Oid> = c
+                .parents
+                .iter()
+                .copied()
+                .filter(|p| ids.contains(p))
+                .collect();
+            let row = graph.push(c.id, &parents);
+            (c, row)
+        })
+        .collect()
 }
 
 /// Seconds since the unix epoch; 0 if the clock is before it.

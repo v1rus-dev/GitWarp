@@ -1,0 +1,859 @@
+//! The Activity strip above the History list: a commit heatmap with a legend,
+//! an author switch (Me / Everyone), a range select and the day filter's bar.
+//!
+//! The counts come from one `git log` on the background executor (the last
+//! weeks first, then the whole history), are cached here and are only
+//! recomputed when the history reloads. Picking a day filters the History
+//! list through [`HistoryView::set_day_filter`]; the history owns the filter,
+//! this view only reads it back to draw the selection and the bar.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use gpui::prelude::*;
+use gpui::{
+    div, px, App, Context, Entity, FontWeight, SharedString, Subscription, Task, WeakEntity, Window,
+};
+
+use git_core::{Activity, Error, Git, Repo};
+use ui::actions::Cancel;
+use ui::metrics::{FONT_MONO, FONT_UI, FS_SM};
+use ui::{
+    ActiveTheme, Button, ButtonSize, HeatLegend, Heatmap, Icon, IconName, Kbd, SegmentItem,
+    Segmented, Select, Skeleton,
+};
+
+use crate::format::format_count;
+use crate::history_view::{DayFilter, HistoryView};
+use crate::workspace::Workspace;
+
+/// Columns of the heatmap: a year plus the partial week on each side.
+const WEEKS: usize = 53;
+/// The days the heatmap's "last 12 months" total counts.
+const LAST_YEAR_DAYS: i32 = 365;
+/// How far back the quick first count looks.
+const PARTIAL_DAYS: i32 = 56;
+/// How many past years the range select offers.
+const YEARS_SHOWN: usize = 5;
+/// The strip's header height, the same as the details dock's.
+const HEADER: f32 = 34.;
+
+const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Who {
+    Me,
+    Everyone,
+}
+
+#[derive(Debug)]
+enum Status {
+    /// Nothing counted yet.
+    Loading,
+    /// The recent weeks are in; days before `from` are still being counted.
+    Partial {
+        from: i32,
+    },
+    Ready,
+    Failed(String),
+}
+
+/// What one counting run found.
+struct Counted {
+    today: i32,
+    me: Option<String>,
+    activity: Activity,
+}
+
+/// Commit counts per day for one author scope.
+type Counts = Rc<HashMap<i32, u32>>;
+
+/// The numbers the heatmap draws for the current author and range.
+#[derive(Clone)]
+struct Shown {
+    counts: Counts,
+    thresholds: [u32; 4],
+    total: usize,
+    end_day: i32,
+}
+
+pub struct ActivityStrip {
+    path: PathBuf,
+    git: Result<Arc<Git>, Arc<Error>>,
+    workspace: WeakEntity<Workspace>,
+    history: Entity<HistoryView>,
+    /// Redraws the selection and the bar when the history's filter changes
+    /// (also from its own Esc).
+    _history_observer: Subscription,
+    collapsed: bool,
+    who: Who,
+    /// `None` is "Last 12 months".
+    year: Option<i32>,
+    status: Status,
+    today: i32,
+    me: Option<String>,
+    mine: Counts,
+    all: Counts,
+    /// Years with commits, newest first, at most [`YEARS_SHOWN`].
+    years: Vec<i32>,
+    shown: Option<Shown>,
+    generation: u64,
+    task: Option<Task<()>>,
+}
+
+impl ActivityStrip {
+    pub fn new(
+        path: PathBuf,
+        git: Result<Arc<Git>, Arc<Error>>,
+        workspace: WeakEntity<Workspace>,
+        history: Entity<HistoryView>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let collapsed = cx
+            .try_global::<crate::AppSettings>()
+            .is_some_and(|state| state.settings.activity_collapsed);
+        let observer = cx.observe(&history, |_, _, cx| cx.notify());
+        let mut strip = Self {
+            path,
+            git,
+            workspace,
+            history,
+            _history_observer: observer,
+            collapsed,
+            who: Who::Me,
+            year: None,
+            status: Status::Loading,
+            today: 0,
+            me: None,
+            mine: Rc::default(),
+            all: Rc::default(),
+            years: Vec::new(),
+            shown: None,
+            generation: 0,
+            task: None,
+        };
+        strip.load(cx);
+        strip
+    }
+
+    /// Counts again, e.g. after a commit moved HEAD. The old numbers stay on
+    /// screen until the new ones land, so the grid does not flash.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.load(cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_collapsed(&self) -> bool {
+        self.collapsed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self.status, Status::Ready)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total(&self) -> Option<usize> {
+        self.shown.as_ref().map(|shown| shown.total)
+    }
+
+    fn load(&mut self, cx: &mut Context<Self>) {
+        self.generation += 1;
+        let generation = self.generation;
+        if self.shown.is_none() {
+            self.status = Status::Loading;
+        }
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                self.status = Status::Failed(error.to_string());
+                return;
+            }
+        };
+        let path = self.path.clone();
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let opened = executor
+                .spawn(async move {
+                    let repo = Repo::open(git, &path).map_err(|e| e.to_string())?;
+                    let today = git_core::today(&repo).map_err(|e| e.to_string())?;
+                    let me = git_core::my_email(&repo).map_err(|e| e.to_string())?;
+                    Ok::<_, String>((repo, today, me))
+                })
+                .await;
+            let (repo, today, me) = match opened {
+                Ok(opened) => opened,
+                Err(message) => {
+                    this.update(cx, |view, cx| view.fail(generation, message, cx))
+                        .ok();
+                    return;
+                }
+            };
+            // The whole history starts counting now; the recent weeks are
+            // counted beside it so a big repository paints them first. Days
+            // are padded by one on each side so no timezone can cut a day.
+            let until = (i64::from(today) + 2) * 86_400;
+            let full = {
+                let (repo, me) = (repo.clone(), me.clone());
+                executor.spawn(async move {
+                    git_core::activity(&repo, 0, until, me.as_deref()).map_err(|e| e.to_string())
+                })
+            };
+            let since = (i64::from(today - PARTIAL_DAYS) - 1) * 86_400;
+            let partial = {
+                let me = me.clone();
+                executor.spawn(async move {
+                    git_core::activity(&repo, since, until, me.as_deref())
+                        .map_err(|e| e.to_string())
+                })
+            };
+            if let Ok(activity) = partial.await {
+                let counted = Counted {
+                    today,
+                    me: me.clone(),
+                    activity,
+                };
+                this.update(cx, |view, cx| view.apply_partial(generation, counted, cx))
+                    .ok();
+            }
+            let result = full.await.map(|activity| Counted {
+                today,
+                me,
+                activity,
+            });
+            this.update(cx, |view, cx| match result {
+                Ok(counted) => view.apply_full(generation, counted, cx),
+                Err(message) => view.fail(generation, message, cx),
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn fail(&mut self, generation: u64, message: String, cx: &mut Context<Self>) {
+        if generation != self.generation {
+            return;
+        }
+        log::warn!("could not count the commits per day: {message}");
+        self.status = Status::Failed(message);
+        cx.notify();
+    }
+
+    /// The recent weeks arrived; ignored when the full count already landed.
+    fn apply_partial(&mut self, generation: u64, counted: Counted, cx: &mut Context<Self>) {
+        if generation != self.generation || !matches!(self.status, Status::Loading) {
+            return;
+        }
+        self.adopt(&counted);
+        self.status = Status::Partial {
+            from: counted.today - PARTIAL_DAYS,
+        };
+        self.recompute();
+        cx.notify();
+    }
+
+    fn apply_full(&mut self, generation: u64, counted: Counted, cx: &mut Context<Self>) {
+        if generation != self.generation {
+            return;
+        }
+        self.adopt(&counted);
+        self.status = Status::Ready;
+        // The set of years may have shrunk on a reload.
+        if self.year.is_some_and(|year| !self.years.contains(&year)) {
+            self.year = None;
+        }
+        self.recompute();
+        cx.notify();
+    }
+
+    /// Takes a run's numbers over; the counts are per day, so a partial run
+    /// and the full one differ only in how far back they reach.
+    fn adopt(&mut self, counted: &Counted) {
+        self.today = counted.today;
+        self.me = counted.me.clone();
+        let mut mine = HashMap::new();
+        let mut all = HashMap::new();
+        for day in &counted.activity.days {
+            if day.all > 0 {
+                all.insert(day.day, day.all);
+            }
+            if day.mine > 0 {
+                mine.insert(day.day, day.mine);
+            }
+        }
+        self.mine = Rc::new(mine);
+        self.all = Rc::new(all);
+        if self.me.is_none() {
+            // Without an identity there is nothing to call "mine".
+            self.who = Who::Everyone;
+        }
+        let mut years: Vec<i32> = self
+            .all
+            .keys()
+            .map(|&day| git_core::civil_from_days(day).0)
+            .collect();
+        years.sort_unstable_by(|a, b| b.cmp(a));
+        years.dedup();
+        years.truncate(YEARS_SHOWN);
+        self.years = years;
+    }
+
+    /// Rebuilds what the heatmap draws after the data, author or range changed.
+    fn recompute(&mut self) {
+        let counts = match self.who {
+            Who::Me => self.mine.clone(),
+            Who::Everyone => self.all.clone(),
+        };
+        let (start, end) = range_days(self.year, self.today);
+        let in_range: Vec<u32> = counts
+            .iter()
+            .filter(|(&day, _)| (start..=end).contains(&day))
+            .map(|(_, &count)| count)
+            .collect();
+        self.shown = Some(Shown {
+            thresholds: git_core::levels(&in_range),
+            total: in_range.iter().map(|&c| c as usize).sum(),
+            counts,
+            end_day: end,
+        });
+    }
+
+    pub(crate) fn set_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        self.collapsed = collapsed;
+        crate::update_settings(cx, move |settings| settings.activity_collapsed = collapsed);
+        cx.notify();
+    }
+
+    /// Switching author or range changes the numbers the filter was picked
+    /// from, so the filter goes away with them.
+    fn set_who(&mut self, who: Who, cx: &mut Context<Self>) {
+        if self.who == who || (who == Who::Me && self.me.is_none()) {
+            return;
+        }
+        self.who = who;
+        self.clear_filter(cx);
+        self.recompute();
+        cx.notify();
+    }
+
+    fn set_year(&mut self, year: Option<i32>, cx: &mut Context<Self>) {
+        if self.year == year {
+            return;
+        }
+        self.year = year;
+        self.clear_filter(cx);
+        self.recompute();
+        cx.notify();
+    }
+
+    fn clear_filter(&mut self, cx: &mut Context<Self>) {
+        self.history
+            .update(cx, |history, cx| history.set_day_filter(None, cx));
+    }
+
+    /// A click, Enter or Space on `day`: filter to it, or drop the filter when
+    /// it is already the filtered day.
+    pub(crate) fn pick_day(&mut self, day: i32, cx: &mut Context<Self>) {
+        let Some(shown) = &self.shown else {
+            return;
+        };
+        if !matches!(self.status, Status::Ready) || !shown.counts.contains_key(&day) {
+            return;
+        }
+        let already = self
+            .history
+            .read(cx)
+            .day_filter()
+            .is_some_and(|filter| filter.day == day);
+        let filter = (!already).then(|| DayFilter {
+            day,
+            me: match self.who {
+                Who::Me => self.me.clone(),
+                Who::Everyone => None,
+            },
+        });
+        self.history
+            .update(cx, |history, cx| history.set_day_filter(filter, cx));
+    }
+
+    fn open_identity(&self, window: &mut Window, cx: &mut App) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_settings_at(crate::settings_ui::Page::Identity, window, cx)
+            })
+            .ok();
+    }
+}
+
+/// The first and last day the total counts: the last 365 days up to today, or
+/// the calendar year (up to today for the current one).
+fn range_days(year: Option<i32>, today: i32) -> (i32, i32) {
+    match year {
+        None => (today - LAST_YEAR_DAYS + 1, today),
+        Some(year) => {
+            let end = git_core::days_from_civil(year, 12, 31).min(today);
+            (git_core::days_from_civil(year, 1, 1), end)
+        }
+    }
+}
+
+/// `Tue, 13 Oct 2026`.
+fn long_date(day: i32) -> String {
+    let (year, month, date) = git_core::civil_from_days(day);
+    // 1970-01-01 was a Thursday and weeks start on Monday.
+    let weekday = (day + 3).rem_euclid(7) as usize;
+    format!(
+        "{}, {date} {} {year}",
+        WEEKDAYS[weekday],
+        MONTHS[month as usize - 1]
+    )
+}
+
+/// `1 commit` / `4 commits`.
+fn commits(count: usize) -> String {
+    format!(
+        "{} commit{}",
+        format_count(count),
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+impl ActivityStrip {
+    fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let collapsed = self.collapsed;
+        let tip = if collapsed {
+            "Expand activity"
+        } else {
+            "Collapse activity"
+        };
+        let toggle = Button::ghost("activity-toggle")
+            .size(ButtonSize::Xs)
+            .icon_only(if collapsed {
+                IconName::ChevR
+            } else {
+                IconName::ChevD
+            })
+            .tooltip(tip)
+            .on_click(cx.listener(move |this, _, _, cx| this.set_collapsed(!this.collapsed, cx)));
+
+        let when = match self.year {
+            Some(year) => format!("in {year}"),
+            None => "in the last year".to_owned(),
+        };
+        let mine = self.who == Who::Me;
+        let strong = |text: String| {
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors.text)
+                .child(text)
+        };
+        let total = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .text_size(FS_SM)
+            .text_color(colors.muted)
+            .whitespace_nowrap();
+        let total = match (&self.status, &self.shown) {
+            (Status::Failed(_), _) => total.child("Activity unavailable"),
+            (Status::Loading, _) | (_, None) => {
+                total.child(Skeleton::new("activity-total-skeleton", px(180.)))
+            }
+            (Status::Partial { .. }, Some(shown)) => total
+                .child(Icon::new(IconName::Fetch).size(px(12.)).color(colors.muted))
+                .child("Counting…")
+                .child(strong(format_count(shown.total)))
+                .child("commits so far"),
+            (Status::Ready, Some(shown)) => {
+                if self.all.is_empty() {
+                    total.child("No commits yet")
+                } else if shown.total == 0 && mine {
+                    total.child(format!("No commits by you {when}"))
+                } else {
+                    let noun = match (mine, shown.total == 1) {
+                        (true, true) => "commit by you",
+                        (true, false) => "commits by you",
+                        (false, true) => "commit",
+                        (false, false) => "commits",
+                    };
+                    total
+                        .child(strong(format_count(shown.total)))
+                        .child(format!("{noun} {when}"))
+                }
+            }
+        };
+
+        let show_legend = !collapsed
+            && matches!(self.status, Status::Ready | Status::Partial { .. })
+            && !self.all.is_empty();
+        let me_disabled = self.me.is_none();
+        let me_tip = match &self.me {
+            Some(email) => format!("Commits where author email = {email}"),
+            None => "Set user.email to see your own commits".to_owned(),
+        };
+        let author = Segmented::new("activity-author")
+            .small()
+            .item(
+                SegmentItem::new("Me")
+                    .with_icon(IconName::User)
+                    .id("activity-author-me")
+                    .disabled(me_disabled)
+                    .tooltip(me_tip),
+            )
+            .item(SegmentItem::new("Everyone").id("activity-author-everyone"))
+            .selected(if mine { 0 } else { 1 })
+            .on_select({
+                let view = cx.entity();
+                move |index, _, cx| {
+                    view.update(cx, |this, cx| {
+                        this.set_who(if index == 0 { Who::Me } else { Who::Everyone }, cx);
+                    });
+                }
+            });
+
+        let mut options: Vec<SharedString> = vec!["Last 12 months".into()];
+        options.extend(self.years.iter().map(|year| year.to_string().into()));
+        let selected = self
+            .year
+            .and_then(|year| self.years.iter().position(|&y| y == year))
+            .map_or(0, |position| position + 1);
+        let years = self.years.clone();
+        let range = Select::new("activity-range")
+            .options(options)
+            .selected(selected)
+            .on_change({
+                let view = cx.entity();
+                move |index, _, cx| {
+                    let year = index.checked_sub(1).and_then(|i| years.get(i).copied());
+                    view.update(cx, |this, cx| this.set_year(year, cx));
+                }
+            });
+
+        div()
+            .h(px(HEADER))
+            .flex_none()
+            .pl(px(12.))
+            .pr(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .font_family(FONT_UI)
+            .child(toggle)
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(ui::metrics::FS_BASE)
+                    .child("Activity"),
+            )
+            .child(total)
+            .child(div().flex_1())
+            .when(show_legend, |this| this.child(HeatLegend::new()))
+            .child(author)
+            .child(range)
+    }
+
+    fn render_body(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let filter = self.history.read(cx).day_filter().cloned();
+        let body = div()
+            .flex()
+            .items_start()
+            .gap(px(24.))
+            .px(px(16.))
+            .pb(px(12.));
+
+        if let Status::Failed(message) = &self.status {
+            let view = cx.entity();
+            return body.child(
+                div()
+                    .flex_1()
+                    .min_h(px(98.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(FS_SM)
+                    .text_color(colors.muted)
+                    .child(Icon::new(IconName::Err).size(px(16.)).color(colors.error))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(colors.text)
+                                    .child("Could not count commits"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(FONT_MONO)
+                                    .child(SharedString::from(message.clone())),
+                            ),
+                    )
+                    .child(
+                        Button::new("activity-retry")
+                            .size(ButtonSize::Small)
+                            .icon(IconName::Fetch)
+                            .label("Retry")
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| this.load(cx));
+                            }),
+                    ),
+            );
+        }
+
+        let loading = matches!(self.status, Status::Loading) || self.shown.is_none();
+        let pending_from = match self.status {
+            Status::Partial { from } => Some(from),
+            _ => None,
+        };
+        let (counts, thresholds, end_day) = match &self.shown {
+            Some(shown) => (shown.counts.clone(), shown.thresholds, shown.end_day),
+            None => (Rc::default(), [0; 4], self.today),
+        };
+        let selected = filter.as_ref().map(|filter| filter.day);
+        let view = cx.entity();
+        let select_view = view.clone();
+        let mut heatmap = Heatmap::new("activity-heatmap", end_day, WEEKS, {
+            let counts = counts.clone();
+            move |day| {
+                let count = counts.get(&day).copied().unwrap_or(0);
+                (count, git_core::level(count, &thresholds))
+            }
+        })
+        .selected(selected)
+        .loading(loading)
+        .pending_from(pending_from)
+        .on_select(move |day, _, cx| {
+            select_view.update(cx, |this, cx| this.pick_day(day, cx));
+        });
+        if filter.is_some() {
+            // Esc in the grid drops the filter; without one the grid lets it
+            // travel on.
+            heatmap = heatmap.on_clear(move |_, cx| {
+                view.update(cx, |this, cx| this.clear_filter(cx));
+            });
+        }
+
+        let side = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .pt(px(18.))
+            .text_size(FS_SM)
+            .text_color(colors.muted);
+        let side = self.render_side(side, filter.as_ref(), loading, cx);
+
+        body.child(
+            div()
+                .id("activity-scroll")
+                .flex_none()
+                .max_w_full()
+                .min_w_0()
+                .overflow_x_scroll()
+                .child(heatmap),
+        )
+        .child(side)
+    }
+
+    fn render_side(
+        &mut self,
+        side: gpui::Div,
+        filter: Option<&DayFilter>,
+        loading: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let colors = cx.theme().colors;
+        let mono = |text: String| {
+            div()
+                .font_family(FONT_MONO)
+                .text_color(colors.text)
+                .child(text)
+        };
+        let link = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .cursor_pointer()
+                .text_color(colors.accent)
+                .hover(|this| this.underline())
+                .child(label)
+        };
+        let line = || div().flex().items_center().gap(px(4.)).flex_wrap();
+
+        if loading {
+            return side
+                .child(Skeleton::new("activity-side-1", px(140.)))
+                .child(Skeleton::new("activity-side-2", px(110.)));
+        }
+        if self.me.is_none() {
+            let view = cx.entity();
+            return side.child(
+                line()
+                    .child("Showing everyone:")
+                    .child(mono("user.email".to_owned()))
+                    .child("is not set for this repository.")
+                    .child(link("activity-set-identity", "Set identity…").on_click(
+                        move |_, window, cx| {
+                            view.update(cx, |this, cx| this.open_identity(window, cx));
+                        },
+                    )),
+            );
+        }
+        if self.all.is_empty() {
+            return side.child("Make the first commit to start the graph.");
+        }
+        if self.who == Who::Me && self.mine.is_empty() {
+            let view = cx.entity();
+            return side
+                .child(
+                    line()
+                        .child("No commits by")
+                        .child(mono(self.me.clone().unwrap_or_default())),
+                )
+                .child(
+                    link("activity-show-everyone", "Show everyone’s commits").on_click(
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| this.set_who(Who::Everyone, cx));
+                        },
+                    ),
+                );
+        }
+        if let (Some(filter), Some(shown)) = (filter, &self.shown) {
+            let count = self
+                .history
+                .read(cx)
+                .day_filter_count()
+                .or_else(|| shown.counts.get(&filter.day).map(|&c| c as usize))
+                .unwrap_or(0);
+            return side
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.text)
+                        .child(long_date(filter.day)),
+                )
+                .child(format!(
+                    "{} · History is filtered to this day.",
+                    commits(count)
+                ));
+        }
+        if matches!(self.status, Status::Partial { .. }) {
+            return side.child(
+                line()
+                    .child("Older weeks fill in as")
+                    .child(mono("git log".to_owned()))
+                    .child("streams; colours settle when counting ends."),
+            );
+        }
+        let keys = |text: &'static str| Kbd::new(text);
+        side.child("Click a day to show its commits in History.")
+            .child(
+                line()
+                    .child(keys("↑"))
+                    .child(keys("↓"))
+                    .child("day ·")
+                    .child(keys("←"))
+                    .child(keys("→"))
+                    .child("week ·")
+                    .child(keys("Enter"))
+                    .child("filter"),
+            )
+    }
+
+    /// The accent-soft bar under the strip while a day filter is on.
+    fn render_filter_bar(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let colors = cx.theme().colors;
+        let history = self.history.read(cx);
+        let filter = history.day_filter()?.clone();
+        let count = history.day_filter_count();
+        let strong = |text: String| div().font_weight(FontWeight::SEMIBOLD).child(text);
+        let noun = if filter.me.is_some() {
+            "of your commits"
+        } else {
+            "commits"
+        };
+        let view = cx.entity();
+        Some(
+            div()
+                .id("activity-day-filter")
+                .h(px(30.))
+                .flex_none()
+                .pl(px(16.))
+                .pr(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .bg(colors.accent_soft)
+                .border_b_1()
+                .border_color(colors.border)
+                .font_family(FONT_UI)
+                .text_size(FS_SM)
+                .child(
+                    Icon::new(IconName::Lanes)
+                        .size(px(14.))
+                        .color(colors.accent),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .child("Showing")
+                        .child(strong(count.map_or("…".to_owned(), format_count)))
+                        .child(noun)
+                        .child("on")
+                        .child(strong(long_date(filter.day))),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new("activity-clear-filter")
+                        .size(ButtonSize::Small)
+                        .label("Clear filter")
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| this.clear_filter(cx));
+                        }),
+                )
+                .child(Kbd::new("Esc")),
+        )
+    }
+}
+
+impl Render for ActivityStrip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let collapsed = self.collapsed;
+        let strip = div()
+            .id("activity-strip")
+            .flex_none()
+            .bg(colors.bg)
+            .border_b_1()
+            .border_color(colors.border)
+            .text_color(colors.text)
+            // Esc anywhere in the strip drops the filter; with none it goes on.
+            .on_action(cx.listener(|this, _: &Cancel, _, cx| {
+                if this.history.read(cx).day_filter().is_some() {
+                    this.clear_filter(cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
+            .child(self.render_header(cx))
+            .when(!collapsed, |this| this.child(self.render_body(cx)));
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .child(strip)
+            .children(self.render_filter_bar(cx))
+    }
+}
