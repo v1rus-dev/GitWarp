@@ -315,7 +315,7 @@ impl WorktreesModel {
             Err(error) => {
                 self.loaded = true;
                 self.loading = false;
-                self.error = Some(error.to_string());
+                self.error = Some(git_message(error));
                 cx.notify();
                 return;
             }
@@ -388,7 +388,7 @@ impl WorktreesModel {
                 }
             }
             Err(error) => {
-                self.error = Some(error.to_string());
+                self.error = Some(git_message(&error));
             }
         }
         cx.notify();
@@ -782,6 +782,31 @@ pub(crate) fn switch_window_to(
 }
 
 /// The user's worktree settings, the defaults when none are loaded (tests).
+/// What a worktree banner shows for a failed git command: git's own message
+/// (`fatal: …` / `error: …`), without the `git <cmd> failed (exit N):` wrapper
+/// and without progress lines such as `Preparing worktree (…)`, as in the design.
+pub(crate) fn git_message(error: &Error) -> String {
+    let Error::Git { stderr, .. } = error else {
+        return error.to_string();
+    };
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let messages: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| line.starts_with("fatal:") || line.starts_with("error:"))
+        .collect();
+    if messages.is_empty() {
+        // Nothing recognisable: keep everything git said rather than nothing.
+        error.to_string()
+    } else {
+        messages.join("\n")
+    }
+}
+
 fn worktree_settings(cx: &App) -> WorktreeSettings {
     cx.try_global::<crate::AppSettings>()
         .map(|state| state.settings.worktrees.clone())
@@ -1027,6 +1052,41 @@ mod tests {
     use super::*;
     use crate::test_support::{git, open_workspace, TempRepo};
     use std::process::Command;
+
+    fn git_error(stderr: &str) -> Error {
+        Error::Git {
+            command: "worktree add",
+            code: Some(128),
+            stderr: stderr.into(),
+        }
+    }
+
+    #[test]
+    fn a_banner_shows_only_gits_message() {
+        // The wrapper and the progress line go; the message stays.
+        assert_eq!(
+            git_message(&git_error(
+                "Preparing worktree (checking out 'x')\nfatal: could not create leading directories of '/a/b': Permission denied\n"
+            )),
+            "fatal: could not create leading directories of '/a/b': Permission denied"
+        );
+        assert_eq!(
+            git_message(&git_error(
+                "error: failed to delete '/a': Permission denied"
+            )),
+            "error: failed to delete '/a': Permission denied"
+        );
+        // Nothing recognisable: everything git said is kept, wrapper included.
+        assert_eq!(
+            git_message(&git_error("weird output")),
+            "git worktree add failed (exit 128): weird output"
+        );
+        // Not a git failure: the error's own text.
+        assert_eq!(
+            git_message(&Error::Parse("start commit")),
+            "could not parse start commit"
+        );
+    }
 
     fn run(dir: &Path, args: &[&str]) {
         let status = Command::new("git")

@@ -6055,6 +6055,28 @@ mod tests {
         history.read_with(&cx, |history, _| assert!(history.day_filter().is_none()));
     }
 
+    /// When the window is too narrow for the whole grid it scrolls, and it
+    /// opens (and stays after a resize) at the newest week, not the oldest.
+    #[gpui::test]
+    fn the_activity_grid_opens_at_the_newest_week(cx: &mut gpui::TestAppContext) {
+        let (repo, _day) = day_filter_repo("strip-scroll-end");
+        let (cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        let strip = view.read_with(&cx, |view, _| view.activity.clone());
+        let scroll = strip.read_with(&cx, |strip, _| strip.scroll_handle());
+
+        cx.simulate_resize(gpui::size(px(560.), px(900.)));
+        cx.run_until_parked();
+        let max = scroll.max_offset().x;
+        assert!(max > px(0.), "the grid should overflow at 560 px");
+        assert_eq!(scroll.offset().x, -max, "scroll starts at the newest week");
+
+        // A resize keeps the end while the user did not scroll away.
+        cx.simulate_resize(gpui::size(px(480.), px(900.)));
+        cx.run_until_parked();
+        assert_eq!(scroll.offset().x, -scroll.max_offset().x);
+    }
+
     /// Enter on a keyboard-selected day filters History; Esc then clears the
     /// filter and the heatmap keeps the focus (a second Enter picks again).
     #[gpui::test]
@@ -6339,6 +6361,40 @@ mod tests {
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         assert_eq!(layers(&mut cx), 0, "Esc did not close the Remove dialog");
+        let _ = std::fs::remove_dir_all(linked);
+    }
+
+    /// `git worktree remove` can fail after the fact (here: the folder turned
+    /// dirty while the dialog was open): the list is reloaded anyway, so it no
+    /// longer shows the stale state. Enter on the focused primary button runs it.
+    #[gpui::test]
+    fn a_failed_remove_still_reloads_the_worktree_list(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktree-remove-fails");
+        let (mut cx, _workspace, view, linked) = open_with_linked_worktree(&repo, cx);
+        let model = view.read_with(&cx, |view, _| view.worktrees_model());
+        let focus = view.read_with(&cx, |view, _| view.worktree_panel_focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_keystrokes("down delete");
+        cx.run_until_parked();
+        assert!(view.read_with(&cx, |view, cx| view.worktrees.read(cx).has_dialog()));
+        let dirty = |cx: &gpui::VisualTestContext| {
+            model.read_with(cx, |model, _| {
+                model.entry(&linked).map(|entry| entry.changes.len())
+            })
+        };
+        assert_eq!(dirty(&cx), Some(0), "the worktree starts clean");
+
+        // An untracked file makes plain `git worktree remove` refuse.
+        std::fs::write(linked.join("late.txt"), "late").expect("dirty the worktree");
+        // Tab: delete-branch box, Cancel, Remove. Enter runs the focused button.
+        cx.simulate_keystrokes("tab tab tab enter");
+        cx.run_until_parked();
+        assert_eq!(
+            dirty(&cx),
+            Some(1),
+            "the list was not reloaded after the failed remove"
+        );
+        assert!(view.read_with(&cx, |view, cx| view.worktrees.read(cx).has_dialog()));
         let _ = std::fs::remove_dir_all(linked);
     }
 

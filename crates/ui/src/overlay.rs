@@ -228,6 +228,12 @@ pub fn defer_focus_restore(window: &Window, cx: &mut App) {
     }
 }
 
+/// Whether a focus restore waits for the key-up of the key press that closed
+/// a layer (the focus sits on the overlay root until then).
+pub(crate) fn restore_pending(window: &Window, cx: &App) -> bool {
+    try_entity(window, cx).is_some_and(|overlays| overlays.read(cx).pending_restore.is_some())
+}
+
 /// Cancels a deferral registered by [`defer_focus_restore`] when the key
 /// press did not end up closing a layer.
 pub fn clear_deferred_focus_restore(window: &Window, cx: &mut App) {

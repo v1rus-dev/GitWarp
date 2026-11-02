@@ -619,6 +619,8 @@ impl RenderOnce for Heatmap {
         div()
             .flex()
             .flex_col()
+            // Keeps its full width inside a scroll box instead of shrinking to it.
+            .flex_none()
             .gap(SP_2)
             .child(months)
             .child(div().flex().child(weekday_column).child(grid))

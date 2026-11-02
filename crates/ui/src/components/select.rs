@@ -120,6 +120,13 @@ impl RenderOnce for Select {
 
         let label = self.options.get(self.selected).cloned().unwrap_or_default();
         let entries = self.entries();
+        // The menu opens on the current value (a native `<select>` does), or on
+        // the first item when the value is not among the options.
+        let highlight = Some(if self.selected < self.options.len() {
+            self.selected
+        } else {
+            0
+        });
         let bounds_slot = bounds.clone();
         let open = {
             let bounds = bounds.clone();
@@ -127,7 +134,7 @@ impl RenderOnce for Select {
                 let anchor = bounds
                     .get()
                     .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), size(px(0.), px(0.))));
-                menu::open_dropdown(anchor, entries.clone(), window, cx);
+                menu::open_dropdown_at(anchor, entries.clone(), highlight, window, cx);
             }
         };
 

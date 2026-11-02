@@ -1,5 +1,7 @@
 //! The button, in its five variants and three sizes.
 
+use std::rc::Rc;
+
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, point, px, transparent_black, App, BoxShadow, ClickEvent, Div, ElementId, FocusHandle,
@@ -7,6 +9,7 @@ use gpui::{
 };
 use gpui::{InteractiveElement, StatefulInteractiveElement};
 
+use crate::actions::Confirm;
 use crate::components::counter::Counter;
 use crate::components::Tooltip;
 use crate::focus::{self, RingOffset};
@@ -338,7 +341,16 @@ impl RenderOnce for Button {
             }
 
             if let Some(listener) = self.on_click {
-                root = root.on_click(move |event, window, cx| listener(event, window, cx));
+                let listener: crate::components::SharedClickHandler = Rc::from(listener);
+                let on_enter = listener.clone();
+                root = root
+                    .on_click(move |event, window, cx| listener(event, window, cx))
+                    // Enter on the focused button activates it (see `focus::activate_on_enter`).
+                    .on_action(move |_: &Confirm, window, cx| {
+                        focus::activate_on_enter(window, cx, |window, cx| {
+                            on_enter(&ClickEvent::default(), window, cx)
+                        });
+                    });
             }
             root = root.track_focus(&focus);
         }

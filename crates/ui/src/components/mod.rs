@@ -9,6 +9,10 @@ use crate::metrics::FONT_UI;
 
 pub(crate) type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static>;
 pub(crate) type ToggleHandler = Box<dyn Fn(bool, &mut Window, &mut gpui::App) + 'static>;
+/// A click handler shared between the click and the Enter key.
+pub(crate) type SharedClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static>;
+/// A toggle handler shared between the click and the Enter key.
+pub(crate) type SharedToggleHandler = Rc<dyn Fn(bool, &mut Window, &mut gpui::App) + 'static>;
 pub(crate) type SelectHandler = Rc<dyn Fn(usize, &mut Window, &mut gpui::App) + 'static>;
 
 mod avatar;

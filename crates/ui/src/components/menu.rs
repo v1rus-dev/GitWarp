@@ -181,7 +181,7 @@ pub fn open_context_menu(
     window: &mut Window,
     cx: &mut App,
 ) -> LayerId {
-    open_at(position, entries, window, cx)
+    open_at(position, entries, None, window, cx)
 }
 
 /// Opens a menu 2px below the bottom-left corner of `anchor`.
@@ -191,18 +191,38 @@ pub fn open_dropdown(
     window: &mut Window,
     cx: &mut App,
 ) -> LayerId {
+    open_dropdown_at(anchor, entries, None, window, cx)
+}
+
+/// Like [`open_dropdown`], with item `highlight` (an item index, separators
+/// not counted) highlighted from the start: a select opens on its current
+/// value, so the arrows move from there.
+pub fn open_dropdown_at(
+    anchor: Bounds<Pixels>,
+    entries: Vec<MenuEntry>,
+    highlight: Option<usize>,
+    window: &mut Window,
+    cx: &mut App,
+) -> LayerId {
     let position = point(anchor.left(), anchor.bottom() + px(2.));
-    open_at(position, entries, window, cx)
+    open_at(position, entries, highlight, window, cx)
 }
 
 fn open_at(
     position: Point<Pixels>,
     entries: Vec<MenuEntry>,
+    highlight: Option<usize>,
     window: &mut Window,
     cx: &mut App,
 ) -> LayerId {
     close_previous(window, cx);
-    let view = cx.new(|cx| MenuView::new(entries, cx));
+    let view = cx.new(|cx| {
+        let mut menu = MenuView::new(entries, cx);
+        if let Some(index) = highlight.filter(|index| menu.enabled().get(*index) == Some(&true)) {
+            menu.nav.set(index);
+        }
+        menu
+    });
     let focus = view.read(cx).focus.clone();
     let id = overlay::open_popover(position, view.clone().into(), window, cx);
     view.update(cx, |menu, _| menu.layer = Some(id));

@@ -26,6 +26,7 @@ use ui::{
 use crate::format::{display_path, expand_home};
 use crate::ref_ops::ref_name_error;
 use crate::workspace::Workspace;
+use crate::worktrees_model::git_message;
 
 /// One local branch offered by the add dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,6 +340,15 @@ impl WorktreeDialog {
         )
     }
 
+    /// Whether the "Check out" select has anything to offer: with every
+    /// branch already open in a worktree (or none at all) the design shows an
+    /// empty, disabled select instead of a branch that cannot be used.
+    fn has_free_branch(&self) -> bool {
+        self.branches
+            .iter()
+            .any(|branch| !is_checked_out(&branch.name, &self.worktrees))
+    }
+
     fn branch_used(&self, name: &str) -> Option<&Worktree> {
         self.worktrees
             .iter()
@@ -386,7 +396,7 @@ impl WorktreeDialog {
         let used = self
             .branches
             .get(self.branch)
-            .filter(|_| self.branch_mode == BranchMode::Existing)
+            .filter(|_| self.branch_mode == BranchMode::Existing && self.has_free_branch())
             .and_then(|branch| self.branch_used(&branch.name));
         let name = self.name_text(cx);
         let name_error = (self.branch_mode == BranchMode::New)
@@ -397,14 +407,15 @@ impl WorktreeDialog {
             && used.is_none()
             && (self.branch_mode == BranchMode::Existing
                 || (!name.is_empty() && name_error.is_none() && self.base_oid().is_some()))
-            && (self.branch_mode == BranchMode::New || self.branches.get(self.branch).is_some())
+            && (self.branch_mode == BranchMode::New
+                || (self.has_free_branch() && self.branches.get(self.branch).is_some()))
             && !self.running;
         let hint = if path.is_empty() {
             Some("Choose a folder for the worktree")
         } else if path_error.is_some() {
             Some("Fix the folder to continue")
         } else if self.branch_mode == BranchMode::Existing
-            && self.branches.get(self.branch).is_none()
+            && (!self.has_free_branch() || self.branches.get(self.branch).is_none())
         {
             Some("Choose a branch to check out")
         } else if used.is_some() {
@@ -488,7 +499,10 @@ impl WorktreeDialog {
 
     fn remove_hint(&self) -> Option<&'static str> {
         let target = self.remove_target()?;
-        if target.main {
+        if self.unlocking {
+            // The hint is the footer's `Unlocking…` (design), not the lock reminder.
+            None
+        } else if target.main {
             Some("Not available for the main worktree")
         } else if target.locked.is_some() {
             Some("Unlock the worktree first")
@@ -498,6 +512,15 @@ impl WorktreeDialog {
             Some("Confirm deleting the unmerged branch")
         } else {
             None
+        }
+    }
+
+    /// Greys the text inputs while the operation runs (design: the whole form
+    /// is disabled then).
+    fn sync_inputs(&self, cx: &mut Context<Self>) {
+        let busy = self.running;
+        for input in [&self.path, &self.new_name].into_iter().flatten() {
+            input.update(cx, |input, cx| input.set_disabled(busy, cx));
         }
     }
 
@@ -521,7 +544,7 @@ impl WorktreeDialog {
         let git = match &self.git {
             Ok(git) => git.clone(),
             Err(error) => {
-                self.error = Some(error.to_string());
+                self.error = Some(git_message(error));
                 cx.notify();
                 return;
             }
@@ -572,7 +595,7 @@ impl WorktreeDialog {
                                 notice = format!(
                                     "Removed worktree {}; kept {branch}: {}",
                                     target.path.display(),
-                                    error
+                                    git_message(&error)
                                 );
                             }
                         }
@@ -583,6 +606,7 @@ impl WorktreeDialog {
         };
         self.running = true;
         self.error = None;
+        self.sync_inputs(cx);
         self.notify_host(cx);
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -606,6 +630,7 @@ impl WorktreeDialog {
         cx: &mut Context<Self>,
     ) {
         self.running = false;
+        self.sync_inputs(cx);
         match result {
             Ok(notice) => {
                 let added = (self.mode == Mode::Add).then(|| self.resolved_path(cx));
@@ -626,9 +651,15 @@ impl WorktreeDialog {
                 }
             }
             Err(error) => {
-                self.error = Some(error.to_string());
+                self.error = Some(git_message(&error));
                 self.notify_host(cx);
                 cx.notify();
+                if self.mode == Mode::Remove {
+                    // `git worktree remove` can fail after it already dropped the
+                    // worktree's registration: reload whatever the outcome.
+                    let on_done = self.on_done.clone();
+                    on_done(window, cx);
+                }
             }
         }
     }
@@ -645,7 +676,7 @@ impl WorktreeDialog {
         let git = match &self.git {
             Ok(git) => git.clone(),
             Err(error) => {
-                self.error = Some(error.to_string());
+                self.error = Some(git_message(error));
                 cx.notify();
                 return;
             }
@@ -673,7 +704,7 @@ impl WorktreeDialog {
                         let on_done = dialog.on_done.clone();
                         on_done(window, cx);
                     }
-                    Err(error) => dialog.error = Some(error.to_string()),
+                    Err(error) => dialog.error = Some(git_message(&error)),
                 }
                 dialog.notify_host(cx);
                 cx.notify();
@@ -888,7 +919,7 @@ fn build(state: &Entity<WorktreeDialog>, cx: &App) -> Dialog {
                 if !dialog.base_options().is_empty() {
                     focus_order.push(DialogFocus::control(dialog.base_focus.clone()));
                 }
-            } else if !dialog.branches.is_empty() {
+            } else if dialog.has_free_branch() {
                 focus_order.push(DialogFocus::control(dialog.branch_focus.clone()));
             }
             focus_order.push(DialogFocus::control(dialog.open_focus.clone()));
@@ -955,6 +986,8 @@ fn add_body(
     cx: &App,
 ) -> AnyElement {
     let path_error = dialog.path_touched.then(|| dialog.path_error(cx)).flatten();
+    // While the operation runs the whole form is greyed (design).
+    let busy = dialog.running;
     let browse = {
         let state = state.clone();
         Box::new(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
@@ -964,9 +997,10 @@ fn add_body(
     let branch_options: Vec<String> = dialog
         .branches
         .iter()
+        .filter(|_| dialog.has_free_branch())
         .map(|branch| match dialog.branch_used(&branch.name) {
             Some(worktree) => format!(
-                "{}  — checked out in {}",
+                "{} — checked out in {}",
                 branch.name,
                 display_path(&worktree.path, dialog.home.as_deref())
             ),
@@ -1026,7 +1060,7 @@ fn add_body(
     let used = dialog
         .branches
         .get(dialog.branch)
-        .filter(|_| dialog.branch_mode == BranchMode::Existing)
+        .filter(|_| dialog.branch_mode == BranchMode::Existing && dialog.has_free_branch())
         .and_then(|branch| dialog.branch_used(&branch.name));
     let branch_error = used.map(|worktree| {
         format!(
@@ -1071,6 +1105,7 @@ fn add_body(
                             .label("Browse…")
                             .icon(IconName::Folder)
                             .focus_handle(dialog.browse_focus.clone())
+                            .disabled(busy)
                             .on_click(browse),
                     )
                     .into_any_element(),
@@ -1110,6 +1145,7 @@ fn add_body(
                         } else {
                             0
                         })
+                        .disabled(busy)
                         .on_select(mode_listener),
                 ),
         );
@@ -1122,7 +1158,7 @@ fn add_body(
                         .options(branch_options)
                         .selected(dialog.branch)
                         .focus_handle(dialog.branch_focus.clone())
-                        .disabled(dialog.branches.is_empty())
+                        .disabled(!dialog.has_free_branch() || busy)
                         .on_change(branch_listener),
                 )
                 .into_any_element(),
@@ -1159,7 +1195,7 @@ fn add_body(
                                     .options(base_options)
                                     .selected(dialog.base)
                                     .focus_handle(dialog.base_focus.clone())
-                                    .disabled(dialog.base_options().is_empty())
+                                    .disabled(dialog.base_options().is_empty() || busy)
                                     .on_change(base_listener),
                             )
                             .into_any_element(),
@@ -1175,6 +1211,7 @@ fn add_body(
         Checkbox::new("worktree-open")
             .label("Open the worktree in a new window")
             .checked(dialog.open_after)
+            .disabled(busy)
             .focus_handle(dialog.open_focus.clone())
             .on_toggle(open_toggle),
     );
@@ -1189,6 +1226,8 @@ fn remove_body(
     let Some(target) = dialog.remove_target() else {
         return div().into_any_element();
     };
+    // Running or unlocking greys the form (design).
+    let busy = dialog.running || dialog.unlocking;
     let mut body = div().flex().flex_col().gap(px(14.));
     if target.main {
         return body
@@ -1246,7 +1285,7 @@ fn remove_body(
                         .label("Unlock")
                         .icon(IconName::Lock)
                         .focus_handle(dialog.unlock_focus.clone())
-                        .disabled(dialog.unlocking)
+                        .disabled(busy)
                         .on_click(unlock),
                 ),
             );
@@ -1273,18 +1312,28 @@ fn remove_body(
                 Checkbox::new("worktree-force")
                     .label("Discard these changes and remove the worktree")
                     .checked(dialog.force)
+                    .disabled(busy)
                     .focus_handle(dialog.force_focus.clone())
                     .on_toggle(force_toggle),
             );
     } else if !target.missing && target.locked.is_none() {
         body = body.child(
+            // The branch is mono (design `<span class="mono">`); the sentence is
+            // laid out as wrapping pieces because gpui divs have no inline flow.
             div()
+                .flex()
+                .flex_wrap()
+                .items_baseline()
+                .gap_x(px(4.))
                 .text_size(FS_SM)
                 .text_color(colors.muted)
-                .child(format!(
-                    "The folder is deleted from disk. The branch {} and its commits stay in the repository.",
-                    target.branch.clone().unwrap_or_else(|| "HEAD".to_owned())
-                )),
+                .child("The folder is deleted from disk. The branch")
+                .child(
+                    div()
+                        .font_family(FONT_MONO)
+                        .child(target.branch.clone().unwrap_or_else(|| "HEAD".to_owned())),
+                )
+                .child("and its commits stay in the repository."),
         );
     }
     if let Some(branch) = &target.branch {
@@ -1318,6 +1367,7 @@ fn remove_body(
                         }),
                 )
                 .checked(dialog.delete_branch)
+                .disabled(busy)
                 .focus_handle(dialog.delete_focus.clone())
                 .on_toggle(delete_toggle),
         );
@@ -1341,6 +1391,7 @@ fn remove_body(
                     Checkbox::new("worktree-force-branch")
                         .label(format!("Delete {branch} anyway"))
                         .checked(dialog.force_branch)
+                        .disabled(busy)
                         .focus_handle(dialog.force_branch_focus.clone())
                         .on_toggle(force_toggle),
                 );

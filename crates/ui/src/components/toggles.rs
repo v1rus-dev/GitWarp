@@ -9,6 +9,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window,
 };
 
+use crate::actions::Confirm;
 use crate::focus::{self, RingOffset};
 use crate::icon::{Icon, IconName};
 use crate::metrics::{FS_BASE, R_PILL, R_XS};
@@ -161,7 +162,16 @@ impl RenderOnce for Checkbox {
             root = root.cursor_pointer().track_focus(&focus);
             if let Some(listener) = self.on_toggle {
                 let next = !self.checked;
-                root = root.on_click(move |_, window, cx| listener(next, window, cx));
+                let listener: crate::components::SharedToggleHandler = std::rc::Rc::from(listener);
+                let on_enter = listener.clone();
+                root = root
+                    .on_click(move |_, window, cx| listener(next, window, cx))
+                    // Enter toggles the focused checkbox like Space (see `focus::activate_on_enter`).
+                    .on_action(move |_: &Confirm, window, cx| {
+                        focus::activate_on_enter(window, cx, |window, cx| {
+                            on_enter(next, window, cx)
+                        });
+                    });
             }
         }
         root

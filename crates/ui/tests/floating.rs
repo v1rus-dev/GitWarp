@@ -502,10 +502,11 @@ fn choosing_a_select_option_calls_on_change(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(layer_count(cx), 1, "enter did not open the select menu");
 
+    // The menu opens on the current value (item 0), so two Downs reach item 2.
     cx.simulate_keystrokes("down down enter");
     assert_eq!(
         chosen.get(),
-        Some(1),
+        Some(2),
         "choosing an option did not report it"
     );
     assert_eq!(layer_count(cx), 0, "the select menu stayed open");
@@ -529,7 +530,7 @@ fn enter_that_closes_a_select_menu_does_not_reopen_it_on_key_up(cx: &mut TestApp
     cx.simulate_keystrokes("down");
     press(cx, "enter");
 
-    assert_eq!(chosen.get(), Some(0), "the option was not chosen");
+    assert_eq!(chosen.get(), Some(1), "the option was not chosen");
     assert_eq!(
         layer_count(cx),
         0,
@@ -950,6 +951,135 @@ fn select_opens_with_space_and_down_and_picks_with_the_keyboard(cx: &mut TestApp
     cx.run_until_parked();
     assert_eq!(layer_count(cx), 1, "down did not open the select menu");
     cx.simulate_keystrokes("down down enter");
-    assert_eq!(chosen.get(), Some(1));
+    assert_eq!(chosen.get(), Some(2));
     assert_eq!(layer_count(cx), 0);
+}
+
+#[gpui::test]
+fn a_select_menu_opens_on_the_current_value_and_returns_focus_after_a_pick(
+    cx: &mut TestAppContext,
+) {
+    init(cx);
+    let chosen = Rc::new(Cell::new(None));
+    let (_, cx) = cx.add_window_view(|_, _| SelectRoot {
+        chosen: chosen.clone(),
+    });
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    // Opened with Down, the current item (0) is highlighted: Enter picks it
+    // without moving, and one Up would wrap from it to the last item.
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 1, "down did not open the select menu");
+    cx.simulate_keystrokes("up");
+    press(cx, "enter");
+    assert_eq!(
+        chosen.get(),
+        Some(3),
+        "Up did not move from the current item"
+    );
+    assert_eq!(layer_count(cx), 0);
+
+    // Focus is back on the select: Enter opens the menu again.
+    cx.run_until_parked();
+    press(cx, "enter");
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 1, "focus did not return to the select");
+}
+
+/// Opens a dialog holding a button, a checkbox and a select (focus handles
+/// `a`, `b`, `c` of the root), the way the app's forms use them.
+fn open_controls_dialog(
+    cx: &mut VisualTestContext,
+    root: &Entity<TestRoot>,
+    clicks: &Rc<Cell<u32>>,
+    toggles: &Rc<Cell<u32>>,
+    chosen: &Rc<Cell<Option<usize>>>,
+) -> (FocusHandle, FocusHandle, FocusHandle) {
+    let (a, b, c) = cx.read(|app| {
+        let root = root.read(app);
+        (root.a.clone(), root.b.clone(), root.c.clone())
+    });
+    let (clicks, toggles, chosen) = (clicks.clone(), toggles.clone(), chosen.clone());
+    let handles = (a.clone(), b.clone(), c.clone());
+    cx.update(|window, app| {
+        dialog::open(window, app, move |_, _| {
+            let (clicks, toggles, chosen) = (clicks.clone(), toggles.clone(), chosen.clone());
+            Dialog::new("Controls")
+                .body(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(
+                            Button::new("activate-button")
+                                .label("Go")
+                                .focus_handle(a.clone())
+                                .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+                        )
+                        .child(
+                            ui::Checkbox::new("activate-checkbox")
+                                .label("Tick")
+                                .focus_handle(b.clone())
+                                .on_toggle(move |_, _, _| toggles.set(toggles.get() + 1)),
+                        )
+                        .child(
+                            Select::new("dialog-select")
+                                .options(["main", "develop", "feat/lanes"])
+                                .selected(0)
+                                .focus_handle(c.clone())
+                                .on_change(move |index, _, _| chosen.set(Some(index))),
+                        ),
+                )
+                .focus_order([
+                    DialogFocus::control(a.clone()),
+                    DialogFocus::control(b.clone()),
+                    DialogFocus::control(c.clone()),
+                ])
+                .autofocus(a.clone())
+        })
+    });
+    cx.run_until_parked();
+    handles
+}
+
+/// Enter on a focused button or checkbox inside a dialog activates it, like
+/// the design's native controls (the dialog's `Confirm` must not swallow it).
+#[gpui::test]
+fn enter_activates_a_focused_button_and_toggles_a_focused_checkbox(cx: &mut TestAppContext) {
+    let (root, cx) = start(cx);
+    let (clicks, toggles) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let chosen = Rc::new(Cell::new(None));
+    let (button, checkbox, _) = open_controls_dialog(cx, &root, &clicks, &toggles, &chosen);
+
+    cx.update(|window, app| window.focus(&button, app));
+    press(cx, "enter");
+    assert_eq!(clicks.get(), 1, "Enter did not activate the button");
+
+    cx.update(|window, app| window.focus(&checkbox, app));
+    press(cx, "enter");
+    assert_eq!(toggles.get(), 1, "Enter did not toggle the checkbox");
+    assert_eq!(layer_count(cx), 1, "the dialog closed");
+}
+
+/// In a dialog, a select picked with Enter hands focus back to itself.
+#[gpui::test]
+fn a_select_in_a_dialog_gets_focus_back_after_a_pick(cx: &mut TestAppContext) {
+    let (root, cx) = start(cx);
+    let (clicks, toggles) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let chosen = Rc::new(Cell::new(None));
+    let (_, _, select) = open_controls_dialog(cx, &root, &clicks, &toggles, &chosen);
+
+    cx.update(|window, app| window.focus(&select, app));
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(layer_count(cx), 2, "down did not open the select menu");
+    cx.simulate_keystrokes("down");
+    press(cx, "enter");
+    cx.run_until_parked();
+    assert_eq!(chosen.get(), Some(1));
+    assert_eq!(layer_count(cx), 1, "only the dialog stays open");
+    assert_focused(cx, &select);
 }

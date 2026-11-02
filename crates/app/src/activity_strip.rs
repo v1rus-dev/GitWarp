@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, App, Context, Entity, FontWeight, SharedString, Subscription, Task, WeakEntity, Window,
+    div, point, px, App, Context, Entity, FontWeight, ScrollHandle, SharedString, Subscription,
+    Task, WeakEntity, Window,
 };
 
 use git_core::{Activity, Error, Git, Repo};
@@ -39,10 +40,6 @@ const PARTIAL_DAYS: i32 = 56;
 const YEARS_SHOWN: usize = 5;
 /// The strip's header height, the same as the details dock's.
 const HEADER: f32 = 34.;
-
-/// The side column never shrinks below the no-wrap key hint
-/// (`↑ ↓ day · ← → week · Enter filter`); the grid gives way instead.
-const SIDE_MIN_WIDTH: f32 = 280.;
 
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTHS: [&str; 12] = [
@@ -108,6 +105,9 @@ pub struct ActivityStrip {
     shown: Option<Shown>,
     generation: u64,
     task: Option<Task<()>>,
+    /// Scroll of the heatmap: it sits at the newest week (the right end)
+    /// unless the user scrolled away (design `activity.js` opens at the end).
+    scroll: ScrollHandle,
 }
 
 /// The UTC day number of the system clock: where the loading skeleton's grid
@@ -149,6 +149,7 @@ impl ActivityStrip {
             shown: None,
             generation: 0,
             task: None,
+            scroll: ScrollHandle::new(),
         };
         strip.load(cx);
         strip
@@ -158,6 +159,12 @@ impl ActivityStrip {
     /// screen until the new ones land, so the grid does not flash.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.load(cx);
+    }
+
+    /// The heatmap's scroll state (tests check it opens at the newest week).
+    #[cfg(test)]
+    pub(crate) fn scroll_handle(&self) -> ScrollHandle {
+        self.scroll.clone()
     }
 
     /// The day the strip counted up to (tests aim the keyboard cursor with it).
@@ -666,9 +673,11 @@ impl ActivityStrip {
             });
         }
 
+        // Design `.act-side { flex: 1 1 0; min-width: 0 }`: the grid keeps the
+        // width it needs and the side column takes what is left.
         let side = div()
             .flex_1()
-            .min_w(px(SIDE_MIN_WIDTH))
+            .min_w_0()
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -677,13 +686,25 @@ impl ActivityStrip {
             .text_color(colors.muted);
         let side = self.render_side(side, filter.as_ref(), loading, cx);
 
+        // Keep the newest week in view: while the scroll sits at its end (or
+        // was never moved) re-pin it, so a resize keeps the end too. The paint
+        // clamps the huge offset to the real end.
+        let at_end = self.scroll.offset().x <= -self.scroll.max_offset().x + px(1.);
+        if at_end {
+            self.scroll.set_offset(point(px(-1.0e6), px(0.)));
+        }
+
         body.child(
             div()
                 .id("activity-scroll")
                 // Design `.heat-scroll { flex: 0 1 auto; overflow-x: auto }`:
-                // the grid shrinks and scrolls so the side column keeps its width.
+                // the grid shrinks and scrolls when the row is too narrow.
+                // A flex box (not gpui's default block), so the grid keeps its
+                // own width and overflows instead of stretching to the box.
+                .flex()
                 .min_w_0()
                 .overflow_x_scroll()
+                .track_scroll(&self.scroll)
                 .child(heatmap),
         )
         .child(side)

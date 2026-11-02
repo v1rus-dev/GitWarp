@@ -279,7 +279,13 @@ impl DialogHost {
             return;
         }
         let on_top = layer.is_some_and(|layer| overlay::is_top_layer(layer, window, cx));
-        if on_top && !self.focus.contains_focused(window, cx) {
+        // A menu closed by Enter parks focus on the overlay root until the
+        // key-up hands it back to its opener; pulling it into the dialog now
+        // would lose that restore.
+        if on_top
+            && !overlay::restore_pending(window, cx)
+            && !self.focus.contains_focused(window, cx)
+        {
             window.focus(&self.focus, cx);
         }
     }
