@@ -54,6 +54,50 @@ pub const GRAPH_WIDTH_MAX: f32 = 480.0;
 /// The graph column width used when the file has no usable value.
 pub const GRAPH_WIDTH_DEFAULT: f32 = 112.0;
 
+/// Prefix of the ids given to accounts migrated from the old
+/// `account_github` / `account_gitlab` settings. The id is fixed per service
+/// (not random) so that migrating the same file twice yields the same record.
+pub const LEGACY_ACCOUNT_ID_PREFIX: &str = "legacy-";
+
+/// How an account signs in. Persisted as `"token"` / `"browser"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountMethod {
+    #[default]
+    Token,
+    Browser,
+}
+
+/// One hosting-service account. The secret (token) is never stored here: it
+/// lives in the system keychain under [`AccountRecord::id`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountRecord {
+    /// Stable, unique id; also the keychain entry name.
+    pub id: String,
+    /// `forge::ServiceKind::id()`.
+    pub kind: String,
+    /// Normalized instance base URL (`https://github.com`).
+    pub base_url: String,
+    pub login: String,
+    /// Shown in menus; defaults to the login.
+    pub label: String,
+    pub method: AccountMethod,
+    /// Host used for git over SSH when it differs from the web host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_host: Option<String>,
+}
+
+impl AccountRecord {
+    /// The label, or the login when the label is empty.
+    pub fn display_label(&self) -> &str {
+        if self.label.trim().is_empty() {
+            &self.login
+        } else {
+            &self.label
+        }
+    }
+}
+
 /// The user's settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -130,10 +174,8 @@ pub struct Settings {
     pub sign_commits: bool,
     /// `user.signingkey`, empty when none is configured.
     pub signing_key: String,
-    /// The connected GitHub account, empty when none.
-    pub account_github: String,
-    /// The connected GitLab account, empty when none.
-    pub account_gitlab: String,
+    /// Hosting-service accounts (Settings → Accounts); secrets are in the keychain.
+    pub accounts: Vec<AccountRecord>,
     /// Which git executable to run.
     pub git_mode: GitMode,
     /// The executable used by [`GitMode::Custom`].
@@ -186,8 +228,7 @@ impl Default for Settings {
             identity_scope: IdentityScope::default(),
             sign_commits: false,
             signing_key: String::new(),
-            account_github: String::new(),
-            account_gitlab: String::new(),
+            accounts: Vec::new(),
             git_mode: GitMode::default(),
             git_path: String::new(),
             keybindings: BTreeMap::new(),
@@ -341,8 +382,7 @@ impl Settings {
         self.git_path = self.git_path.trim().to_owned();
         self.merge_command = self.merge_command.trim().to_owned();
         self.signing_key = self.signing_key.trim().to_owned();
-        self.account_github = self.account_github.trim().to_owned();
-        self.account_gitlab = self.account_gitlab.trim().to_owned();
+        normalize_accounts(&mut self.accounts);
     }
 }
 
@@ -758,14 +798,83 @@ fn settings_from_value(value: Value) -> Settings {
         identity_scope: take(&mut object, "identity_scope", defaults.identity_scope),
         sign_commits: take(&mut object, "sign_commits", defaults.sign_commits),
         signing_key: take(&mut object, "signing_key", defaults.signing_key),
-        account_github: take(&mut object, "account_github", defaults.account_github),
-        account_gitlab: take(&mut object, "account_gitlab", defaults.account_gitlab),
+        accounts: take_accounts(&mut object),
         git_mode: take(&mut object, "git_mode", defaults.git_mode),
         git_path: take(&mut object, "git_path", defaults.git_path),
         keybindings: take(&mut object, "keybindings", defaults.keybindings),
         worktrees: take(&mut object, "worktrees", defaults.worktrees),
         worktree_recency: take(&mut object, "worktree_recency", defaults.worktree_recency),
     }
+}
+
+/// Parses the accounts, dropping entries that fail on their own, then
+/// migrates the legacy `account_github` / `account_gitlab` names into records.
+///
+/// The legacy keys are removed from `object` and are not part of [`Settings`],
+/// so the next save drops them from the file. A legacy account that already
+/// has a record for the same service, instance and login is not added twice,
+/// which makes loading a file that still holds the old keys repeatable.
+fn take_accounts(object: &mut Map<String, Value>) -> Vec<AccountRecord> {
+    let mut accounts = match object.remove("accounts") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .filter_map(|item| match serde_json::from_value::<AccountRecord>(item) {
+                Ok(account) => Some(account),
+                Err(e) => {
+                    log::warn!("dropping invalid account: {e}");
+                    None
+                }
+            })
+            .collect(),
+        Some(_) => {
+            log::warn!("ignoring invalid setting `accounts`: expected a list");
+            Vec::new()
+        }
+    };
+    for (key, kind, base_url) in [
+        ("account_github", "github", "https://github.com"),
+        ("account_gitlab", "gitlab", "https://gitlab.com"),
+    ] {
+        let login = take(object, key, String::new()).trim().to_owned();
+        if login.is_empty() {
+            continue;
+        }
+        let exists = accounts
+            .iter()
+            .any(|a| a.kind == kind && a.base_url == base_url && a.login == login);
+        if !exists {
+            accounts.push(AccountRecord {
+                id: format!("{LEGACY_ACCOUNT_ID_PREFIX}{kind}"),
+                kind: kind.to_owned(),
+                base_url: base_url.to_owned(),
+                label: login.clone(),
+                login,
+                method: AccountMethod::Token,
+                ssh_host: None,
+            });
+        }
+    }
+    accounts
+}
+
+/// Trims the text fields and drops records that cannot be used: an empty id,
+/// a service this build does not know, or an id that repeats.
+fn normalize_accounts(accounts: &mut Vec<AccountRecord>) {
+    let mut seen = std::collections::HashSet::new();
+    accounts.retain_mut(|account| {
+        account.id = account.id.trim().to_owned();
+        account.base_url = account.base_url.trim().trim_end_matches('/').to_owned();
+        account.login = account.login.trim().to_owned();
+        account.label = account.label.trim().to_owned();
+        if account.label.is_empty() {
+            account.label = account.login.clone();
+        }
+        !account.id.is_empty()
+            && !account.base_url.is_empty()
+            && forge::ServiceKind::from_id(&account.kind).is_some()
+            && seen.insert(account.id.clone())
+    });
 }
 
 /// Takes `key` and deserializes it, or returns `fallback` on absence or error.
@@ -1172,8 +1281,15 @@ mod tests {
             identity_scope: IdentityScope::Repository,
             sign_commits: true,
             signing_key: "SHA256:abc".to_owned(),
-            account_github: "mira-k".to_owned(),
-            account_gitlab: "mira.kovalenko".to_owned(),
+            accounts: vec![AccountRecord {
+                id: "a1".to_owned(),
+                kind: "gitlab".to_owned(),
+                base_url: "https://gitlab.modsen.app".to_owned(),
+                login: "mira.kovalenko".to_owned(),
+                label: "Work".to_owned(),
+                method: AccountMethod::Token,
+                ssh_host: Some("ssh.modsen.app".to_owned()),
+            }],
             git_mode: GitMode::Custom,
             git_path: "/opt/git/bin/git".to_owned(),
             ..Settings::default()
@@ -1273,5 +1389,100 @@ mod tests {
         settings.merge_tool = MergeTool::Custom;
         settings.merge_command = "mytool $LOCAL".to_owned();
         assert_eq!(settings.merge_command(), "mytool $LOCAL");
+    }
+
+    fn account(id: &str, kind: &str, url: &str, login: &str) -> AccountRecord {
+        AccountRecord {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            base_url: url.to_owned(),
+            login: login.to_owned(),
+            label: login.to_owned(),
+            method: AccountMethod::Token,
+            ssh_host: None,
+        }
+    }
+
+    #[test]
+    fn accounts_round_trip_without_secrets() {
+        let dir = TempDir::new("accounts-round-trip");
+        let store = SettingsStore::new(settings_path(dir.path()));
+        let mut browser = account("b2", "github", "https://github.com", "mira-k");
+        browser.method = AccountMethod::Browser;
+        let settings = Settings {
+            accounts: vec![
+                account("a1", "gitea", "https://codeberg.org", "mira"),
+                browser,
+            ],
+            ..Settings::default()
+        };
+        store.save(&settings).unwrap();
+        assert_eq!(store.load(), settings);
+        let json = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert!(json.contains(r#""method": "browser""#), "{json}");
+        assert!(!json.contains("token\":"), "no secret field: {json}");
+    }
+
+    #[test]
+    fn a_broken_account_is_dropped_alone() {
+        let dir = TempDir::new("accounts-broken");
+        let loaded = load_json(
+            dir.path(),
+            r#"{"accounts":[
+                {"id":"a1","kind":"github","base_url":"https://github.com","login":"m","label":"m","method":"token"},
+                {"id":"a2","kind":"github"},
+                {"id":"a3","kind":"nope","base_url":"https://x.io","login":"m","label":"m","method":"token"},
+                {"id":"a1","kind":"gitlab","base_url":"https://gitlab.com","login":"dup","label":"dup","method":"token"}]}"#,
+        );
+        let ids: Vec<&str> = loaded.accounts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["a1"]);
+    }
+
+    #[test]
+    fn legacy_account_names_become_records() {
+        let dir = TempDir::new("accounts-legacy");
+        let loaded = load_json(
+            dir.path(),
+            r#"{"account_github":" mira-k ","account_gitlab":"mira.kovalenko"}"#,
+        );
+        assert_eq!(loaded.accounts.len(), 2);
+        let github = &loaded.accounts[0];
+        assert_eq!(github.id, "legacy-github");
+        assert_eq!(github.kind, "github");
+        assert_eq!(github.base_url, "https://github.com");
+        assert_eq!(github.login, "mira-k");
+        assert_eq!(github.label, "mira-k");
+        assert_eq!(github.method, AccountMethod::Token);
+        let gitlab = &loaded.accounts[1];
+        assert_eq!(gitlab.id, "legacy-gitlab");
+        assert_eq!(gitlab.base_url, "https://gitlab.com");
+        assert_eq!(gitlab.login, "mira.kovalenko");
+
+        // Saving drops the legacy keys from the file; loading again changes nothing.
+        let store = SettingsStore::new(settings_path(dir.path()));
+        store.save(&loaded).unwrap();
+        let json = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert!(!json.contains("account_github"), "{json}");
+        assert!(!json.contains("account_gitlab"), "{json}");
+        assert_eq!(store.load(), loaded);
+    }
+
+    #[test]
+    fn legacy_migration_is_idempotent_and_skips_empty_names() {
+        let dir = TempDir::new("accounts-legacy-twice");
+        let json = r#"{"account_github":"mira-k","account_gitlab":"  "}"#;
+        let first = load_json(dir.path(), json);
+        let second = load_json(dir.path(), json);
+        assert_eq!(first.accounts, second.accounts);
+        assert_eq!(first.accounts.len(), 1);
+
+        // The legacy key next to a record that already covers it adds nothing.
+        let both = load_json(
+            dir.path(),
+            r#"{"accounts":[{"id":"x1","kind":"github","base_url":"https://github.com",
+                "login":"mira-k","label":"Me","method":"token"}],"account_github":"mira-k"}"#,
+        );
+        assert_eq!(both.accounts.len(), 1);
+        assert_eq!(both.accounts[0].id, "x1");
     }
 }

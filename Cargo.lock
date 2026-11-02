@@ -236,6 +236,7 @@ name = "app"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "forge",
  "git-core",
  "git-graph",
  "gpui-pre",

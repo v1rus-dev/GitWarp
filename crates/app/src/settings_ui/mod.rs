@@ -1,4 +1,4 @@
-//! The Settings surface: eight pages in the design's order, with a persistent
+//! The Settings surface: nine pages in the design's order, with a persistent
 //! left navigation and an automatically saved settings file.
 //!
 //! The page is a centred window drawn over the workspace, not a replacement for
@@ -9,6 +9,8 @@
 //! on the background executor. Appearance changes additionally rebuild the
 //! theme global, so the whole window repaints at once.
 
+mod account_dialog;
+mod accounts;
 mod appearance;
 mod diff;
 mod form;
@@ -49,10 +51,11 @@ pub enum Page {
     Keybindings,
     Diff,
     Identity,
+    Accounts,
 }
 
 impl Page {
-    pub const ALL: [Page; 8] = [
+    pub const ALL: [Page; 9] = [
         Page::General,
         Page::Appearance,
         Page::Git,
@@ -61,6 +64,7 @@ impl Page {
         Page::Keybindings,
         Page::Diff,
         Page::Identity,
+        Page::Accounts,
     ];
 
     fn title(self) -> &'static str {
@@ -73,6 +77,7 @@ impl Page {
             Page::Keybindings => "Keybindings",
             Page::Diff => "Diff & merge",
             Page::Identity => "Identity",
+            Page::Accounts => "Accounts",
         }
     }
 
@@ -86,6 +91,7 @@ impl Page {
             Page::Keybindings => IconName::Keyboard,
             Page::Diff => IconName::Split,
             Page::Identity => IconName::User,
+            Page::Accounts => IconName::Cloud,
         }
     }
 }
@@ -150,9 +156,15 @@ pub struct SettingsView {
     pub(crate) _email_events: Subscription,
     /// Bumped by every edit; a stale debounced save is dropped.
     pub(crate) identity_save_generation: u64,
-    /// Accounts found in the user's git credential helper, per host.
-    pub(crate) accounts: identity::Accounts,
-    pub(crate) account_dialog: Option<Entity<identity::AccountDialog>>,
+
+    /// Accounts: live status per account id, the per-account check counter
+    /// (a stale answer is dropped), a page-level error and the open dialogs.
+    pub(crate) account_status: std::collections::HashMap<String, crate::accounts::AccountStatus>,
+    pub(crate) account_checks:
+        std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    pub(crate) accounts_error: Option<SharedString>,
+    pub(crate) account_dialog: Option<Entity<account_dialog::AccountDialog>>,
+    pub(crate) account_prompt: Option<Entity<accounts::AccountPrompt>>,
 
     /// Diff & merge: the editable merge command.
     pub(crate) merge_command: Entity<ui::TextInput>,
@@ -266,8 +278,11 @@ impl SettingsView {
             _name_events: name_events,
             _email_events: email_events,
             identity_save_generation: 0,
-            accounts: identity::Accounts::default(),
+            account_status: std::collections::HashMap::new(),
+            account_checks: std::collections::HashMap::new(),
+            accounts_error: None,
             account_dialog: None,
+            account_prompt: None,
             merge_command,
             _merge_command_events: merge_command_events,
             merge_test: None,
@@ -276,6 +291,7 @@ impl SettingsView {
         match page {
             Page::Ssh => view.reload_ssh(cx),
             Page::Identity => view.reload_identity(cx),
+            Page::Accounts => view.open_accounts(cx),
             _ => {}
         }
         view
@@ -305,6 +321,7 @@ impl SettingsView {
             Page::Git => self.start_git_detection(window, cx),
             Page::Ssh => self.reload_ssh(cx),
             Page::Identity => self.reload_identity(cx),
+            Page::Accounts => self.open_accounts(cx),
             _ => {}
         }
         cx.notify();
@@ -385,6 +402,7 @@ impl SettingsView {
             Page::Keybindings => keybindings::render(self, window, cx),
             Page::Diff => diff::render(self, window, cx),
             Page::Identity => identity::render(self, window, cx),
+            Page::Accounts => accounts::render(self, window, cx),
         }
     }
 

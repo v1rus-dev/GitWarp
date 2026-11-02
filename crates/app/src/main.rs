@@ -1,3 +1,4 @@
+mod accounts;
 mod activity_strip;
 mod app_icon;
 mod changes_view;
@@ -337,6 +338,7 @@ fn main() {
                 save_in_flight: false,
                 dirty: false,
             });
+            accounts::init_secret_store(cx);
             cx.set_global(network_service::NetworkService::start());
             // A background save may still be in flight when the user quits;
             // closing the last window does reach `on_app_quit` on Linux, so

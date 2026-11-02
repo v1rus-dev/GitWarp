@@ -207,6 +207,7 @@ fn page_name(page: Page) -> &'static str {
         Page::Keybindings => "Keybindings",
         Page::Diff => "Diff & merge",
         Page::Identity => "Identity",
+        Page::Accounts => "Accounts",
     }
 }
 

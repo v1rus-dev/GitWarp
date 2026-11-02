@@ -2,7 +2,8 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, App, Hsla, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window,
+    div, px, AnyElement, App, Hsla, IntoElement, ParentElement, RenderOnce, SharedString, Styled,
+    Window,
 };
 
 use crate::icon::{Icon, IconName};
@@ -27,6 +28,7 @@ pub struct Banner {
     list: Vec<SharedString>,
     plain_list: bool,
     mono_body: bool,
+    action: Option<AnyElement>,
 }
 
 impl Banner {
@@ -38,6 +40,7 @@ impl Banner {
             list: Vec::new(),
             plain_list: false,
             mono_body: false,
+            action: None,
         }
     }
 
@@ -55,6 +58,12 @@ impl Banner {
     /// Draws the list as plain mono rows: no bullets, no indent (file names).
     pub fn plain_list(mut self) -> Self {
         self.plain_list = true;
+        self
+    }
+
+    /// An action (a button) under the text, inside the banner.
+    pub fn action(mut self, action: impl IntoElement) -> Self {
+        self.action = Some(action.into_any_element());
         self
     }
 
@@ -135,6 +144,9 @@ impl RenderOnce for Banner {
                                     }
                                 })),
                         )
+                    })
+                    .when_some(self.action, |this, action| {
+                        this.child(div().mt(px(4.)).child(action))
                     }),
             )
     }
