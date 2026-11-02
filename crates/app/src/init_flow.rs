@@ -250,20 +250,25 @@ pub(crate) fn details(
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(4.))
                     .text_size(FS_BASE)
                     .text_color(colors.muted)
-                    .child(
-                        div()
-                            .font_family(FONT_MONO)
-                            .child(repo_name(root.as_path())),
-                    )
-                    .child(ui::t!("welcome.init.details.branch"))
-                    .child(div().font_family(FONT_MONO).child(branch))
-                    .child(ui::i18n::t_count(
-                        "welcome.init.details.commits",
-                        u64::try_from(commits).unwrap_or(u64::MAX),
-                        &[("n", &format_count(commits))],
+                    .children(ui::i18n::pieces_children(
+                        ui::i18n::t_count_pieces(
+                            "welcome.init.details.repo",
+                            u64::try_from(commits).unwrap_or(u64::MAX),
+                            &[("n", &format_count(commits))],
+                            &["repo", "branch"],
+                        ),
+                        vec![
+                            div()
+                                .font_family(FONT_MONO)
+                                .child(repo_name(root.as_path()))
+                                .into_any_element(),
+                            div()
+                                .font_family(FONT_MONO)
+                                .child(branch)
+                                .into_any_element(),
+                        ],
                     ))
                     .into_any_element(),
             )
@@ -275,18 +280,17 @@ pub(crate) fn details(
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(2.))
                     .text_size(FS_BASE)
                     .text_color(colors.muted)
-                    .child(ui::t!("welcome.init.details.root_prefix"))
-                    .child(
-                        div()
+                    .children(ui::i18n::pieces_children(
+                        ui::i18n::t_pieces("welcome.init.details.root", &[], &["root"]),
+                        vec![div()
                             .font_family(FONT_MONO)
                             .max_w(px(420.))
                             .truncate()
-                            .child(root),
-                    )
-                    .child(ui::t!("welcome.init.details.root_suffix"))
+                            .child(root)
+                            .into_any_element()],
+                    ))
                     .into_any_element(),
             )
         }

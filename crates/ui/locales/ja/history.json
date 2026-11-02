@@ -7,7 +7,7 @@
   "history.badge.from": "{name} から",
   "history.badge.from_tooltip": "{name} からマージ · クリックでそのコミットを表示",
   "history.branch_bar.commits.other": "{n} コミット",
-  "history.branch_bar.commits_of": "コミット:",
+  "history.branch_bar.commits_of": "{branch} のコミット",
   "history.branch_bar.merged_into": "{main} にマージ · {hash}",
   "history.branch_bar.merges.other": "{n} マージ",
   "history.branch_bar.select_merge": "マージコミット {hash} を選択",
@@ -57,7 +57,7 @@
   "history.header.summary": "概要",
   "history.load.cancel": "キャンセル",
   "history.load.lanes_folded.other": "未使用のレーン {n} 本を折りたたみました",
-  "history.load.loading.other": "読み込み中… {n} コミット{folded}",
+  "history.load.loading.other": "読み込み中… {n} コミット",
   "history.menu.back": "戻る",
   "history.menu.branch": "ブランチ {name}",
   "history.menu.branch_picker": "ブランチ…",
@@ -78,5 +78,7 @@
   "history.strip.cancelled": "履歴が不完全です — 読み込みが中止されました",
   "history.strip.git_failed": "履歴が不完全です: git {command} が失敗しました",
   "history.strip.incomplete": "履歴が不完全です",
-  "history.strip.generic": "履歴が不完全です: {message}"
+  "history.strip.generic": "履歴が不完全です: {message}",
+  "history.branch_bar.with_merges": "{commits} · {merges}",
+  "history.load.with_folded": "{loading} · {folded}"
 }

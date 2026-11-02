@@ -8,7 +8,7 @@
   "history.badge.from_tooltip": "Fusionnée depuis {name} · cliquez pour afficher ses commits",
   "history.branch_bar.commits.one": "{n} commit",
   "history.branch_bar.commits.other": "{n} commits",
-  "history.branch_bar.commits_of": "Commits de",
+  "history.branch_bar.commits_of": "Commits de {branch}",
   "history.branch_bar.merged_into": "Fusionnée dans {main} · {hash}",
   "history.branch_bar.merges.one": "{n} fusion",
   "history.branch_bar.merges.other": "{n} fusions",
@@ -61,8 +61,8 @@
   "history.load.cancel": "Annuler",
   "history.load.lanes_folded.one": "{n} voie inactive repliée",
   "history.load.lanes_folded.other": "{n} voies inactives repliées",
-  "history.load.loading.one": "Chargement… {n} commit{folded}",
-  "history.load.loading.other": "Chargement… {n} commits{folded}",
+  "history.load.loading.one": "Chargement… {n} commit",
+  "history.load.loading.other": "Chargement… {n} commits",
   "history.menu.back": "Retour",
   "history.menu.branch": "Branche {name}",
   "history.menu.branch_picker": "Branche…",
@@ -83,5 +83,7 @@
   "history.strip.cancelled": "L’historique est incomplet : le chargement a été annulé",
   "history.strip.git_failed": "L’historique est incomplet : échec de git {command}",
   "history.strip.incomplete": "L’historique est incomplet",
-  "history.strip.generic": "L’historique est incomplet : {message}"
+  "history.strip.generic": "L’historique est incomplet : {message}",
+  "history.branch_bar.with_merges": "{commits} · {merges}",
+  "history.load.with_folded": "{loading} · {folded}"
 }

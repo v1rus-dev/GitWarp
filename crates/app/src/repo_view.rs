@@ -182,16 +182,21 @@ impl ToolbarLayout {
 /// switcher button widen the bar, so the steps start higher than with the two
 /// switchers alone. Below 740 the worktree button is dropped: Ctrl Alt W still
 /// opens the switcher, under the branch switcher then.
-pub fn toolbar_layout(width: f32) -> ToolbarLayout {
+///
+/// The two labelled steps (1580 and 1460) were tuned to the English labels.
+/// `label_extra` is how much wider the labels are in the active language
+/// ([`label_extra_width`], 0 for English); both thresholds move up by it, so a
+/// longer translation drops its labels earlier instead of clipping them.
+pub fn toolbar_layout(width: f32, label_extra: f32) -> ToolbarLayout {
     let full = ToolbarLayout::full();
-    if width >= 1580. {
+    if width >= 1580. + label_extra {
         // The design's own 140px cap on the repository and branch names.
         ToolbarLayout {
             repo_name: Some(140.),
             branch_name: Some(140.),
             ..full
         }
-    } else if width >= 1460. {
+    } else if width >= 1460. + label_extra {
         ToolbarLayout {
             worktree_name: Some(64.),
             ..full
@@ -277,6 +282,53 @@ pub fn toolbar_layout(width: f32) -> ToolbarLayout {
         .compact()
         .tighter()
     }
+}
+
+/// Catalog keys of the labels the toolbar shows while `ToolbarLayout::labels` is on:
+/// the four tool buttons and the three view tabs.
+const TOOLBAR_LABELS: [&str; 7] = [
+    "repo.toolbar.fetch",
+    "repo.toolbar.pull",
+    "repo.toolbar.push",
+    "repo.toolbar.stash",
+    "repo.toolbar.view_history",
+    "repo.toolbar.view_changes",
+    "repo.toolbar.view_worktrees",
+];
+
+/// How much wider the toolbar labels are in `lang` than in English, given a text
+/// `measure`; never negative, so English (and any shorter language) keeps the
+/// English steps.
+pub fn label_extra_width(lang: &str, measure: impl Fn(&str) -> f32) -> f32 {
+    let total = |lang: &str| -> f32 {
+        TOOLBAR_LABELS
+            .iter()
+            .map(|key| measure(&ui::i18n::t_in(lang, key)))
+            .sum()
+    };
+    (total(lang) - total("en")).max(0.)
+}
+
+/// [`label_extra_width`] for the active language, measured with the window's text
+/// system at the toolbar font.
+fn toolbar_label_extra(window: &Window) -> f32 {
+    let font = ui::fonts::ui_font();
+    label_extra_width(ui::i18n::language(), |text| {
+        let run = TextRun {
+            len: text.len(),
+            font: font.clone(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        f32::from(
+            window
+                .text_system()
+                .shape_line(SharedString::from(text.to_owned()), FS_BASE, &[run], None)
+                .width,
+        )
+    })
 }
 
 /// Where the details dock sits: the stored choice, else by window width.
@@ -4153,7 +4205,7 @@ impl Render for RepositoryView {
         let colors = cx.theme().colors;
         let width = f32::from(window.viewport_size().width);
         let height = f32::from(window.viewport_size().height);
-        let layout = toolbar_layout(width);
+        let layout = toolbar_layout(width, toolbar_label_extra(window));
 
         // Until the user picks a side, the dock follows the window width, so
         // a window resized past the breakpoint docks the details right. The
@@ -4960,37 +5012,35 @@ mod tests {
     #[test]
     fn toolbar_keeps_the_window_controls_visible_at_every_width() {
         // Inter 13px, generously rounded up per character: the prototype's own
-        // measurement is 51px for "gitwarp" (7.3px/char).
-        fn text(chars: usize) -> f32 {
-            chars as f32 * 8.
+        // measurement is 51px for "gitwarp" (7.3px/char). Wide (CJK) characters
+        // take 13px.
+        fn text(label: &str) -> f32 {
+            label
+                .chars()
+                .map(|c| match c as u32 {
+                    0..=0x7f => 8.,
+                    // Accented Latin and Cyrillic run a little wider than ASCII.
+                    0x80..=0x2e7f => 9.,
+                    _ => 13.,
+                })
+                .sum()
         }
-        // Every item at its worst case, in the same terms as the toolbar.
-        fn needed(layout: ToolbarLayout) -> f32 {
+        // Every item at its worst case, in the same terms as the toolbar;
+        // `labels_width` is the summed width of the seven toolbar labels.
+        fn needed(layout: ToolbarLayout, labels_width: f32) -> f32 {
             let name_item = |name: Option<f32>| {
                 let name = name.unwrap_or(0.);
                 2. * layout.item_pad + 14. + 6. + name + 6. + 12.
             };
-            // Button: 8px padding each side, 14px icon, 6px gap.
-            let tools = if layout.labels {
-                4. * (16. + 14. + 6.)
-                    + text("Fetch".len())
-                    + text("Pull".len())
-                    + text("Push".len())
-                    + text("Stash".len())
+            // Button: 8px padding each side, 14px icon, 6px gap; the segment adds
+            // 10px padding each side, 14px icon, 6px gap and a 1px border.
+            let labelled = 4. * (16. + 14. + 6.) + 3. * (20. + 14. + 6.) + 2.;
+            let controls = if layout.labels {
+                labelled + labels_width
             } else {
-                // Icon-only tool buttons are 28 wide (`Button` squares them).
-                112.
-            };
-            // Segment: 10px padding each side, 14px icon, 6px gap, 1px border.
-            let segmented = if layout.labels {
-                3. * (20. + 14. + 6.)
-                    + text("History".len())
-                    + text("Changes".len())
-                    + text("Worktrees".len())
-                    + 2.
-            } else {
-                // Three 34px icon segments and the border.
-                104.
+                // Icon-only tool buttons are 28 wide (`Button` squares them), and
+                // three 34px icon segments plus the border.
+                112. + 104.
             };
             // The worktree button: icon, name, the warning dot (6px + gap),
             // chevron.
@@ -5004,66 +5054,89 @@ mod tests {
                 + name_item(layout.branch_name)
                 + worktree_item
                 + 9. // separator
-                + tools
-                + segmented
+                + controls
                 + 26. // settings
                 + 104.; // window controls
             fixed + layout.search_min + 2. * layout.padding + 12. * layout.gap
         }
+        let labels_width = |lang: &str| -> f32 {
+            TOOLBAR_LABELS
+                .iter()
+                .map(|key| text(&ui::i18n::t_in(lang, key)))
+                .sum()
+        };
 
-        for width in [
-            620., 699., 700., 760., 839., 840., 869., 870., 1000., 1200., 1340., 1419., 1420.,
-            1600.,
-        ] {
-            let layout = toolbar_layout(width);
-            // The client-side frame keeps a 10px shadow band and a 1px border
-            // on each side.
-            let content = width - 22.;
-            assert!(
-                needed(layout) <= content,
-                "toolbar overflows at {width}: needs {} of {content}",
-                needed(layout)
-            );
+        // Every language, not just English: `t_in` reads the catalogs without
+        // touching the process-wide active language.
+        for lang in ui::i18n::LANGUAGES {
+            let extra = label_extra_width(lang, text);
+            let labels = labels_width(lang);
+            for width in [
+                620., 699., 700., 760., 839., 840., 869., 870., 1000., 1200., 1340., 1419., 1420.,
+                1459., 1460., 1579., 1580., 1600., 1700., 1800., 2000.,
+            ] {
+                let layout = toolbar_layout(width, extra);
+                // The client-side frame keeps a 10px shadow band and a 1px border
+                // on each side.
+                let content = width - 22.;
+                assert!(
+                    needed(layout, labels) <= content,
+                    "{lang}: toolbar overflows at {width}: needs {} of {content}",
+                    needed(layout, labels)
+                );
+            }
         }
     }
 
     #[test]
+    fn longer_labels_move_the_labelled_steps_up_and_english_keeps_its_own() {
+        assert_eq!(label_extra_width("en", |t| t.chars().count() as f32), 0.);
+        let extra = label_extra_width("fr", |t| t.chars().count() as f32);
+        assert!(extra > 0.);
+        assert!(toolbar_layout(1460., 0.).labels);
+        assert!(!toolbar_layout(1460., extra).labels);
+        assert!(toolbar_layout(1460. + extra, extra).labels);
+        assert_eq!(toolbar_layout(1580., 0.).repo_name, Some(140.));
+        assert_eq!(toolbar_layout(1580., extra).repo_name, Some(96.));
+    }
+
+    #[test]
     fn toolbar_steps_hide_labels_and_names_in_order() {
-        assert!(toolbar_layout(1600.).labels);
-        assert!(toolbar_layout(1460.).labels);
-        assert!(!toolbar_layout(1459.).labels);
-        assert_eq!(toolbar_layout(1579.).repo_name, Some(96.));
-        assert!(!toolbar_layout(1200.).labels);
-        assert_eq!(toolbar_layout(1600.).repo_name, Some(140.));
-        assert_eq!(toolbar_layout(1200.).repo_name, Some(96.));
-        assert_eq!(toolbar_layout(1080.).repo_name, Some(96.));
-        assert_eq!(toolbar_layout(1000.).repo_name, Some(64.));
-        assert_eq!(toolbar_layout(900.).repo_name, Some(64.));
-        assert_eq!(toolbar_layout(899.).repo_name, None);
-        assert_eq!(toolbar_layout(810.).repo_name, None);
-        assert_eq!(toolbar_layout(810.).branch_name, Some(64.));
-        assert_eq!(toolbar_layout(809.).branch_name, None);
-        assert_eq!(toolbar_layout(650.).search_min, 60.);
-        assert_eq!(toolbar_layout(650.).padding, 6.);
-        assert_eq!(toolbar_layout(760.).search_min, 96.);
-        assert_eq!(toolbar_layout(1200.).search_min, 150.);
-        assert!(!toolbar_layout(900.).search_kbd);
-        assert!(!toolbar_layout(1200.).search_kbd);
-        assert!(toolbar_layout(1600.).search_kbd);
-        assert_eq!(toolbar_layout(1200.).gap, 6.);
-        assert_eq!(toolbar_layout(800.).gap, 4.);
-        assert_eq!(toolbar_layout(1200.).item_pad, 8.);
-        assert_eq!(toolbar_layout(800.).item_pad, 7.);
+        assert!(toolbar_layout(1600., 0.).labels);
+        assert!(toolbar_layout(1460., 0.).labels);
+        assert!(!toolbar_layout(1459., 0.).labels);
+        assert_eq!(toolbar_layout(1579., 0.).repo_name, Some(96.));
+        assert!(!toolbar_layout(1200., 0.).labels);
+        assert_eq!(toolbar_layout(1600., 0.).repo_name, Some(140.));
+        assert_eq!(toolbar_layout(1200., 0.).repo_name, Some(96.));
+        assert_eq!(toolbar_layout(1080., 0.).repo_name, Some(96.));
+        assert_eq!(toolbar_layout(1000., 0.).repo_name, Some(64.));
+        assert_eq!(toolbar_layout(900., 0.).repo_name, Some(64.));
+        assert_eq!(toolbar_layout(899., 0.).repo_name, None);
+        assert_eq!(toolbar_layout(810., 0.).repo_name, None);
+        assert_eq!(toolbar_layout(810., 0.).branch_name, Some(64.));
+        assert_eq!(toolbar_layout(809., 0.).branch_name, None);
+        assert_eq!(toolbar_layout(650., 0.).search_min, 60.);
+        assert_eq!(toolbar_layout(650., 0.).padding, 6.);
+        assert_eq!(toolbar_layout(760., 0.).search_min, 96.);
+        assert_eq!(toolbar_layout(1200., 0.).search_min, 150.);
+        assert!(!toolbar_layout(900., 0.).search_kbd);
+        assert!(!toolbar_layout(1200., 0.).search_kbd);
+        assert!(toolbar_layout(1600., 0.).search_kbd);
+        assert_eq!(toolbar_layout(1200., 0.).gap, 6.);
+        assert_eq!(toolbar_layout(800., 0.).gap, 4.);
+        assert_eq!(toolbar_layout(1200., 0.).item_pad, 8.);
+        assert_eq!(toolbar_layout(800., 0.).item_pad, 7.);
     }
 
     #[test]
     fn the_worktree_button_loses_its_name_then_the_button_as_the_bar_narrows() {
-        assert_eq!(toolbar_layout(1600.).worktree_name, Some(96.));
-        assert_eq!(toolbar_layout(1200.).worktree_name, Some(64.));
-        assert_eq!(toolbar_layout(899.).worktree_name, None);
-        assert!(toolbar_layout(740.).worktree_button);
-        assert!(!toolbar_layout(739.).worktree_button);
-        assert!(!toolbar_layout(620.).worktree_button);
+        assert_eq!(toolbar_layout(1600., 0.).worktree_name, Some(96.));
+        assert_eq!(toolbar_layout(1200., 0.).worktree_name, Some(64.));
+        assert_eq!(toolbar_layout(899., 0.).worktree_name, None);
+        assert!(toolbar_layout(740., 0.).worktree_button);
+        assert!(!toolbar_layout(739., 0.).worktree_button);
+        assert!(!toolbar_layout(620., 0.).worktree_button);
     }
 
     #[test]

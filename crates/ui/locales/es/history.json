@@ -8,7 +8,7 @@
   "history.badge.from_tooltip": "Fusionado desde {name} · haz clic para mostrar sus commits",
   "history.branch_bar.commits.one": "{n} commit",
   "history.branch_bar.commits.other": "{n} commits",
-  "history.branch_bar.commits_of": "Commits de",
+  "history.branch_bar.commits_of": "Commits de {branch}",
   "history.branch_bar.merged_into": "Fusionado en {main} · {hash}",
   "history.branch_bar.merges.one": "{n} fusión",
   "history.branch_bar.merges.other": "{n} fusiones",
@@ -61,8 +61,8 @@
   "history.load.cancel": "Cancelar",
   "history.load.lanes_folded.one": "{n} carril inactivo plegado",
   "history.load.lanes_folded.other": "{n} carriles inactivos plegados",
-  "history.load.loading.one": "Cargando… {n} commit{folded}",
-  "history.load.loading.other": "Cargando… {n} commits{folded}",
+  "history.load.loading.one": "Cargando… {n} commit",
+  "history.load.loading.other": "Cargando… {n} commits",
   "history.menu.back": "Atrás",
   "history.menu.branch": "Rama {name}",
   "history.menu.branch_picker": "Rama…",
@@ -83,5 +83,7 @@
   "history.strip.cancelled": "El historial está incompleto: la carga se canceló",
   "history.strip.git_failed": "El historial está incompleto: falló git {command}",
   "history.strip.incomplete": "El historial está incompleto",
-  "history.strip.generic": "El historial está incompleto: {message}"
+  "history.strip.generic": "El historial está incompleto: {message}",
+  "history.branch_bar.with_merges": "{commits} · {merges}",
+  "history.load.with_folded": "{loading} · {folded}"
 }

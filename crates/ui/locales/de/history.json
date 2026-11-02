@@ -8,7 +8,7 @@
   "history.badge.from_tooltip": "Gemergt von {name} · klicken, um dessen Commits anzuzeigen",
   "history.branch_bar.commits.one": "{n} Commit",
   "history.branch_bar.commits.other": "{n} Commits",
-  "history.branch_bar.commits_of": "Commits von",
+  "history.branch_bar.commits_of": "Commits von {branch}",
   "history.branch_bar.merged_into": "Gemergt in {main} · {hash}",
   "history.branch_bar.merges.one": "{n} Merge",
   "history.branch_bar.merges.other": "{n} Merges",
@@ -61,8 +61,8 @@
   "history.load.cancel": "Abbrechen",
   "history.load.lanes_folded.one": "{n} inaktive Spur eingeklappt",
   "history.load.lanes_folded.other": "{n} inaktive Spuren eingeklappt",
-  "history.load.loading.one": "Wird geladen… {n} Commit{folded}",
-  "history.load.loading.other": "Wird geladen… {n} Commits{folded}",
+  "history.load.loading.one": "Wird geladen… {n} Commit",
+  "history.load.loading.other": "Wird geladen… {n} Commits",
   "history.menu.back": "Zurück",
   "history.menu.branch": "Branch {name}",
   "history.menu.branch_picker": "Branch…",
@@ -83,5 +83,7 @@
   "history.strip.cancelled": "Verlauf ist unvollständig — Laden wurde abgebrochen",
   "history.strip.git_failed": "Verlauf ist unvollständig: git {command} ist fehlgeschlagen",
   "history.strip.incomplete": "Verlauf ist unvollständig",
-  "history.strip.generic": "Verlauf ist unvollständig: {message}"
+  "history.strip.generic": "Verlauf ist unvollständig: {message}",
+  "history.branch_bar.with_merges": "{commits} · {merges}",
+  "history.load.with_folded": "{loading} · {folded}"
 }

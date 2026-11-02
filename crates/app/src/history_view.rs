@@ -2732,19 +2732,18 @@ impl HistoryView {
         let ready = matches!(rows.state, DayState::Ready);
         let commits = rows.items.len();
         let merges = rows.merged_from.len();
-        let mut counts = if ready {
-            ui::i18n::t_count("history.branch_bar.commits", commits as u64, &[]).to_string()
-        } else {
+        let counts = if !ready {
             "…".to_owned()
+        } else if merges > 0 {
+            ui::t!(
+                "history.branch_bar.with_merges",
+                commits = ui::i18n::t_count("history.branch_bar.commits", commits as u64, &[]),
+                merges = ui::i18n::t_count("history.branch_bar.merges", merges as u64, &[])
+            )
+            .to_string()
+        } else {
+            ui::i18n::t_count("history.branch_bar.commits", commits as u64, &[]).to_string()
         };
-        if ready && merges > 0 {
-            counts.push_str(" · ");
-            counts.push_str(&ui::i18n::t_count(
-                "history.branch_bar.merges",
-                merges as u64,
-                &[],
-            ));
-        }
         let into = rows.merged_into.as_ref().map(|(oid, main)| {
             let hash = short_hash(oid);
             let oid = *oid;
@@ -2791,9 +2790,14 @@ impl HistoryView {
                                 .size(px(13.))
                                 .color(colors.muted),
                         )
-                        .child(ui::t!("history.branch_bar.commits_of"))
-                        .child(
-                            div()
+                        .child(div().min_w_0().flex().items_center().children(
+                            ui::i18n::pieces_children(
+                                ui::i18n::t_pieces(
+                                    "history.branch_bar.commits_of",
+                                    &[],
+                                    &["branch"],
+                                ),
+                                vec![div()
                                 .id("history-branch-filter-name")
                                 .min_w_0()
                                 // The design caps the name at 40ch.
@@ -2802,8 +2806,10 @@ impl HistoryView {
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(colors.text)
                                 .tooltip(Tooltip::text(rows.branch.clone()))
-                                .child(rows.branch.clone()),
-                        ),
+                                .child(rows.branch.clone())
+                                .into_any_element()],
+                            ),
+                        )),
                 )
                 .child(div().flex_none().text_color(colors.muted).child(counts))
                 .children(into)
@@ -2827,17 +2833,23 @@ impl HistoryView {
         };
         // The folded lanes are part of the history's own progress line: say
         // how many the graph is hiding while the rows stream in.
-        let folded = if self.collapse && self.geometry().folded_count > 0 {
-            format!(
-                " · {}",
-                ui::i18n::t_count(
+        let loading_text = ui::i18n::t_count(
+            "history.load.loading",
+            loaded,
+            &[("n", &format_count(loaded as usize))],
+        );
+        let loading_text = if self.collapse && self.geometry().folded_count > 0 {
+            ui::t!(
+                "history.load.with_folded",
+                loading = loading_text,
+                folded = ui::i18n::t_count(
                     "history.load.lanes_folded",
                     self.geometry.folded_count as u64,
                     &[]
                 )
             )
         } else {
-            String::new()
+            loading_text
         };
         div()
             .w_full()
@@ -2856,11 +2868,7 @@ impl HistoryView {
                     .flex_none()
                     .font_weight(FontWeight::BOLD)
                     .text_color(colors.text)
-                    .child(ui::i18n::t_count(
-                        "history.load.loading",
-                        loaded,
-                        &[("n", &format_count(loaded as usize)), ("folded", &folded)],
-                    )),
+                    .child(loading_text),
             )
             .child(
                 div()
@@ -3964,20 +3972,13 @@ impl BodyText {
     /// with the matching value; the rest is plain. Translators see one
     /// sentence, so word order can differ per language.
     fn templated(template: &str, code: &[(&str, &str)]) -> Self {
-        let mut body = Self::new();
-        let mut rest = template;
-        while let Some((at, name, value)) = code
-            .iter()
-            .filter_map(|(name, value)| {
-                rest.find(&format!("{{{name}}}"))
-                    .map(|at| (at, *name, *value))
+        let names: Vec<&str> = code.iter().map(|(name, _)| *name).collect();
+        ui::i18n::split_template(template, &names)
+            .into_iter()
+            .fold(Self::new(), |body, piece| match piece {
+                ui::i18n::Piece::Text(text) => body.plain(&text),
+                ui::i18n::Piece::Slot(index) => body.code(code[index].1),
             })
-            .min_by_key(|(at, ..)| *at)
-        {
-            body = body.plain(&rest[..at]).code(value);
-            rest = &rest[at + name.len() + 2..];
-        }
-        body.plain(rest)
     }
 
     /// The styled runs for [`Self::element`]: one per plain or code stretch.

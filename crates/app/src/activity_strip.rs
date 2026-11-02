@@ -20,10 +20,11 @@ use gpui::{
 
 use git_core::{Activity, Error, Git, Repo};
 use ui::actions::Cancel;
+use ui::i18n;
 use ui::metrics::{FONT_MONO, FONT_UI, FS_SM};
 use ui::{
-    ActiveTheme, Button, ButtonSize, HeatLegend, Heatmap, Icon, IconName, Kbd, SegmentItem,
-    Segmented, Select, Skeleton,
+    long_date, ActiveTheme, Button, ButtonSize, HeatLegend, Heatmap, Icon, IconName, Kbd,
+    SegmentItem, Segmented, Select, Skeleton,
 };
 
 use crate::format::format_count;
@@ -42,31 +43,6 @@ const YEARS_SHOWN: usize = 5;
 const HEADER: f32 = 34.;
 /// Narrowest the side column may get; the grid scrolls before it shrinks below.
 const SIDE_MIN_W: f32 = 160.;
-
-// Catalog keys (shared with the heatmap's own labels), translated at render.
-const WEEKDAYS: [&str; 7] = [
-    "kit.heatmap.weekday.mon",
-    "kit.heatmap.weekday.tue",
-    "kit.heatmap.weekday.wed",
-    "kit.heatmap.weekday.thu",
-    "kit.heatmap.weekday.fri",
-    "kit.heatmap.weekday.sat",
-    "kit.heatmap.weekday.sun",
-];
-const MONTHS: [&str; 12] = [
-    "kit.heatmap.month.jan",
-    "kit.heatmap.month.feb",
-    "kit.heatmap.month.mar",
-    "kit.heatmap.month.apr",
-    "kit.heatmap.month.may",
-    "kit.heatmap.month.jun",
-    "kit.heatmap.month.jul",
-    "kit.heatmap.month.aug",
-    "kit.heatmap.month.sep",
-    "kit.heatmap.month.oct",
-    "kit.heatmap.month.nov",
-    "kit.heatmap.month.dec",
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Who {
@@ -449,23 +425,6 @@ pub(crate) fn range_days(year: Option<i32>, today: i32) -> (i32, i32) {
     }
 }
 
-/// `Tue, 13 Oct 2026`.
-pub(crate) fn long_date(day: i32) -> String {
-    let (year, month, date) = git_core::civil_from_days(day);
-    // 1970-01-01 was a Thursday and weeks start on Monday.
-    let weekday = (day + 3).rem_euclid(7) as usize;
-    ui::i18n::t_args(
-        "kit.heatmap.long_date",
-        &[
-            ("weekday", &ui::i18n::t(WEEKDAYS[weekday])),
-            ("day", &date),
-            ("month", &ui::i18n::t(MONTHS[month as usize - 1])),
-            ("year", &year),
-        ],
-    )
-    .to_string()
-}
-
 /// `1 commit` / `4 commits`.
 pub(crate) fn commits(count: usize) -> String {
     ui::i18n::t_count(
@@ -521,13 +480,15 @@ impl ActivityStrip {
             }
             (Status::Partial { .. }, Some(shown)) => total
                 .child(Icon::new(IconName::Fetch).size(px(12.)).color(colors.muted))
-                .child(ui::t!("activity.total.counting"))
-                .child(strong(format_count(shown.total)))
-                .child(ui::i18n::t_count(
-                    "activity.total.so_far",
-                    shown.total as u64,
-                    &[],
-                )),
+                .child(div().flex().children(i18n::pieces_children(
+                    i18n::t_count_pieces(
+                        "activity.total.counting",
+                        shown.total as u64,
+                        &[],
+                        &["n"],
+                    ),
+                    vec![strong(format_count(shown.total)).into_any_element()],
+                ))),
             (Status::Ready, Some(shown)) => {
                 if self.all.is_empty() {
                     total.child(ui::t!("activity.total.none"))
@@ -538,17 +499,30 @@ impl ActivityStrip {
                     })
                 } else {
                     let n = shown.total as u64;
-                    let noun = match (mine, self.year) {
-                        (true, Some(year)) => {
-                            ui::i18n::t_count("activity.total.mine_year", n, &[("year", &year)])
+                    let pieces = match (mine, self.year) {
+                        (true, Some(year)) => i18n::t_count_pieces(
+                            "activity.total.mine_year",
+                            n,
+                            &[("year", &year)],
+                            &["n"],
+                        ),
+                        (true, None) => {
+                            i18n::t_count_pieces("activity.total.mine_last_year", n, &[], &["n"])
                         }
-                        (true, None) => ui::i18n::t_count("activity.total.mine_last_year", n, &[]),
-                        (false, Some(year)) => {
-                            ui::i18n::t_count("activity.total.all_year", n, &[("year", &year)])
+                        (false, Some(year)) => i18n::t_count_pieces(
+                            "activity.total.all_year",
+                            n,
+                            &[("year", &year)],
+                            &["n"],
+                        ),
+                        (false, None) => {
+                            i18n::t_count_pieces("activity.total.all_last_year", n, &[], &["n"])
                         }
-                        (false, None) => ui::i18n::t_count("activity.total.all_last_year", n, &[]),
                     };
-                    total.child(strong(format_count(shown.total))).child(noun)
+                    total.child(div().flex().children(i18n::pieces_children(
+                        pieces,
+                        vec![strong(format_count(shown.total)).into_any_element()],
+                    )))
                 }
             }
         };
@@ -786,7 +760,8 @@ impl ActivityStrip {
                 .hover(|this| this.underline())
                 .child(label)
         };
-        let line = || div().flex().items_center().gap(px(4.)).flex_wrap();
+        // No gap: the spaces between runs come from the translated sentence.
+        let line = || div().flex().items_center().flex_wrap();
 
         if loading {
             return side
@@ -796,12 +771,10 @@ impl ActivityStrip {
         if self.me.is_none() {
             let view = cx.entity();
             return side
-                .child(
-                    line()
-                        .child(ui::t!("activity.side.unset_prefix"))
-                        .child(mono("user.email".to_owned()))
-                        .child(ui::t!("activity.side.unset_suffix")),
-                )
+                .child(line().children(i18n::pieces_children(
+                    i18n::t_pieces("activity.side.unset", &[], &["key"]),
+                    vec![mono("user.email".to_owned()).into_any_element()],
+                )))
                 .child(
                     link(
                         "activity-set-identity",
@@ -819,13 +792,11 @@ impl ActivityStrip {
             let view = cx.entity();
             return side
                 .child(
-                    line().child(ui::t!("activity.side.none_by")).child(
-                        // The design ends the line with a full stop right after the address.
-                        div()
-                            .flex()
-                            .child(mono(self.me.clone().unwrap_or_default()))
-                            .child("."),
-                    ),
+                    // The design ends the line with a full stop right after the address.
+                    line().children(i18n::pieces_children(
+                        i18n::t_pieces("activity.side.none_by", &[], &["email"]),
+                        vec![mono(self.me.clone().unwrap_or_default()).into_any_element()],
+                    )),
                 )
                 .child(
                     link(
@@ -854,14 +825,20 @@ impl ActivityStrip {
                 .child(ui::t!("activity.side.filtered", commits = commits(count)));
         }
         if matches!(self.status, Status::Partial { .. }) {
-            return side.child(
-                line()
-                    .child(ui::t!("activity.side.partial_prefix"))
-                    .child(mono("git log".to_owned()))
-                    .child(ui::t!("activity.side.partial_suffix")),
-            );
+            return side.child(line().children(i18n::pieces_children(
+                i18n::t_pieces("activity.side.partial", &[], &["command"]),
+                vec![mono("git log".to_owned()).into_any_element()],
+            )));
         }
         let keys = |text: &'static str| Kbd::new(text);
+        let pair = |a: &'static str, b: &'static str| {
+            div()
+                .flex()
+                .gap(px(4.))
+                .child(keys(a))
+                .child(keys(b))
+                .into_any_element()
+        };
         side.child(ui::t!("activity.side.hint")).child(
             // Wraps only when the side column is too narrow, as in the
             // design; items wrap whole, never mid-word.
@@ -869,16 +846,19 @@ impl ActivityStrip {
                 .flex()
                 .flex_wrap()
                 .items_center()
-                .gap(px(4.))
                 .whitespace_nowrap()
-                .child(keys("↑"))
-                .child(keys("↓"))
-                .child(ui::t!("activity.side.keys_day"))
-                .child(keys("←"))
-                .child(keys("→"))
-                .child(ui::t!("activity.side.keys_week"))
-                .child(keys("Enter"))
-                .child(ui::t!("activity.side.keys_filter")),
+                .children(i18n::pieces_children(
+                    i18n::t_pieces(
+                        "activity.side.keys",
+                        &[],
+                        &["day_keys", "week_keys", "filter_key"],
+                    ),
+                    vec![
+                        pair("↑", "↓"),
+                        pair("←", "→"),
+                        keys("Enter").into_any_element(),
+                    ],
+                )),
         )
     }
 
@@ -890,10 +870,10 @@ impl ActivityStrip {
         let count = history.day_filter_count();
         let strong = |text: String| div().font_weight(FontWeight::SEMIBOLD).child(text);
         let noun_n = count.unwrap_or(0) as u64;
-        let noun = if filter.me.is_some() {
-            ui::i18n::t_count("activity.filter.noun_mine", noun_n, &[])
+        let pieces = if filter.me.is_some() {
+            i18n::t_count_pieces("activity.filter.mine", noun_n, &[], &["n", "date"])
         } else {
-            ui::i18n::t_count("activity.filter.noun_all", noun_n, &[])
+            i18n::t_count_pieces("activity.filter.all", noun_n, &[], &["n", "date"])
         };
         let view = cx.entity();
         Some(
@@ -916,17 +896,13 @@ impl ActivityStrip {
                         .size(px(14.))
                         .color(colors.accent),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(4.))
-                        .child(ui::t!("activity.filter.showing"))
-                        .child(strong(count.map_or("…".to_owned(), format_count)))
-                        .child(noun)
-                        .child(ui::t!("activity.filter.on"))
-                        .child(strong(long_date(filter.day))),
-                )
+                .child(div().flex().items_center().children(i18n::pieces_children(
+                    pieces,
+                    vec![
+                        strong(count.map_or("…".to_owned(), format_count)).into_any_element(),
+                        strong(long_date(filter.day)).into_any_element(),
+                    ],
+                )))
                 .child(div().flex_1())
                 .child(
                     Button::new("activity-clear-filter")

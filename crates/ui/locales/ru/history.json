@@ -9,7 +9,7 @@
   "history.branch_bar.commits.one": "{n} коммит",
   "history.branch_bar.commits.few": "{n} коммита",
   "history.branch_bar.commits.many": "{n} коммитов",
-  "history.branch_bar.commits_of": "Коммиты ветки",
+  "history.branch_bar.commits_of": "Коммиты ветки {branch}",
   "history.branch_bar.merged_into": "Слито в {main} · {hash}",
   "history.branch_bar.merges.one": "{n} слияние",
   "history.branch_bar.merges.few": "{n} слияния",
@@ -65,9 +65,9 @@
   "history.load.lanes_folded.one": "{n} неактивная линия свёрнута",
   "history.load.lanes_folded.few": "{n} неактивные линии свёрнуты",
   "history.load.lanes_folded.many": "{n} неактивных линий свёрнуто",
-  "history.load.loading.one": "Загрузка… {n} коммит{folded}",
-  "history.load.loading.few": "Загрузка… {n} коммита{folded}",
-  "history.load.loading.many": "Загрузка… {n} коммитов{folded}",
+  "history.load.loading.one": "Загрузка… {n} коммит",
+  "history.load.loading.few": "Загрузка… {n} коммита",
+  "history.load.loading.many": "Загрузка… {n} коммитов",
   "history.menu.back": "Назад",
   "history.menu.branch": "Ветка {name}",
   "history.menu.branch_picker": "Ветка…",
@@ -88,5 +88,7 @@
   "history.strip.cancelled": "История неполная — загрузка отменена",
   "history.strip.git_failed": "История неполная: git {command} завершился с ошибкой",
   "history.strip.incomplete": "История неполная",
-  "history.strip.generic": "История неполная: {message}"
+  "history.strip.generic": "История неполная: {message}",
+  "history.branch_bar.with_merges": "{commits} · {merges}",
+  "history.load.with_folded": "{loading} · {folded}"
 }

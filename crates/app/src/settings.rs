@@ -410,8 +410,8 @@ pub enum DateFormat {
 
 /// The interface language. The saved choice is handed to `ui::i18n::set_language`
 /// once at startup (see `main.rs`), so a change takes effect after a restart, like
-/// the design announces. Languages whose catalog is still empty fall back to English
-/// text key by key.
+/// the design announces. Every language has a full catalog; a key missing from one
+/// would still fall back to the English text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Language {

@@ -125,10 +125,6 @@ fn every_catalog_file_is_embedded() {
 fn catalog_parity() {
     let all = load_all();
     for lang in LANGUAGES.iter().filter(|lang| **lang != "en") {
-        let total: usize = all[*lang].values().map(|map| map.len()).sum();
-        if total == 0 {
-            continue; // translations still pending for this language
-        }
         for (area, en) in &all["en"] {
             let expected = expected_keys(en, lang);
             let actual: BTreeSet<String> = all[*lang][area].keys().cloned().collect();

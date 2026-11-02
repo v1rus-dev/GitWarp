@@ -30,7 +30,8 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::{OnceLock, RwLock};
 
-use gpui::SharedString;
+use gpui::prelude::*;
+use gpui::{div, px, AnyElement, SharedString};
 
 /// Every embedded catalog file as `(language code, JSON text)`.
 pub const CATALOGS: &[(&str, &str)] = &[
@@ -158,6 +159,11 @@ fn active() -> usize {
     *ACTIVE.read().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The code of the active language (one of [`LANGUAGES`]).
+pub fn language() -> &'static str {
+    LANGUAGES[active()]
+}
+
 fn lookup(lang: usize, key: &str) -> Option<SharedString> {
     let all = catalogs();
     all[lang].get(key).or_else(|| all[0].get(key)).cloned()
@@ -170,6 +176,13 @@ fn lookup(lang: usize, key: &str) -> Option<SharedString> {
 /// ```
 pub fn t(key: &str) -> SharedString {
     lookup(active(), key).unwrap_or_else(|| SharedString::from(key.to_owned()))
+}
+
+/// Translates `key` into `lang` (a code from [`LANGUAGES`]; unknown means English) without
+/// touching the active language. For measuring a text in another language.
+pub fn t_in(lang: &str, key: &str) -> SharedString {
+    let index = LANGUAGES.iter().position(|l| *l == lang).unwrap_or(0);
+    lookup(index, key).unwrap_or_else(|| SharedString::from(key.to_owned()))
 }
 
 /// Translates `key` and replaces each `{name}` with the matching argument.
@@ -196,6 +209,92 @@ pub fn t_count(key: &str, n: u64, args: &[(&str, &dyn Display)]) -> SharedString
     let mut all: Vec<(&str, &dyn Display)> = vec![("n", &n)];
     all.extend_from_slice(args);
     substitute(&template, &all).into()
+}
+
+/// One stretch of a translated sentence: literal text, or the position of a styled slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Piece {
+    Text(String),
+    /// Index into the `slots` list passed to [`split_template`].
+    Slot(usize),
+}
+
+/// Splits `template` at the `{name}` placeholders listed in `slots`. Other `{..}` text stays
+/// literal. Lets a caller render one translated sentence with styled runs (mono, bold) while
+/// the translator controls the word order.
+pub fn split_template(template: &str, slots: &[&str]) -> Vec<Piece> {
+    let mut pieces = Vec::new();
+    let mut rest = template;
+    while let Some((at, index)) = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, name)| rest.find(&format!("{{{name}}}")).map(|at| (at, index)))
+        .min_by_key(|(at, _)| *at)
+    {
+        if at > 0 {
+            pieces.push(Piece::Text(rest[..at].to_owned()));
+        }
+        pieces.push(Piece::Slot(index));
+        rest = &rest[at + slots[index].len() + 2..];
+    }
+    if !rest.is_empty() {
+        pieces.push(Piece::Text(rest.to_owned()));
+    }
+    pieces
+}
+
+/// [`t_args`] for a sentence with styled slots: `args` are substituted, the `{name}` of each
+/// entry in `slots` is left for [`split_template`].
+pub fn t_pieces(key: &str, args: &[(&str, &dyn Display)], slots: &[&str]) -> Vec<Piece> {
+    split_template(&substitute(&t(key), args), slots)
+}
+
+/// [`t_count`] for a sentence with styled slots (`"n"` may be a slot to style the count).
+pub fn t_count_pieces(
+    key: &str,
+    n: u64,
+    args: &[(&str, &dyn Display)],
+    slots: &[&str],
+) -> Vec<Piece> {
+    let lang = active();
+    let category = plural_category(LANGUAGES[lang], n);
+    let template = lookup(lang, &format!("{key}.{category}"))
+        .or_else(|| lookup(lang, &format!("{key}.other")))
+        .unwrap_or_else(|| SharedString::from(key.to_owned()));
+    let mut all: Vec<(&str, &dyn Display)> = Vec::new();
+    if !slots.contains(&"n") {
+        all.push(("n", &n));
+    }
+    all.extend_from_slice(args);
+    split_template(&substitute(&template, &all), slots)
+}
+
+/// Turns pieces into row children: text pieces and the `slots` elements in template order.
+///
+/// Spaces at a text piece's edge become a 4 px margin instead of depending on how a flex
+/// item lays out edge whitespace; CJK text has none, so it joins its slot directly. The row
+/// itself must have no `gap`.
+pub fn pieces_children(pieces: Vec<Piece>, slots: Vec<AnyElement>) -> Vec<AnyElement> {
+    let mut slots: Vec<Option<AnyElement>> = slots.into_iter().map(Some).collect();
+    pieces
+        .into_iter()
+        .filter_map(|piece| match piece {
+            Piece::Slot(index) => slots.get_mut(index).and_then(Option::take),
+            Piece::Text(text) => {
+                let trimmed = text.trim();
+                let lead = text.starts_with(char::is_whitespace);
+                let trail = text.ends_with(char::is_whitespace);
+                Some(
+                    div()
+                        .flex_none()
+                        .when(lead, |this| this.pl(px(4.)))
+                        .when(trail && !trimmed.is_empty(), |this| this.pr(px(4.)))
+                        .child(SharedString::from(trimmed.to_owned()))
+                        .into_any_element(),
+                )
+            }
+        })
+        .collect()
 }
 
 /// `t!("key")` is [`t`]; `t!("key", name = value, ...)` is [`t_args`].
@@ -283,6 +382,24 @@ mod tests {
     fn substitutes_named_placeholders() {
         let out = substitute("a {x} b {y} {z}", &[("x", &1), ("y", &"two")]);
         assert_eq!(out, "a 1 b two {z}");
+    }
+
+    #[test]
+    fn split_template_orders_slots_by_position() {
+        assert_eq!(
+            split_template("a {y} b {x}{x}", &["x", "y"]),
+            vec![
+                Piece::Text("a ".into()),
+                Piece::Slot(1),
+                Piece::Text(" b ".into()),
+                Piece::Slot(0),
+                Piece::Slot(0),
+            ]
+        );
+        assert_eq!(
+            split_template("{z}", &["x"]),
+            vec![Piece::Text("{z}".into())]
+        );
     }
 
     #[test]
