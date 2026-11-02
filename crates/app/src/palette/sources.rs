@@ -199,6 +199,7 @@ fn page_name(page: Page) -> &'static str {
         Page::General => "General",
         Page::Appearance => "Appearance",
         Page::Git => "Git",
+        Page::Worktrees => "Worktrees",
         Page::Ssh => "SSH keys",
         Page::Keybindings => "Keybindings",
         Page::Diff => "Diff & merge",

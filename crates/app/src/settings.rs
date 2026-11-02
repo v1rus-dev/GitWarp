@@ -137,6 +137,8 @@ pub struct Settings {
     pub git_path: String,
     /// Per-action shortcut overrides; an empty value unbinds the action.
     pub keybindings: BTreeMap<String, String>,
+    /// Where new worktrees go and what happens around creating and removing them.
+    pub worktrees: WorktreeSettings,
 }
 
 impl Default for Settings {
@@ -183,8 +185,57 @@ impl Default for Settings {
             git_mode: GitMode::default(),
             git_path: String::new(),
             keybindings: BTreeMap::new(),
+            worktrees: WorktreeSettings::default(),
         }
     }
+}
+
+/// The base folders offered by Settings → Worktrees, `~` stored literally.
+pub const WORKTREE_BASES: [&str; 3] = ["~/develop", "~/worktrees", "~/develop/.worktrees"];
+
+/// The folder-name templates offered by Settings → Worktrees.
+pub const WORKTREE_TEMPLATES: [&str; 2] = ["{repo}-{branch}", "{branch}"];
+
+/// Worktree creation and removal preferences.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorktreeSettings {
+    /// Folder new worktrees are created in; `~` is expanded when used.
+    pub base: String,
+    /// Folder name: `{repo}` and `{branch}` are substituted.
+    pub template: String,
+    /// Whether the app switches to a freshly created worktree.
+    pub after_create: AfterCreate,
+    /// Copy untracked `.env` files into the new worktree.
+    pub copy_env: bool,
+    /// Ask before removing a clean worktree.
+    pub confirm_remove_clean: bool,
+    /// Ask before deleting the branch together with its worktree.
+    pub confirm_delete_branch: bool,
+}
+
+impl Default for WorktreeSettings {
+    fn default() -> Self {
+        Self {
+            base: WORKTREE_BASES[0].to_owned(),
+            template: WORKTREE_TEMPLATES[0].to_owned(),
+            after_create: AfterCreate::default(),
+            copy_env: true,
+            confirm_remove_clean: true,
+            confirm_delete_branch: true,
+        }
+    }
+}
+
+/// What happens when a worktree has been created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AfterCreate {
+    /// Open the new worktree.
+    #[default]
+    Switch,
+    /// Stay in the current worktree.
+    Stay,
 }
 
 #[allow(dead_code)] // used by the welcome screen (stage 2.3+)
@@ -692,6 +743,7 @@ fn settings_from_value(value: Value) -> Settings {
         git_mode: take(&mut object, "git_mode", defaults.git_mode),
         git_path: take(&mut object, "git_path", defaults.git_path),
         keybindings: take(&mut object, "keybindings", defaults.keybindings),
+        worktrees: take(&mut object, "worktrees", defaults.worktrees),
     }
 }
 
@@ -800,6 +852,38 @@ mod tests {
         };
         store.save(&settings).unwrap();
         assert_eq!(store.load(), settings);
+    }
+
+    #[test]
+    fn worktree_settings_default_without_the_key_and_round_trip() {
+        let dir = TempDir::new("worktrees-settings");
+        // An old file without the key keeps loading with the defaults.
+        let old = load_json(dir.path(), r#"{"theme":"dark"}"#);
+        assert_eq!(old.worktrees, WorktreeSettings::default());
+        assert_eq!(old.worktrees.base, "~/develop");
+        assert_eq!(old.worktrees.template, "{repo}-{branch}");
+        assert_eq!(old.worktrees.after_create, AfterCreate::Switch);
+        assert!(old.worktrees.copy_env);
+
+        // A partial object fills the rest from the defaults.
+        let partial = load_json(dir.path(), r#"{"worktrees":{"after_create":"stay"}}"#);
+        assert_eq!(partial.worktrees.after_create, AfterCreate::Stay);
+        assert_eq!(partial.worktrees.base, "~/develop");
+
+        let store = SettingsStore::new(settings_path(dir.path()));
+        let settings = Settings {
+            worktrees: WorktreeSettings {
+                base: "~/worktrees".to_owned(),
+                template: "{branch}".to_owned(),
+                after_create: AfterCreate::Stay,
+                copy_env: false,
+                confirm_remove_clean: false,
+                confirm_delete_branch: false,
+            },
+            ..Settings::default()
+        };
+        store.save(&settings).unwrap();
+        assert_eq!(store.load().worktrees, settings.worktrees);
     }
 
     #[test]

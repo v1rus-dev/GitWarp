@@ -1,4 +1,4 @@
-//! The Settings surface: seven pages in the design's order, with a persistent
+//! The Settings surface: eight pages in the design's order, with a persistent
 //! left navigation and an automatically saved settings file.
 //!
 //! The page is a centred window drawn over the workspace, not a replacement for
@@ -17,6 +17,7 @@ mod git;
 mod identity;
 pub(crate) mod keybindings;
 mod ssh;
+mod worktrees;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,6 +44,7 @@ pub enum Page {
     General,
     Appearance,
     Git,
+    Worktrees,
     Ssh,
     Keybindings,
     Diff,
@@ -50,10 +52,11 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 7] = [
+    pub const ALL: [Page; 8] = [
         Page::General,
         Page::Appearance,
         Page::Git,
+        Page::Worktrees,
         Page::Ssh,
         Page::Keybindings,
         Page::Diff,
@@ -65,6 +68,7 @@ impl Page {
             Page::General => "General",
             Page::Appearance => "Appearance",
             Page::Git => "Git",
+            Page::Worktrees => "Worktrees",
             Page::Ssh => "SSH keys",
             Page::Keybindings => "Keybindings",
             Page::Diff => "Diff & merge",
@@ -77,6 +81,7 @@ impl Page {
             Page::General => IconName::Gear,
             Page::Appearance => IconName::Eye,
             Page::Git => IconName::Git,
+            Page::Worktrees => IconName::Worktree,
             Page::Ssh => IconName::Key,
             Page::Keybindings => IconName::Keyboard,
             Page::Diff => IconName::Split,
@@ -375,6 +380,7 @@ impl SettingsView {
             Page::General => general::render(self, window, cx),
             Page::Appearance => appearance::render(self, window, cx),
             Page::Git => git::render(self, window, cx),
+            Page::Worktrees => worktrees::render(self, window, cx),
             Page::Ssh => ssh::render(self, window, cx),
             Page::Keybindings => keybindings::render(self, window, cx),
             Page::Diff => diff::render(self, window, cx),

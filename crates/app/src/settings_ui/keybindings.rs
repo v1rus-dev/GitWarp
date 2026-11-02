@@ -24,7 +24,7 @@ pub struct Action {
     pub default: &'static str,
 }
 
-pub const ACTIONS: [Action; 14] = [
+pub const ACTIONS: [Action; 15] = [
     Action {
         id: "palette",
         group: "General",
@@ -60,6 +60,12 @@ pub const ACTIONS: [Action; 14] = [
         group: "Repository",
         name: "Switch branch",
         default: "ctrl-shift-b",
+    },
+    Action {
+        id: "worktree_switcher",
+        group: "Repository",
+        name: "Switch worktree",
+        default: "ctrl-alt-w",
     },
     Action {
         id: "fetch",
