@@ -1,7 +1,7 @@
 # Bundled git
 
-GitWarp prefers a git shipped next to the app (see "Which git" in the root
-README for the lookup paths). `fetch-or-build.sh` produces that `git/`
+GitWarp prefers a git shipped next to the app (see "Which git" in
+[CONTRIBUTING.md](../../CONTRIBUTING.md) for the lookup paths). `fetch-or-build.sh` produces that `git/`
 directory:
 
 ```sh
