@@ -86,6 +86,7 @@ pub struct WelcomeView {
     open_focus: FocusHandle,
     clone_focus: FocusHandle,
     init_focus: FocusHandle,
+    settings_focus: FocusHandle,
     /// The open Initialize dialog, if any.
     dialog: Option<Entity<InitDialog>>,
     /// The open Clone dialog, if any.
@@ -134,6 +135,7 @@ impl WelcomeView {
             open_focus: cx.focus_handle().tab_stop(true),
             clone_focus: cx.focus_handle().tab_stop(false),
             init_focus: cx.focus_handle().tab_stop(true),
+            settings_focus: cx.focus_handle().tab_stop(true),
             dialog: None,
             clone_dialog: None,
             activity,
@@ -334,6 +336,7 @@ impl WelcomeView {
 
         let open_ring = focus::focus_visible(&self.open_focus, window, cx);
         let init_ring = focus::focus_visible(&self.init_focus, window, cx);
+        let settings_ring = focus::focus_visible(&self.settings_focus, window, cx);
 
         div()
             .w(px(LEFT_W))
@@ -416,6 +419,28 @@ impl WelcomeView {
                 init_ring,
                 cx,
                 Some(init),
+            ))
+            // Spacer: pushes Settings to the bottom of the panel.
+            .child(div().flex_1())
+            .child(action_row(
+                ActionSpec {
+                    id: "welcome-settings",
+                    icon: IconName::Gear,
+                    label: ui::t!("repo.toolbar.settings"),
+                    kbd: Some("Ctrl+,"),
+                    disabled: false,
+                    tooltip: ui::t!("palette.command.open_settings"),
+                },
+                self.settings_focus.clone(),
+                settings_ring,
+                cx,
+                {
+                    let workspace = self.workspace.clone();
+                    Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+                        let _ = workspace
+                            .update(cx, |workspace, cx| workspace.open_settings(window, cx));
+                    }))
+                },
             ))
     }
 
@@ -716,13 +741,22 @@ impl Render for WelcomeView {
                     .px(px(8.))
                     .flex()
                     .items_center()
-                    .justify_end()
                     .gap(px(6.))
                     .bg(colors.sidebar)
                     .border_t_1()
                     .border_color(colors.border)
                     .text_size(FS_SM)
                     .text_color(colors.muted)
+                    .child(
+                        div()
+                            .id("welcome-status-version")
+                            .tooltip(Tooltip::text(ui::t!("welcome.status.version_tooltip")))
+                            .child(ui::t!(
+                                "welcome.status.version",
+                                version = env!("CARGO_PKG_VERSION")
+                            )),
+                    )
+                    .child(div().flex_1())
                     .child(
                         div()
                             .id("welcome-status-git")

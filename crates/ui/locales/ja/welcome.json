@@ -98,5 +98,7 @@
   "welcome.recent.no_matches_text": "「{filter}」に一致する最近のリポジトリはありません。",
   "welcome.recent.no_matches_title": "一致するものはありません",
   "welcome.recent.title": "最近のリポジトリ",
+  "welcome.status.version": "GitWarp v{version}",
+  "welcome.status.version_tooltip": "GitWarp のバージョン",
   "welcome.tagline": "速くてキーボード中心の Git クライアント"
 }

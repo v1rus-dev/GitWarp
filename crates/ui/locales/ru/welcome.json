@@ -118,5 +118,7 @@
   "welcome.recent.no_matches_text": "Нет недавних репозиториев, подходящих под «{filter}».",
   "welcome.recent.no_matches_title": "Нет совпадений",
   "welcome.recent.title": "Недавние репозитории",
+  "welcome.status.version": "GitWarp v{version}",
+  "welcome.status.version_tooltip": "Версия GitWarp",
   "welcome.tagline": "Быстрый git-клиент с управлением с клавиатуры."
 }

@@ -108,5 +108,7 @@
   "welcome.recent.no_matches_text": "Kein letztes Repository passt zu „{filter}“.",
   "welcome.recent.no_matches_title": "Keine Treffer",
   "welcome.recent.title": "Letzte Repositories",
+  "welcome.status.version": "GitWarp v{version}",
+  "welcome.status.version_tooltip": "GitWarp-Version",
   "welcome.tagline": "Ein schneller, tastaturorientierter Git-Client."
 }

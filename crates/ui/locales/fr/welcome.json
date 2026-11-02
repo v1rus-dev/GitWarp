@@ -108,5 +108,7 @@
   "welcome.recent.no_matches_text": "Aucun dépôt récent ne correspond à « {filter} ».",
   "welcome.recent.no_matches_title": "Aucun résultat",
   "welcome.recent.title": "Dépôts récents",
+  "welcome.status.version": "GitWarp v{version}",
+  "welcome.status.version_tooltip": "Version de GitWarp",
   "welcome.tagline": "Un client git rapide, pensé pour le clavier."
 }

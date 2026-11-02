@@ -108,5 +108,7 @@
   "welcome.recent.no_matches_text": "Ningún repositorio reciente coincide con “{filter}”.",
   "welcome.recent.no_matches_title": "Sin coincidencias",
   "welcome.recent.title": "Repositorios recientes",
+  "welcome.status.version": "GitWarp v{version}",
+  "welcome.status.version_tooltip": "Versión de GitWarp",
   "welcome.tagline": "Un cliente Git rápido y dirigido por teclado."
 }
