@@ -6,7 +6,8 @@
 #![allow(clippy::unusual_byte_groupings)] // `0xRRGGBB_AA` mirrors the CSS colour.
 
 use gpui::{
-    hsla, point, px, rgb, rgba, App, BoxShadow, Global, Hsla, Pixels, Window, WindowAppearance,
+    hsla, point, px, rgb, rgba, App, BoxShadow, Global, Hsla, Pixels, Rgba, Window,
+    WindowAppearance,
 };
 
 /// The resolved colour theme.
@@ -131,6 +132,8 @@ pub struct ThemeColors {
     pub code_ty: Hsla,
     pub code_fn: Hsla,
     pub overlay: Hsla,
+    /// The commit-activity ramp, 0 (no commits) to 4 (busiest day).
+    pub heat: [Hsla; 5],
 }
 
 impl ThemeColors {
@@ -179,6 +182,13 @@ impl ThemeColors {
             code_ty: solid(0xe5c07b),
             code_fn: solid(0x6bb2f0),
             overlay: translucent(0x06080c_99),
+            heat: [
+                solid(0x272a30),
+                solid(0x324460),
+                solid(0x43608c),
+                solid(0x5882c1),
+                solid(0x6ea4f7),
+            ],
         }
     }
 
@@ -227,6 +237,13 @@ impl ThemeColors {
             code_ty: solid(0x8a5a00),
             code_fn: solid(0x1f5fbf),
             overlay: translucent(0x1f293a_38),
+            heat: [
+                solid(0xededee),
+                solid(0xb2c8f0),
+                solid(0x88a9e8),
+                solid(0x5988df),
+                solid(0x2a66d6),
+            ],
         }
     }
 }
@@ -319,6 +336,18 @@ impl Theme {
         self.colors.accent_hover = accent;
         self.colors.accent_soft = accent.opacity(0.16);
         self.colors.focus = accent;
+        if style.accent != Accent::Blue {
+            // The ramp is the accent mixed into the background (activity.css);
+            // Blue keeps the exact design values.
+            let mixes = match self.appearance {
+                Appearance::Dark => [0.30, 0.50, 0.75],
+                Appearance::Light => [0.36, 0.56, 0.78],
+            };
+            for (level, amount) in mixes.into_iter().enumerate() {
+                self.colors.heat[level + 1] = mix(accent, self.colors.bg, amount);
+            }
+            self.colors.heat[4] = accent;
+        }
         self.row_height = style.density.row_height();
         self.ui_font_size = px(style.ui_font_size.clamp(12., 14.));
         self.mono_font_size = px(style.mono_font_size.clamp(9., 20.));
@@ -356,6 +385,19 @@ impl Theme {
         let hue = (lane as f32 * 137.508 / 360.).fract();
         hsla(hue, 0.65, self.graph_lightness, 1.)
     }
+}
+
+/// `foreground` over `background` at `amount` (0 to 1), blended in sRGB like
+/// CSS `color-mix(in srgb, …)`.
+fn mix(foreground: Hsla, background: Hsla, amount: f32) -> Hsla {
+    let (fg, bg) = (Rgba::from(foreground), Rgba::from(background));
+    Rgba {
+        r: bg.r + (fg.r - bg.r) * amount,
+        g: bg.g + (fg.g - bg.g) * amount,
+        b: bg.b + (fg.b - bg.b) * amount,
+        a: 1.,
+    }
+    .into()
 }
 
 /// Opaque colour from a `0xRRGGBB` literal.
@@ -462,6 +504,26 @@ impl ActiveTheme for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heat_ramp_follows_a_non_blue_accent_and_keeps_blue_exact() {
+        let mut theme = Theme::dark();
+        let blue = theme.colors.heat;
+        theme.apply_style(ThemeStyle::default());
+        assert_eq!(theme.colors.heat, blue);
+        theme.apply_style(ThemeStyle {
+            accent: Accent::Green,
+            ..ThemeStyle::default()
+        });
+        assert_eq!(theme.colors.heat[4], theme.colors.st_added);
+        assert_eq!(theme.colors.heat[0], blue[0]);
+        // The dark blue ramp is the same mix: 30 % of the accent over the bg.
+        let mut check = Theme::dark();
+        let accent = check.colors.accent;
+        check.colors.heat[1] = mix(accent, check.colors.bg, 0.30);
+        let (got, want) = (Rgba::from(check.colors.heat[1]), Rgba::from(blue[1]));
+        assert!((got.r - want.r).abs() < 0.005 && (got.b - want.b).abs() < 0.005);
+    }
 
     #[test]
     fn the_style_applies_density_accent_and_type_sizes() {

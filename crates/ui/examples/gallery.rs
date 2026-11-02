@@ -18,10 +18,11 @@ use ui::metrics::{
 use ui::theme::{self, ActiveTheme, Theme, ThemeColors, ThemeMode};
 use ui::{
     actions, dialog, focus, menu, overlay, toast, Avatar, Banner, BannerKind, Button, ButtonSize,
-    Checkbox, Chip, ChipKind, CountPill, Counter, Dialog, DialogFocus, EmptyState, FileRow, Icon,
-    IconName, Kbd, ListRow, MenuEntry, MenuItem, Progress, Radio, RefBadge, RefKind, SearchField,
-    SegmentItem, Segmented, Select, Skeleton, Spinner, Splitter, StatusGlyph, Switch, Tab, Tabs,
-    TextInput, TextInputEvent, ToastKind, Tree, TreeNodeData, WindowControls,
+    Checkbox, Chip, ChipKind, CountPill, Counter, Dialog, DialogFocus, EmptyState, FileRow,
+    HeatLegend, Heatmap, Icon, IconName, Kbd, ListRow, MenuEntry, MenuItem, Progress, Radio,
+    RefBadge, RefKind, SearchField, SegmentItem, Segmented, Select, Skeleton, Spinner, Splitter,
+    StatusGlyph, Switch, Tab, Tabs, TextInput, TextInputEvent, ToastKind, Tree, TreeNodeData,
+    WindowControls,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,7 @@ enum Section {
     Inputs,
     Floating,
     Lists,
+    Activity,
 }
 
 impl Section {
@@ -59,6 +61,7 @@ impl Section {
             "inputs" => Self::Inputs,
             "floating" => Self::Floating,
             "lists" => Self::Lists,
+            "activity" => Self::Activity,
             _ => return None,
         })
     }
@@ -188,6 +191,7 @@ struct Gallery {
     list_selected: usize,
     list_keyboard: bool,
     list_focus: FocusHandle,
+    heat_selected: Option<i32>,
 }
 
 impl Gallery {
@@ -226,6 +230,7 @@ impl Gallery {
             list_selected: 2,
             list_keyboard: false,
             list_focus: cx.focus_handle().tab_stop(true),
+            heat_selected: None,
         }
     }
 
@@ -427,6 +432,9 @@ impl Render for Gallery {
         }
         if self.shows(Section::Lists) {
             sections.push(lists_section(self, colors, window, cx).into_any_element());
+        }
+        if self.shows(Section::Activity) {
+            sections.push(activity_section(self, colors, cx).into_any_element());
         }
         if self.shows(Section::Interaction) {
             sections.push(interaction_section(self, colors, window, cx).into_any_element());
@@ -1461,6 +1469,102 @@ fn progress_section(colors: ThemeColors) -> impl IntoElement {
                     component_row("Skeleton", colors)
                         .child(Skeleton::new("skel-1", px(160.)))
                         .child(Skeleton::new("skel-2", px(220.))),
+                ),
+        )
+}
+
+/// Sample commit counts: a busy-weekday rhythm with quiet stretches.
+fn sample_commits(day: i32) -> u32 {
+    let hash = (day as u32).wrapping_mul(2_654_435_761) >> 16;
+    let weekday = (day + 3).rem_euclid(7);
+    if weekday >= 5 && !hash.is_multiple_of(3) || hash.is_multiple_of(7) {
+        return 0;
+    }
+    (hash % 9) + u32::from(weekday == 2) * 3
+}
+
+fn sample_heat(day: i32) -> (u32, u8) {
+    let count = sample_commits(day);
+    let level = match count {
+        0 => 0,
+        1..=2 => 1,
+        3..=5 => 2,
+        6..=8 => 3,
+        _ => 4,
+    };
+    (count, level)
+}
+
+fn activity_section(
+    gallery: &Gallery,
+    colors: ThemeColors,
+    cx: &mut Context<Gallery>,
+) -> impl IntoElement {
+    let today = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+        / 86_400) as i32;
+    let select = {
+        let view = cx.entity();
+        move |day: i32, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                this.heat_selected = Some(day);
+                cx.notify();
+            });
+        }
+    };
+    let clear = {
+        let view = cx.entity();
+        move |_: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                this.heat_selected = None;
+                cx.notify();
+            });
+        }
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .child(heading("Activity heatmap"))
+        .child(
+            card(colors)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .child(
+                            Heatmap::new("heat-regular", today, 53, sample_heat)
+                                .selected(gallery.heat_selected)
+                                .on_select(select.clone())
+                                .on_clear(clear.clone()),
+                        )
+                        .child(div().flex().justify_end().child(HeatLegend::new())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .child(
+                            Heatmap::new("heat-compact", today, 53, sample_heat)
+                                .compact(true)
+                                .selected(gallery.heat_selected)
+                                .on_select(select)
+                                .on_clear(clear),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .child(HeatLegend::new().compact(true)),
+                        ),
+                )
+                .child(Heatmap::new("heat-loading", today, 53, sample_heat).loading(true))
+                .child(
+                    Heatmap::new("heat-counting", today, 53, sample_heat)
+                        .pending_from(Some(today - 200)),
                 ),
         )
 }

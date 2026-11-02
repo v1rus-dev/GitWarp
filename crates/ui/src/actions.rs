@@ -25,6 +25,9 @@ actions!(
         TreeActivate,
         TreeRename,
         TreeDelete,
+        HeatmapWeekPrev,
+        HeatmapWeekNext,
+        HeatmapActivate,
     ]
 );
 
@@ -61,6 +64,9 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("space", TreeActivate, Some("ui-tree")),
         KeyBinding::new("f2", TreeRename, Some("ui-tree")),
         KeyBinding::new("delete", TreeDelete, Some("ui-tree")),
+        KeyBinding::new("left", HeatmapWeekPrev, Some("ui-heatmap")),
+        KeyBinding::new("right", HeatmapWeekNext, Some("ui-heatmap")),
+        KeyBinding::new("space", HeatmapActivate, Some("ui-heatmap")),
     ]);
 
     // Root handlers cannot run while nothing is focused: the dispatch path is

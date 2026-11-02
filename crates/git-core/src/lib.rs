@@ -7,6 +7,7 @@
 //! exactly as in the terminal. Further hot read paths (log, status, diff)
 //! move onto the same runner without touching the UI.
 
+pub mod activity;
 mod config;
 pub mod credential;
 mod diff;
@@ -30,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
+pub use activity::{activity, level, levels, my_email, Activity, DayCount};
 pub use config::{
     global_get, global_identity, set_global_identity, set_global_signing, ConfigScope, Identity,
 };

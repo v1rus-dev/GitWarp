@@ -31,7 +31,7 @@ impl Skeleton {
 }
 
 /// Shimmer opacity, never below 0.4 so the skeleton is visible at any phase.
-fn shimmer_opacity(delta: f32) -> f32 {
+pub(crate) fn shimmer_opacity(delta: f32) -> f32 {
     let phase = (2. * delta - 1.).abs();
     0.4 + 0.6 * (1. - phase)
 }
