@@ -15,7 +15,7 @@ impl Oid {
             return None;
         }
         let mut bytes = [0u8; 32];
-        for (i, pair) in hex.chunks_exact(2).enumerate() {
+        for (i, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
             bytes[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
         }
         Some(Self {

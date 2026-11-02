@@ -2040,6 +2040,8 @@ mod tests {
         }
     }
 
+    // Deprecated in Rust 1.99 for `try_update`, which is newer than the 1.89 MSRV.
+    #[allow(deprecated)]
     fn take(counter: &std::sync::atomic::AtomicUsize) -> bool {
         counter
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
