@@ -62,6 +62,16 @@ fn parse_url(scheme: &str, rest: &str) -> Option<RemoteRef> {
         "ssh" => Transport::Ssh,
         _ => return None,
     };
+    // A delimiter or an escape inside the authority of a web URL can make
+    // another host out of it (`https://github.com?@evil.test/x`,
+    // `https://github.com%2F@evil.test/x`): not a remote we know.
+    if transport != Transport::Ssh {
+        let raw = rest.split('/').next().unwrap_or("");
+        if raw.contains(['?', '#', '%']) || raw.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return None;
+        }
+    }
     let rest = rest.split(['?', '#']).next().unwrap_or("");
     let (authority, path) = split_host_path(rest);
     let (host, port) = parse_authority(authority)?;

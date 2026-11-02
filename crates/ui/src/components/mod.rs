@@ -69,7 +69,7 @@ pub use tabs::{Tab, Tabs};
 pub use text_input::{
     Submit as TextInputSubmit, TextArea, TextAreaEvent, TextInput, TextInputEvent,
 };
-pub use toast::{Toast, ToastId, ToastKind, ToastQueue};
+pub use toast::{Toast, ToastAction, ToastBody, ToastId, ToastKind, ToastLine, ToastQueue};
 pub use toggles::{Checkbox, Radio, Switch};
 pub use tooltip::Tooltip;
 pub use tree::{Tree, TreeNodeData, TreeNodeTrailing};

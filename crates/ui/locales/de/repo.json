@@ -63,6 +63,7 @@
   "repo.status.loading_history": "Verlauf wird geladen…",
   "repo.status.unstaged_staged": "{unstaged} nicht bereitgestellt · {staged} bereitgestellt",
   "repo.toast.account_added": "{label} auf {host} verbunden. {remote} verwendet es jetzt.",
+  "repo.toast.account_not_saved": "Das Konto für {remote} konnte nicht gespeichert werden. Es wurde nichts gestartet.",
   "repo.toast.account_one": "{host} hat ein Konto ({label}); {remote} verwendet es bereits.",
   "repo.toast.account_picked": "{remote} verwendet in diesem Repository {label}",
   "repo.toast.account_push_urls": "Jede Push-URL behält ihr eigenes Konto. Bearbeite sie unter Einstellungen → Konten.",

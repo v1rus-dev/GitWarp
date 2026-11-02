@@ -63,6 +63,7 @@
   "repo.status.loading_history": "Loading history…",
   "repo.status.unstaged_staged": "{unstaged} unstaged · {staged} staged",
   "repo.toast.account_added": "Connected {label} on {host}. {remote} now uses it.",
+  "repo.toast.account_not_saved": "Could not remember the account for {remote}. Nothing was started.",
   "repo.toast.account_one": "{host} has one account ({label}); {remote} already uses it.",
   "repo.toast.account_picked": "{remote} will use {label} in this repository",
   "repo.toast.account_push_urls": "Each push URL keeps its own account. Edit them in Settings → Accounts.",

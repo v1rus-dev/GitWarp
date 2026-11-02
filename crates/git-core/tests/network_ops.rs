@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use git_core::network::{
-    self, CancelToken, CloneOptions, FetchOptions, NetworkContext, PushOptions,
+    self, CancelToken, CloneOptions, FetchOptions, NetworkContext, PushOptions, PushStatus,
 };
 use git_core::{Git, GitChoice, Head, RefKind, Repo};
 
@@ -430,5 +430,387 @@ fn clone_target_extracts_names() {
     assert_eq!(
         network::suggested_folder("git@github.com:nexu-io/open-design.git").as_deref(),
         Some("open-design")
+    );
+}
+
+/// A context that ignores the user's own git configuration.
+fn isolated() -> NetworkContext {
+    NetworkContext::with_env([
+        ("GIT_CONFIG_GLOBAL".to_owned(), "/dev/null".to_owned()),
+        ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()),
+    ])
+}
+
+fn bare() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q", "--bare"]);
+    dir
+}
+
+fn push_main(set_upstream: bool) -> PushOptions {
+    PushOptions {
+        remote: Some("origin".to_owned()),
+        refspec: Some("main".to_owned()),
+        set_upstream,
+    }
+}
+
+#[test]
+fn multi_push_continues_after_a_failed_target_and_updates_the_tracking_ref() {
+    let (source, _remote, repo) = source_with_remote();
+    let (first, third) = (bare(), bare());
+    let missing = source.path().join("does-not-exist.git");
+    let urls: Vec<String> = [first.path(), missing.as_path(), third.path()]
+        .iter()
+        .map(|p| p.to_str().unwrap().to_owned())
+        .collect();
+
+    let outcome = network::push_each(
+        &repo,
+        &urls,
+        &push_main(true),
+        &isolated(),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(outcome.targets.len(), 3);
+    assert_eq!(
+        outcome.targets[0].result,
+        Ok(PushStatus::Pushed { commits: Some(1) })
+    );
+    assert!(
+        outcome.targets[1].result.is_err(),
+        "{:?}",
+        outcome.targets[1]
+    );
+    assert_eq!(
+        outcome.targets[2].result,
+        Ok(PushStatus::Pushed { commits: Some(1) })
+    );
+    assert!(outcome.changed);
+    // The ones after the failure were pushed too.
+    let head = git_out(source.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(git_out(first.path(), &["rev-parse", "main"]), head);
+    assert_eq!(git_out(third.path(), &["rev-parse", "main"]), head);
+    // Tracking ref and upstream follow, as for a named remote.
+    assert_eq!(
+        git_out(source.path(), &["rev-parse", "refs/remotes/origin/main"]),
+        head
+    );
+    let local = repo
+        .refs()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.kind == RefKind::LocalBranch && r.name == "main")
+        .unwrap();
+    assert_eq!(local.upstream.as_deref(), Some("origin/main"));
+}
+
+#[test]
+fn multi_push_to_all_targets_reports_each_and_updates_the_tracking_ref_once() {
+    let (source, _remote, repo) = source_with_remote();
+    let (first, second) = (bare(), bare());
+    let urls: Vec<String> = [first.path(), second.path()]
+        .iter()
+        .map(|p| p.to_str().unwrap().to_owned())
+        .collect();
+    let push = |repo: &Repo| {
+        network::push_each(
+            repo,
+            &urls,
+            &push_main(false),
+            &isolated(),
+            &CancelToken::new(),
+            |_| {},
+        )
+        .unwrap()
+    };
+
+    let outcome = push(&repo);
+    assert!(outcome.targets.iter().all(|t| t.result.is_ok()));
+    let head = git_out(source.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git_out(source.path(), &["rev-parse", "refs/remotes/origin/main"]),
+        head
+    );
+
+    // Nothing new: every target is up to date, and nothing "changed".
+    let again = push(&repo);
+    assert!(!again.changed);
+    assert!(again
+        .targets
+        .iter()
+        .all(|t| t.result == Ok(PushStatus::UpToDate)));
+
+    // A new commit is counted per target.
+    commit_file(source.path(), "b.txt", "two\n", "B");
+    let third_push = push(&repo);
+    assert!(third_push
+        .targets
+        .iter()
+        .all(|t| t.result == Ok(PushStatus::Pushed { commits: Some(1) })));
+    assert_eq!(
+        git_out(source.path(), &["rev-parse", "refs/remotes/origin/main"]),
+        git_out(source.path(), &["rev-parse", "HEAD"])
+    );
+}
+
+#[test]
+fn multi_push_reports_a_rejected_target_without_touching_the_tracking_ref() {
+    let (source, _remote, repo) = source_with_remote();
+    let target = bare();
+    // The target already has a diverging `main`.
+    let other = tempfile::tempdir().unwrap();
+    git(other.path(), &["init", "-q"]);
+    commit_file(other.path(), "x.txt", "x\n", "X");
+    git(
+        other.path(),
+        &[
+            "push",
+            "-q",
+            target.path().to_str().unwrap(),
+            "HEAD:refs/heads/main",
+        ],
+    );
+    let urls = vec![target.path().to_str().unwrap().to_owned()];
+
+    let outcome = network::push_each(
+        &repo,
+        &urls,
+        &push_main(false),
+        &isolated(),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .unwrap();
+    // The reason is git's porcelain summary, not "failed to push some refs".
+    assert_eq!(
+        outcome.targets[0].result,
+        Err("rejected (fetch first)".to_owned())
+    );
+    assert!(!outcome.targets[0].partial);
+    assert!(!outcome.changed);
+    let tracking = Command::new("git")
+        .arg("-C")
+        .arg(source.path())
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/main",
+        ])
+        .output()
+        .unwrap();
+    assert!(!tracking.status.success(), "no target took the push");
+}
+
+fn urls_of(dirs: &[&Path]) -> Vec<String> {
+    dirs.iter()
+        .map(|p| p.to_str().unwrap().to_owned())
+        .collect()
+}
+
+fn run_each(repo: &Repo, urls: &[String], refspec: &str) -> network::NetworkOutcome {
+    network::push_each(
+        repo,
+        urls,
+        &PushOptions {
+            remote: Some("origin".to_owned()),
+            refspec: Some(refspec.to_owned()),
+            set_upstream: false,
+        },
+        &isolated(),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .unwrap()
+}
+
+#[test]
+fn multi_push_gives_the_hooks_reason_for_a_declined_target() {
+    let (source, _remote, repo) = source_with_remote();
+    let (open_target, declining) = (bare(), bare());
+    let hook = declining.path().join("hooks/pre-receive");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let urls = urls_of(&[declining.path(), open_target.path()]);
+    let outcome = run_each(&repo, &urls, "main");
+    assert_eq!(
+        outcome.targets[0].result,
+        Err("remote rejected (pre-receive hook declined)".to_owned())
+    );
+    // The next target is still pushed, and the tracking ref follows it.
+    assert!(outcome.targets[1].result.is_ok());
+    let head = git_out(source.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(git_out(open_target.path(), &["rev-parse", "main"]), head);
+    assert_eq!(
+        git_out(source.path(), &["rev-parse", "refs/remotes/origin/main"]),
+        head
+    );
+}
+
+#[test]
+fn multi_push_reports_a_partly_refused_push_as_partial() {
+    let (source, _remote, repo) = source_with_remote();
+    let target = bare();
+    // The target already has `v1` at another commit; `v2` is new there.
+    git(source.path(), &["tag", "v2"]);
+    commit_file(source.path(), "b.txt", "two\n", "B");
+    git(source.path(), &["tag", "v1"]);
+    let other = tempfile::tempdir().unwrap();
+    git(other.path(), &["init", "-q"]);
+    commit_file(other.path(), "x.txt", "x\n", "X");
+    git(other.path(), &["tag", "v1"]);
+    git(
+        other.path(),
+        &[
+            "push",
+            "-q",
+            target.path().to_str().unwrap(),
+            "refs/tags/v1",
+        ],
+    );
+    let urls = urls_of(&[target.path()]);
+    let outcome = run_each(&repo, &urls, "refs/tags/*:refs/tags/*");
+    let only = &outcome.targets[0];
+    assert!(only.partial, "{only:?}");
+    assert_eq!(only.result, Err("rejected (already exists)".to_owned()));
+    // The new tag did go through.
+    assert!(git_out(target.path(), &["tag", "--list"]).contains("v2"));
+}
+
+#[test]
+fn a_new_branch_is_not_reported_as_up_to_date() {
+    let (source, _remote, repo) = source_with_remote();
+    git(source.path(), &["checkout", "-q", "-b", "feature"]);
+    for n in 0..3 {
+        commit_file(source.path(), &format!("f{n}.txt"), "x\n", "F");
+    }
+    let (a, b) = (bare(), bare());
+    let outcome = run_each(&repo, &urls_of(&[a.path(), b.path()]), "feature");
+    for target in &outcome.targets {
+        assert_eq!(target.result, Ok(PushStatus::Pushed { commits: Some(4) }));
+    }
+    // A branch whose commits are all on a remote ref already: no count, but
+    // still "new branch", never "up to date".
+    git(source.path(), &["branch", "same", "feature"]);
+    let c = bare();
+    git(
+        source.path(),
+        &["push", "-q", c.path().to_str().unwrap(), "feature"],
+    );
+    git(
+        source.path(),
+        &["update-ref", "refs/remotes/origin/feature", "feature"],
+    );
+    let outcome = run_each(&repo, &urls_of(&[c.path()]), "same");
+    assert_eq!(outcome.targets[0].result, Ok(PushStatus::NewBranch));
+}
+
+#[test]
+fn multi_push_tags_go_to_every_target() {
+    let (source, _remote, repo) = source_with_remote();
+    git(source.path(), &["tag", "v1"]);
+    git(source.path(), &["tag", "v2"]);
+    let missing = source.path().join("missing.git");
+    let (a, b) = (bare(), bare());
+    let urls = urls_of(&[a.path(), missing.as_path(), b.path()]);
+
+    let one = run_each(&repo, &urls, "refs/tags/v1");
+    assert_eq!(one.targets[0].result, Ok(PushStatus::NewTag));
+    assert!(one.targets[1].result.is_err());
+    assert_eq!(one.targets[2].result, Ok(PushStatus::NewTag));
+    assert_eq!(git_out(a.path(), &["tag", "--list"]).trim(), "v1");
+
+    let all = run_each(&repo, &urls, "refs/tags/*:refs/tags/*");
+    assert!(all.targets[0].result.is_ok() && all.targets[2].result.is_ok());
+    assert!(all.targets[1].result.is_err());
+    for target in [&a, &b] {
+        assert_eq!(git_out(target.path(), &["tag", "--list"]).trim(), "v1\nv2");
+    }
+    // A tag push has no tracking branch to move.
+    let tracking = Command::new("git")
+        .arg("-C")
+        .arg(source.path())
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/main",
+        ])
+        .output()
+        .unwrap();
+    assert!(!tracking.status.success());
+}
+
+#[test]
+fn delete_each_removes_the_branch_everywhere_and_the_tracking_ref() {
+    let (source, _remote, repo) = source_with_remote();
+    let (a, b) = (bare(), bare());
+    let missing = source.path().join("missing.git");
+    git(source.path(), &["branch", "topic"]);
+    let all = urls_of(&[a.path(), b.path()]);
+    run_each(&repo, &all, "topic");
+    git(
+        source.path(),
+        &["update-ref", "refs/remotes/origin/topic", "topic"],
+    );
+
+    // One target is unreachable: the others still lose the branch.
+    let urls = urls_of(&[a.path(), missing.as_path(), b.path()]);
+    let outcome = network::delete_each(
+        &repo,
+        &urls,
+        "origin",
+        "topic",
+        &isolated(),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(outcome.targets[0].result, Ok(PushStatus::Deleted));
+    assert!(outcome.targets[1].result.is_err());
+    assert_eq!(outcome.targets[2].result, Ok(PushStatus::Deleted));
+    for target in [&a, &b] {
+        assert!(!git_out(target.path(), &["branch", "--list"]).contains("topic"));
+    }
+    let tracking = Command::new("git")
+        .arg("-C")
+        .arg(source.path())
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/topic",
+        ])
+        .output()
+        .unwrap();
+    assert!(!tracking.status.success(), "the tracking ref is gone");
+
+    // Nothing took it: the tracking ref stays.
+    git(
+        source.path(),
+        &["update-ref", "refs/remotes/origin/topic", "main"],
+    );
+    let none = urls_of(&[missing.as_path()]);
+    network::delete_each(
+        &repo,
+        &none,
+        "origin",
+        "topic",
+        &isolated(),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .unwrap();
+    git_out(
+        source.path(),
+        &["rev-parse", "--verify", "refs/remotes/origin/topic"],
     );
 }

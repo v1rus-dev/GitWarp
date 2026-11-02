@@ -63,6 +63,7 @@
   "repo.status.loading_history": "Cargando historial…",
   "repo.status.unstaged_staged": "{unstaged} no preparados · {staged} preparados",
   "repo.toast.account_added": "{label} conectada en {host}. {remote} ahora la usa.",
+  "repo.toast.account_not_saved": "No se pudo recordar la cuenta de {remote}. No se inició nada.",
   "repo.toast.account_one": "{host} tiene una cuenta ({label}); {remote} ya la usa.",
   "repo.toast.account_picked": "{remote} usará {label} en este repositorio",
   "repo.toast.account_push_urls": "Cada URL de push conserva su propia cuenta. Edítalas en Ajustes → Cuentas.",

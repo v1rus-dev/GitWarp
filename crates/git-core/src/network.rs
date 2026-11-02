@@ -24,13 +24,32 @@ pub struct NetworkContext {
     /// Variables laid over git's own ones, e.g. `GIT_ASKPASS` or
     /// `GIT_TERMINAL_PROMPT=1`.
     pub env: Vec<(String, String)>,
+    /// `key=value` pairs passed to git as `-c key=value` before the
+    /// subcommand, e.g. `credential.https://host.helper=`. They go on the
+    /// command line, so they must never hold a secret.
+    pub git_config: Vec<String>,
 }
 
 impl NetworkContext {
     pub fn with_env(env: impl IntoIterator<Item = (String, String)>) -> Self {
         Self {
             env: env.into_iter().collect(),
+            git_config: Vec::new(),
         }
+    }
+
+    /// Adds `-c key=value` settings for the git command.
+    pub fn with_git_config(mut self, config: impl IntoIterator<Item = String>) -> Self {
+        self.git_config.extend(config);
+        self
+    }
+
+    /// The `-c key=value` arguments, to be placed before the subcommand.
+    pub fn config_args(&self) -> Vec<String> {
+        self.git_config
+            .iter()
+            .flat_map(|setting| ["-c".to_owned(), setting.clone()])
+            .collect()
     }
 
     /// A context in which git may ask for credentials through `GIT_ASKPASS`.
@@ -68,6 +87,37 @@ pub struct NetworkOutcome {
     pub lines: Vec<String>,
     /// Whether the output reported a new, updated or deleted ref.
     pub changed: bool,
+    /// One entry per push URL when a push went to each of several URLs
+    /// separately ([`push_each`]); empty otherwise.
+    pub targets: Vec<PushTargetOutcome>,
+}
+
+/// What one push URL of a multi-push remote answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushTargetOutcome {
+    pub url: String,
+    /// `Err` holds the reason: the porcelain summary of a refused ref
+    /// (`rejected (non-fast-forward)`), otherwise git's own text, for the
+    /// caller to classify and word.
+    pub result: std::result::Result<PushStatus, String>,
+    /// The target refused some refs but took others of the same push.
+    pub partial: bool,
+}
+
+/// A target that took the push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushStatus {
+    UpToDate,
+    /// `commits` is how many commits the target did not have, when git said.
+    Pushed {
+        commits: Option<usize>,
+    },
+    /// A branch the target did not have, when its commits could not be counted.
+    NewBranch,
+    /// A tag the target did not have.
+    NewTag,
+    /// The ref was deleted on the target.
+    Deleted,
 }
 
 impl NetworkOutcome {
@@ -239,6 +289,7 @@ pub fn fetch(
     on_progress: impl FnMut(Progress),
 ) -> Result<NetworkOutcome> {
     let mut cmd = repo.command();
+    cmd.args(context.config_args());
     cmd.args(["fetch", "--progress"]);
     if options.tags {
         cmd.arg("--tags");
@@ -282,6 +333,7 @@ pub fn pull(
         }
     }
     let mut cmd = repo.command();
+    cmd.args(context.config_args());
     cmd.args(["pull", "--ff-only", "--progress"]);
     if let Some(remote) = remote {
         cmd.arg(remote);
@@ -303,6 +355,7 @@ pub fn update_submodule(
     on_progress: impl FnMut(Progress),
 ) -> Result<NetworkOutcome> {
     let mut cmd = repo.command();
+    cmd.args(context.config_args());
     cmd.args([
         "submodule",
         "update",
@@ -366,6 +419,7 @@ pub fn push(
     on_progress: impl FnMut(Progress),
 ) -> Result<NetworkOutcome> {
     let mut cmd = repo.command();
+    cmd.args(context.config_args());
     cmd.args(["push", "--progress"]);
     if options.set_upstream {
         cmd.arg("--set-upstream");
@@ -377,6 +431,262 @@ pub fn push(
         cmd.arg(refspec);
     }
     run_streaming(cmd, "push", context, cancel, on_progress)
+}
+
+/// Pushes to each of `urls` in its own git process and reports a result per
+/// URL, in order.
+///
+/// One `git push <remote>` to several push URLs stops at the first transport
+/// or authentication failure, so the later targets would never be tried.
+/// Afterwards, when at least one target took the push, the remote-tracking
+/// ref (and the upstream, with `options.set_upstream`) is updated the way git
+/// does for a named remote. A failed target never fails the call; only
+/// cancelling does.
+pub fn push_each(
+    repo: &Repo,
+    urls: &[String],
+    options: &PushOptions,
+    context: &NetworkContext,
+    cancel: &CancelToken,
+    mut on_progress: impl FnMut(Progress),
+) -> Result<NetworkOutcome> {
+    let (refspec, local, branch) = push_refspec(repo, options)?;
+    let mut outcome = NetworkOutcome::default();
+    for url in urls {
+        // Pushing to a URL instead of the remote's name bypasses
+        // `remote.<name>.push`, `push.default` and `push.followTags` on
+        // purpose: the app always passes an explicit refspec, and the
+        // tracking ref is recorded below the way a named remote would.
+        let mut cmd = repo.command();
+        cmd.args(context.config_args());
+        cmd.args(["push", "--progress", "--porcelain", "--", url, &refspec]);
+        let (result, stdout) =
+            run_streaming_inner(cmd, "push", context, cancel, &mut on_progress, true);
+        let refs = parse_porcelain(&stdout);
+        let mut partial = false;
+        let result = match result {
+            Ok(done) => {
+                outcome.lines.extend(done.lines);
+                push_status(repo, &refs)
+            }
+            Err(error @ Error::Cancelled { .. }) => return Err(error),
+            // git exits 1 when a ref is refused, but still lists every ref on
+            // stdout: the refusal reason is there, not in the exit text.
+            Err(Error::Git { .. }) if refs.iter().any(|r| r.flag == '!') => {
+                partial = refs.iter().any(|r| !matches!(r.flag, '!' | '='));
+                Err(refused_reasons(&refs))
+            }
+            Err(Error::Git { stderr, .. }) => Err(stderr),
+            Err(error) => Err(error.to_string()),
+        };
+        outcome.targets.push(PushTargetOutcome {
+            url: url.clone(),
+            result,
+            partial,
+        });
+    }
+    outcome.changed = outcome
+        .targets
+        .iter()
+        .any(|t| matches!(t.result, Ok(PushStatus::Pushed { .. })));
+    let any_ok = outcome.targets.iter().any(|t| t.result.is_ok());
+    if let (true, Some(remote), Some(branch), Some(local)) =
+        (any_ok, &options.remote, branch, local)
+    {
+        record_push(repo, remote, &local, &branch, options.set_upstream)?;
+    }
+    Ok(outcome)
+}
+
+/// The refspec to push and, when it pushes a local branch to a branch, that
+/// branch's local and remote names.
+fn push_refspec(
+    repo: &Repo,
+    options: &PushOptions,
+) -> Result<(String, Option<String>, Option<String>)> {
+    // `HEAD` is never passed on as a refspec: the tracking ref needs the
+    // branch's name, so it is replaced by the checked-out branch.
+    let refspec = match options.refspec.as_ref().filter(|r| r.as_str() != "HEAD") {
+        Some(refspec) => refspec.clone(),
+        None => match repo.head()? {
+            Head::Branch { name, .. } => name,
+            Head::Detached(_) => {
+                return Err(Error::Git {
+                    command: "push",
+                    code: None,
+                    stderr: "Cannot push with a detached HEAD.".to_owned(),
+                });
+            }
+        },
+    };
+    let spec = refspec.trim_start_matches('+');
+    let (src, dst) = spec.split_once(':').unwrap_or((spec, spec));
+    let dst = dst.strip_prefix("refs/heads/").unwrap_or(dst);
+    // A tag, a deletion (`:branch`) or any other ref has no tracking branch.
+    let branch_push = !src.is_empty() && !dst.is_empty() && !dst.starts_with("refs/");
+    let local = src.strip_prefix("refs/heads/").unwrap_or(src);
+    Ok((
+        refspec.clone(),
+        branch_push.then(|| local.to_owned()),
+        branch_push.then(|| dst.to_owned()),
+    ))
+}
+
+/// Points `refs/remotes/<remote>/<branch>` at what was pushed and, when asked,
+/// makes it the upstream of `local`.
+fn record_push(
+    repo: &Repo,
+    remote: &str,
+    local: &str,
+    branch: &str,
+    set_upstream_to: bool,
+) -> Result<()> {
+    let out = repo
+        .command()
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{local}^{{commit}}"))
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "rev-parse")?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let out = repo
+        .command()
+        .args(["update-ref"])
+        .arg(format!("refs/remotes/{remote}/{branch}"))
+        .arg(&sha)
+        .output()
+        .map_err(Error::Spawn)?;
+    check_output(out, "update-ref")?;
+    if set_upstream_to {
+        set_upstream(repo, local, remote, branch)?;
+    }
+    Ok(())
+}
+
+/// One ref line of `git push --porcelain`: `<flag>\t<from>:<to>\t<summary>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PorcelainRef {
+    /// ` ` fast-forward, `+` forced, `-` deleted, `*` new, `!` rejected,
+    /// `=` up to date.
+    pub flag: char,
+    pub refs: String,
+    /// `abc..def`, `[new branch]`, `[rejected] (non-fast-forward)`, ...
+    pub summary: String,
+}
+
+/// The ref lines of `git push --porcelain` output; `To <url>` and `Done` are
+/// skipped.
+pub fn parse_porcelain(stdout: &str) -> Vec<PorcelainRef> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let flag = parts.next()?;
+            let refs = parts.next()?;
+            let summary = parts.next()?;
+            let mut chars = flag.chars();
+            let flag = chars.next()?;
+            if chars.next().is_some() || !matches!(flag, ' ' | '+' | '-' | '*' | '!' | '=') {
+                return None;
+            }
+            Some(PorcelainRef {
+                flag,
+                refs: refs.to_owned(),
+                summary: summary.trim().to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The status of one target from its porcelain lines. A rejected ref is an
+/// error even though the other refs of the same push may have gone through.
+fn push_status(repo: &Repo, refs: &[PorcelainRef]) -> std::result::Result<PushStatus, String> {
+    if refs.iter().any(|r| r.flag == '!') {
+        return Err(refused_reasons(refs));
+    }
+    let moved: Vec<&PorcelainRef> = refs.iter().filter(|r| r.flag != '=').collect();
+    if moved.is_empty() {
+        // Only `=` lines say "up to date"; no ref lines at all say nothing.
+        return Ok(if refs.is_empty() {
+            PushStatus::Pushed { commits: None }
+        } else {
+            PushStatus::UpToDate
+        });
+    }
+    let commits = moved
+        .iter()
+        .map(|r| commits_pushed(repo, r))
+        .try_fold(0usize, |sum, count| count.map(|count| sum + count));
+    if commits.is_none() && moved.len() == 1 {
+        let only = moved[0];
+        let to_tag = only
+            .refs
+            .rsplit_once(':')
+            .is_some_and(|(_, to)| to.starts_with("refs/tags/"));
+        match only.flag {
+            '-' => return Ok(PushStatus::Deleted),
+            '*' if to_tag => return Ok(PushStatus::NewTag),
+            '*' => return Ok(PushStatus::NewBranch),
+            _ => {}
+        }
+    }
+    Ok(PushStatus::Pushed { commits })
+}
+
+/// The reasons of the refused (`!`) refs, from git's summary text:
+/// `[remote rejected] (pre-receive hook declined)` becomes
+/// `remote rejected (pre-receive hook declined)`.
+fn refused_reasons(refs: &[PorcelainRef]) -> String {
+    let mut reasons: Vec<String> = Vec::new();
+    for r in refs.iter().filter(|r| r.flag == '!') {
+        let reason = r.summary.replace(['[', ']'], "");
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+    reasons.join("; ")
+}
+
+/// How many commits a pushed ref added, from git's `old..new` summary or, for
+/// a new branch, from what no remote-tracking ref holds yet.
+fn commits_pushed(repo: &Repo, pushed: &PorcelainRef) -> Option<usize> {
+    let range = match pushed.flag {
+        ' ' | '+' => {
+            let (old, new) = pushed
+                .summary
+                .split_once("...")
+                .or_else(|| pushed.summary.split_once(".."))?;
+            let new = new.split_whitespace().next()?;
+            format!("{old}..{new}")
+        }
+        '*' => {
+            let (local, to) = pushed.refs.split_once(':')?;
+            // A new tag is not counted in commits.
+            if to.starts_with("refs/tags/") {
+                return None;
+            }
+            let out = repo
+                .command()
+                .args(["rev-list", "--count", local, "--not", "--remotes"])
+                .output()
+                .ok()?;
+            return String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .ok()
+                .filter(|count| *count > 0);
+        }
+        _ => return None,
+    };
+    let out = repo
+        .command()
+        .args(["rev-list", "--count", &range])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 /// Pushes one tag to `remote`.
@@ -410,6 +720,7 @@ pub fn push_tags(
     on_progress: impl FnMut(Progress),
 ) -> Result<NetworkOutcome> {
     let mut cmd = repo.command();
+    cmd.args(context.config_args());
     cmd.args(["push", "--progress", "--tags", remote]);
     run_streaming(cmd, "push --tags", context, cancel, on_progress)
 }
@@ -424,8 +735,48 @@ pub fn delete_remote_branch(
     on_progress: impl FnMut(Progress),
 ) -> Result<NetworkOutcome> {
     let mut cmd = repo.command();
+    cmd.args(context.config_args());
     cmd.args(["push", "--progress", remote, "--delete", branch]);
     run_streaming(cmd, "push --delete", context, cancel, on_progress)
+}
+
+/// Deletes `branch` on each of `urls` in its own git process (see
+/// [`push_each`]) and, when at least one target took it, drops the
+/// remote-tracking ref like `git push <remote> --delete` does.
+pub fn delete_each(
+    repo: &Repo,
+    urls: &[String],
+    remote: &str,
+    branch: &str,
+    context: &NetworkContext,
+    cancel: &CancelToken,
+    on_progress: impl FnMut(Progress),
+) -> Result<NetworkOutcome> {
+    let options = PushOptions {
+        remote: None,
+        refspec: Some(format!(":refs/heads/{branch}")),
+        set_upstream: false,
+    };
+    let outcome = push_each(repo, urls, &options, context, cancel, on_progress)?;
+    if outcome.targets.iter().any(|t| t.result.is_ok()) {
+        let tracking = format!("refs/remotes/{remote}/{branch}");
+        let exists = repo
+            .command()
+            .args(["rev-parse", "--verify", "--quiet", &tracking])
+            .output()
+            .map_err(Error::Spawn)?
+            .status
+            .success();
+        if exists {
+            let out = repo
+                .command()
+                .args(["update-ref", "-d", &tracking])
+                .output()
+                .map_err(Error::Spawn)?;
+            check_output(out, "update-ref")?;
+        }
+    }
+    Ok(outcome)
 }
 
 /// Makes `remote/branch` the upstream of the local branch `local`.
@@ -452,6 +803,7 @@ pub fn clone(
 ) -> Result<NetworkOutcome> {
     let created = !options.dest.exists();
     let mut cmd = git.command();
+    cmd.args(context.config_args());
     cmd.args(["clone", "--progress"]);
     if let Some(branch) = &options.branch {
         cmd.args(["--branch", branch]);
@@ -538,20 +890,49 @@ fn read_progress_lines<R: Read + Send + 'static>(
 
 /// Runs `cmd` with `--progress` and streams its stderr.
 fn run_streaming(
-    mut cmd: Command,
+    cmd: Command,
     command: &'static str,
     context: &NetworkContext,
     cancel: &CancelToken,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<NetworkOutcome> {
+    run_streaming_inner(cmd, command, context, cancel, &mut on_progress, false).0
+}
+
+/// [`run_streaming`], optionally keeping what git printed on stdout (for
+/// `push --porcelain`). The text is returned for failures too.
+fn run_streaming_inner(
+    mut cmd: Command,
+    command: &'static str,
+    context: &NetworkContext,
+    cancel: &CancelToken,
+    on_progress: &mut impl FnMut(Progress),
+    capture_stdout: bool,
+) -> (Result<NetworkOutcome>, String) {
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(if capture_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::piped());
     for (key, value) in &context.env {
         cmd.env(key, value);
     }
-    let mut child = cmd.spawn().map_err(Error::Spawn)?;
-    let stderr = child.stderr.take().ok_or(Error::Parse("git stderr"))?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => return (Err(Error::Spawn(error)), String::new()),
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return (Err(Error::Parse("git stderr")), String::new());
+    };
+    let stdout_reader = child.stdout.take().map(|mut stdout| {
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stdout.read_to_string(&mut text);
+            text
+        })
+    });
     let (line_tx, line_rx) = mpsc::channel();
     let reader = read_progress_lines(stderr, line_tx);
 
@@ -591,6 +972,9 @@ fn run_streaming(
     }
     let status = child.wait();
     let _ = reader.join();
+    let stdout = stdout_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
     // Drain the tail that arrived while we were waiting for the child.
     while let Ok(line) = line_rx.try_recv() {
         if !line.contains('%') && outcome.lines.len() < 200 {
@@ -598,9 +982,9 @@ fn run_streaming(
         }
     }
     if cancelled {
-        return Err(Error::Cancelled { command });
+        return (Err(Error::Cancelled { command }), stdout);
     }
-    match status {
+    let result = match status {
         Ok(status) if status.success() => Ok(outcome),
         Ok(status) => Err(Error::Git {
             command,
@@ -612,7 +996,8 @@ fn run_streaming(
             },
         }),
         Err(error) => Err(Error::Io(error)),
-    }
+    };
+    (result, stdout)
 }
 
 /// `Receiving objects:  42% (…)` → phase, percent and the original line.
@@ -698,5 +1083,40 @@ mod tests {
             .fraction(),
             Some(1.0)
         );
+    }
+
+    #[test]
+    fn config_settings_become_dash_c_arguments() {
+        let context = NetworkContext::default().with_git_config([
+            "credential.https://a.test.helper=".to_owned(),
+            "credential.https://b.test.helper=".to_owned(),
+        ]);
+        assert_eq!(
+            context.config_args(),
+            [
+                "-c",
+                "credential.https://a.test.helper=",
+                "-c",
+                "credential.https://b.test.helper="
+            ]
+        );
+        assert!(NetworkContext::default().config_args().is_empty());
+    }
+
+    #[test]
+    fn parses_porcelain_ref_lines() {
+        let out = "To /srv/a.git\n \trefs/heads/main:refs/heads/main\t1a2b3c4..5d6e7f8\n\
+                   *\trefs/heads/x:refs/heads/x\t[new branch]\n\
+                   =\trefs/heads/y:refs/heads/y\t[up to date]\n\
+                   !\trefs/heads/z:refs/heads/z\t[rejected] (non-fast-forward)\n\
+                   -\t:refs/heads/gone\t[deleted]\nDone\n";
+        let refs = parse_porcelain(out);
+        let flags: Vec<char> = refs.iter().map(|r| r.flag).collect();
+        assert_eq!(flags, [' ', '*', '=', '!', '-']);
+        assert_eq!(refs[0].refs, "refs/heads/main:refs/heads/main");
+        assert_eq!(refs[0].summary, "1a2b3c4..5d6e7f8");
+        assert_eq!(refs[3].summary, "[rejected] (non-fast-forward)");
+        assert!(parse_porcelain("To x\nDone\n").is_empty());
+        assert!(parse_porcelain("").is_empty());
     }
 }

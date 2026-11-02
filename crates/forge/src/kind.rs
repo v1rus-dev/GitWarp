@@ -54,4 +54,15 @@ impl ServiceKind {
             _ => "pull request",
         }
     }
+
+    /// The user name git sends over HTTPS together with the account's token.
+    /// GitLab and Bitbucket ignore the login and want a fixed one for token
+    /// authentication; the others take the account's own login.
+    pub fn git_username(self, login: &str) -> String {
+        match self {
+            ServiceKind::GitLab => "oauth2".to_owned(),
+            ServiceKind::Bitbucket => "x-bitbucket-api-token-auth".to_owned(),
+            ServiceKind::GitHub | ServiceKind::Gitea | ServiceKind::AzureDevOps => login.to_owned(),
+        }
+    }
 }

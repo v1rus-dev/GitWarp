@@ -544,6 +544,16 @@ struct NetworkActivity {
 }
 
 /// One event from the worker to the UI.
+/// What a job's result toasts need, known when it starts.
+struct JobMeta {
+    /// The accounts the job answered prompts with.
+    used: Vec<remote_accounts::UsedAccount>,
+    /// The remote's remembered account choice, for naming push targets.
+    remembered: Option<String>,
+    /// The branch or tag a push result names.
+    subject: String,
+}
+
 enum NetworkEvent {
     Progress(Progress),
     Done(Result<git_core::network::NetworkOutcome, Error>),
@@ -1826,10 +1836,18 @@ impl RepositoryView {
         account: &crate::settings::AccountRecord,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         self.account_modal = None;
         let Some(key) = self.repo_key() else {
-            return;
+            // Without a repository key the choice cannot be stored; a job that
+            // waited for it must not start on a guess.
+            toast::show(
+                ui::ToastKind::Error,
+                ui::t!("repo.toast.account_not_saved", remote = remote),
+                window,
+                cx,
+            );
+            return false;
         };
         let (remote_name, id) = (remote.to_owned(), account.id.clone());
         crate::update_settings(cx, move |settings| {
@@ -1846,6 +1864,7 @@ impl RepositoryView {
             cx,
         );
         cx.notify();
+        true
     }
 
     /// Opens the Add account dialog for the service of `remote`, on its public
@@ -2283,15 +2302,28 @@ impl RepositoryView {
             Ok(git) => git.clone(),
             Err(_) => return,
         };
-        let context = cx
-            .try_global::<NetworkService>()
-            .map(|service| service.context(false))
-            .unwrap_or_default();
+        // Account hosts are answered from the keychain; a prompt for anything
+        // else is cancelled (the fetch never opens a dialog), and a remote
+        // that needs a choice is skipped.
+        let (_, credentials) = self.job_credentials(&Job::Fetch(FetchOptions::default()), cx);
+        let store = match crate::accounts::cached_store(cx) {
+            Some(Ok(store)) => Some(store),
+            _ => None,
+        };
+        let (context, guard) = match cx.try_global::<NetworkService>() {
+            Some(service) => service.job_context(crate::network_service::JobAuth {
+                interactive: false,
+                accounts: credentials.accounts,
+                store,
+            }),
+            None => Default::default(),
+        };
         self.background_fetch_running = true;
         cx.spawn(async move |this, cx| {
             let changed = cx
                 .background_executor()
                 .spawn(async move {
+                    let _guard = guard;
                     let repo = match Repo::open(git, &root) {
                         Ok(repo) => repo,
                         Err(error) => {
@@ -2351,10 +2383,37 @@ impl RepositoryView {
                 return;
             }
         };
-        let (context, asker) = match cx.try_global::<NetworkService>() {
-            Some(service) => (service.context(true), service.host_keys()),
+        let (uses, credentials) = self.job_credentials(&job, cx);
+        // Several accounts fit a remote and none was chosen: ask first, then
+        // start again (it asks about the next remote, if any).
+        if let Some(remote) = credentials.choose.first() {
+            self.pick_account_for_job(remote.clone(), job, window, cx);
+            return;
+        }
+        let (accounts, remembered) = self.account_settings(cx);
+        let meta = JobMeta {
+            used: remote_accounts::used_accounts(&credentials, &accounts),
+            remembered: uses
+                .first()
+                .and_then(|u| remembered.get(&u.remote).cloned()),
+            subject: self.job_subject(&job, cx),
+        };
+        let (context, guard, asker) = match cx.try_global::<NetworkService>() {
+            Some(service) => {
+                let store = match crate::accounts::cached_store(cx) {
+                    Some(Ok(store)) => Some(store),
+                    _ => None,
+                };
+                let (context, guard) = service.job_context(crate::network_service::JobAuth {
+                    interactive: true,
+                    accounts: credentials.accounts,
+                    store,
+                });
+                (context, guard, service.host_keys())
+            }
             None => (
                 git_core::network::NetworkContext::default(),
+                None,
                 crate::network_service::HostKeyAsker::unavailable(),
             ),
         };
@@ -2372,6 +2431,8 @@ impl RepositoryView {
         let worker_job = job.clone();
         cx.background_executor()
             .spawn(async move {
+                // The job's accounts stay registered until the job ended.
+                let _guard = guard;
                 let result = Repo::open(git, &root).and_then(|repo| {
                     worker_job.run(
                         &repo,
@@ -2391,7 +2452,7 @@ impl RepositoryView {
             cx.background_executor().timer(NETWORK_POLL).await;
             let done = this
                 .update_in(cx, |view, window, cx| {
-                    view.poll_network(&rx, generation, &job, window, cx)
+                    view.poll_network(&rx, generation, &job, &meta, window, cx)
                 })
                 .unwrap_or(true);
             if done {
@@ -2407,6 +2468,7 @@ impl RepositoryView {
         rx: &Receiver<NetworkEvent>,
         generation: u64,
         job: &Job,
+        meta: &JobMeta,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -2433,23 +2495,247 @@ impl RepositoryView {
         if let Some(result) = finished {
             self.network = None;
             match result {
+                Ok(outcome) if !outcome.targets.is_empty() => {
+                    self.show_push_result(&outcome, meta, window, cx);
+                    if outcome.targets.iter().any(|t| t.result.is_ok()) {
+                        self.reload_after_network(cx);
+                    }
+                }
                 Ok(outcome) => {
                     toast::show(ui::ToastKind::Ok, job.done_message(&outcome), window, cx);
                     self.reload_after_network(cx);
                 }
-                Err(error) => {
-                    toast::show(
-                        ui::ToastKind::Error,
-                        network_ops::friendly_error(&error),
-                        window,
-                        cx,
-                    );
-                }
+                Err(error) => self.show_job_error(&error, meta, window, cx),
             }
             return true;
         }
         cx.notify();
         false
+    }
+
+    /// The remotes `job` contacts and the accounts git may answer with.
+    fn job_credentials(
+        &self,
+        job: &Job,
+        cx: &App,
+    ) -> (
+        Vec<remote_accounts::RemoteUse>,
+        remote_accounts::JobCredentials,
+    ) {
+        let Some(extras) = self.sidebar_extras.as_ref() else {
+            return Default::default();
+        };
+        let (accounts, remembered) = self.account_settings(cx);
+        let history = self.history.read(cx);
+        let uses =
+            network_ops::job_remote_uses(job, history.head(), history.refs(), &extras.remotes);
+        let credentials =
+            remote_accounts::job_credentials(&accounts, &extras.remote_targets, &uses, &remembered);
+        (uses, credentials)
+    }
+
+    /// What a push result names: the branch, the tag, or all tags.
+    fn job_subject(&self, job: &Job, cx: &App) -> String {
+        match job {
+            Job::PushTag { tag, .. } => tag.clone(),
+            Job::PushTags { .. } => ui::t!("network.push.subject_tags").to_string(),
+            Job::DeleteRemoteBranch { branch, .. } => branch.clone(),
+            _ => match self.history.read(cx).head() {
+                Some(git_core::Head::Branch { name, .. }) => name.clone(),
+                _ => String::new(),
+            },
+        }
+    }
+
+    /// Asks which account answers for `remote`, then starts `job` again. Cancel
+    /// starts nothing.
+    fn pick_account_for_job(
+        &mut self,
+        remote: String,
+        job: Job,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (accounts, _) = self.account_settings(cx);
+        let Some(resolution) = self.resolution_of(&remote, cx) else {
+            return;
+        };
+        let target = std::iter::once(&resolution.fetch)
+            .chain(resolution.pushes.iter())
+            .find(|t| matches!(t.account, remote_accounts::UrlAccount::Choose(_)))
+            .cloned();
+        let Some(target) = target else {
+            return;
+        };
+        let candidates: Vec<_> = target
+            .matching
+            .iter()
+            .filter_map(|id| accounts.iter().find(|a| a.id == *id).cloned())
+            .collect();
+        let view = cx.entity();
+        let name = remote.clone();
+        let picker = open_picker(
+            remote,
+            target.host.clone(),
+            candidates,
+            None,
+            std::rc::Rc::new(move |account, window, cx| {
+                let job = job.clone();
+                let name = name.clone();
+                view.update(cx, |view, cx| {
+                    if view.remember_account(&name, account, window, cx) {
+                        view.start_network_job(job, window, cx);
+                    }
+                });
+            }),
+            window,
+            cx,
+        );
+        self.account_modal = Some(picker.into_any());
+    }
+
+    /// The account dialog on the token step of `id`.
+    fn reconnect_account(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (accounts, _) = self.account_settings(cx);
+        let Some(account) = accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        let dialog = account_dialog::open(AccountOpen::Reconnect(account), None, None, window, cx);
+        self.account_modal = Some(dialog.into_any());
+    }
+
+    fn reconnect_action(&self, id: String, cx: &mut Context<Self>) -> ui::ToastAction {
+        let view = cx.entity();
+        ui::ToastAction::new(ui::t!("network.push.reconnect"), move |window, cx| {
+            let id = id.clone();
+            view.update(cx, |view, cx| view.reconnect_account(&id, window, cx));
+        })
+    }
+
+    /// The error toast of a failed job; a refused account token gets a
+    /// Reconnect button.
+    fn show_job_error(
+        &mut self,
+        error: &Error,
+        meta: &JobMeta,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if network_ops::is_auth_error(error) {
+            if let Some(account) = remote_accounts::failed_account(&meta.used, &error.to_string()) {
+                let body = ui::ToastBody {
+                    lines: Vec::new(),
+                    action: Some(self.reconnect_action(account.account_id.clone(), cx)),
+                };
+                toast::show_with(
+                    ui::ToastKind::Error,
+                    ui::t!(
+                        "network.toast.token_rejected",
+                        host = account.host,
+                        label = account.label
+                    ),
+                    Some(body),
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
+        toast::show(
+            ui::ToastKind::Error,
+            network_ops::friendly_error(error),
+            window,
+            cx,
+        );
+    }
+
+    /// The result of a push that went to each of several URLs.
+    fn show_push_result(
+        &mut self,
+        outcome: &git_core::network::NetworkOutcome,
+        meta: &JobMeta,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use git_core::network::PushStatus;
+        let (accounts, _) = self.account_settings(cx);
+        let total = outcome.targets.len();
+        let ok = outcome.targets.iter().filter(|t| t.result.is_ok()).count();
+        let mut lines = Vec::with_capacity(total);
+        for target in &outcome.targets {
+            let (host, account) = remote_accounts::push_target_info(
+                &accounts,
+                &target.url,
+                meta.remembered.as_deref(),
+            );
+            let label = account
+                .as_ref()
+                .map_or_else(|| "\u{2014}".to_owned(), |(_, label)| label.clone());
+            let text = format!("{host} \u{b7} {label}");
+            lines.push(match &target.result {
+                Ok(status) => ui::ToastLine {
+                    ok: true,
+                    text: text.into(),
+                    detail: Some(match status {
+                        PushStatus::Pushed { commits: Some(n) } => {
+                            ui::i18n::t_count("network.push.commits", *n as u64, &[])
+                        }
+                        PushStatus::Pushed { commits: None } => ui::t!("network.push.pushed"),
+                        PushStatus::NewBranch => ui::t!("network.push.new_branch"),
+                        PushStatus::NewTag => ui::t!("network.push.new_tag"),
+                        PushStatus::Deleted => ui::t!("network.push.deleted"),
+                        PushStatus::UpToDate => ui::t!("network.push.up_to_date"),
+                    }),
+                    action: None,
+                },
+                Err(text_err) => {
+                    let (reason, auth) = network_ops::target_failure(text_err);
+                    // Some refs of the push went through, some were refused.
+                    let reason = if target.partial {
+                        ui::t!("network.push.partial", reason = reason).to_string()
+                    } else {
+                        reason
+                    };
+                    ui::ToastLine {
+                        ok: false,
+                        text: text.into(),
+                        detail: Some(reason.into()),
+                        action: account
+                            .filter(|_| auth)
+                            .map(|(id, _)| self.reconnect_action(id, cx)),
+                    }
+                }
+            });
+        }
+        let (kind, title) = if ok == total {
+            (
+                ui::ToastKind::Ok,
+                ui::i18n::t_count(
+                    "network.push.title_all",
+                    total as u64,
+                    &[("subject", &meta.subject)],
+                ),
+            )
+        } else {
+            (
+                ui::ToastKind::Error,
+                ui::i18n::t_count(
+                    "network.push.title_some",
+                    total as u64,
+                    &[("subject", &meta.subject), ("ok", &ok)],
+                ),
+            )
+        };
+        toast::show_with(
+            kind,
+            title,
+            Some(ui::ToastBody {
+                lines,
+                action: None,
+            }),
+            window,
+            cx,
+        );
     }
 
     /// Reloads everything a remote change can affect.

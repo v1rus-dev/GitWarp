@@ -34,6 +34,22 @@ fn kind_ids_roundtrip_and_names() {
     assert_eq!(ServiceKind::GitHub.pr_noun(), "pull request");
 }
 
+#[test]
+fn git_username_per_service() {
+    assert_eq!(ServiceKind::GitHub.git_username("mira"), "mira");
+    assert_eq!(ServiceKind::Gitea.git_username("mira-k"), "mira-k");
+    assert_eq!(
+        ServiceKind::AzureDevOps.git_username("mira@acme"),
+        "mira@acme"
+    );
+    // The login is irrelevant for these two: the service wants a fixed name.
+    assert_eq!(ServiceKind::GitLab.git_username("mira"), "oauth2");
+    assert_eq!(
+        ServiceKind::Bitbucket.git_username("mira"),
+        "x-bitbucket-api-token-auth"
+    );
+}
+
 // ---- Instance ----
 
 #[test]
@@ -244,6 +260,23 @@ fn parse_rejects_non_remotes() {
     ] {
         assert_eq!(RemoteRef::parse(url), None, "{url}");
     }
+}
+
+#[test]
+fn web_urls_with_delimiters_in_the_authority_are_not_remotes() {
+    for url in [
+        "https://github.com?@evil.test/o/r",
+        "https://github.com#@evil.test/o/r",
+        "https://github.com%2F@evil.test/o/r",
+        "http://github.com%2f@evil.test/o/r.git",
+        "https://us er@github.com/o/r",
+    ] {
+        assert_eq!(RemoteRef::parse(url), None, "{url}");
+    }
+    // A query or fragment after the path is still dropped.
+    assert_eq!(p("https://github.com/o/r.git?x=1#f").repo, "r");
+    // `@` inside the path is path.
+    assert_eq!(p("https://u@evil.test/o/p@github.com").host, "evil.test");
 }
 
 // ---- matching ----

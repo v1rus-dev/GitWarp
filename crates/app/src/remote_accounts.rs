@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use forge::{resolve_with, AccountRef, Instance, RemoteRef, RepoCoords, Resolution, ServiceKind};
 
-use crate::accounts::{instance_of, public_host};
+use crate::accounts::{instance_of, kind_of, public_host};
+use crate::network_service::{AccountCredential, HostKey};
 use crate::settings::AccountRecord;
 
 /// The URLs of one configured remote, as read from git.
@@ -194,11 +195,20 @@ fn host_key(url: &str) -> String {
         .unwrap_or_else(|| url.trim().to_owned())
 }
 
+/// Whether two URLs of one remote are the same address, ignoring a trailing
+/// slash.
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('/') == b.trim().trim_end_matches('/')
+}
+
 /// A remote with every URL resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteResolution {
     pub name: String,
     pub multi_push: bool,
+    /// The fetch URL is one of the push URLs, so its row would repeat that
+    /// push row.
+    pub fetch_is_a_push_url: bool,
     pub fetch: Target,
     /// One per push URL; empty unless `multi_push`.
     pub pushes: Vec<Target>,
@@ -216,6 +226,11 @@ pub fn resolve_remote(
     RemoteResolution {
         name: targets.name.clone(),
         multi_push,
+        fetch_is_a_push_url: multi_push
+            && targets
+                .push_urls
+                .iter()
+                .any(|url| same_url(url, &targets.fetch_url)),
         fetch: resolve_url(refs, &targets.fetch_url, remembered),
         pushes: if multi_push {
             targets
@@ -244,6 +259,162 @@ pub fn resolve_all(
             resolve_remote(&refs, t, id)
         })
         .collect()
+}
+
+/* ------------------------------ network jobs ----------------------------- */
+
+/// Which URL of a remote a job contacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// The fetch URL: fetch, pull.
+    Fetch,
+    /// Every push URL: push, push tags, delete a remote branch.
+    Push,
+}
+
+/// A remote a job talks to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteUse {
+    pub remote: String,
+    pub direction: Direction,
+}
+
+/// The accounts a network job can answer git's prompts with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobCredentials {
+    /// One entry per host git will contact where an account applies.
+    pub accounts: HashMap<HostKey, AccountCredential>,
+    /// Remotes with several matching accounts and no remembered choice, in
+    /// the job's order: an interactive job asks before it starts.
+    pub choose: Vec<String>,
+}
+
+/// The accounts for `uses`, from the URLs git will contact.
+///
+/// Only `https://` URLs count, and `http://` only when the account's own
+/// instance is `http://` too: a token is never offered over a scheme its
+/// instance does not use. A host is keyed by scheme, host and port, so a token
+/// can reach no other server than the account's instance. When two remotes of
+/// one job map the same host to different accounts the first remote wins: git
+/// asks about the host, not the remote.
+pub fn job_credentials(
+    accounts: &[AccountRecord],
+    targets: &[RemoteTargets],
+    uses: &[RemoteUse],
+    remembered: &std::collections::BTreeMap<String, String>,
+) -> JobCredentials {
+    let refs = account_refs(accounts);
+    let mut result = JobCredentials::default();
+    for used in uses {
+        let Some(target) = targets.iter().find(|t| t.name == used.remote) else {
+            continue;
+        };
+        let urls: &[String] = match used.direction {
+            Direction::Fetch => std::slice::from_ref(&target.fetch_url),
+            Direction::Push => &target.push_urls,
+        };
+        for url in urls {
+            let resolved =
+                resolve_url(&refs, url, remembered.get(&used.remote).map(String::as_str));
+            match resolved.account {
+                UrlAccount::Linked(id) => {
+                    if let Some((key, credential)) = credential_for(accounts, &id, url) {
+                        result.accounts.entry(key).or_insert(credential);
+                    }
+                }
+                UrlAccount::Choose(_) => {
+                    if !result.choose.contains(&used.remote) {
+                        result.choose.push(used.remote.clone());
+                    }
+                }
+                UrlAccount::NoAccount(_) | UrlAccount::Unknown => {}
+            }
+        }
+    }
+    result
+}
+
+/// An account a job answered prompts with, for the "rejected the token" toast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsedAccount {
+    pub account_id: String,
+    /// `host[:port]`.
+    pub host: String,
+    pub label: String,
+}
+
+/// The accounts of `credentials`, ordered by host.
+pub fn used_accounts(credentials: &JobCredentials, accounts: &[AccountRecord]) -> Vec<UsedAccount> {
+    let mut used: Vec<UsedAccount> = credentials
+        .accounts
+        .iter()
+        .filter_map(|(key, credential)| {
+            let label = label_of(accounts, &credential.account_id)?;
+            let url = key.url();
+            Some(UsedAccount {
+                account_id: credential.account_id.clone(),
+                host: url
+                    .split_once("://")
+                    .map_or(url.clone(), |(_, h)| h.to_owned()),
+                label: label.to_owned(),
+            })
+        })
+        .collect();
+    used.sort_by(|a, b| a.host.cmp(&b.host));
+    used
+}
+
+/// The account whose token a failed job most likely used: the one whose host
+/// git's error names, else the first.
+pub fn failed_account<'a>(used: &'a [UsedAccount], error_text: &str) -> Option<&'a UsedAccount> {
+    let lower = error_text.to_lowercase();
+    used.iter()
+        .find(|account| lower.contains(&account.host.to_lowercase()))
+        .or_else(|| used.first())
+}
+
+/// The host and account of one push URL, for the push result toast.
+pub fn push_target_info(
+    accounts: &[AccountRecord],
+    url: &str,
+    remembered: Option<&str>,
+) -> (String, Option<(String, String)>) {
+    let target = resolve_url(&account_refs(accounts), url, remembered);
+    let account = match &target.account {
+        UrlAccount::Linked(id) => label_of(accounts, id).map(|l| (id.clone(), l.to_owned())),
+        _ => None,
+    };
+    (target.host, account)
+}
+
+fn credential_for(
+    accounts: &[AccountRecord],
+    id: &str,
+    url: &str,
+) -> Option<(HostKey, AccountCredential)> {
+    let account = accounts.iter().find(|a| a.id == id)?;
+    let remote = RemoteRef::parse(url)?;
+    let scheme = match remote.transport {
+        forge::Transport::Https => "https",
+        forge::Transport::Http
+            if account
+                .base_url
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("http://") =>
+        {
+            "http"
+        }
+        forge::Transport::Http | forge::Transport::Ssh => return None,
+    };
+    let kind = kind_of(account)?;
+    Some((
+        HostKey::new(scheme, &remote.host, remote.port),
+        AccountCredential {
+            account_id: account.id.clone(),
+            username: kind.git_username(&account.login),
+        },
+    ))
 }
 
 /* -------------------------------- display -------------------------------- */
@@ -439,7 +610,8 @@ pub fn display(
                 .to_string(),
             ),
             add_account: None,
-            fetch: Some(row(&resolution.fetch, "fetch")),
+            // The fetch row only when it says something the push rows do not.
+            fetch: (!resolution.fetch_is_a_push_url).then(|| row(&resolution.fetch, "fetch")),
             pushes: resolution.pushes.iter().map(|t| row(t, "push")).collect(),
         };
     }
@@ -952,10 +1124,9 @@ mod tests {
         assert_eq!(chip.text, "2 push URLs");
         assert_eq!(chip.tooltip, "Pushes to github.com and codeberg.org");
         assert_eq!(d.tooltip.as_deref(), Some("publish · pushes to 2 targets"));
-        // The fetch account comes first, then one row per push URL.
-        let fetch = d.fetch.as_ref().unwrap();
-        assert_eq!(fetch.label, "fetch → github.com");
-        assert_eq!(fetch.chip.as_ref().unwrap().text, "mira-k");
+        // The fetch URL is the first push URL: no separate fetch row.
+        assert!(r.fetch_is_a_push_url);
+        assert!(d.fetch.is_none());
         assert_eq!(d.pushes.len(), 2);
         assert_eq!(d.pushes[0].host, "github.com");
         assert_eq!(d.pushes[0].label, "push → github.com");
@@ -1119,6 +1290,208 @@ mod tests {
         ];
         let ids: Vec<String> = account_refs(&accounts).into_iter().map(|a| a.id).collect();
         assert_eq!(ids, ["a1"]);
+    }
+
+    fn uses(list: &[(&str, Direction)]) -> Vec<RemoteUse> {
+        list.iter()
+            .map(|(remote, direction)| RemoteUse {
+                remote: (*remote).to_owned(),
+                direction: *direction,
+            })
+            .collect()
+    }
+
+    fn creds(
+        accounts: &[AccountRecord],
+        t: &[RemoteTargets],
+        u: &[(&str, Direction)],
+        remembered: &[(&str, &str)],
+    ) -> JobCredentials {
+        let remembered = remembered
+            .iter()
+            .map(|(r, id)| ((*r).to_owned(), (*id).to_owned()))
+            .collect();
+        job_credentials(accounts, t, &uses(u), &remembered)
+    }
+
+    fn key(scheme: &str, host: &str, port: Option<u16>) -> HostKey {
+        HostKey::new(scheme, host, port)
+    }
+
+    #[test]
+    fn a_linked_https_remote_gives_its_host_an_account() {
+        let accounts = [github("a1", "mira")];
+        let t = [targets("origin", REPO, &[])];
+        let c = creds(&accounts, &t, &[("origin", Direction::Fetch)], &[]);
+        assert_eq!(c.choose, Vec::<String>::new());
+        assert_eq!(
+            c.accounts,
+            HashMap::from([(
+                key("https", "github.com", None),
+                AccountCredential {
+                    account_id: "a1".into(),
+                    username: "mira".into()
+                }
+            )])
+        );
+    }
+
+    #[test]
+    fn only_https_counts_and_http_only_for_an_http_account() {
+        let accounts = [
+            github("a1", "mira"),
+            account("g1", "gitlab", "http://git.lan:8080", "mira"),
+        ];
+        let t = [
+            targets("ssh", "git@github.com:acme/app.git", &[]),
+            targets("plain", "http://github.com/acme/app.git", &[]),
+            targets("lan", "http://git.lan:8080/g/p.git", &[]),
+            targets("lans", "https://git.lan:8080/g/p.git", &[]),
+        ];
+        let c = creds(
+            &accounts,
+            &t,
+            &[
+                ("ssh", Direction::Fetch),
+                ("plain", Direction::Fetch),
+                ("lan", Direction::Fetch),
+            ],
+            &[],
+        );
+        // ssh: no token over ssh; plain http to an https account: refused;
+        // http to an http instance: allowed, with GitLab's fixed user name.
+        assert_eq!(
+            c.accounts.keys().collect::<Vec<_>>(),
+            vec![&key("http", "git.lan", Some(8080))]
+        );
+        assert_eq!(c.accounts.values().next().unwrap().username, "oauth2");
+        // An https URL of the same http-only instance is fine too.
+        let c = creds(&accounts, &t, &[("lans", Direction::Fetch)], &[]);
+        assert!(c
+            .accounts
+            .contains_key(&key("https", "git.lan", Some(8080))));
+    }
+
+    #[test]
+    fn several_accounts_without_a_choice_are_listed_not_used() {
+        let accounts = [github("a1", "mira"), github("a2", "mira-at-acme")];
+        let t = [
+            targets("origin", REPO, &[]),
+            targets("up", "https://gitlab.com/g/p.git", &[]),
+        ];
+        let c = creds(
+            &accounts,
+            &t,
+            &[("origin", Direction::Fetch), ("origin", Direction::Push)],
+            &[],
+        );
+        assert!(c.accounts.is_empty());
+        assert_eq!(c.choose, ["origin"]);
+        // A remembered choice settles it, and the chosen login is used.
+        let c = creds(
+            &accounts,
+            &t,
+            &[("origin", Direction::Fetch)],
+            &[("origin", "a2")],
+        );
+        assert!(c.choose.is_empty());
+        assert_eq!(c.accounts.values().next().unwrap().account_id, "a2");
+        assert_eq!(c.accounts.values().next().unwrap().username, "mira-at-acme");
+    }
+
+    #[test]
+    fn a_push_job_covers_every_push_url_host() {
+        let accounts = [
+            github("a1", "mira"),
+            account("c1", "gitea", "https://codeberg.org", "mira-k"),
+        ];
+        let t = [targets(
+            "publish",
+            REPO,
+            &[
+                "https://github.com/acme/app.git",
+                "https://codeberg.org/acme/app.git",
+                "https://nowhere.example/acme/app.git",
+            ],
+        )];
+        let push = creds(&accounts, &t, &[("publish", Direction::Push)], &[]);
+        let mut hosts: Vec<_> = push.accounts.keys().map(|k| k.host.as_str()).collect();
+        hosts.sort_unstable();
+        // The host without an account stays out: it keeps today's behaviour.
+        assert_eq!(hosts, ["codeberg.org", "github.com"]);
+        // Fetching contacts the fetch URL only.
+        let fetch = creds(&accounts, &t, &[("publish", Direction::Fetch)], &[]);
+        assert_eq!(fetch.accounts.len(), 1);
+    }
+
+    #[test]
+    fn a_host_shared_by_two_remotes_keeps_the_first_account() {
+        let accounts = [github("a1", "mira"), github("a2", "mira-at-acme")];
+        let t = [
+            targets("origin", REPO, &[]),
+            targets("fork", "https://github.com/me/app.git", &[]),
+        ];
+        let c = creds(
+            &accounts,
+            &t,
+            &[("origin", Direction::Fetch), ("fork", Direction::Fetch)],
+            &[("origin", "a1"), ("fork", "a2")],
+        );
+        assert_eq!(c.accounts.len(), 1);
+        assert_eq!(c.accounts.values().next().unwrap().account_id, "a1");
+    }
+
+    #[test]
+    fn an_unknown_remote_or_a_local_path_adds_nothing() {
+        let accounts = [github("a1", "mira")];
+        let t = [targets("local", "/srv/git/app.git", &[])];
+        let c = creds(
+            &accounts,
+            &t,
+            &[("local", Direction::Fetch), ("missing", Direction::Fetch)],
+            &[],
+        );
+        assert_eq!(c, JobCredentials::default());
+    }
+
+    #[test]
+    fn the_failed_account_is_the_one_whose_host_the_error_names() {
+        let accounts = [
+            github("a1", "mira"),
+            account("c1", "gitea", "https://codeberg.org", "mira-k"),
+        ];
+        let t = [targets(
+            "publish",
+            REPO,
+            &[
+                "https://github.com/acme/app.git",
+                "https://codeberg.org/acme/app.git",
+            ],
+        )];
+        let c = creds(&accounts, &t, &[("publish", Direction::Push)], &[]);
+        let used = used_accounts(&c, &accounts);
+        assert_eq!(
+            used.iter().map(|u| u.host.as_str()).collect::<Vec<_>>(),
+            ["codeberg.org", "github.com"]
+        );
+        let failed = failed_account(
+            &used,
+            "fatal: Authentication failed for 'https://github.com/acme/app.git/'",
+        );
+        assert_eq!(failed.unwrap().account_id, "a1");
+        // No host in the text: the first one.
+        assert_eq!(failed_account(&used, "boom").unwrap().account_id, "c1");
+        assert_eq!(failed_account(&[], "boom"), None);
+    }
+
+    #[test]
+    fn push_targets_are_described_by_host_and_account() {
+        let accounts = [github("a1", "mira")];
+        let (host, account) = push_target_info(&accounts, "https://github.com/a/b.git", None);
+        assert_eq!(host, "github.com");
+        assert_eq!(account, Some(("a1".to_owned(), "mira".to_owned())));
+        let (host, account) = push_target_info(&accounts, "https://codeberg.org/a/b.git", None);
+        assert_eq!((host.as_str(), account), ("codeberg.org", None));
     }
 
     #[test]

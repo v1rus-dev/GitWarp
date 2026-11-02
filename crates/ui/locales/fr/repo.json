@@ -63,6 +63,7 @@
   "repo.status.loading_history": "Chargement de l’historique…",
   "repo.status.unstaged_staged": "{unstaged} non indexées · {staged} indexées",
   "repo.toast.account_added": "{label} connecté sur {host}. {remote} l’utilise désormais.",
+  "repo.toast.account_not_saved": "Impossible de mémoriser le compte de {remote}. Rien n’a été lancé.",
   "repo.toast.account_one": "{host} a un compte ({label}) ; {remote} l’utilise déjà.",
   "repo.toast.account_picked": "{remote} utilisera {label} dans ce dépôt",
   "repo.toast.account_push_urls": "Chaque URL de push garde son propre compte. Modifiez-les dans Réglages → Comptes.",
