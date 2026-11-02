@@ -25,6 +25,7 @@ mod settings;
 mod settings_ui;
 mod sidebar;
 mod syntax;
+mod telemetry;
 #[cfg(test)]
 mod test_support;
 mod text_runs;
@@ -75,6 +76,7 @@ fn update_settings(cx: &mut App, f: impl FnOnce(&mut Settings)) {
         }
         let state = cx.global_mut::<AppSettings>();
         f(&mut state.settings);
+        telemetry::set_enabled(state.settings.telemetry);
         let Some(path) = state.path.clone() else {
             return;
         };
@@ -188,6 +190,8 @@ fn main() {
             Settings::default()
         }
     };
+    // Kept alive until `main` returns: dropping the guard flushes queued events.
+    let _sentry = telemetry::init(loaded.telemetry);
     // Before the first window renders, so every view reads the chosen language.
     ui::i18n::set_language(loaded.language.code());
     // The command line and GITWARP_GIT win over the Git page's choice.
