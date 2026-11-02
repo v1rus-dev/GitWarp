@@ -110,7 +110,7 @@ pub struct Settings {
     pub confirm_discard: bool,
     /// Ask before deleting a branch.
     pub confirm_delete_branch: bool,
-    /// Send anonymous usage statistics.
+    /// Send anonymous usage statistics and crash reports (Sentry). On by default.
     pub telemetry: bool,
     /// Highlight the characters that differ inside a modified diff line.
     pub diff_word_highlight: bool,
@@ -178,7 +178,7 @@ impl Default for Settings {
             confirm_force_push: true,
             confirm_discard: true,
             confirm_delete_branch: true,
-            telemetry: false,
+            telemetry: true,
             diff_word_highlight: true,
             diff_wrap: false,
             diff_line_numbers: true,
