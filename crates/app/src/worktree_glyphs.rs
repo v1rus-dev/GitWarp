@@ -7,7 +7,8 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, Div, ElementId, InteractiveElement, ParentElement, StatefulInteractiveElement, Styled,
+    div, px, Div, ElementId, InteractiveElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled,
 };
 
 use ui::metrics::FS_SM;
@@ -17,8 +18,9 @@ use ui::{Icon, IconName, Tooltip};
 use crate::worktrees_model::WorktreeEntry;
 
 /// The tooltip of the main worktree's row.
-pub const MAIN_WORKTREE_TIP: &str =
-    "Git calls it the main worktree: the original folder of this repository. It cannot be removed.";
+pub fn main_worktree_tip() -> SharedString {
+    ui::i18n::t("worktrees.glyph.main_tip")
+}
 
 /// One status glyph of a worktree row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,13 +39,22 @@ impl WorktreeGlyph {
     /// The tooltip text.
     pub fn tooltip(&self) -> String {
         match self {
-            WorktreeGlyph::Locked(reason) if reason.is_empty() => "Locked".to_owned(),
-            WorktreeGlyph::Locked(reason) => format!("Locked: {reason}"),
-            WorktreeGlyph::Missing => "Folder is missing".to_owned(),
-            WorktreeGlyph::Changed(count) => format!("{count} changed files"),
-            WorktreeGlyph::AheadBehind { ahead, behind } => {
-                format!("{ahead} ahead, {behind} behind")
+            WorktreeGlyph::Locked(reason) if reason.is_empty() => {
+                ui::i18n::t("worktrees.glyph.locked").to_string()
             }
+            WorktreeGlyph::Locked(reason) => {
+                ui::t!("worktrees.glyph.locked_reason", reason = reason).to_string()
+            }
+            WorktreeGlyph::Missing => ui::i18n::t("worktrees.glyph.missing").to_string(),
+            WorktreeGlyph::Changed(count) => {
+                ui::i18n::t_count("worktrees.glyph.changed", *count as u64, &[]).to_string()
+            }
+            WorktreeGlyph::AheadBehind { ahead, behind } => ui::t!(
+                "worktrees.glyph.ahead_behind",
+                ahead = ahead,
+                behind = behind
+            )
+            .to_string(),
         }
     }
 }
@@ -172,7 +183,7 @@ mod tests {
             [
                 "Locked: review in progress",
                 "Folder is missing",
-                "1 changed files",
+                "1 changed file",
                 "1 ahead, 2 behind"
             ]
         );

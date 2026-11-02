@@ -23,7 +23,7 @@ use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_SM};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{Button, Chip, CountPill, Icon, IconName, Skeleton, Tooltip, TreeNodeData};
 
-use crate::worktree_glyphs::{worktree_glyphs, MAIN_WORKTREE_TIP};
+use crate::worktree_glyphs::{main_worktree_tip, worktree_glyphs};
 use crate::worktrees_model::WorktreeEntry;
 
 /// The six sidebar sections, in display order.
@@ -1844,7 +1844,7 @@ fn worktree_row(
         .child(worktree_glyphs(&id, entry, selected, colors));
 
     if main {
-        row = row.tooltip(Tooltip::text(MAIN_WORKTREE_TIP));
+        row = row.tooltip(Tooltip::text(main_worktree_tip()));
     }
     if current {
         row = row.child(
