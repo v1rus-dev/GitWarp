@@ -10,9 +10,8 @@ use gpui::{div, px, AnyElement, Context, IntoElement, ParentElement, Styled, Win
 
 use ui::metrics::{FS_BASE, FS_SM, R_SM};
 use ui::theme::ActiveTheme;
-use ui::{Button, ButtonSize, Icon, IconName, Kbd};
+use ui::{Button, ButtonSize, Icon, IconName, Kbd, Select};
 
-use super::form;
 use super::{heading, SettingsView};
 
 /// One bindable action. The id is stable and is the key in `settings.json`.
@@ -425,18 +424,16 @@ pub(super) fn render(
         .child(view.kb_query.clone());
     let group_picker = {
         let entity = cx.entity();
-        form::select(
-            "settings-kb-group".into(),
-            GROUPS.iter().map(|id| group_label(id)),
-            view.kb_group,
-            false,
-            move |index, _, cx| {
+        // Not `form::select`: its fixed 180px would overflow this 150px slot.
+        Select::new("settings-kb-group")
+            .options(GROUPS.iter().map(|id| group_label(id)))
+            .selected(view.kb_group)
+            .on_change(move |index, _, cx| {
                 entity.update(cx, |view, cx| {
                     view.kb_group = index.min(GROUPS.len() - 1);
                     cx.notify();
                 });
-            },
-        )
+            })
     };
     let reset_all = {
         let entity = cx.entity();
@@ -465,7 +462,7 @@ pub(super) fn render(
             .items_center()
             .gap(px(8.))
             .child(search)
-            .child(div().w(px(150.)).child(group_picker))
+            .child(div().w(px(150.)).flex_none().child(group_picker))
             .child(reset_all)
             .child(export),
     );
