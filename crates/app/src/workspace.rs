@@ -175,11 +175,29 @@ impl Workspace {
 
     /// Switches to the repository at `path`.
     pub fn open_repository(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_repository_at_day(path, None, window, cx);
+    }
+
+    /// Switches to the repository at `path`, with its History already
+    /// filtered to `day` (the welcome screen's activity card).
+    pub fn open_repository_at_day(
+        &mut self,
+        path: PathBuf,
+        day: Option<crate::history_view::DayFilter>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let git = self.git.clone();
         let workspace = cx.weak_entity();
         let view = cx.new(|cx| RepositoryView::new(path.clone(), git, workspace, window, cx));
         let name = repo_name(&path);
         let focus = view.read(cx).focus_handle();
+        if day.is_some() {
+            // The day query runs on its own `git log`, so the filter does not
+            // have to wait for the history to load.
+            let history = view.read(cx).history();
+            history.update(cx, |history, cx| history.set_day_filter(day, cx));
+        }
         self.content = Content::Repository(view);
         window.set_window_title(&format!("{name} — GitWarp"));
         // The keyboard belongs to the new content at once, like the welcome

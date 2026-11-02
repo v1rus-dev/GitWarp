@@ -30,9 +30,9 @@ use crate::history_view::{DayFilter, HistoryView};
 use crate::workspace::Workspace;
 
 /// Columns of the heatmap: a year plus the partial week on each side.
-const WEEKS: usize = 53;
+pub(crate) const WEEKS: usize = 53;
 /// The days the heatmap's "last 12 months" total counts.
-const LAST_YEAR_DAYS: i32 = 365;
+pub(crate) const LAST_YEAR_DAYS: i32 = 365;
 /// How far back the quick first count looks.
 const PARTIAL_DAYS: i32 = 56;
 /// How many past years the range select offers.
@@ -392,7 +392,7 @@ impl ActivityStrip {
 
 /// The first and last day the total counts: the last 365 days up to today, or
 /// the calendar year (up to today for the current one).
-fn range_days(year: Option<i32>, today: i32) -> (i32, i32) {
+pub(crate) fn range_days(year: Option<i32>, today: i32) -> (i32, i32) {
     match year {
         None => (today - LAST_YEAR_DAYS + 1, today),
         Some(year) => {
@@ -403,7 +403,7 @@ fn range_days(year: Option<i32>, today: i32) -> (i32, i32) {
 }
 
 /// `Tue, 13 Oct 2026`.
-fn long_date(day: i32) -> String {
+pub(crate) fn long_date(day: i32) -> String {
     let (year, month, date) = git_core::civil_from_days(day);
     // 1970-01-01 was a Thursday and weeks start on Monday.
     let weekday = (day + 3).rem_euclid(7) as usize;
@@ -415,7 +415,7 @@ fn long_date(day: i32) -> String {
 }
 
 /// `1 commit` / `4 commits`.
-fn commits(count: usize) -> String {
+pub(crate) fn commits(count: usize) -> String {
     format!(
         "{} commit{}",
         format_count(count),

@@ -31,6 +31,7 @@ use crate::format::{display_path, expand_home, home_dir, relative_time};
 use crate::history_view::unix_now;
 use crate::init_flow::{banner_body, details, DialogKind, InitFlow, StatusKind};
 use crate::settings::RecentRepo;
+use crate::welcome_activity::WelcomeActivity;
 use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
@@ -89,6 +90,8 @@ pub struct WelcomeView {
     dialog: Option<Entity<InitDialog>>,
     /// The open Clone dialog, if any.
     clone_dialog: Option<Entity<CloneDialog>>,
+    /// The "Your activity" card above the recent list.
+    activity: Entity<WelcomeActivity>,
     _filter_events: Subscription,
 }
 
@@ -113,6 +116,10 @@ impl WelcomeView {
             }
         });
 
+        let activity = {
+            let (git, workspace) = (git.clone(), workspace.clone());
+            cx.new(|cx| WelcomeActivity::new(git, workspace, cx))
+        };
         Self {
             git,
             workspace,
@@ -129,6 +136,7 @@ impl WelcomeView {
             init_focus: cx.focus_handle().tab_stop(true),
             dialog: None,
             clone_dialog: None,
+            activity,
             _filter_events: filter_events,
         }
     }
@@ -140,7 +148,9 @@ impl WelcomeView {
 
     /// Adopts a newly resolved git (after a Retry) and repaints the label.
     pub fn set_git(&mut self, git: Result<Arc<Git>, Arc<Error>>, cx: &mut Context<Self>) {
-        self.git = git;
+        self.git = git.clone();
+        self.activity
+            .update(cx, |activity, cx| activity.set_git(git, cx));
         cx.notify();
     }
 
@@ -161,6 +171,19 @@ impl WelcomeView {
             let len = self.filtered_len();
             self.selected = clamp_selection(self.selected, len);
         }
+    }
+
+    /// Tells the activity card the recent list and the selected row.
+    fn sync_activity(&self, cx: &mut Context<Self>) {
+        let paths = self.recent.iter().map(|repo| repo.path.clone()).collect();
+        let selected = self
+            .recent
+            .iter()
+            .filter(|repo| self.matches(repo))
+            .nth(self.selected)
+            .map(|repo| repo.path.clone());
+        self.activity
+            .update(cx, |activity, cx| activity.sync(paths, selected, cx));
     }
 
     /// Starts one background HEAD read per row that has none yet.
@@ -504,6 +527,7 @@ impl WelcomeView {
             .gap(px(12.))
             .px(px(24.))
             .py(px(20.))
+            .child(self.activity.clone())
             .child(header)
             .child(panel)
             .child(hint)
@@ -612,6 +636,7 @@ impl Render for WelcomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prune_dialog(window, cx);
         self.sync_recent(cx);
+        self.sync_activity(cx);
         self.ensure_branches(cx);
 
         let client = matches!(window.window_decorations(), Decorations::Client { .. });
@@ -1351,7 +1376,7 @@ fn read_recent(cx: &App) -> Vec<RecentRepo> {
 }
 
 /// The last path component, without touching the file system.
-fn recent_name(path: &Path) -> String {
+pub(crate) fn recent_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())

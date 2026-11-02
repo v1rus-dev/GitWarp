@@ -685,8 +685,8 @@ impl RepositoryView {
         self.set_view(ViewMode::Changes, window, cx);
     }
 
-    /// The history view, for the search's focus hand-off and the tests.
-    #[cfg(test)]
+    /// The history view, for the search's focus hand-off, the welcome screen's
+    /// day filter and the tests.
     pub(crate) fn history(&self) -> Entity<HistoryView> {
         self.history.clone()
     }

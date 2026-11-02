@@ -28,6 +28,7 @@ mod syntax;
 mod test_support;
 mod theme;
 mod welcome;
+mod welcome_activity;
 mod workspace;
 mod worktree_dialog;
 mod worktrees_view;
@@ -327,7 +328,7 @@ fn main() {
             let window_size = if path.is_some() {
                 size(px(1200.), px(800.))
             } else {
-                size(px(960.), px(620.))
+                size(px(960.), px(680.))
             };
             let bounds = Bounds::centered(None, window_size, cx);
             cx.open_window(
