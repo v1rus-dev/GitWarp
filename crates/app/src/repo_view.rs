@@ -49,15 +49,16 @@ use crate::settings::{
     SIDEBAR_WIDTH_MIN,
 };
 use crate::sidebar::{
-    commit_for, read_sidebar_extras, shortcut_action, sidebar_menu, sidebar_nodes, Expansion,
-    SidebarAction, SidebarExtras, SidebarMenuEntry,
+    commit_for, read_sidebar_extras, shortcut_action, sidebar_menu, sidebar_nodes, worktree_menu,
+    worktree_panel_rows, Expansion, PanelEvent, PanelState, SidebarAction, SidebarExtras,
+    SidebarMenuEntry, WorktreeAction, WorktreePanel,
 };
 use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
 use crate::worktree_dialog::SelectedCommit;
-use crate::worktrees_model::{WorktreesModel, WorktreesModelEvent};
+use crate::worktrees_model::{WorktreeEntry, WorktreesModel, WorktreesModelEvent};
 use crate::worktrees_view::{WorktreesEvent, WorktreesView};
 
 actions!(
@@ -79,9 +80,8 @@ actions!(
     ]
 );
 
-/// The centre views the sidebar and toolbar switch between. `Worktrees` is
-/// opened from the sidebar's Worktrees section, so the toolbar's History /
-/// Changes switch stays on History while it shows.
+/// The centre views the toolbar's segment switches between. `Worktrees` also
+/// swaps the sidebar tree for the worktree panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewMode {
     History,
@@ -151,6 +151,12 @@ impl ToolbarLayout {
             ..self
         }
     }
+
+    /// One more step at the narrowest window: the three view tabs took the
+    /// room the search and the gaps kept.
+    fn tighter(self) -> Self {
+        Self { gap: 3., ..self }
+    }
 }
 
 /// The toolbar steps, measured against the real text widths of every item.
@@ -161,18 +167,22 @@ impl ToolbarLayout {
 /// can shrink; the steps below keep the worst case (names at their maximum,
 /// `Fetch`/`Pull`/`Push`/`Stash`/`History`/`Changes` labelled) inside the bar.
 ///
-/// The labels are dropped from 1360 down: at 1200 a long repository name plus
+/// The labels are dropped from 1340 down: at 1200 a long repository name plus
 /// the segmented labels do not fit even with the search at its minimum, which
-/// clipped "Changes".
+/// clipped "Changes". The third view tab ("Worktrees") widens the labelled bar
+/// by 112px, so the labels and the 140px name caps start 80px higher than with
+/// two tabs.
 pub fn toolbar_layout(width: f32) -> ToolbarLayout {
     let full = ToolbarLayout::full();
-    if width >= 1360. {
+    if width >= 1420. {
         // The design's own 140px cap on both names.
         ToolbarLayout {
             repo_name: Some(140.),
             branch_name: Some(140.),
             ..full
         }
+    } else if width >= 1340. {
+        full
     } else if width >= 1000. {
         // Icon-only tools and view switch, so the bar fits at 1200.
         ToolbarLayout {
@@ -190,7 +200,7 @@ pub fn toolbar_layout(width: f32) -> ToolbarLayout {
             search_min: 120.,
             ..full
         }
-    } else if width >= 810. {
+    } else if width >= 840. {
         ToolbarLayout {
             labels: false,
             search_kbd: false,
@@ -228,12 +238,13 @@ pub fn toolbar_layout(width: f32) -> ToolbarLayout {
             search_kbd: false,
             repo_name: None,
             branch_name: None,
-            search_basis: 72.,
-            search_min: 72.,
-            padding: 8.,
+            search_basis: 60.,
+            search_min: 60.,
+            padding: 6.,
             ..full
         }
         .compact()
+        .tighter()
     }
 }
 
@@ -319,11 +330,16 @@ pub struct RepositoryView {
     changes: Entity<ChangesView>,
     _changes_observer: Subscription,
     worktrees: Entity<WorktreesView>,
-    /// The worktree list shared by the Worktrees page and, next, the sidebar
-    /// panel and the titlebar switcher.
+    /// The worktree list shared by the Worktrees page, the sidebar panel and,
+    /// next, the titlebar switcher.
     worktrees_model: Entity<WorktreesModel>,
     _worktrees_observer: Subscription,
+    /// Redraws the sidebar's worktree panel when the model changes.
+    _worktrees_redraw: Subscription,
     _worktrees_leave: Subscription,
+    /// The worktree panel's keyboard focus and list scroll.
+    worktree_panel_focus: FocusHandle,
+    worktree_panel_scroll: ScrollHandle,
     view: ViewMode,
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
@@ -450,6 +466,12 @@ impl RepositoryView {
                 cx,
             )
         });
+        let sidebar_view = cx.entity();
+        history.update(cx, |history, _| {
+            history.set_sidebar_action_handler(Rc::new(move |action, window, cx| {
+                sidebar_view.update(cx, |view, cx| view.run_sidebar_action(action, window, cx));
+            }));
+        });
         let observer = cx.observe(&history, |this, history, cx| {
             // A repository opened from a subdirectory is remembered by its
             // root, so the switcher's "current" marker must follow it.
@@ -517,6 +539,7 @@ impl RepositoryView {
                 }
             },
         );
+        let worktrees_redraw = cx.observe(&worktrees_model, |_, _, cx| cx.notify());
         let worktrees_leave = cx.subscribe_in(
             &worktrees,
             window,
@@ -582,7 +605,10 @@ impl RepositoryView {
             worktrees,
             worktrees_model,
             _worktrees_observer: worktrees_observer,
+            _worktrees_redraw: worktrees_redraw,
             _worktrees_leave: worktrees_leave,
+            worktree_panel_focus: cx.focus_handle().tab_stop(true),
+            worktree_panel_scroll: ScrollHandle::new(),
             view: ViewMode::History,
             workspace,
             focus: focus.clone(),
@@ -664,7 +690,7 @@ impl RepositoryView {
     }
 
     /// The worktree list shared with the sidebar panel and the switcher.
-    #[allow(dead_code)] // read by the sidebar panel and the switcher (W4, W5)
+    #[allow(dead_code)] // read by the switcher (W5)
     pub(crate) fn worktrees_model(&self) -> Entity<WorktreesModel> {
         self.worktrees_model.clone()
     }
@@ -687,7 +713,11 @@ impl RepositoryView {
             }
             return;
         }
+        let was_worktrees = self.view == ViewMode::Worktrees;
         self.view = mode;
+        if was_worktrees != (mode == ViewMode::Worktrees) {
+            self.sync_sidebar_filter(cx);
+        }
         match mode {
             ViewMode::Changes => {
                 self.changes.update(cx, |changes, cx| changes.refresh(cx));
@@ -706,6 +736,154 @@ impl RepositoryView {
             }
         }
         cx.notify();
+    }
+
+    /// The sidebar filter belongs to whatever the sidebar lists: branches and
+    /// tags, or (in the Worktrees view) worktrees. Switching between them
+    /// starts a fresh, empty filter with the matching placeholder.
+    fn sync_sidebar_filter(&mut self, cx: &mut Context<Self>) {
+        let placeholder = if self.view == ViewMode::Worktrees {
+            "Filter worktrees…"
+        } else {
+            "Filter branches, tags…"
+        };
+        self.filter.clear();
+        self.sidebar_filter.update(cx, |input, cx| {
+            input.set_placeholder(placeholder, cx);
+            input.set_text("", cx);
+        });
+    }
+
+    /// The worktree panel's rows, in the order they are drawn.
+    fn worktree_panel_paths(&self, cx: &App) -> Vec<PathBuf> {
+        worktree_panel_rows(self.worktrees_model.read(cx).entries(), &self.filter)
+            .into_iter()
+            .map(|entry| entry.path().to_path_buf())
+            .collect()
+    }
+
+    /// Everything the worktree panel reports: clicks, keys, the menu.
+    fn worktree_panel_event(
+        &mut self,
+        event: PanelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let model = self.worktrees_model.clone();
+        let selected = model.read(cx).selected().map(|e| e.path().to_path_buf());
+        match event {
+            PanelEvent::Select(path) => model.update(cx, |model, cx| model.select(&path, cx)),
+            PanelEvent::Switch(path) => {
+                model.update(cx, |model, cx| model.switch_to(&path, window, cx));
+            }
+            PanelEvent::Menu(path, position) => {
+                model.update(cx, |model, cx| model.select(&path, cx));
+                self.open_worktree_menu(&path, position, window, cx);
+            }
+            PanelEvent::Move(delta) => {
+                let paths = self.worktree_panel_paths(cx);
+                if paths.is_empty() {
+                    return;
+                }
+                let at = selected.and_then(|path| paths.iter().position(|p| *p == path));
+                let next = match at {
+                    Some(at) => at.saturating_add_signed(delta).min(paths.len() - 1),
+                    None if delta < 0 => paths.len() - 1,
+                    None => 0,
+                };
+                self.worktree_panel_scroll.scroll_to_item(next);
+                model.update(cx, |model, cx| model.select(&paths[next], cx));
+            }
+            PanelEvent::Confirm => {
+                if let Some(path) = selected {
+                    model.update(cx, |model, cx| model.switch_to(&path, window, cx));
+                }
+            }
+            PanelEvent::Delete => {
+                // The main worktree cannot be removed.
+                let removable = selected.filter(|path| {
+                    model
+                        .read(cx)
+                        .entry(path)
+                        .is_some_and(|entry| !entry.is_main())
+                });
+                if let Some(path) = removable {
+                    self.worktrees
+                        .update(cx, |worktrees, cx| worktrees.open_remove(&path, window, cx));
+                }
+            }
+            PanelEvent::Leave => self.set_view(ViewMode::History, window, cx),
+            PanelEvent::NewWorktree => {
+                self.worktrees
+                    .update(cx, |worktrees, cx| worktrees.focus_quick(window, cx));
+            }
+        }
+    }
+
+    /// The right-click menu of a worktree row.
+    fn open_worktree_menu(
+        &mut self,
+        path: &Path,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self.worktrees_model.read(cx).entry(path).cloned() else {
+            return;
+        };
+        let view = cx.entity();
+        let model = self.worktrees_model.clone();
+        let entries: Vec<MenuEntry> = worktree_menu(&entry)
+            .into_iter()
+            .map(|item| {
+                let Some(item) = item else {
+                    return MenuEntry::Separator;
+                };
+                let mut menu_item = MenuItem::new(item.label)
+                    .icon(item.icon)
+                    .disabled(item.disabled);
+                if item.danger {
+                    menu_item = menu_item.danger();
+                }
+                let (view, model, path) = (view.clone(), model.clone(), path.to_path_buf());
+                MenuEntry::Item(menu_item.action(move |window, cx| {
+                    run_worktree_action(item.action, &path, &model, &view, window, cx);
+                }))
+            })
+            .collect();
+        menu::open_context_menu(position, entries, window, cx);
+    }
+
+    /// The panel that replaces the sidebar tree in the Worktrees view.
+    fn worktree_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let model = self.worktrees_model.read(cx);
+        let state = if model.error().is_some() {
+            PanelState::Error
+        } else if !model.is_loaded() {
+            PanelState::Loading
+        } else {
+            PanelState::Ready
+        };
+        let rows: Vec<WorktreeEntry> = worktree_panel_rows(model.entries(), &self.filter)
+            .into_iter()
+            .cloned()
+            .collect();
+        let total = model.entries().len();
+        let selected = model.selected().map(|entry| entry.path().to_path_buf());
+        let view = cx.entity();
+        WorktreePanel::new(
+            state,
+            rows,
+            total,
+            self.filter.clone(),
+            selected,
+            self.worktree_panel_focus.clone(),
+            self.worktree_panel_scroll.clone(),
+            move |event, window, cx| {
+                view.update(cx, |view, cx| view.worktree_panel_event(event, window, cx));
+            },
+        )
+        .into_any_element()
     }
 
     /// Reloads the history and the activity counts that depend on it.
@@ -829,6 +1007,7 @@ impl RepositoryView {
             // Worktrees page is left when one of its rows is selected.
             if self.view == ViewMode::Worktrees {
                 self.view = ViewMode::History;
+                self.sync_sidebar_filter(cx);
             }
             self.history
                 .update(cx, |history, cx| history.reveal_commit(oid, cx));
@@ -2683,21 +2862,23 @@ impl RepositoryView {
         } else {
             SegmentItem::icon(IconName::Edit)
         };
+        let worktrees_item = if layout.labels {
+            SegmentItem::new("Worktrees").with_icon(IconName::Worktree)
+        } else {
+            SegmentItem::icon(IconName::Worktree)
+        };
         let switch_view = cx.entity();
         bar = bar.child(no_shrink(
             Segmented::new("view-switch")
                 .item(history_item)
                 .item(changes_item.tooltip("Local changes"))
-                .selected(match self.view {
-                    ViewMode::History | ViewMode::Worktrees => 0,
-                    ViewMode::Changes => 1,
-                })
+                // The design's tooltip also shows `Ctrl Alt W`; that shortcut
+                // arrives with the titlebar switcher, and the segment's
+                // tooltip takes text only.
+                .item(worktrees_item.tooltip("Worktrees"))
+                .selected(segment_for_view(self.view))
                 .on_select(move |index, window, cx| {
-                    let mode = if index == 1 {
-                        ViewMode::Changes
-                    } else {
-                        ViewMode::History
-                    };
+                    let mode = view_for_segment(index);
                     switch_view.update(cx, |view, cx| view.set_view(mode, window, cx));
                 }),
         ));
@@ -2751,14 +2932,21 @@ impl RepositoryView {
 
     fn render_sidebar(&mut self, width: f32, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
-        let nodes = self.tree_nodes(cx);
+        let worktrees_mode = self.view == ViewMode::Worktrees;
+        let panel = worktrees_mode.then(|| self.worktree_panel(cx));
+        // The tree is not built while the worktree panel stands in for it.
+        let nodes = if worktrees_mode {
+            Vec::new()
+        } else {
+            self.tree_nodes(cx)
+        };
         if let Some(index) = nodes.iter().position(|node| node.current) {
             // ScrollHandle applies this during prepaint, so asking during
             // render lands on the rows that are about to be laid out.
             self.sidebar_scroll.scroll_to_item(index);
         }
         let filtering = !self.filter.trim().is_empty();
-        let no_matches = filtering && nodes.is_empty();
+        let no_matches = !worktrees_mode && filtering && nodes.is_empty();
         // Every row's identity and expansion, so a click, Enter/Space or
         // ←/→ can toggle any expandable node, not only the sections.
         let rows: Vec<(SharedString, bool, bool)> = nodes
@@ -2877,6 +3065,7 @@ impl RepositoryView {
                     .min_h_0()
                     .flex()
                     .flex_col()
+                    .when_some(panel, |this, panel| this.child(panel))
                     .when(no_matches, |this| {
                         this.child(
                             div()
@@ -2891,7 +3080,7 @@ impl RepositoryView {
                                 .child("No matches"),
                         )
                     })
-                    .when(!no_matches, |this| {
+                    .when(!no_matches && !worktrees_mode, |this| {
                         this.child(
                             div().w_full().flex_1().min_w_0().min_h_0().child(
                                 Tree::new("sidebar-tree", nodes)
@@ -4446,6 +4635,50 @@ fn meta_row(label: &'static str, value: impl IntoElement, colors: ThemeColors) -
         .child(div().flex_1().min_w_0().child(value))
 }
 
+/// The toolbar segment that shows `view`: History, Changes, Worktrees.
+fn segment_for_view(view: ViewMode) -> usize {
+    match view {
+        ViewMode::History => 0,
+        ViewMode::Changes => 1,
+        ViewMode::Worktrees => 2,
+    }
+}
+
+/// The view the toolbar segment at `index` opens.
+fn view_for_segment(index: usize) -> ViewMode {
+    match index {
+        1 => ViewMode::Changes,
+        2 => ViewMode::Worktrees,
+        _ => ViewMode::History,
+    }
+}
+
+/// Runs one item of a worktree's context menu.
+fn run_worktree_action(
+    action: WorktreeAction,
+    path: &Path,
+    model: &Entity<WorktreesModel>,
+    view: &Entity<RepositoryView>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match action {
+        WorktreeAction::Switch => model.update(cx, |model, cx| model.switch_to(path, window, cx)),
+        WorktreeAction::OpenInWindow => {
+            model.update(cx, |model, cx| model.open_in_window(path, window, cx))
+        }
+        WorktreeAction::Reveal => model.update(cx, |model, cx| model.reveal(path, window, cx)),
+        WorktreeAction::CopyPath => model.update(cx, |model, cx| model.copy_path(path, window, cx)),
+        WorktreeAction::ToggleLock => {
+            model.update(cx, |model, cx| model.toggle_lock(path, window, cx))
+        }
+        WorktreeAction::Remove => view.update(cx, |view, cx| {
+            view.worktrees
+                .update(cx, |worktrees, cx| worktrees.open_remove(path, window, cx));
+        }),
+    }
+}
+
 /// A click, Enter/Space or ←/→ on an expandable row flips its expansion.
 fn node_toggler(
     rows: Vec<(SharedString, bool, bool)>,
@@ -4549,9 +4782,14 @@ mod tests {
             };
             // Segment: 10px padding each side, 14px icon, 6px gap, 1px border.
             let segmented = if layout.labels {
-                2. * (20. + 14. + 6.) + text("History".len()) + text("Changes".len()) + 2.
+                3. * (20. + 14. + 6.)
+                    + text("History".len())
+                    + text("Changes".len())
+                    + text("Worktrees".len())
+                    + 2.
             } else {
-                70.
+                // Three 34px icon segments and the border.
+                104.
             };
             let fixed = 26. // sidebar toggle
                 + name_item(layout.repo_name)
@@ -4565,7 +4803,8 @@ mod tests {
         }
 
         for width in [
-            620., 700., 760., 810., 870., 1000., 1200., 1360., 1400., 1600.,
+            620., 699., 700., 760., 839., 840., 869., 870., 1000., 1200., 1340., 1419., 1420.,
+            1600.,
         ] {
             let layout = toolbar_layout(width);
             // The client-side frame keeps a 10px shadow band and a 1px border
@@ -4582,19 +4821,21 @@ mod tests {
     #[test]
     fn toolbar_steps_hide_labels_and_names_in_order() {
         assert!(toolbar_layout(1600.).labels);
-        assert!(toolbar_layout(1360.).labels);
-        assert!(!toolbar_layout(1359.).labels);
+        assert!(toolbar_layout(1340.).labels);
+        assert!(!toolbar_layout(1339.).labels);
+        assert_eq!(toolbar_layout(1419.).repo_name, Some(96.));
         assert!(!toolbar_layout(1200.).labels);
         assert_eq!(toolbar_layout(1600.).repo_name, Some(140.));
         assert_eq!(toolbar_layout(1200.).repo_name, Some(96.));
         assert_eq!(toolbar_layout(1000.).repo_name, Some(96.));
         assert_eq!(toolbar_layout(900.).repo_name, Some(64.));
-        assert_eq!(toolbar_layout(820.).repo_name, Some(64.));
+        assert_eq!(toolbar_layout(840.).repo_name, Some(64.));
+        assert_eq!(toolbar_layout(839.).repo_name, None);
         assert_eq!(toolbar_layout(800.).repo_name, None);
         assert_eq!(toolbar_layout(800.).branch_name, Some(64.));
         assert_eq!(toolbar_layout(720.).branch_name, None);
-        assert_eq!(toolbar_layout(650.).search_min, 72.);
-        assert_eq!(toolbar_layout(650.).padding, 8.);
+        assert_eq!(toolbar_layout(650.).search_min, 60.);
+        assert_eq!(toolbar_layout(650.).padding, 6.);
         assert_eq!(toolbar_layout(720.).search_min, 96.);
         assert_eq!(toolbar_layout(1200.).search_min, 150.);
         assert!(!toolbar_layout(900.).search_kbd);
@@ -5689,5 +5930,164 @@ mod tests {
                     .activity_collapsed
             );
         });
+    }
+
+    #[test]
+    fn the_view_segment_has_a_third_tab_for_worktrees() {
+        for (index, view) in [
+            (0, ViewMode::History),
+            (1, ViewMode::Changes),
+            (2, ViewMode::Worktrees),
+        ] {
+            assert_eq!(view_for_segment(index), view);
+            assert_eq!(segment_for_view(view), index);
+        }
+    }
+
+    /// A repository with a linked worktree on branch `extra`, opened in a real
+    /// window. Returns the folder of the linked worktree.
+    fn open_with_linked_worktree(
+        repo: &crate::test_support::TempRepo,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::VisualTestContext,
+        Entity<Workspace>,
+        Entity<RepositoryView>,
+        PathBuf,
+    ) {
+        commit(repo.path(), "a.txt", "one\n");
+        let git = crate::test_support::git();
+        let linked = repo.path().parent().unwrap().join(format!(
+            "{}-linked",
+            repo.path().file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&linked);
+        let opened = Repo::open(git.clone(), repo.path()).expect("open the repository");
+        let tip = match opened.head().expect("read HEAD") {
+            Head::Branch {
+                target: Some(oid), ..
+            }
+            | Head::Detached(oid) => oid,
+            Head::Branch { target: None, .. } => panic!("no commit"),
+        };
+        opened
+            .create_branch("extra", tip, false)
+            .expect("create the branch");
+        opened
+            .add_worktree(&linked, "extra")
+            .expect("add the worktree");
+
+        let (mut cx, workspace) = crate::test_support::open_workspace(git, cx);
+        let path = repo.path().to_path_buf();
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_repository(path, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        let view = cx.update(|_, cx| {
+            workspace
+                .read(cx)
+                .repository_for_test()
+                .expect("the repository is open")
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_view(ViewMode::Worktrees, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        (cx, workspace, view, linked)
+    }
+
+    /// The Worktrees view replaces the sidebar tree with the worktree panel;
+    /// History brings the tree back.
+    #[gpui::test]
+    fn the_worktrees_view_swaps_the_sidebar_tree_for_the_panel(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktree-panel-swap");
+        let (mut cx, _workspace, view, linked) = open_with_linked_worktree(&repo, cx);
+        assert!(cx.debug_bounds("worktree-panel").is_some());
+        assert!(cx.debug_bounds("sidebar-tree-node-0").is_none());
+        // The main worktree is pinned first; the linked one follows.
+        assert!(cx.debug_bounds("worktree-row-0").is_some());
+        assert!(cx.debug_bounds("worktree-row-1").is_some());
+        assert!(cx.debug_bounds("worktree-row-2").is_none());
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.set_view(ViewMode::History, window, cx));
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("worktree-panel").is_none());
+        assert!(cx.debug_bounds("sidebar-tree-node-0").is_some());
+        let _ = std::fs::remove_dir_all(linked);
+    }
+
+    /// ↑/↓ move and select, Enter switches the window to the selected
+    /// worktree.
+    #[gpui::test]
+    fn arrows_select_and_enter_switches_the_worktree(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktree-panel-enter");
+        let (mut cx, workspace, view, linked) = open_with_linked_worktree(&repo, cx);
+        let model = view.read_with(&cx, |view, _| view.worktrees_model());
+        let selected_branch = |cx: &gpui::VisualTestContext| {
+            model.read_with(cx, |model, _| {
+                model.selected().and_then(|e| e.branch()).map(str::to_owned)
+            })
+        };
+        let focus = view.read_with(&cx, |view, _| view.worktree_panel_focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        assert_eq!(selected_branch(&cx).as_deref(), Some("main"));
+
+        cx.simulate_keystrokes("down");
+        assert_eq!(selected_branch(&cx).as_deref(), Some("extra"));
+        cx.simulate_keystrokes("down");
+        assert_eq!(
+            selected_branch(&cx).as_deref(),
+            Some("extra"),
+            "stays on the last row"
+        );
+        cx.simulate_keystrokes("up");
+        assert_eq!(selected_branch(&cx).as_deref(), Some("main"));
+
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        let opened = cx.update(|_, cx| {
+            workspace
+                .read(cx)
+                .repository_for_test()
+                .expect("a repository is open")
+        });
+        let root = opened.read_with(&cx, |view, cx| {
+            view.worktrees_model().read(cx).root().to_path_buf()
+        });
+        assert_eq!(root.canonicalize().unwrap(), linked.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(linked);
+    }
+
+    /// Del opens the Remove dialog for a linked worktree and does nothing on
+    /// the main one.
+    #[gpui::test]
+    fn delete_opens_remove_only_for_a_non_main_worktree(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("worktree-panel-delete");
+        let (mut cx, _workspace, view, linked) = open_with_linked_worktree(&repo, cx);
+        let model = view.read_with(&cx, |view, _| view.worktrees_model());
+        let focus = view.read_with(&cx, |view, _| view.worktree_panel_focus.clone());
+        let has_dialog = |cx: &gpui::VisualTestContext| {
+            view.read_with(cx, |view, cx| view.worktrees.read(cx).has_dialog())
+        };
+        cx.update(|window, cx| window.focus(&focus, cx));
+
+        // The main worktree is selected first.
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
+        assert!(!has_dialog(&cx), "the main worktree cannot be removed");
+
+        cx.simulate_keystrokes("down delete");
+        cx.run_until_parked();
+        model.read_with(&cx, |model, _| {
+            assert_eq!(model.selected().and_then(|e| e.branch()), Some("extra"));
+        });
+        assert!(has_dialog(&cx), "Remove should open for a linked worktree");
+        let _ = std::fs::remove_dir_all(linked);
     }
 }

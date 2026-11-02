@@ -5,6 +5,7 @@
 //! The view also owns the repository metadata the shell needs — HEAD and the
 //! refs — because it is the view that opens the [`Repo`].
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -43,7 +44,17 @@ use crate::ref_ops::{CardRefKind, CommitCard, RefAction};
 
 /// What the history row menu asks the shell to do.
 pub(crate) type RefActionHandler = Rc<dyn Fn(RefAction, &mut Window, &mut App)>;
+
+/// What the shell does with a sidebar action chosen from a ref's menu.
+pub(crate) type SidebarActionHandler = Rc<dyn Fn(SidebarAction, &mut Window, &mut App)>;
+
+/// Sets (`Some`) or clears (`None`) the History's branch filter.
+type FilterSetter = Rc<dyn Fn(Option<String>, &mut App)>;
+
+/// A sidebar node key's context-menu model.
+type RefMenuSource = Rc<dyn Fn(&str) -> Vec<SidebarMenuEntry>>;
 use crate::settings::{GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MAX, GRAPH_WIDTH_MIN};
+use crate::sidebar::{sidebar_menu, SidebarAction, SidebarMenuEntry};
 use crate::theme;
 use crate::workspace::{OpenGitSettings, Workspace};
 
@@ -618,6 +629,13 @@ pub struct HistoryView {
     workspace: WeakEntity<Workspace>,
     /// What the shell does with a row action (branch/tag/reset dialogs).
     on_action: RefActionHandler,
+    /// What the shell does with a sidebar action chosen from a ref's menu
+    /// (a branch submenu of the row menu, or a badge's menu); `None` until the
+    /// shell installs it, and then those items do nothing.
+    sidebar_action: Option<SidebarActionHandler>,
+    /// The branch last picked in a row-menu picker, for the whole session. It
+    /// is listed first in the next picker and never applied by itself.
+    last_picked_branch: Rc<RefCell<Option<String>>>,
     /// The repository root, once `Repo::open` succeeded.
     root: Option<PathBuf>,
     items: Vec<Item>,
@@ -751,6 +769,437 @@ fn push_row_action(
     })));
 }
 
+/// What kind of branch a row action can target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowBranchKind {
+    /// The checked-out branch.
+    Head,
+    Local,
+    Remote,
+}
+
+/// A branch on a row's commit that a row action can target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RowBranch {
+    /// The short name: `main`, or `origin/main` for a remote branch.
+    name: String,
+    kind: RowBranchKind,
+}
+
+impl RowBranch {
+    /// The sidebar node key whose menu belongs to this branch.
+    fn menu_key(&self) -> String {
+        match self.kind {
+            RowBranchKind::Remote => format!("rbranch:{}", self.name),
+            RowBranchKind::Head | RowBranchKind::Local => format!("local:{}", self.name),
+        }
+    }
+}
+
+/// The branches a row's actions work on, for the commit `commit`:
+/// `(other local branches, all targetable branches)`.
+///
+/// The first list is what "Switch to" offers: local branches other than HEAD,
+/// A–Z. The second is for the filter and "Branch" items: the HEAD branch
+/// first, then local A–Z, then remote A–Z. A remote branch is dropped when a
+/// local branch of the same name sits on the same commit (a duplicate for this
+/// purpose), and the symbolic `origin/HEAD` is never offered.
+fn row_branches(commit: Oid, head: Option<&Head>, refs: &[Ref]) -> (Vec<String>, Vec<RowBranch>) {
+    let head_name = match head {
+        Some(Head::Branch { name, .. }) => Some(name.as_str()),
+        _ => None,
+    };
+    let on_commit = |kind: git_core::RefKind| {
+        let mut names: Vec<&str> = refs
+            .iter()
+            .filter(|reference| reference.kind == kind && reference.target == commit)
+            .map(|reference| reference.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    let locals = on_commit(git_core::RefKind::LocalBranch);
+    let others: Vec<String> = locals
+        .iter()
+        .filter(|name| Some(**name) != head_name)
+        .map(|name| (*name).to_owned())
+        .collect();
+
+    let mut branches: Vec<RowBranch> = Vec::new();
+    if let Some(name) = locals.iter().find(|name| Some(**name) == head_name) {
+        branches.push(RowBranch {
+            name: (*name).to_owned(),
+            kind: RowBranchKind::Head,
+        });
+    }
+    branches.extend(others.iter().map(|name| RowBranch {
+        name: name.clone(),
+        kind: RowBranchKind::Local,
+    }));
+    for name in on_commit(git_core::RefKind::RemoteBranch) {
+        let local_name = name.split_once('/').map_or(name, |(_, rest)| rest);
+        if name.ends_with("/HEAD") || locals.contains(&local_name) {
+            continue;
+        }
+        branches.push(RowBranch {
+            name: name.to_owned(),
+            kind: RowBranchKind::Remote,
+        });
+    }
+    (others, branches)
+}
+
+/// The picker's order: `list` as given, with the last-picked branch moved to
+/// the front when it is in the list.
+fn picker_order(mut list: Vec<RowBranch>, last_picked: Option<&str>) -> Vec<RowBranch> {
+    if let Some(index) = list
+        .iter()
+        .position(|branch| Some(branch.name.as_str()) == last_picked)
+    {
+        let picked = list.remove(index);
+        list.insert(0, picked);
+    }
+    list
+}
+
+/// The sidebar node key a badge's right-click opens, or `None` for a badge
+/// that has no menu (a detached HEAD, the "+N" overflow).
+fn badge_menu_key(spec: &BadgeSpec) -> Option<String> {
+    match spec.kind {
+        RefKind::Head if spec.label.as_ref() == "HEAD" => None,
+        RefKind::Head | RefKind::Local => Some(format!("local:{}", spec.label)),
+        RefKind::Remote => Some(format!("rbranch:{}", spec.label)),
+        RefKind::Tag => Some(format!("tag:{}", spec.label)),
+        _ => None,
+    }
+}
+
+/// A sidebar menu model as menu entries; the items dispatch their
+/// [`SidebarAction`] through `handler`, and a disabled item (no action) stays
+/// shown but off.
+fn sidebar_menu_entries(
+    model: Vec<SidebarMenuEntry>,
+    handler: Option<SidebarActionHandler>,
+) -> Vec<MenuEntry> {
+    model
+        .into_iter()
+        .map(|entry| match entry {
+            SidebarMenuEntry::Separator => MenuEntry::Separator,
+            SidebarMenuEntry::Item(item) => {
+                let mut menu_item = MenuItem::new(item.label)
+                    .icon(item.icon)
+                    .disabled(!item.enabled);
+                if let Some(shortcut) = item.shortcut {
+                    menu_item = menu_item.shortcut(shortcut);
+                }
+                if item.danger {
+                    menu_item = menu_item.danger();
+                }
+                if let Some(handler) = handler.clone() {
+                    let action = item.action;
+                    menu_item = menu_item.action(move |window, cx| {
+                        handler(action.clone(), window, cx);
+                    });
+                }
+                MenuEntry::Item(menu_item)
+            }
+        })
+        .collect()
+}
+
+/// What picking a branch in a row-menu picker does.
+#[derive(Clone, Copy)]
+enum Pick {
+    /// Check the branch out.
+    Switch,
+    /// Narrow the History to the branch.
+    Filter,
+    /// Show the branch's full sidebar menu in place.
+    Menu,
+}
+
+/// Everything the history row menu is built from. The menu is pure data plus
+/// callbacks, so its shape is testable without a window; the pickers and the
+/// "Branch" view replace the open menu's rows in place ([`MenuItem::submenu`]),
+/// and "Back" is a submenu item that returns the root rows.
+#[derive(Clone)]
+struct RowMenu {
+    hash: String,
+    card: CommitCard,
+    /// The branch "Reset … to here…" names; `HEAD` when detached.
+    reset_branch: String,
+    /// Targetable branches, HEAD first, local A–Z, remote A–Z.
+    branches: Vec<RowBranch>,
+    /// Local branches other than HEAD, for "Switch to".
+    switchable: Vec<String>,
+    /// The branch this row merged in, while a branch filter is on.
+    merged: Option<String>,
+    /// The branch the History is narrowed to.
+    filter: Option<String>,
+    last_picked: Rc<RefCell<Option<String>>>,
+    on_action: RefActionHandler,
+    on_sidebar: Option<SidebarActionHandler>,
+    on_filter: FilterSetter,
+    /// A sidebar key's menu model.
+    branch_menu: RefMenuSource,
+}
+
+impl RowMenu {
+    fn entries(&self) -> Vec<MenuEntry> {
+        let hash = self.hash.clone();
+        let mut entries = vec![MenuEntry::Item(
+            MenuItem::new("Copy commit hash")
+                .icon(IconName::Copy)
+                .shortcut("Ctrl+C")
+                .action(move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(hash.clone()));
+                }),
+        )];
+        self.push_switch(&mut entries);
+        self.push_filter_items(&mut entries);
+        self.push_branch_items(&mut entries);
+        if let Some(merged) = &self.merged {
+            entries.push(MenuEntry::Separator);
+            entries.push(MenuEntry::Item(self.filter_item(merged, IconName::Branch)));
+        }
+        let (card, on_action) = (&self.card, &self.on_action);
+        push_row_action(
+            &mut entries,
+            card,
+            on_action,
+            "Create branch here…".to_owned(),
+            IconName::Branch,
+            Some("B"),
+            RefAction::CreateBranch,
+            false,
+        );
+        push_row_action(
+            &mut entries,
+            card,
+            on_action,
+            "Create tag here…".to_owned(),
+            IconName::Tag,
+            None,
+            RefAction::CreateTag,
+            false,
+        );
+        entries.push(MenuEntry::Separator);
+        push_row_action(
+            &mut entries,
+            card,
+            on_action,
+            "Cherry-pick".to_owned(),
+            IconName::Undo,
+            None,
+            RefAction::CherryPick,
+            false,
+        );
+        push_row_action(
+            &mut entries,
+            card,
+            on_action,
+            "Revert commit".to_owned(),
+            IconName::Undo,
+            None,
+            RefAction::Revert,
+            false,
+        );
+        push_row_action(
+            &mut entries,
+            card,
+            on_action,
+            format!("Reset {} to here…", self.reset_branch),
+            IconName::Undo,
+            None,
+            RefAction::Reset,
+            true,
+        );
+        entries
+    }
+
+    /// "Switch to {b}" for one other local branch, "Switch to…" for several,
+    /// "Checkout this commit" for none.
+    fn push_switch(&self, entries: &mut Vec<MenuEntry>) {
+        match self.switchable.as_slice() {
+            [] => {
+                let (on_action, card) = (self.on_action.clone(), self.card.clone());
+                entries.push(MenuEntry::Item(
+                    MenuItem::new("Checkout this commit")
+                        .icon(IconName::Check)
+                        .action(move |window, cx| {
+                            on_action(RefAction::CheckoutCommit(card.clone()), window, cx);
+                        }),
+                ));
+            }
+            [name] => entries.push(MenuEntry::Item(self.switch_item(name))),
+            names => {
+                let list = names
+                    .iter()
+                    .map(|name| RowBranch {
+                        name: name.clone(),
+                        kind: RowBranchKind::Local,
+                    })
+                    .collect();
+                entries.push(MenuEntry::Item(self.picker_item(
+                    "Switch to…",
+                    IconName::Check,
+                    list,
+                    Pick::Switch,
+                )));
+            }
+        }
+    }
+
+    fn push_filter_items(&self, entries: &mut Vec<MenuEntry>) {
+        if self.filter.is_some() {
+            let on_filter = self.on_filter.clone();
+            entries.push(MenuEntry::Item(
+                MenuItem::new("Show all commits")
+                    .icon(IconName::X)
+                    .action(move |_, cx| on_filter(None, cx)),
+            ));
+        }
+        match self.branches.as_slice() {
+            [] => {}
+            [branch] => entries.push(MenuEntry::Item(
+                self.filter_item(&branch.name, IconName::Branch),
+            )),
+            _ => entries.push(MenuEntry::Item(self.picker_item(
+                "Show all commits of…",
+                IconName::Branch,
+                self.branches.clone(),
+                Pick::Filter,
+            ))),
+        }
+    }
+
+    fn push_branch_items(&self, entries: &mut Vec<MenuEntry>) {
+        match self.branches.as_slice() {
+            [] => {}
+            [branch] => {
+                let this = self.clone();
+                let branch = branch.clone();
+                entries.push(MenuEntry::Item(
+                    MenuItem::new(format!("Branch {}", branch.name))
+                        .icon(branch_icon(&branch))
+                        .shortcut("›")
+                        .submenu(move || this.branch_view(&branch)),
+                ));
+            }
+            _ => entries.push(MenuEntry::Item(self.picker_item(
+                "Branch…",
+                IconName::Branch,
+                self.branches.clone(),
+                Pick::Menu,
+            ))),
+        }
+    }
+
+    fn switch_item(&self, name: &str) -> MenuItem {
+        let (on_action, branch) = (self.on_action.clone(), name.to_owned());
+        MenuItem::new(format!("Switch to {name}"))
+            .icon(IconName::Check)
+            .action(move |window, cx| {
+                on_action(RefAction::CheckoutBranch(branch.clone()), window, cx);
+            })
+    }
+
+    /// "Show all commits of {name}"; disabled with a check while it is the
+    /// active filter.
+    fn filter_item(&self, name: &str, icon: IconName) -> MenuItem {
+        let active = self.filter.as_deref() == Some(name);
+        let (on_filter, branch) = (self.on_filter.clone(), name.to_owned());
+        MenuItem::new(format!("Show all commits of {name}"))
+            .icon(if active { IconName::Check } else { icon })
+            .disabled(active)
+            .action(move |_, cx| on_filter(Some(branch.clone()), cx))
+    }
+
+    /// An item that swaps the menu for a picker over `list`.
+    fn picker_item(
+        &self,
+        label: &'static str,
+        icon: IconName,
+        list: Vec<RowBranch>,
+        pick: Pick,
+    ) -> MenuItem {
+        let this = self.clone();
+        MenuItem::new(label)
+            .icon(icon)
+            .shortcut("›")
+            .submenu(move || this.picker(list.clone(), pick))
+    }
+
+    /// "Back" plus a rule, then the branches: the last-picked one first. It
+    /// replaces the menu; nothing is applied until a branch is chosen.
+    fn picker(&self, list: Vec<RowBranch>, pick: Pick) -> Vec<MenuEntry> {
+        let mut entries = vec![self.back_item(), MenuEntry::Separator];
+        for branch in picker_order(list, self.last_picked.borrow().as_deref()) {
+            let mut item = MenuItem::new(branch.name.clone()).icon(branch_icon(&branch));
+            match branch.kind {
+                RowBranchKind::Head => item = item.shortcut("HEAD"),
+                RowBranchKind::Remote => item = item.shortcut("remote"),
+                RowBranchKind::Local => {}
+            }
+            let last_picked = self.last_picked.clone();
+            let name = branch.name.clone();
+            item = match pick {
+                Pick::Switch => {
+                    let (on_action, name) = (self.on_action.clone(), name);
+                    item.action(move |window, cx| {
+                        last_picked.replace(Some(name.clone()));
+                        on_action(RefAction::CheckoutBranch(name.clone()), window, cx);
+                    })
+                }
+                Pick::Filter => {
+                    let (on_filter, name) = (self.on_filter.clone(), name);
+                    item.action(move |_, cx| {
+                        last_picked.replace(Some(name.clone()));
+                        on_filter(Some(name.clone()), cx);
+                    })
+                }
+                Pick::Menu => {
+                    let this = self.clone();
+                    item.submenu(move || {
+                        last_picked.replace(Some(name.clone()));
+                        this.branch_view(&branch)
+                    })
+                }
+            };
+            entries.push(MenuEntry::Item(item));
+        }
+        entries
+    }
+
+    /// A branch's full sidebar menu, under "Back".
+    fn branch_view(&self, branch: &RowBranch) -> Vec<MenuEntry> {
+        let mut entries = vec![self.back_item(), MenuEntry::Separator];
+        entries.extend(sidebar_menu_entries(
+            (self.branch_menu)(&branch.menu_key()),
+            self.on_sidebar.clone(),
+        ));
+        entries
+    }
+
+    /// "Back": the row menu's root rows again.
+    fn back_item(&self) -> MenuEntry {
+        let this = self.clone();
+        MenuEntry::Item(
+            MenuItem::new("Back")
+                .icon(IconName::Undo)
+                .shortcut("‹")
+                .submenu(move || this.entries()),
+        )
+    }
+}
+
+fn branch_icon(branch: &RowBranch) -> IconName {
+    match branch.kind {
+        RowBranchKind::Remote => IconName::Cloud,
+        RowBranchKind::Head | RowBranchKind::Local => IconName::Branch,
+    }
+}
+
 impl HistoryView {
     /// Starts in the loading state; opening the repository, reading HEAD, the
     /// refs and the history all run in the background and fill in the rows or
@@ -780,6 +1229,8 @@ impl HistoryView {
             git,
             workspace,
             on_action,
+            sidebar_action: None,
+            last_picked_branch: Rc::new(RefCell::new(None)),
             root: None,
             items: Vec::new(),
             pending_rows: false,
@@ -1551,6 +2002,12 @@ impl HistoryView {
         (self.on_action)(action, window, cx);
     }
 
+    /// Installs what the shell does with a sidebar action chosen from a ref's
+    /// menu, so the row menu's "Branch" view and the badge menus work.
+    pub(crate) fn set_sidebar_action_handler(&mut self, handler: SidebarActionHandler) {
+        self.sidebar_action = Some(handler);
+    }
+
     /// Right-clicking a row selects it and opens the row menu at the pointer.
     fn open_row_menu(
         &mut self,
@@ -1559,152 +2016,65 @@ impl HistoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let hash = self
-            .rows()
-            .get(index)
-            .map(|item| item.commit.id.to_string());
-        let card = self.rows().get(index).map(|item| {
-            CommitCard::from_commit(&item.commit, self.refs().unwrap_or(&[]), self.head())
-        });
-        let branch = match self.head() {
-            Some(Head::Branch { name, .. }) => name.clone(),
-            _ => "HEAD".to_owned(),
+        let Some(item) = self.rows().get(index) else {
+            return;
         };
-        let mut entries = vec![MenuEntry::Item(
-            MenuItem::new("Copy commit hash")
-                .icon(IconName::Copy)
-                .shortcut("Ctrl+C")
-                .disabled(hash.is_none())
-                .action(move |_, cx| {
-                    if let Some(hash) = hash.clone() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(hash));
-                    }
-                }),
-        )];
-        if let Some(card) = card {
-            let on_action = self.on_action.clone();
-            let head_branch = match self.head() {
-                Some(Head::Branch { name, .. }) => Some(name.clone()),
-                _ => None,
-            };
-            let locals: Vec<String> = card
-                .refs
-                .iter()
-                .filter(|reference| reference.kind == CardRefKind::Local)
-                .map(|reference| reference.name.clone())
-                .filter(|name| Some(name) != head_branch.as_ref())
-                .collect();
-            if locals.is_empty() {
-                let checkout = on_action.clone();
-                let checkout_card = card.clone();
-                entries.push(MenuEntry::Item(
-                    MenuItem::new("Checkout this commit")
-                        .icon(IconName::Check)
-                        .action(move |window, cx| {
-                            checkout(RefAction::CheckoutCommit(checkout_card.clone()), window, cx);
-                        }),
-                ));
-            }
-            for name in locals {
-                let checkout = on_action.clone();
-                let branch = name.clone();
-                entries.push(MenuEntry::Item(
-                    MenuItem::new(format!("Switch to {name}"))
-                        .icon(IconName::Check)
-                        .action(move |window, cx| {
-                            checkout(RefAction::CheckoutBranch(branch.clone()), window, cx);
-                        }),
-                ));
-            }
-            // The branch filter: leave it, or narrow to a local branch on this
-            // commit. (The pickers and the merged-branch items are W7's.)
-            let view = cx.entity();
-            if self.branch_filter().is_some() {
-                let view = view.clone();
-                entries.push(MenuEntry::Item(
-                    MenuItem::new("Show all commits")
-                        .icon(IconName::X)
-                        .action(move |_, cx| {
-                            view.update(cx, |view, cx| view.set_branch_filter(None, cx));
-                        }),
-                ));
-            }
-            let active = self.branch_filter().map(str::to_owned);
-            for reference in card
-                .refs
-                .iter()
-                .filter(|reference| reference.kind == CardRefKind::Local)
-            {
-                let name = reference.name.clone();
-                let is_active = active.as_deref() == Some(name.as_str());
-                let view = view.clone();
-                entries.push(MenuEntry::Item(
-                    MenuItem::new(format!("Show all commits of {name}"))
-                        .icon(if is_active {
-                            IconName::Check
-                        } else {
-                            IconName::Branch
-                        })
-                        .disabled(is_active)
-                        .action(move |_, cx| {
-                            let name = name.clone();
-                            view.update(cx, |view, cx| view.set_branch_filter(Some(name), cx));
-                        }),
-                ));
-            }
-            push_row_action(
-                &mut entries,
-                &card,
-                &on_action,
-                "Create branch here…".to_owned(),
-                IconName::Branch,
-                Some("B"),
-                RefAction::CreateBranch,
-                false,
-            );
-            push_row_action(
-                &mut entries,
-                &card,
-                &on_action,
-                "Create tag here…".to_owned(),
-                IconName::Tag,
-                None,
-                RefAction::CreateTag,
-                false,
-            );
-            entries.push(MenuEntry::Separator);
-            push_row_action(
-                &mut entries,
-                &card,
-                &on_action,
-                "Cherry-pick".to_owned(),
-                IconName::Undo,
-                None,
-                RefAction::CherryPick,
-                false,
-            );
-            push_row_action(
-                &mut entries,
-                &card,
-                &on_action,
-                "Revert commit".to_owned(),
-                IconName::Undo,
-                None,
-                RefAction::Revert,
-                false,
-            );
-            push_row_action(
-                &mut entries,
-                &card,
-                &on_action,
-                format!("Reset {branch} to here…"),
-                IconName::Undo,
-                None,
-                RefAction::Reset,
-                true,
-            );
+        let commit = item.commit.id;
+        let refs = self.refs().unwrap_or(&[]);
+        let card = CommitCard::from_commit(&item.commit, refs, self.head());
+        let (switchable, branches) = row_branches(commit, self.head(), refs);
+        let view = cx.entity();
+        let menu = RowMenu {
+            hash: commit.to_string(),
+            card,
+            reset_branch: match self.head() {
+                Some(Head::Branch { name, .. }) => name.clone(),
+                _ => "HEAD".to_owned(),
+            },
+            branches,
+            switchable,
+            merged: self
+                .branch_rows
+                .as_ref()
+                .and_then(|rows| rows.merged_from.get(&commit).cloned()),
+            filter: self.branch_filter().map(str::to_owned),
+            last_picked: self.last_picked_branch.clone(),
+            on_action: self.on_action.clone(),
+            on_sidebar: self.sidebar_action.clone(),
+            on_filter: Rc::new(move |branch, cx| {
+                view.update(cx, |view, cx| view.set_branch_filter(branch, cx));
+            }),
+            branch_menu: self.ref_menu_source(),
+        };
+        menu::open_context_menu(position, menu.entries(), window, cx);
+    }
+
+    /// Where a ref's own sidebar menu comes from: the sidebar's model for a
+    /// sidebar key, over a snapshot of HEAD and the refs.
+    fn ref_menu_source(&self) -> RefMenuSource {
+        let head = self.head().cloned();
+        let refs: Rc<[Ref]> = self.refs().unwrap_or(&[]).into();
+        // No worktree extras: only the worktree rows' menus read them.
+        Rc::new(move |key| sidebar_menu(key, head.as_ref(), None, Some(&refs)))
+    }
+
+    /// Right-clicking a branch, tag or remote badge opens that ref's own
+    /// sidebar menu in place of the row menu.
+    fn open_badge_menu(
+        &mut self,
+        spec: &BadgeSpec,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = badge_menu_key(spec) else {
+            return;
+        };
+        let source = self.ref_menu_source();
+        let entries = sidebar_menu_entries(source(&key), self.sidebar_action.clone());
+        if !entries.is_empty() {
+            menu::open_context_menu(position, entries, window, cx);
         }
-        menu::open_context_menu(position, entries, window, cx);
     }
 
     /// The commit card a dialog shows for `oid`; a commit outside the loaded
@@ -2733,11 +3103,40 @@ impl HistoryView {
                     .items_center()
                     .gap(px(BADGE_GAP));
                 for (index, spec) in specs.iter().take(fit.shown).enumerate() {
+                    // The wrapper takes the right-click: `RefBadge` has no
+                    // mouse hooks, and the row's own menu must not also open.
+                    let menu_spec = spec.clone();
                     summary = summary.child(
-                        RefBadge::new(format!("history-badge-{ix}-{index}"), spec.label.clone())
-                            .kind(spec.kind)
-                            .max_label_width(px(BADGE_LABEL_MAX))
-                            .tooltip(spec.tooltip.clone()),
+                        div()
+                            .id(format!("history-badge-menu-{ix}-{index}"))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .debug_selector(|| format!("history-badge-menu-{ix}-{index}"))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                                    if badge_menu_key(&menu_spec).is_none() {
+                                        return;
+                                    }
+                                    cx.stop_propagation();
+                                    let focus = view.focus.clone();
+                                    window.focus(&focus, cx);
+                                    view.select_row(ix, cx);
+                                    view.open_badge_menu(&menu_spec, event.position, window, cx);
+                                    // Keep the menu that just took focus.
+                                    window.prevent_default();
+                                }),
+                            )
+                            .child(
+                                RefBadge::new(
+                                    format!("history-badge-{ix}-{index}"),
+                                    spec.label.clone(),
+                                )
+                                .kind(spec.kind)
+                                .max_label_width(px(BADGE_LABEL_MAX))
+                                .tooltip(spec.tooltip.clone()),
+                            ),
                     );
                 }
                 if fit.collapsed {
@@ -3806,6 +4205,398 @@ mod tests {
         }
     }
 
+    fn local(name: &str, target: Oid) -> Ref {
+        reference(
+            git_core::RefKind::LocalBranch,
+            &format!("refs/heads/{name}"),
+            name,
+            target,
+        )
+    }
+
+    fn remote(name: &str, target: Oid) -> Ref {
+        reference(
+            git_core::RefKind::RemoteBranch,
+            &format!("refs/remotes/{name}"),
+            name,
+            target,
+        )
+    }
+
+    fn branch_names(branches: &[RowBranch]) -> Vec<&str> {
+        branches.iter().map(|branch| branch.name.as_str()).collect()
+    }
+
+    #[test]
+    fn row_branches_put_head_first_then_local_then_remote_and_drop_duplicates() {
+        let commit = oid(1);
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: Some(commit),
+        };
+        let refs = vec![
+            remote("origin/zed", commit),
+            local("feat/b", commit),
+            remote("origin/main", commit),
+            local("main", commit),
+            remote("origin/HEAD", commit),
+            local("feat/a", commit),
+            remote("origin/alpha", commit),
+            local("elsewhere", oid(2)),
+            // Same short name as a local branch, but on another commit: kept.
+            remote("origin/feat/a", oid(3)),
+        ];
+
+        let (others, branches) = row_branches(commit, Some(&head), &refs);
+
+        assert_eq!(others, ["feat/a", "feat/b"]);
+        assert_eq!(
+            branch_names(&branches),
+            ["main", "feat/a", "feat/b", "origin/alpha", "origin/zed"]
+        );
+        assert_eq!(branches[0].kind, RowBranchKind::Head);
+        assert_eq!(branches[1].kind, RowBranchKind::Local);
+        assert_eq!(branches[3].kind, RowBranchKind::Remote);
+    }
+
+    #[test]
+    fn row_branches_keep_a_remote_whose_local_twin_sits_on_another_commit() {
+        let commit = oid(1);
+        let refs = vec![local("feat", oid(2)), remote("origin/feat", commit)];
+
+        let (others, branches) = row_branches(commit, None, &refs);
+
+        assert!(others.is_empty());
+        assert_eq!(branch_names(&branches), ["origin/feat"]);
+    }
+
+    #[test]
+    fn the_picker_lists_the_last_picked_branch_first() {
+        let list = |names: &[&str]| -> Vec<RowBranch> {
+            names
+                .iter()
+                .map(|name| RowBranch {
+                    name: (*name).to_owned(),
+                    kind: RowBranchKind::Local,
+                })
+                .collect()
+        };
+        let ordered = picker_order(list(&["main", "a", "b"]), Some("b"));
+        assert_eq!(branch_names(&ordered), ["b", "main", "a"]);
+        let ordered = picker_order(list(&["main", "a", "b"]), Some("gone"));
+        assert_eq!(branch_names(&ordered), ["main", "a", "b"]);
+        let ordered = picker_order(list(&["main", "a", "b"]), None);
+        assert_eq!(branch_names(&ordered), ["main", "a", "b"]);
+    }
+
+    fn row_menu(
+        commit: Oid,
+        head: Option<Head>,
+        refs: Vec<Ref>,
+        filter: Option<&str>,
+        merged: Option<&str>,
+    ) -> RowMenu {
+        let (switchable, branches) = row_branches(commit, head.as_ref(), &refs);
+        let refs: Rc<[Ref]> = refs.into();
+        let head_for_menu = head.clone();
+        RowMenu {
+            hash: commit.to_string(),
+            card: CommitCard::bare(commit),
+            reset_branch: match &head {
+                Some(Head::Branch { name, .. }) => name.clone(),
+                _ => "HEAD".to_owned(),
+            },
+            branches,
+            switchable,
+            merged: merged.map(str::to_owned),
+            filter: filter.map(str::to_owned),
+            last_picked: Rc::new(RefCell::new(None)),
+            on_action: Rc::new(|_, _, _| {}),
+            on_sidebar: None,
+            on_filter: Rc::new(|_, _| {}),
+            branch_menu: Rc::new(move |key| {
+                sidebar_menu(key, head_for_menu.as_ref(), None, Some(&refs))
+            }),
+        }
+    }
+
+    /// Labels of the items; a rule is `---`.
+    fn labels(entries: &[MenuEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                MenuEntry::Item(item) => item.label.to_string(),
+                MenuEntry::Separator => "---".to_owned(),
+            })
+            .collect()
+    }
+
+    fn find<'a>(entries: &'a [MenuEntry], label: &str) -> &'a MenuItem {
+        entries
+            .iter()
+            .find_map(|entry| match entry {
+                MenuEntry::Item(item) if item.label.as_ref() == label => Some(item),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no item {label:?} in {:?}", labels(entries)))
+    }
+
+    /// The rows the item swaps the menu for.
+    fn open(entries: &[MenuEntry], label: &str) -> Vec<MenuEntry> {
+        let submenu = find(entries, label)
+            .submenu
+            .clone()
+            .unwrap_or_else(|| panic!("{label:?} is not a submenu"));
+        submenu()
+    }
+
+    const ROW_TAIL: [&str; 6] = [
+        "Create branch here…",
+        "Create tag here…",
+        "---",
+        "Cherry-pick",
+        "Revert commit",
+        "Reset main to here…",
+    ];
+
+    fn tail(labels: Vec<String>) -> Vec<String> {
+        labels[labels.len() - ROW_TAIL.len()..].to_vec()
+    }
+
+    fn main_head(commit: Oid) -> Option<Head> {
+        Some(Head::Branch {
+            name: "main".to_owned(),
+            target: Some(commit),
+        })
+    }
+
+    #[test]
+    fn a_row_without_branches_offers_to_check_out_the_commit() {
+        let commit = oid(1);
+        let menu = row_menu(commit, main_head(oid(9)), vec![], None, None);
+        let entries = menu.entries();
+
+        assert_eq!(
+            labels(&entries)[..2],
+            ["Copy commit hash", "Checkout this commit"]
+        );
+        // No branch on the commit: no filter or branch items either.
+        assert_eq!(labels(&entries).len(), 2 + ROW_TAIL.len());
+        assert_eq!(tail(labels(&entries)), ROW_TAIL);
+    }
+
+    #[test]
+    fn a_row_with_head_and_one_other_branch_switches_directly_but_picks_the_rest() {
+        let commit = oid(1);
+        let refs = vec![local("main", commit), local("feat", commit)];
+        let menu = row_menu(commit, main_head(commit), refs, None, None);
+        let entries = menu.entries();
+
+        let head = labels(&entries);
+        assert_eq!(
+            head[..5],
+            [
+                "Copy commit hash",
+                "Switch to feat",
+                // Two branches on the commit (HEAD and feat): the pickers.
+                "Show all commits of…",
+                "Branch…",
+                "Create branch here…",
+            ]
+        );
+        assert_eq!(tail(head), ROW_TAIL);
+    }
+
+    #[test]
+    fn a_row_with_a_single_branch_uses_the_direct_items() {
+        let commit = oid(1);
+        let refs = vec![local("feat", commit)];
+        let menu = row_menu(commit, main_head(oid(9)), refs, None, None);
+        let entries = menu.entries();
+
+        assert_eq!(
+            labels(&entries)[..4],
+            [
+                "Copy commit hash",
+                "Switch to feat",
+                "Show all commits of feat",
+                "Branch feat",
+            ]
+        );
+        assert!(!find(&entries, "Show all commits of feat").disabled);
+        assert!(find(&entries, "Branch feat").submenu.is_some());
+    }
+
+    #[test]
+    fn a_row_with_several_branches_uses_the_pickers() {
+        let commit = oid(1);
+        let refs = vec![
+            local("b", commit),
+            local("a", commit),
+            remote("origin/c", commit),
+        ];
+        let menu = row_menu(commit, main_head(oid(9)), refs, None, None);
+        let entries = menu.entries();
+
+        assert_eq!(
+            labels(&entries)[..4],
+            [
+                "Copy commit hash",
+                "Switch to…",
+                "Show all commits of…",
+                "Branch…",
+            ]
+        );
+        // "Switch to…" lists local branches only; the others also remotes.
+        let switch = labels(&open(&entries, "Switch to…"));
+        assert_eq!(switch, ["Back", "---", "a", "b"]);
+        let filter = labels(&open(&entries, "Show all commits of…"));
+        assert_eq!(filter, ["Back", "---", "a", "b", "origin/c"]);
+    }
+
+    #[test]
+    fn the_active_filter_adds_show_all_and_disables_its_own_branch() {
+        let commit = oid(1);
+        let refs = vec![local("feat", commit)];
+        let menu = row_menu(commit, main_head(oid(9)), refs, Some("feat"), None);
+        let entries = menu.entries();
+
+        assert_eq!(
+            labels(&entries)[..5],
+            [
+                "Copy commit hash",
+                "Switch to feat",
+                "Show all commits",
+                "Show all commits of feat",
+                "Branch feat",
+            ]
+        );
+        let item = find(&entries, "Show all commits of feat");
+        assert!(item.disabled);
+        assert_eq!(item.icon, Some(IconName::Check));
+    }
+
+    #[test]
+    fn a_merge_row_in_filter_mode_adds_the_merged_branch_after_a_rule() {
+        let commit = oid(1);
+        let menu = row_menu(
+            commit,
+            main_head(oid(9)),
+            vec![],
+            Some("feat"),
+            Some("topic"),
+        );
+        let entries = menu.entries();
+
+        assert_eq!(
+            labels(&entries)[..5],
+            [
+                "Copy commit hash",
+                "Checkout this commit",
+                "Show all commits",
+                "---",
+                "Show all commits of topic",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_branch_item_opens_the_branch_sidebar_menu_and_back_returns_to_the_root() {
+        let commit = oid(1);
+        let refs = vec![local("feat", commit)];
+        let menu = row_menu(commit, main_head(oid(9)), refs, None, None);
+        let root = menu.entries();
+
+        let view = open(&root, "Branch feat");
+        let names = labels(&view);
+        assert_eq!(names[..3], ["Back", "---", "Checkout"]);
+        assert!(names.contains(&"Rename…".to_owned()));
+        assert!(names.contains(&"Copy branch name".to_owned()));
+
+        assert_eq!(labels(&open(&view, "Back")), labels(&root));
+    }
+
+    #[test]
+    fn a_remote_branch_opens_the_remote_branch_menu() {
+        let commit = oid(1);
+        let refs = vec![remote("origin/feat", commit)];
+        let menu = row_menu(commit, main_head(oid(9)), refs, None, None);
+        let root = menu.entries();
+
+        assert_eq!(
+            find(&root, "Branch origin/feat").icon,
+            Some(IconName::Cloud)
+        );
+        let names = labels(&open(&root, "Branch origin/feat"));
+        assert_eq!(names[2], "Checkout as local branch");
+        assert!(names.contains(&"Delete remote branch…".to_owned()));
+    }
+
+    #[test]
+    fn picking_a_branch_is_remembered_and_listed_first_without_being_applied() {
+        let commit = oid(1);
+        let refs = vec![local("a", commit), local("b", commit), local("c", commit)];
+        let menu = row_menu(commit, main_head(oid(9)), refs, None, None);
+        let root = menu.entries();
+
+        let picker = open(&root, "Branch…");
+        assert_eq!(labels(&picker), ["Back", "---", "a", "b", "c"]);
+        // Choosing "c" shows its menu and remembers it.
+        let view = open(&picker, "c");
+        assert_eq!(labels(&view)[..3], ["Back", "---", "Checkout"]);
+        assert_eq!(menu.last_picked.borrow().as_deref(), Some("c"));
+
+        // Next time "c" is first, and the other pickers list it first too.
+        assert_eq!(
+            labels(&open(&root, "Branch…")),
+            ["Back", "---", "c", "a", "b"]
+        );
+        assert_eq!(
+            labels(&open(&root, "Show all commits of…")),
+            ["Back", "---", "c", "a", "b"]
+        );
+    }
+
+    #[test]
+    fn the_branch_view_keeps_the_sidebar_enabled_state() {
+        let commit = oid(1);
+        let refs = vec![local("feat", commit)];
+        let menu = row_menu(commit, main_head(oid(9)), refs, None, None);
+
+        let view = open(&menu.entries(), "Branch feat");
+
+        assert!(!find(&view, "Checkout").disabled);
+        // Merge is not wired yet in the sidebar either.
+        assert!(find(&view, "Merge feat into main").disabled);
+    }
+
+    #[test]
+    fn badges_open_their_ref_menu_but_overflow_and_detached_head_do_not() {
+        let spec = |kind, label: &str| BadgeSpec {
+            kind,
+            label: label.to_owned().into(),
+            tooltip: "".into(),
+        };
+        assert_eq!(
+            badge_menu_key(&spec(RefKind::Head, "main")).as_deref(),
+            Some("local:main")
+        );
+        assert_eq!(badge_menu_key(&spec(RefKind::Head, "HEAD")), None);
+        assert_eq!(
+            badge_menu_key(&spec(RefKind::Local, "feat/x")).as_deref(),
+            Some("local:feat/x")
+        );
+        assert_eq!(
+            badge_menu_key(&spec(RefKind::Remote, "origin/main")).as_deref(),
+            Some("rbranch:origin/main")
+        );
+        assert_eq!(
+            badge_menu_key(&spec(RefKind::Tag, "v1.0")).as_deref(),
+            Some("tag:v1.0")
+        );
+        assert_eq!(badge_menu_key(&spec(RefKind::Overflow, "+3")), None);
+    }
+
     #[test]
     fn badges_order_head_locals_remotes_and_tags_without_duplicating_head() {
         let head_oid = oid(1);
@@ -4477,6 +5268,58 @@ mod tests {
                 "the row menu stayed open after its item was clicked"
             );
         });
+    }
+
+    /// Right-clicking a branch badge opens that branch's own sidebar menu (not
+    /// the row menu), and its items go to the sidebar action handler.
+    #[gpui::test]
+    fn right_clicking_a_branch_badge_opens_the_branch_menu(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, Modifiers, MouseButton};
+
+        let repo = crate::test_support::TempRepo::new("history-badge-menu");
+        commit(repo.path(), "a.txt", "A");
+        commit(repo.path(), "b.txt", "B");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        let seen: Rc<RefCell<Vec<SidebarAction>>> = Rc::default();
+        let sink = seen.clone();
+        history.update(&mut cx, |view, _| {
+            view.set_sidebar_action_handler(Rc::new(move |action, _, _| {
+                sink.borrow_mut().push(action);
+            }));
+        });
+        let branch = history.read_with(&cx, |view, _| match view.head() {
+            Some(Head::Branch { name, .. }) => name.clone(),
+            other => panic!("expected a branch HEAD, got {other:?}"),
+        });
+
+        let badge = cx
+            .debug_bounds("history-badge-menu-0-0")
+            .expect("the HEAD badge of the first row was not drawn");
+        let position = badge.center();
+        cx.simulate_mouse_down(position, MouseButton::Right, Modifiers::default());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(
+                ui::overlay::layer_count(window, cx),
+                1,
+                "right-clicking a badge must open exactly one menu"
+            );
+        });
+
+        // Item 1 of the branch menu, "Show all commits of {branch}", sits 48 px
+        // below the menu's corner (6 px padding, one 28 px row, half a row).
+        cx.simulate_click(
+            point(position.x + px(40.), position.y + px(48.)),
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            *seen.borrow(),
+            [SidebarAction::ShowBranchCommits(branch)],
+            "the badge menu is not the branch's sidebar menu"
+        );
     }
 
     /// The status only says "No matches" once the whole history was scanned; a

@@ -98,13 +98,18 @@ impl WorktreesView {
         }
     }
 
+    /// Whether the add or remove dialog is open (tests).
+    #[cfg(test)]
+    pub(crate) fn has_dialog(&self) -> bool {
+        self.dialog.is_some()
+    }
+
     pub(crate) fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()
     }
 
     /// Puts the cursor in the quick-create input (the sidebar's "New
     /// worktree…").
-    #[allow(dead_code)] // used by the sidebar panel (W4)
     pub(crate) fn focus_quick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = self.quick.read(cx).focus_handle().clone();
         window.focus(&handle, cx);

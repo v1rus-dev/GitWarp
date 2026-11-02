@@ -32,6 +32,7 @@ mod welcome;
 mod welcome_activity;
 mod workspace;
 mod worktree_dialog;
+mod worktree_glyphs;
 mod worktree_path;
 mod worktrees_model;
 mod worktrees_view;

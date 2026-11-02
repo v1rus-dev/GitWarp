@@ -20,6 +20,9 @@ use crate::theme::ActiveTheme;
 /// A menu callback.
 pub type MenuAction = Rc<dyn Fn(&mut Window, &mut App)>;
 
+/// Builds the rows an item replaces its menu with; called on every activation.
+pub type MenuSubmenu = Rc<dyn Fn() -> Vec<MenuEntry>>;
+
 /// One actionable row of a menu.
 #[derive(Clone)]
 pub struct MenuItem {
@@ -29,6 +32,9 @@ pub struct MenuItem {
     pub danger: bool,
     pub disabled: bool,
     pub action: MenuAction,
+    /// When set, activating the item swaps the open menu's rows for these
+    /// instead of closing it and running `action`.
+    pub submenu: Option<MenuSubmenu>,
 }
 
 impl MenuItem {
@@ -40,6 +46,7 @@ impl MenuItem {
             danger: false,
             disabled: false,
             action: Rc::new(|_, _| {}),
+            submenu: None,
         }
     }
 
@@ -65,6 +72,14 @@ impl MenuItem {
 
     pub fn action(mut self, action: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.action = Rc::new(action);
+        self
+    }
+
+    /// Makes the item replace the open menu's rows in place (same position,
+    /// same focus) instead of closing it. A "Back" row is just another such
+    /// item that returns the parent's rows.
+    pub fn submenu(mut self, entries: impl Fn() -> Vec<MenuEntry> + 'static) -> Self {
+        self.submenu = Some(Rc::new(entries));
         self
     }
 }
@@ -244,11 +259,11 @@ impl MenuView {
             .collect()
     }
 
-    fn item_action(&self, index: usize) -> Option<MenuAction> {
+    fn item(&self, index: usize) -> Option<&MenuItem> {
         self.entries
             .iter()
             .filter_map(|entry| match entry {
-                MenuEntry::Item(item) => Some(item.action.clone()),
+                MenuEntry::Item(item) => Some(item),
                 MenuEntry::Separator => None,
             })
             .nth(index)
@@ -264,10 +279,17 @@ impl MenuView {
         cx.notify();
     }
 
-    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut App) {
-        let Some(action) = self.item_action(index) else {
+    fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.item(index) else {
             return;
         };
+        if let Some(submenu) = item.submenu.clone() {
+            self.entries = submenu();
+            self.nav.clear();
+            cx.notify();
+            return;
+        }
+        let action = item.action.clone();
         if let Some(layer) = self.layer {
             overlay::close(layer, window, cx);
         }

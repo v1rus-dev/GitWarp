@@ -7,12 +7,24 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use git_core::{Git, Head, Oid, Ref, RefKind, Repo, Stash, Submodule, SubmoduleState, Worktree};
-use gpui::SharedString;
-use ui::{IconName, TreeNodeData};
+use gpui::prelude::FluentBuilder;
+use gpui::{
+    div, px, App, ElementId, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, RenderOnce, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Window,
+};
+use ui::actions::{Cancel, Confirm, SelectNext, SelectPrev, TreeDelete};
+use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_SM};
+use ui::theme::{ActiveTheme, ThemeColors};
+use ui::{Button, Chip, CountPill, Icon, IconName, Skeleton, Tooltip, TreeNodeData};
+
+use crate::worktree_glyphs::{worktree_glyphs, MAIN_WORKTREE_TIP};
+use crate::worktrees_model::WorktreeEntry;
 
 /// The six sidebar sections, in display order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1250,6 +1262,525 @@ impl TagRun {
     }
 }
 
+// ----- the Worktrees view's panel -----
+
+/// The rows of the worktree panel: those whose folder name or branch contain
+/// `query` (case-insensitive), the main worktree pinned first and the rest by
+/// recency (the model's order breaks ties).
+pub fn worktree_panel_rows<'a>(
+    entries: &'a [WorktreeEntry],
+    query: &str,
+) -> Vec<&'a WorktreeEntry> {
+    let query = query.trim().to_lowercase();
+    let mut rows: Vec<&WorktreeEntry> = entries
+        .iter()
+        .filter(|entry| {
+            query.is_empty()
+                || format!("{} {}", entry.name(), entry.branch().unwrap_or(""))
+                    .to_lowercase()
+                    .contains(&query)
+        })
+        .collect();
+    // `sort_by_key` is stable: equal recency keeps the model's order.
+    rows.sort_by_key(|entry| (!entry.is_main(), Reverse(entry.last_used.unwrap_or(0))));
+    rows
+}
+
+/// What a worktree's context menu item does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeAction {
+    Switch,
+    OpenInWindow,
+    Reveal,
+    CopyPath,
+    ToggleLock,
+    Remove,
+}
+
+/// One item of a worktree's context menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeMenuItem {
+    pub action: WorktreeAction,
+    pub label: &'static str,
+    pub icon: IconName,
+    pub disabled: bool,
+    pub danger: bool,
+}
+
+/// The context menu of `entry`; `None` is the separator. The disabled rules
+/// are the design's: switching needs another, existing folder; locking and
+/// removing never apply to the main worktree, locking not to a missing one.
+pub fn worktree_menu(entry: &WorktreeEntry) -> Vec<Option<WorktreeMenuItem>> {
+    let item = |action, label, icon, disabled, danger| {
+        Some(WorktreeMenuItem {
+            action,
+            label,
+            icon,
+            disabled,
+            danger,
+        })
+    };
+    vec![
+        item(
+            WorktreeAction::Switch,
+            "Switch to this worktree",
+            IconName::Worktree,
+            entry.is_current() || entry.missing,
+            false,
+        ),
+        item(
+            WorktreeAction::OpenInWindow,
+            "Open in new window",
+            IconName::Sidebar,
+            entry.missing,
+            false,
+        ),
+        item(
+            WorktreeAction::Reveal,
+            "Reveal in file manager",
+            IconName::Folder,
+            entry.missing,
+            false,
+        ),
+        item(
+            WorktreeAction::CopyPath,
+            "Copy path",
+            IconName::Copy,
+            false,
+            false,
+        ),
+        None,
+        item(
+            WorktreeAction::ToggleLock,
+            if entry.locked().is_some() {
+                "Unlock"
+            } else {
+                "Lock"
+            },
+            IconName::Lock,
+            entry.is_main() || entry.missing,
+            false,
+        ),
+        item(
+            WorktreeAction::Remove,
+            "Remove worktree…",
+            IconName::Trash,
+            entry.is_main(),
+            true,
+        ),
+    ]
+}
+
+/// What the panel reports to its owner.
+#[derive(Clone, Debug)]
+pub enum PanelEvent {
+    /// A click: show this worktree in the detail pane.
+    Select(PathBuf),
+    /// A double-click: switch to this worktree.
+    Switch(PathBuf),
+    /// A right-click, with the pointer position.
+    Menu(PathBuf, Point<Pixels>),
+    /// ↓ / ↑: move the selection.
+    Move(isize),
+    /// Enter: switch to the selected worktree.
+    Confirm,
+    /// Del: remove the selected worktree.
+    Delete,
+    /// Esc: leave the Worktrees view.
+    Leave,
+    /// "New worktree…".
+    NewWorktree,
+}
+
+/// What the panel shows instead of rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PanelState {
+    Loading,
+    Error,
+    Ready,
+}
+
+type PanelHandler = Rc<dyn Fn(PanelEvent, &mut Window, &mut App) + 'static>;
+
+/// The worktree list that replaces the sidebar tree in the Worktrees view.
+#[derive(IntoElement)]
+pub struct WorktreePanel {
+    state: PanelState,
+    /// The visible rows, already filtered and ordered.
+    rows: Vec<WorktreeEntry>,
+    /// Every worktree, for the header count.
+    total: usize,
+    query: String,
+    selected: Option<PathBuf>,
+    focus: FocusHandle,
+    scroll: ScrollHandle,
+    on_event: PanelHandler,
+}
+
+impl WorktreePanel {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        state: PanelState,
+        rows: Vec<WorktreeEntry>,
+        total: usize,
+        query: String,
+        selected: Option<PathBuf>,
+        focus: FocusHandle,
+        scroll: ScrollHandle,
+        on_event: impl Fn(PanelEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            state,
+            rows,
+            total,
+            query,
+            selected,
+            focus,
+            scroll,
+            on_event: Rc::new(on_event),
+        }
+    }
+}
+
+impl RenderOnce for WorktreePanel {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let ring_visible = ui::focus::focus_visible(&self.focus, window, cx);
+
+        let mut root = div()
+            .id("worktree-panel")
+            .debug_selector(|| "worktree-panel".to_string())
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            // `ui-tree` carries the Delete binding; ←/→/Space/F2 are not
+            // handled here and do nothing.
+            .key_context("ui-tree")
+            .track_focus(&self.focus);
+        {
+            let on_event = self.on_event.clone();
+            root = root.on_action(move |_: &SelectNext, window: &mut Window, cx: &mut App| {
+                on_event(PanelEvent::Move(1), window, cx)
+            });
+        }
+        {
+            let on_event = self.on_event.clone();
+            root = root.on_action(move |_: &SelectPrev, window: &mut Window, cx: &mut App| {
+                on_event(PanelEvent::Move(-1), window, cx)
+            });
+        }
+        {
+            let on_event = self.on_event.clone();
+            root = root.on_action(move |_: &Confirm, window: &mut Window, cx: &mut App| {
+                on_event(PanelEvent::Confirm, window, cx)
+            });
+        }
+        {
+            let on_event = self.on_event.clone();
+            root = root.on_action(move |_: &TreeDelete, window: &mut Window, cx: &mut App| {
+                on_event(PanelEvent::Delete, window, cx)
+            });
+        }
+        {
+            let on_event = self.on_event.clone();
+            root = root.on_action(move |_: &Cancel, window: &mut Window, cx: &mut App| {
+                on_event(PanelEvent::Leave, window, cx)
+            });
+        }
+
+        // Header: WORKTREES + count.
+        let mut header = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .px(px(12.))
+            .pt(px(10.))
+            .pb(px(4.))
+            .text_size(FS_XS)
+            .font_weight(FontWeight::BOLD)
+            .text_color(colors.muted)
+            .child("WORKTREES");
+        if self.state == PanelState::Ready {
+            header = header.child(CountPill::new(self.total.to_string()));
+        }
+        root = root.child(header);
+
+        let message = |text: SharedString| {
+            div()
+                .px(px(12.))
+                .py(px(16.))
+                .text_size(FS_SM)
+                .text_color(colors.muted)
+                .child(text)
+        };
+        let body = match self.state {
+            PanelState::Loading => div()
+                .id("worktree-panel-loading")
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .px(px(12.))
+                .py(px(16.))
+                .children(
+                    [180., 140., 170., 150.]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, w)| Skeleton::new(("worktree-panel-skeleton", i), px(w))),
+                )
+                .into_any_element(),
+            PanelState::Error => div()
+                .flex_1()
+                .min_h_0()
+                .child(message("Could not read the worktree list.".into()))
+                .into_any_element(),
+            PanelState::Ready if self.rows.is_empty() => div()
+                .flex_1()
+                .min_h_0()
+                .child(message(
+                    format!("No worktree matches “{}”.", self.query.trim()).into(),
+                ))
+                .into_any_element(),
+            PanelState::Ready => {
+                let mut list = div()
+                    .id("worktree-panel-list")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll);
+                let pinned = self.rows.first().is_some_and(WorktreeEntry::is_main);
+                for (index, entry) in self.rows.iter().enumerate() {
+                    let selected = self.selected.as_deref() == Some(entry.path());
+                    let row = worktree_row(
+                        index,
+                        entry,
+                        selected,
+                        selected && ring_visible,
+                        &self.focus,
+                        &self.on_event,
+                        colors,
+                        cx,
+                    );
+                    // The divider below the pinned main worktree lives in the
+                    // same list child, so scroll-to-item indexes stay rows.
+                    let divider = pinned && index == 0 && self.rows.len() > 1;
+                    list =
+                        list.child(div().flex_none().flex().flex_col().child(row).when(
+                            divider,
+                            |this| {
+                                this.child(div().h(px(1.)).mx(px(14.)).my(px(4.)).bg(colors.border))
+                            },
+                        ));
+                }
+                list.into_any_element()
+            }
+        };
+        root = root.child(body);
+
+        // "New worktree…" focuses the quick-create input of the centre pane.
+        let on_event = self.on_event.clone();
+        root.child(
+            div().flex_none().px(px(8.)).py(px(8.)).child(
+                div().w_full().child(
+                    Button::new("worktree-panel-new")
+                        .icon(IconName::Plus)
+                        .label("New worktree…")
+                        .disabled(self.state != PanelState::Ready)
+                        .on_click(move |_, window, cx| {
+                            on_event(PanelEvent::NewWorktree, window, cx)
+                        }),
+                ),
+            ),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// One two-line row: name (and the "default" chip) over the branch, status
+/// glyphs at the end. The current worktree has the accent bar and a bold
+/// name; the selected one the selection background; the two are independent.
+fn worktree_row(
+    index: usize,
+    entry: &WorktreeEntry,
+    selected: bool,
+    ring: bool,
+    focus: &FocusHandle,
+    on_event: &PanelHandler,
+    colors: ThemeColors,
+    cx: &App,
+) -> impl IntoElement {
+    let main = entry.is_main();
+    let current = entry.is_current();
+    let missing = entry.missing;
+    let path = entry.path().to_path_buf();
+    let foreground = if selected {
+        colors.selection_fg
+    } else if missing {
+        colors.muted
+    } else {
+        colors.text
+    };
+    let secondary = if selected {
+        colors.selection_sub
+    } else {
+        colors.muted
+    };
+    let icon_color = if selected {
+        if main {
+            colors.selection_sub
+        } else {
+            colors.selection_fg
+        }
+    } else if main || current {
+        colors.accent
+    } else {
+        colors.muted
+    };
+
+    let mut name = div()
+        .min_w_0()
+        .truncate()
+        .font_weight(if current {
+            FontWeight::BOLD
+        } else {
+            FontWeight::SEMIBOLD
+        })
+        .child(entry.name());
+    if missing {
+        name = name.line_through();
+    }
+    let branch = div()
+        .min_w_0()
+        .truncate()
+        .font_family(FONT_MONO)
+        .text_size(FS_SM)
+        .text_color(secondary)
+        .child(entry.branch().unwrap_or("detached HEAD").to_owned());
+
+    let id = format!("worktree-row-{index}");
+    let mut row = div()
+        .id(ElementId::named_usize("worktree-row", index))
+        .debug_selector({
+            let id = id.clone();
+            move || id.clone()
+        })
+        .relative()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(8.))
+        .min_h(px(40.))
+        .mx(px(6.))
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(R_SM)
+        .font_family(FONT_UI)
+        .text_size(FS_BASE)
+        .text_color(foreground)
+        .child(
+            div().flex_none().child(
+                Icon::new(if main {
+                    IconName::Git
+                } else {
+                    IconName::Worktree
+                })
+                .size(px(14.))
+                .color(icon_color),
+            ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .min_w_0()
+                        .child(name)
+                        .when(main, |this| {
+                            this.child(div().flex_none().child(Chip::new(
+                                ElementId::named_usize("worktree-row-default", index),
+                                "default",
+                            )))
+                        }),
+                )
+                .child(branch),
+        )
+        .child(worktree_glyphs(&id, entry, selected, colors));
+
+    if main {
+        row = row.tooltip(Tooltip::text(MAIN_WORKTREE_TIP));
+    }
+    if current {
+        row = row.child(
+            div()
+                .absolute()
+                .left(px(-4.))
+                .top(px(4.))
+                .bottom(px(4.))
+                .w(px(2.))
+                .rounded(px(1.))
+                .bg(colors.accent),
+        );
+    }
+    if selected {
+        row = row.bg(colors.selection);
+    } else {
+        let hover = colors.hover;
+        row = row.hover(move |style| style.bg(hover));
+    }
+    if ring {
+        row = row.child(ui::focus::focus_ring(
+            ui::focus::RingOffset::Inset2,
+            R_SM,
+            cx,
+        ));
+    }
+    {
+        let on_event = on_event.clone();
+        let focus = focus.clone();
+        let path = path.clone();
+        row = row.on_mouse_down(
+            MouseButton::Left,
+            move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                // The panel keeps the keyboard even when a menu or dialog
+                // opens from the handler.
+                window.focus(&focus, cx);
+                if event.click_count >= 2 {
+                    on_event(PanelEvent::Switch(path.clone()), window, cx);
+                } else {
+                    on_event(PanelEvent::Select(path.clone()), window, cx);
+                }
+                window.prevent_default();
+            },
+        );
+    }
+    {
+        let on_event = on_event.clone();
+        let focus = focus.clone();
+        row = row.on_mouse_down(
+            MouseButton::Right,
+            move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                window.focus(&focus, cx);
+                on_event(PanelEvent::Menu(path.clone(), event.position), window, cx);
+                window.prevent_default();
+            },
+        );
+    }
+    row
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -2422,5 +2953,117 @@ mod tests {
             Some(SidebarAction::RemoveWorktree("/tmp/w".into()))
         );
         assert_eq!(run("section:tags", "Del"), None);
+    }
+
+    fn worktree_entry(
+        name: &str,
+        branch: Option<&str>,
+        main: bool,
+        last_used: Option<u64>,
+    ) -> WorktreeEntry {
+        WorktreeEntry {
+            worktree: Worktree {
+                path: PathBuf::from(format!("/tmp/{name}")),
+                branch: branch.map(str::to_owned),
+                head: None,
+                bare: false,
+                detached: branch.is_none(),
+                locked: None,
+                prunable: false,
+                current: false,
+                main,
+            },
+            changes: Vec::new(),
+            missing: false,
+            head_summary: None,
+            ahead: 0,
+            behind: 0,
+            has_upstream: false,
+            last_used,
+        }
+    }
+
+    fn panel_names(entries: &[WorktreeEntry], query: &str) -> Vec<String> {
+        worktree_panel_rows(entries, query)
+            .iter()
+            .map(|entry| entry.name())
+            .collect()
+    }
+
+    #[test]
+    fn the_panel_pins_main_first_then_orders_by_recency() {
+        // The model hands them over current first; main is not the current one.
+        let entries = [
+            worktree_entry("review", Some("feat/palette"), false, Some(300)),
+            worktree_entry("app", Some("main"), true, Some(10)),
+            worktree_entry("hotfix", Some("fix/git"), false, Some(500)),
+            worktree_entry("bisect", None, false, None),
+        ];
+        assert_eq!(
+            panel_names(&entries, ""),
+            ["app", "hotfix", "review", "bisect"]
+        );
+    }
+
+    #[test]
+    fn the_panel_filter_matches_name_and_branch_ignoring_case() {
+        let entries = [
+            worktree_entry("app", Some("main"), true, None),
+            worktree_entry("review", Some("feat/Palette"), false, None),
+            worktree_entry("bisect", None, false, None),
+        ];
+        assert_eq!(panel_names(&entries, "PAL"), ["review"]);
+        assert_eq!(panel_names(&entries, " bis "), ["bisect"]);
+        assert_eq!(panel_names(&entries, "main"), ["app"]);
+        // The panel's "detached HEAD" label is not searchable text.
+        assert!(panel_names(&entries, "detached").is_empty());
+        assert!(panel_names(&entries, "nothing").is_empty());
+    }
+
+    #[test]
+    fn the_worktree_menu_follows_the_designs_disabled_rules() {
+        let disabled = |entry: &WorktreeEntry| -> Vec<(&'static str, bool)> {
+            worktree_menu(entry)
+                .into_iter()
+                .flatten()
+                .map(|item| (item.label, item.disabled))
+                .collect()
+        };
+        // The main, current worktree: no switch, no lock, no remove.
+        let mut main = worktree_entry("app", Some("main"), true, None);
+        main.worktree.current = true;
+        assert_eq!(
+            disabled(&main),
+            [
+                ("Switch to this worktree", true),
+                ("Open in new window", false),
+                ("Reveal in file manager", false),
+                ("Copy path", false),
+                ("Lock", true),
+                ("Remove worktree…", true),
+            ]
+        );
+        // A plain linked worktree: everything is available; a lock flips the
+        // label.
+        let mut linked = worktree_entry("hotfix", Some("fix"), false, None);
+        assert!(disabled(&linked).iter().all(|(_, off)| !off));
+        linked.worktree.locked = Some("why".to_owned());
+        assert!(disabled(&linked).contains(&("Unlock", false)));
+        // A missing folder cannot be opened, revealed, switched to or locked,
+        // but its record can be copied and removed.
+        linked.missing = true;
+        assert_eq!(
+            disabled(&linked),
+            [
+                ("Switch to this worktree", true),
+                ("Open in new window", true),
+                ("Reveal in file manager", true),
+                ("Copy path", false),
+                ("Unlock", true),
+                ("Remove worktree…", false),
+            ]
+        );
+        // The separator sits between Copy path and Lock/Unlock.
+        assert!(worktree_menu(&linked)[4].is_none());
     }
 }

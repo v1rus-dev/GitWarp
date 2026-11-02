@@ -748,6 +748,13 @@ impl WorktreesModel {
         cx.emit(WorktreesModelEvent::Changed);
     }
 
+    /// Shows the folder in the file manager.
+    pub fn reveal(&self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        cx.reveal_path(path);
+        let label = display_path(path, self.home.as_deref());
+        toast::show(ToastKind::Info, format!("Revealed {label}"), window, cx);
+    }
+
     /// Copies the folder path to the clipboard.
     pub fn copy_path(&self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let text = path.display().to_string();
