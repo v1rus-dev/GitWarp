@@ -43,9 +43,29 @@ const HEADER: f32 = 34.;
 /// Narrowest the side column may get; the grid scrolls before it shrinks below.
 const SIDE_MIN_W: f32 = 160.;
 
-const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+// Catalog keys (shared with the heatmap's own labels), translated at render.
+const WEEKDAYS: [&str; 7] = [
+    "kit.heatmap.weekday.mon",
+    "kit.heatmap.weekday.tue",
+    "kit.heatmap.weekday.wed",
+    "kit.heatmap.weekday.thu",
+    "kit.heatmap.weekday.fri",
+    "kit.heatmap.weekday.sat",
+    "kit.heatmap.weekday.sun",
+];
 const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    "kit.heatmap.month.jan",
+    "kit.heatmap.month.feb",
+    "kit.heatmap.month.mar",
+    "kit.heatmap.month.apr",
+    "kit.heatmap.month.may",
+    "kit.heatmap.month.jun",
+    "kit.heatmap.month.jul",
+    "kit.heatmap.month.aug",
+    "kit.heatmap.month.sep",
+    "kit.heatmap.month.oct",
+    "kit.heatmap.month.nov",
+    "kit.heatmap.month.dec",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -434,20 +454,26 @@ pub(crate) fn long_date(day: i32) -> String {
     let (year, month, date) = git_core::civil_from_days(day);
     // 1970-01-01 was a Thursday and weeks start on Monday.
     let weekday = (day + 3).rem_euclid(7) as usize;
-    format!(
-        "{}, {date} {} {year}",
-        WEEKDAYS[weekday],
-        MONTHS[month as usize - 1]
+    ui::i18n::t_args(
+        "kit.heatmap.long_date",
+        &[
+            ("weekday", &ui::i18n::t(WEEKDAYS[weekday])),
+            ("day", &date),
+            ("month", &ui::i18n::t(MONTHS[month as usize - 1])),
+            ("year", &year),
+        ],
     )
+    .to_string()
 }
 
 /// `1 commit` / `4 commits`.
 pub(crate) fn commits(count: usize) -> String {
-    format!(
-        "{} commit{}",
-        format_count(count),
-        if count == 1 { "" } else { "s" }
+    ui::i18n::t_count(
+        "activity.commits",
+        count as u64,
+        &[("n", &format_count(count))],
     )
+    .to_string()
 }
 
 impl ActivityStrip {
@@ -455,9 +481,9 @@ impl ActivityStrip {
         let colors = cx.theme().colors;
         let collapsed = self.collapsed;
         let tip = if collapsed {
-            "Expand activity"
+            ui::t!("activity.header.expand")
         } else {
-            "Collapse activity"
+            ui::t!("activity.header.collapse")
         };
         let toggle = Button::ghost("activity-toggle")
             .size(ButtonSize::Xs)
@@ -469,10 +495,6 @@ impl ActivityStrip {
             .tooltip(tip)
             .on_click(cx.listener(move |this, _, _, cx| this.set_collapsed(!this.collapsed, cx)));
 
-        let when = match self.year {
-            Some(year) => format!("in {year}"),
-            None => "in the last year".to_owned(),
-        };
         let mine = self.who == Who::Me;
         let strong = |text: String| {
             div()
@@ -493,30 +515,36 @@ impl ActivityStrip {
             .text_color(colors.muted)
             .whitespace_nowrap();
         let total = match (&self.status, &self.shown) {
-            (Status::Failed(_), _) => total.child("Activity unavailable"),
+            (Status::Failed(_), _) => total.child(ui::t!("activity.total.unavailable")),
             (Status::Loading, _) | (_, None) => {
                 total.child(Skeleton::new("activity-total-skeleton", px(180.)))
             }
             (Status::Partial { .. }, Some(shown)) => total
                 .child(Icon::new(IconName::Fetch).size(px(12.)).color(colors.muted))
-                .child("Counting…")
+                .child(ui::t!("activity.total.counting"))
                 .child(strong(format_count(shown.total)))
-                .child("commits so far"),
+                .child(ui::t!("activity.total.so_far")),
             (Status::Ready, Some(shown)) => {
                 if self.all.is_empty() {
-                    total.child("No commits yet")
+                    total.child(ui::t!("activity.total.none"))
                 } else if shown.total == 0 && mine {
-                    total.child(format!("No commits by you {when}"))
+                    total.child(match self.year {
+                        Some(year) => ui::t!("activity.total.none_mine_year", year = year),
+                        None => ui::t!("activity.total.none_mine_last_year"),
+                    })
                 } else {
-                    let noun = match (mine, shown.total == 1) {
-                        (true, true) => "commit by you",
-                        (true, false) => "commits by you",
-                        (false, true) => "commit",
-                        (false, false) => "commits",
+                    let n = shown.total as u64;
+                    let noun = match (mine, self.year) {
+                        (true, Some(year)) => {
+                            ui::i18n::t_count("activity.total.mine_year", n, &[("year", &year)])
+                        }
+                        (true, None) => ui::i18n::t_count("activity.total.mine_last_year", n, &[]),
+                        (false, Some(year)) => {
+                            ui::i18n::t_count("activity.total.all_year", n, &[("year", &year)])
+                        }
+                        (false, None) => ui::i18n::t_count("activity.total.all_last_year", n, &[]),
                     };
-                    total
-                        .child(strong(format_count(shown.total)))
-                        .child(format!("{noun} {when}"))
+                    total.child(strong(format_count(shown.total))).child(noun)
                 }
             }
         };
@@ -531,19 +559,21 @@ impl ActivityStrip {
         let me_disabled =
             self.me.is_none() && matches!(self.status, Status::Ready | Status::Partial { .. });
         let me_tip = match &self.me {
-            Some(email) => format!("Commits where author email = {email}"),
-            None => "Set user.email to see your own commits".to_owned(),
+            Some(email) => ui::t!("activity.author.me_tip", email = email),
+            None => ui::t!("activity.author.me_tip_unset"),
         };
         let author = Segmented::new("activity-author")
             .small()
             .item(
-                SegmentItem::new("Me")
+                SegmentItem::new(ui::t!("activity.author.me"))
                     .with_icon(IconName::User)
                     .id("activity-author-me")
                     .disabled(me_disabled)
                     .tooltip(me_tip),
             )
-            .item(SegmentItem::new("Everyone").id("activity-author-everyone"))
+            .item(
+                SegmentItem::new(ui::t!("activity.author.everyone")).id("activity-author-everyone"),
+            )
             .selected(if mine { 0 } else { 1 })
             .on_select({
                 let view = cx.entity();
@@ -554,7 +584,7 @@ impl ActivityStrip {
                 }
             });
 
-        let mut options: Vec<SharedString> = vec!["Last 12 months".into()];
+        let mut options: Vec<SharedString> = vec![ui::t!("activity.range.last_12_months")];
         options.extend(self.years.iter().map(|year| year.to_string().into()));
         let selected = self
             .year
@@ -586,7 +616,7 @@ impl ActivityStrip {
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_size(ui::metrics::FS_BASE)
-                    .child("Activity"),
+                    .child(ui::t!("activity.header.title")),
             )
             .child(total)
             .child(div().flex_1())
@@ -637,7 +667,7 @@ impl ActivityStrip {
                                 div()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(colors.text)
-                                    .child("Could not count commits"),
+                                    .child(ui::t!("activity.error.title")),
                             )
                             .child(
                                 div()
@@ -649,7 +679,7 @@ impl ActivityStrip {
                         Button::new("activity-retry")
                             .size(ButtonSize::Small)
                             .icon(IconName::Fetch)
-                            .label("Retry")
+                            .label(ui::t!("activity.error.retry"))
                             .on_click(move |_, _, cx| {
                                 view.update(cx, |this, cx| this.load(cx));
                             }),
@@ -744,7 +774,7 @@ impl ActivityStrip {
                 .text_color(colors.text)
                 .child(text)
         };
-        let link = |id: &'static str, label: &'static str| {
+        let link = |id: &'static str, label: SharedString| {
             div()
                 .id(id)
                 .cursor_pointer()
@@ -764,24 +794,28 @@ impl ActivityStrip {
             return side
                 .child(
                     line()
-                        .child("Showing everyone:")
+                        .child(ui::t!("activity.side.unset_prefix"))
                         .child(mono("user.email".to_owned()))
-                        .child("is not set for this repository."),
+                        .child(ui::t!("activity.side.unset_suffix")),
                 )
-                .child(link("activity-set-identity", "Set identity…").on_click(
-                    move |_, window, cx| {
+                .child(
+                    link(
+                        "activity-set-identity",
+                        ui::t!("activity.side.set_identity"),
+                    )
+                    .on_click(move |_, window, cx| {
                         view.update(cx, |this, cx| this.open_identity(window, cx));
-                    },
-                ));
+                    }),
+                );
         }
         if self.all.is_empty() {
-            return side.child("Make the first commit to start the graph.");
+            return side.child(ui::t!("activity.side.first_commit"));
         }
         if self.who == Who::Me && self.mine.is_empty() {
             let view = cx.entity();
             return side
                 .child(
-                    line().child("No commits by").child(
+                    line().child(ui::t!("activity.side.none_by")).child(
                         // The design ends the line with a full stop right after the address.
                         div()
                             .flex()
@@ -790,11 +824,13 @@ impl ActivityStrip {
                     ),
                 )
                 .child(
-                    link("activity-show-everyone", "Show everyone’s commits").on_click(
-                        move |_, _, cx| {
-                            view.update(cx, |this, cx| this.set_who(Who::Everyone, cx));
-                        },
-                    ),
+                    link(
+                        "activity-show-everyone",
+                        ui::t!("activity.side.show_everyone"),
+                    )
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| this.set_who(Who::Everyone, cx));
+                    }),
                 );
         }
         if let (Some(filter), Some(shown)) = (filter, &self.shown) {
@@ -811,39 +847,35 @@ impl ActivityStrip {
                         .text_color(colors.text)
                         .child(long_date(filter.day)),
                 )
-                .child(format!(
-                    "{} · History is filtered to this day.",
-                    commits(count)
-                ));
+                .child(ui::t!("activity.side.filtered", commits = commits(count)));
         }
         if matches!(self.status, Status::Partial { .. }) {
             return side.child(
                 line()
-                    .child("Older weeks fill in as")
+                    .child(ui::t!("activity.side.partial_prefix"))
                     .child(mono("git log".to_owned()))
-                    .child("streams; colours settle when counting ends."),
+                    .child(ui::t!("activity.side.partial_suffix")),
             );
         }
         let keys = |text: &'static str| Kbd::new(text);
-        side.child("Click a day to show its commits in History.")
-            .child(
-                // Wraps only when the side column is too narrow, as in the
-                // design; items wrap whole, never mid-word.
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(4.))
-                    .whitespace_nowrap()
-                    .child(keys("↑"))
-                    .child(keys("↓"))
-                    .child("day ·")
-                    .child(keys("←"))
-                    .child(keys("→"))
-                    .child("week ·")
-                    .child(keys("Enter"))
-                    .child("filter"),
-            )
+        side.child(ui::t!("activity.side.hint")).child(
+            // Wraps only when the side column is too narrow, as in the
+            // design; items wrap whole, never mid-word.
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(4.))
+                .whitespace_nowrap()
+                .child(keys("↑"))
+                .child(keys("↓"))
+                .child(ui::t!("activity.side.keys_day"))
+                .child(keys("←"))
+                .child(keys("→"))
+                .child(ui::t!("activity.side.keys_week"))
+                .child(keys("Enter"))
+                .child(ui::t!("activity.side.keys_filter")),
+        )
     }
 
     /// The accent-soft bar under the strip while a day filter is on.
@@ -853,10 +885,11 @@ impl ActivityStrip {
         let filter = history.day_filter()?.clone();
         let count = history.day_filter_count();
         let strong = |text: String| div().font_weight(FontWeight::SEMIBOLD).child(text);
+        let noun_n = count.unwrap_or(0) as u64;
         let noun = if filter.me.is_some() {
-            "of your commits"
+            ui::i18n::t_count("activity.filter.noun_mine", noun_n, &[])
         } else {
-            "commits"
+            ui::i18n::t_count("activity.filter.noun_all", noun_n, &[])
         };
         let view = cx.entity();
         Some(
@@ -884,17 +917,17 @@ impl ActivityStrip {
                         .flex()
                         .items_center()
                         .gap(px(4.))
-                        .child("Showing")
+                        .child(ui::t!("activity.filter.showing"))
                         .child(strong(count.map_or("…".to_owned(), format_count)))
                         .child(noun)
-                        .child("on")
+                        .child(ui::t!("activity.filter.on"))
                         .child(strong(long_date(filter.day))),
                 )
                 .child(div().flex_1())
                 .child(
                     Button::new("activity-clear-filter")
                         .size(ButtonSize::Small)
-                        .label("Clear filter")
+                        .label(ui::t!("activity.filter.clear"))
                         .on_click(move |_, _, cx| {
                             view.update(cx, |this, cx| this.clear_filter(cx));
                         }),

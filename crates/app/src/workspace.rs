@@ -783,8 +783,10 @@ pub fn git_label(git: &Result<Arc<Git>, Arc<Error>>) -> SharedString {
     match git {
         Ok(git) => format!("git {} · {}", git.version(), git.source()).into(),
         Err(error) => match error.class() {
-            git_core::ErrorClass::GitTooOld { found, .. } => format!("git {found} too old").into(),
-            _ => "git not found".into(),
+            git_core::ErrorClass::GitTooOld { found, .. } => {
+                ui::t!("repo.git.too_old", version = found)
+            }
+            _ => ui::t!("repo.git.not_found"),
         },
     }
 }

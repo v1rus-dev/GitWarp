@@ -10,7 +10,7 @@ use std::process::Command as Process;
 use std::sync::Arc;
 
 use git_core::{CommitInfo, Git, Head, Oid, Ref, RefKind};
-use gpui::{App, Global};
+use gpui::{App, Global, SharedString};
 use ui::IconName;
 
 use super::matcher::{self, Match};
@@ -40,12 +40,12 @@ pub enum Group {
 
 impl Group {
     /// The header text, already upper case: GPUI has no text-transform.
-    pub fn header(self) -> &'static str {
+    pub fn header(self) -> SharedString {
         match self {
-            Group::Commands => "COMMANDS",
-            Group::Branches => "BRANCHES",
-            Group::Commits => "COMMITS",
-            Group::Files => "FILES",
+            Group::Commands => ui::t!("palette.group.commands"),
+            Group::Branches => ui::t!("palette.group.branches"),
+            Group::Commits => ui::t!("palette.group.commits"),
+            Group::Files => ui::t!("palette.group.files"),
         }
     }
 
@@ -129,35 +129,41 @@ impl Command {
 
     pub fn title(self, state: ViewState) -> String {
         match self {
-            Command::FetchAll => "Fetch all remotes".into(),
-            Command::Pull => "Pull current branch".into(),
-            Command::Push => "Push current branch".into(),
-            Command::StashChanges => "Stash local changes".into(),
-            Command::SwitchBranch => "Switch branch…".into(),
-            Command::CreateBranchHere => "Create branch here…".into(),
-            Command::CreateTagHere => "Create tag here…".into(),
-            Command::ShowBranchCommits => "Show all commits of current branch".into(),
-            Command::AddRemote => "Add remote…".into(),
-            Command::AddWorktree => "Add worktree…".into(),
-            Command::Refresh => "Refresh repository".into(),
-            Command::ToggleSidebar => "Toggle sidebar".into(),
-            Command::ToggleDetails => "Toggle details dock".into(),
-            Command::ToggleActivity if state.activity_collapsed => "Show Activity strip".into(),
-            Command::ToggleActivity => "Hide Activity strip".into(),
-            Command::FocusSearch => "Search commits".into(),
-            Command::ShowHistory => "Switch to History".into(),
-            Command::ShowChanges => "Switch to Local changes".into(),
-            Command::ShowWorktrees => "Switch to Worktrees".into(),
-            Command::CollapseIdleLanes if state.idle_lanes_collapsed => {
-                "Expand idle lanes in graph".into()
+            Command::FetchAll => ui::t!("palette.command.fetch_all").to_string(),
+            Command::Pull => ui::t!("palette.command.pull").to_string(),
+            Command::Push => ui::t!("palette.command.push").to_string(),
+            Command::StashChanges => ui::t!("palette.command.stash").to_string(),
+            Command::SwitchBranch => ui::t!("palette.command.switch_branch").to_string(),
+            Command::CreateBranchHere => ui::t!("palette.command.create_branch").to_string(),
+            Command::CreateTagHere => ui::t!("palette.command.create_tag").to_string(),
+            Command::ShowBranchCommits => ui::t!("palette.command.show_branch_commits").to_string(),
+            Command::AddRemote => ui::t!("palette.command.add_remote").to_string(),
+            Command::AddWorktree => ui::t!("palette.command.add_worktree").to_string(),
+            Command::Refresh => ui::t!("palette.command.refresh").to_string(),
+            Command::ToggleSidebar => ui::t!("palette.command.toggle_sidebar").to_string(),
+            Command::ToggleDetails => ui::t!("palette.command.toggle_details").to_string(),
+            Command::ToggleActivity if state.activity_collapsed => {
+                ui::t!("palette.command.show_activity").to_string()
             }
-            Command::CollapseIdleLanes => "Collapse idle lanes in graph".into(),
-            Command::FitGraph => "Fit graph to its lanes".into(),
-            Command::OpenSettings(Page::General) => "Open Settings".into(),
-            Command::OpenSettings(page) => format!("Open Settings → {}", page_name(page)),
-            Command::OpenRepository => "Open repository…".into(),
-            Command::Clone => "Clone repository…".into(),
-            Command::CloseRepository => "Close repository".into(),
+            Command::ToggleActivity => ui::t!("palette.command.hide_activity").to_string(),
+            Command::FocusSearch => ui::t!("palette.command.search").to_string(),
+            Command::ShowHistory => ui::t!("palette.command.show_history").to_string(),
+            Command::ShowChanges => ui::t!("palette.command.show_changes").to_string(),
+            Command::ShowWorktrees => ui::t!("palette.command.show_worktrees").to_string(),
+            Command::CollapseIdleLanes if state.idle_lanes_collapsed => {
+                ui::t!("palette.command.expand_idle_lanes").to_string()
+            }
+            Command::CollapseIdleLanes => ui::t!("palette.command.collapse_idle_lanes").to_string(),
+            Command::FitGraph => ui::t!("palette.command.fit_graph").to_string(),
+            Command::OpenSettings(Page::General) => {
+                ui::t!("palette.command.open_settings").to_string()
+            }
+            Command::OpenSettings(page) => {
+                ui::t!("palette.command.open_settings_page", page = page_name(page)).to_string()
+            }
+            Command::OpenRepository => ui::t!("palette.command.open_repository").to_string(),
+            Command::Clone => ui::t!("palette.command.clone").to_string(),
+            Command::CloseRepository => ui::t!("palette.command.close_repository").to_string(),
         }
     }
 
@@ -197,16 +203,17 @@ impl Command {
 }
 
 /// The page's name in the settings navigation.
-fn page_name(page: Page) -> &'static str {
+fn page_name(page: Page) -> SharedString {
     match page {
-        Page::General => "General",
-        Page::Appearance => "Appearance",
-        Page::Git => "Git",
-        Page::Worktrees => "Worktrees",
-        Page::Ssh => "SSH keys",
-        Page::Keybindings => "Keybindings",
-        Page::Diff => "Diff & merge",
-        Page::Identity => "Identity",
+        Page::General => ui::t!("settings.page.general"),
+        Page::Appearance => ui::t!("settings.page.appearance"),
+        // The product name of the tool, not translated (as in the settings navigation).
+        Page::Git => "Git".into(),
+        Page::Worktrees => ui::t!("settings.page.worktrees"),
+        Page::Ssh => ui::t!("settings.page.ssh"),
+        Page::Keybindings => ui::t!("settings.page.keybindings"),
+        Page::Diff => ui::t!("settings.diff.title"),
+        Page::Identity => ui::t!("settings.page.identity"),
     }
 }
 

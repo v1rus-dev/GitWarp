@@ -603,7 +603,7 @@ impl RepositoryView {
         );
         let search = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder("Search commits, authors, hashes", cx);
+            input.set_placeholder(ui::t!("repo.search.placeholder"), cx);
             input
         });
         let search_focus = search.read(cx).focus_handle().clone();
@@ -622,7 +622,7 @@ impl RepositoryView {
         });
         let sidebar_filter = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder("Filter branches, tags…", cx);
+            input.set_placeholder(ui::t!("repo.sidebar.filter_refs"), cx);
             input
         });
         let sidebar_filter_events =
@@ -799,9 +799,9 @@ impl RepositoryView {
     /// starts a fresh, empty filter with the matching placeholder.
     fn sync_sidebar_filter(&mut self, cx: &mut Context<Self>) {
         let placeholder = if self.view == ViewMode::Worktrees {
-            "Filter worktrees…"
+            ui::t!("repo.sidebar.filter_worktrees")
         } else {
-            "Filter branches, tags…"
+            ui::t!("repo.sidebar.filter_refs")
         };
         self.filter.clear();
         self.sidebar_filter.update(cx, |input, cx| {
@@ -1197,10 +1197,13 @@ impl RepositoryView {
             SidebarAction::CheckoutRemoteBranch(remote) => {
                 let label = remote.clone();
                 self.checkout_guarded(
-                    format!("Check out {label}?"),
+                    ui::t!("repo.checkout.title", name = label).to_string(),
                     move |repo| {
                         repo.checkout_remote(&remote)?;
-                        Ok((ui::ToastKind::Ok, format!("Checked out {label}")))
+                        Ok((
+                            ui::ToastKind::Ok,
+                            ui::t!("repo.checkout.done", name = label).to_string(),
+                        ))
                     },
                     window,
                     cx,
@@ -1218,7 +1221,7 @@ impl RepositoryView {
                 let Some(target) = target else {
                     toast::show(
                         ui::ToastKind::Warn,
-                        "The tag has no commit to check out",
+                        ui::t!("repo.toast.tag_no_commit"),
                         window,
                         cx,
                     );
@@ -1226,12 +1229,12 @@ impl RepositoryView {
                 };
                 let label = name.clone();
                 self.checkout_guarded(
-                    format!("Check out tag {label}?"),
+                    ui::t!("repo.checkout.tag_title", name = label).to_string(),
                     move |repo| {
                         repo.checkout_detached(target)?;
                         Ok((
                             ui::ToastKind::Ok,
-                            format!("Checked out tag {label} (detached HEAD)"),
+                            ui::t!("repo.checkout.tag_done", name = label).to_string(),
                         ))
                     },
                     window,
@@ -1261,13 +1264,27 @@ impl RepositoryView {
             SidebarAction::ApplyStash(index) => {
                 self.run_repo_action(window, cx, move |repo| {
                     repo.stash_apply(index)?;
-                    Ok((ui::ToastKind::Ok, format!("Applied stash@{{{index}}}")))
+                    Ok((
+                        ui::ToastKind::Ok,
+                        ui::t!(
+                            "repo.toast.stash_applied",
+                            stash = format!("stash@{{{index}}}")
+                        )
+                        .to_string(),
+                    ))
                 });
             }
             SidebarAction::PopStash(index) => {
                 self.run_repo_action(window, cx, move |repo| {
                     repo.stash_pop(index)?;
-                    Ok((ui::ToastKind::Ok, format!("Popped stash@{{{index}}}")))
+                    Ok((
+                        ui::ToastKind::Ok,
+                        ui::t!(
+                            "repo.toast.stash_popped",
+                            stash = format!("stash@{{{index}}}")
+                        )
+                        .to_string(),
+                    ))
                 });
             }
             SidebarAction::ViewStash(index) => {
@@ -1281,7 +1298,10 @@ impl RepositoryView {
                     None => {
                         toast::show(
                             ui::ToastKind::Warn,
-                            format!("stash@{{{index}}} no longer exists"),
+                            ui::t!(
+                                "repo.toast.stash_gone",
+                                stash = format!("stash@{{{index}}}")
+                            ),
                             window,
                             cx,
                         );
@@ -1300,7 +1320,7 @@ impl RepositoryView {
                     .ok();
                 toast::show(
                     ui::ToastKind::Ok,
-                    format!("Opened {path} in a new window"),
+                    ui::t!("repo.toast.opened_in_window", name = path),
                     window,
                     cx,
                 );
@@ -1331,7 +1351,7 @@ impl RepositoryView {
                 let Some(oid) = oid else {
                     toast::show(
                         ui::ToastKind::Warn,
-                        "Create a commit before tagging",
+                        ui::t!("repo.toast.commit_before_tag"),
                         window,
                         cx,
                     );
@@ -1401,7 +1421,7 @@ impl RepositoryView {
                 let Some((remote, branch)) = name.split_once('/') else {
                     toast::show(
                         ui::ToastKind::Warn,
-                        format!("Cannot tell which remote {name} belongs to"),
+                        ui::t!("repo.toast.unknown_remote", name = name),
                         window,
                         cx,
                     );
@@ -1426,9 +1446,13 @@ impl RepositoryView {
                     return;
                 }
                 crate::confirm_dialog::open(
-                    format!("Delete {name}?"),
-                    format!("This deletes the branch “{branch}” on {remote}. It cannot be undone."),
-                    "Delete branch",
+                    ui::t!("repo.delete_remote_branch.title", name = name),
+                    ui::t!(
+                        "repo.delete_remote_branch.body",
+                        branch = branch,
+                        remote = remote
+                    ),
+                    ui::t!("repo.delete_remote_branch.confirm"),
                     move |window, cx| {
                         view.update(cx, |view, cx| {
                             view.start_network_job(
@@ -1458,13 +1482,20 @@ impl RepositoryView {
                         return Err(Error::Git {
                             command: "branch --set-upstream-to",
                             code: None,
-                            stderr: format!(
-                                "There is no {upstream} yet. Push {branch} first to create it."
-                            ),
+                            stderr: ui::t!(
+                                "repo.upstream.missing",
+                                upstream = upstream,
+                                branch = branch
+                            )
+                            .to_string(),
                         });
                     }
                     git_core::network::set_upstream(repo, &branch, &remote, &branch)?;
-                    Ok((ui::ToastKind::Ok, format!("{branch} now tracks {upstream}")))
+                    Ok((
+                        ui::ToastKind::Ok,
+                        ui::t!("repo.upstream.tracks", branch = branch, upstream = upstream)
+                            .to_string(),
+                    ))
                 });
             }
             SidebarAction::ShowBranchCommits(name) => {
@@ -1486,7 +1517,7 @@ impl RepositoryView {
                     .ok();
                 toast::show(
                     ui::ToastKind::Ok,
-                    format!("Opened {label} in a new window"),
+                    ui::t!("repo.toast.opened_in_window", name = label),
                     window,
                     cx,
                 );
@@ -1495,14 +1526,20 @@ impl RepositoryView {
                 let path = PathBuf::from(path);
                 self.run_repo_action(window, cx, move |repo| {
                     repo.lock_worktree(&path, Some("locked manually"))?;
-                    Ok((ui::ToastKind::Ok, format!("Locked {}", path.display())))
+                    Ok((
+                        ui::ToastKind::Ok,
+                        ui::t!("repo.toast.worktree_locked", path = path.display()).to_string(),
+                    ))
                 });
             }
             SidebarAction::UnlockWorktree(path) => {
                 let path = PathBuf::from(path);
                 self.run_repo_action(window, cx, move |repo| {
                     repo.unlock_worktree(&path)?;
-                    Ok((ui::ToastKind::Ok, format!("Unlocked {}", path.display())))
+                    Ok((
+                        ui::ToastKind::Ok,
+                        ui::t!("repo.toast.worktree_unlocked", path = path.display()).to_string(),
+                    ))
                 });
             }
             SidebarAction::RenameWorktree(path) => {
@@ -1524,7 +1561,7 @@ impl RepositoryView {
                     repo.prune_worktrees()?;
                     Ok((
                         ui::ToastKind::Ok,
-                        "Pruned stale worktree records".to_owned(),
+                        ui::t!("repo.toast.worktrees_pruned").to_string(),
                     ))
                 });
             }
@@ -1564,12 +1601,12 @@ impl RepositoryView {
             RefAction::CheckoutCommit(card) => {
                 let short = card.short.clone();
                 self.checkout_guarded(
-                    format!("Check out {short}?"),
+                    ui::t!("repo.checkout.title", name = short).to_string(),
                     move |repo| {
                         repo.checkout_detached(card.oid)?;
                         Ok((
                             ui::ToastKind::Ok,
-                            format!("Checked out {short} (detached HEAD)"),
+                            ui::t!("repo.checkout.commit_done", name = short).to_string(),
                         ))
                     },
                     window,
@@ -1689,10 +1726,13 @@ impl RepositoryView {
     fn checkout_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let label = name.clone();
         self.checkout_guarded(
-            format!("Switch to {label}?"),
+            ui::t!("repo.checkout.switch_title", name = label).to_string(),
             move |repo| {
                 repo.checkout_branch(&name)?;
-                Ok((ui::ToastKind::Ok, format!("Switched to {label}")))
+                Ok((
+                    ui::ToastKind::Ok,
+                    ui::t!("repo.checkout.switch_done", name = label).to_string(),
+                ))
             },
             window,
             cx,
@@ -1724,11 +1764,7 @@ impl RepositoryView {
             self.run_repo_action(window, cx, checkout);
             return;
         }
-        let files = if dirty == 1 {
-            "1 uncommitted change".to_owned()
-        } else {
-            format!("{dirty} uncommitted changes")
-        };
+        let body = ui::i18n::t_count("repo.checkout.dirty_body", dirty as u64, &[]);
         let view = cx.entity();
         // Each button may fire, but only one does. `Rc` lets every closure
         // hold the checkout and the chosen one take it.
@@ -1738,7 +1774,7 @@ impl RepositoryView {
         };
         crate::checkout_dialog::open(
             title,
-            format!("{files} in the working tree. What should happen to them?"),
+            body,
             {
                 let view = view.clone();
                 let checkout = checkout.clone();
@@ -1838,9 +1874,12 @@ impl RepositoryView {
     fn stash_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.run_repo_action(window, cx, |repo| {
             if repo.stash_save(None)? {
-                Ok((ui::ToastKind::Ok, "Stashed local changes".to_owned()))
+                Ok((ui::ToastKind::Ok, ui::t!("repo.toast.stashed").to_string()))
             } else {
-                Ok((ui::ToastKind::Info, "No local changes to stash".to_owned()))
+                Ok((
+                    ui::ToastKind::Info,
+                    ui::t!("repo.toast.nothing_to_stash").to_string(),
+                ))
             }
         });
     }
@@ -1965,7 +2004,7 @@ impl RepositoryView {
         let generation = self.network_generation;
         self.network = Some(NetworkActivity {
             verb: job.verb(),
-            detail: "Connecting…".into(),
+            detail: ui::t!("repo.network.connecting"),
             progress: None,
         });
         cx.notify();
@@ -2488,7 +2527,7 @@ impl RepositoryView {
                     None => {
                         toast::show(
                             ui::ToastKind::Warn,
-                            "Create a commit before branching",
+                            ui::t!("repo.toast.commit_before_branch"),
                             window,
                             cx,
                         );
@@ -2504,7 +2543,7 @@ impl RepositoryView {
                 _ => {
                     ui::toast::show(
                         ui::ToastKind::Info,
-                        "HEAD is detached — there is no current branch",
+                        ui::t!("repo.toast.detached_no_branch"),
                         window,
                         cx,
                     );
@@ -2624,7 +2663,7 @@ impl RepositoryView {
                 Ok(Some(None)) => {
                     toast::show(
                         ui::ToastKind::Info,
-                        format!("{path} has no commits yet"),
+                        ui::t!("repo.toast.no_commits_yet", path = path),
                         window,
                         cx,
                     );
@@ -2674,7 +2713,7 @@ impl RepositoryView {
         }
         let workspace = self.workspace.clone();
         entries.push(MenuEntry::Item(
-            MenuItem::new("Open repository…")
+            MenuItem::new(ui::t!("repo.menu.open_repository"))
                 .icon(IconName::Folder)
                 .shortcut("Ctrl+O")
                 .action(move |window, cx| {
@@ -2687,7 +2726,7 @@ impl RepositoryView {
         ));
         let view = cx.entity();
         entries.push(MenuEntry::Item(
-            MenuItem::new("Worktrees…")
+            MenuItem::new(ui::t!("repo.menu.worktrees"))
                 .icon(IconName::Worktree)
                 .action(move |window, cx| {
                     view.update(cx, |view, cx| {
@@ -2697,7 +2736,7 @@ impl RepositoryView {
         ));
         let workspace = self.workspace.clone();
         entries.push(MenuEntry::Item(
-            MenuItem::new("Close repository")
+            MenuItem::new(ui::t!("repo.menu.close_repository"))
                 .icon(IconName::X)
                 .action(move |window, cx| {
                     workspace
@@ -2710,9 +2749,9 @@ impl RepositoryView {
         let view = cx.entity();
         entries.push(MenuEntry::Item(
             MenuItem::new(if enabled {
-                "Fetch in the background"
+                ui::t!("repo.menu.fetch_background_on")
             } else {
-                "Background fetch is off"
+                ui::t!("repo.menu.fetch_background_off")
             })
             .icon(if enabled {
                 IconName::Check
@@ -2734,7 +2773,7 @@ impl RepositoryView {
         };
         let Some(refs) = history.refs() else {
             return vec![MenuEntry::Item(
-                MenuItem::new("Loading branches…")
+                MenuItem::new(ui::t!("repo.menu.loading_branches"))
                     .icon(IconName::Branch)
                     .disabled(true),
             )];
@@ -2768,7 +2807,7 @@ impl RepositoryView {
         }
         if count == 0 {
             entries.push(MenuEntry::Item(
-                MenuItem::new("No local branches")
+                MenuItem::new(ui::t!("repo.menu.no_local_branches"))
                     .icon(IconName::Branch)
                     .disabled(true),
             ));
@@ -2780,7 +2819,7 @@ impl RepositoryView {
             None => None,
         };
         let card = head_oid.map(CommitCard::bare);
-        let mut create = MenuItem::new("Create branch…").icon(IconName::Plus);
+        let mut create = MenuItem::new(ui::t!("repo.menu.create_branch")).icon(IconName::Plus);
         if let Some(card) = card {
             let view = cx.entity();
             let card = history.card_for(card.oid);
@@ -2803,7 +2842,7 @@ impl RepositoryView {
     fn branch_label(&self, cx: &Context<Self>) -> SharedString {
         match self.history.read(cx).head() {
             Some(Head::Branch { name, .. }) => name.clone().into(),
-            Some(Head::Detached(_)) => "detached HEAD".into(),
+            Some(Head::Detached(_)) => ui::t!("repo.toolbar.detached_head"),
             None => "…".into(),
         }
     }
@@ -2819,7 +2858,7 @@ impl RepositoryView {
 
         let sidebar_toggle = Button::ghost("sidebar-toggle")
             .icon_only(IconName::Sidebar)
-            .tooltip_kbd("Toggle sidebar", "Ctrl+B")
+            .tooltip_kbd(ui::t!("repo.toolbar.toggle_sidebar"), "Ctrl+B")
             .on_click(cx.listener(|view, _, _, cx| view.toggle_sidebar(cx)));
 
         let repo_click = {
@@ -2834,7 +2873,7 @@ impl RepositoryView {
             Some(self.repo_name.clone()),
             layout.repo_name,
             layout.item_pad,
-            ("Switch repository", None),
+            (ui::t!("repo.toolbar.switch_repository"), None),
             self.repo_bounds.clone(),
             repo_click,
             colors,
@@ -2852,7 +2891,7 @@ impl RepositoryView {
             Some(branch),
             layout.branch_name,
             layout.item_pad,
-            ("Switch branch", Some("Ctrl+Shift+B")),
+            (ui::t!("repo.toolbar.switch_branch"), Some("Ctrl+Shift+B")),
             self.branch_bounds.clone(),
             branch_click,
             colors,
@@ -2894,12 +2933,12 @@ impl RepositoryView {
         let stash_view = cx.entity();
         let mut stash_button = Button::tool("toolbar-stash")
             .icon(IconName::Stash)
-            .tooltip_kbd("Stash local changes", "Ctrl+Shift+S")
+            .tooltip_kbd(ui::t!("repo.toolbar.stash_tip"), "Ctrl+Shift+S")
             .on_click(move |_, window, cx| {
                 stash_view.update(cx, |view, cx| view.stash_changes(window, cx));
             });
         if layout.labels {
-            stash_button = stash_button.label("Stash");
+            stash_button = stash_button.label(ui::t!("repo.toolbar.stash"));
         }
         if stash_count > 0 {
             stash_button = stash_button.counter(Counter::new(stash_count.to_string()));
@@ -2927,8 +2966,8 @@ impl RepositoryView {
         let fetch_button = network_tool(
             "toolbar-fetch",
             IconName::Fetch,
-            "Fetch",
-            "Fetch all remotes, tags and pruned branches".to_owned(),
+            ui::t!("repo.toolbar.fetch"),
+            ui::t!("repo.toolbar.fetch_tip").to_string(),
             crate::settings_ui::keybindings::key_cap(cx, "fetch"),
             None,
             layout.labels,
@@ -2946,7 +2985,7 @@ impl RepositoryView {
         let pull_button = network_tool(
             "toolbar-pull",
             IconName::Down,
-            "Pull",
+            ui::t!("repo.toolbar.pull"),
             hints.pull_tip,
             crate::settings_ui::keybindings::key_cap(cx, "pull"),
             (hints.behind > 0).then(|| Counter::new(format!("↓{}", hints.behind))),
@@ -2957,7 +2996,7 @@ impl RepositoryView {
         let push_button = network_tool(
             "toolbar-push",
             IconName::Up,
-            "Push",
+            ui::t!("repo.toolbar.push"),
             hints.push_tip,
             crate::settings_ui::keybindings::key_cap(cx, "push"),
             (hints.ahead > 0).then(|| Counter::new(format!("↑{}", hints.ahead)).accent()),
@@ -2983,17 +3022,17 @@ impl RepositoryView {
             .child(titlebar_fill());
 
         let history_item = if layout.labels {
-            SegmentItem::new("History").with_icon(IconName::Lanes)
+            SegmentItem::new(ui::t!("repo.toolbar.view_history")).with_icon(IconName::Lanes)
         } else {
             SegmentItem::icon(IconName::Lanes)
         };
         let changes_item = if layout.labels {
-            SegmentItem::new("Changes").with_icon(IconName::Edit)
+            SegmentItem::new(ui::t!("repo.toolbar.view_changes")).with_icon(IconName::Edit)
         } else {
             SegmentItem::icon(IconName::Edit)
         };
         let worktrees_item = if layout.labels {
-            SegmentItem::new("Worktrees").with_icon(IconName::Worktree)
+            SegmentItem::new(ui::t!("repo.toolbar.view_worktrees")).with_icon(IconName::Worktree)
         } else {
             SegmentItem::icon(IconName::Worktree)
         };
@@ -3001,11 +3040,13 @@ impl RepositoryView {
         bar = bar.child(no_shrink(
             Segmented::new("view-switch")
                 .item(history_item)
-                .item(changes_item.tooltip("Local changes"))
+                .item(changes_item.tooltip(ui::t!("repo.toolbar.local_changes")))
                 .item(
                     match crate::settings_ui::keybindings::key_cap(cx, "worktree_switcher") {
-                        Some(cap) => worktrees_item.tooltip_kbd("Worktrees", cap),
-                        None => worktrees_item.tooltip("Worktrees"),
+                        Some(cap) => {
+                            worktrees_item.tooltip_kbd(ui::t!("repo.toolbar.view_worktrees"), cap)
+                        }
+                        None => worktrees_item.tooltip(ui::t!("repo.toolbar.view_worktrees")),
                     },
                 )
                 .selected(segment_for_view(self.view))
@@ -3040,7 +3081,7 @@ impl RepositoryView {
                     view.search_focus_list(window, cx);
                 }))
                 .tooltip(Tooltip::with_kbd(
-                    "Search commits, authors, hashes",
+                    ui::t!("repo.search.placeholder"),
                     "Ctrl+K",
                 ))
                 .child(field),
@@ -3055,7 +3096,7 @@ impl RepositoryView {
         bar = bar.child(no_shrink(
             Button::ghost("settings-button")
                 .icon_only(IconName::Gear)
-                .tooltip_kbd("Settings", "Ctrl+,")
+                .tooltip_kbd(ui::t!("repo.toolbar.settings"), "Ctrl+,")
                 .on_click(settings_click),
         ));
 
@@ -3209,7 +3250,7 @@ impl RepositoryView {
                                 .items_center()
                                 .text_size(FS_SM)
                                 .text_color(colors.muted)
-                                .child("No matches"),
+                                .child(ui::t!("repo.sidebar.no_matches")),
                         )
                     })
                     .when(!no_matches && !worktrees_mode, |this| {
@@ -3330,12 +3371,12 @@ impl RepositoryView {
             .item(
                 SegmentItem::icon(IconName::PanelR)
                     .id("dock-right")
-                    .tooltip("Dock details to the right"),
+                    .tooltip(ui::t!("repo.details.dock_right")),
             )
             .item(
                 SegmentItem::icon(IconName::PanelB)
                     .id("dock-bottom")
-                    .tooltip("Dock details to the bottom"),
+                    .tooltip(ui::t!("repo.details.dock_bottom")),
             )
             .selected(if dock == Dock::Right { 0 } else { 1 })
             .on_select(move |index, _, cx| {
@@ -3359,7 +3400,7 @@ impl RepositoryView {
             .border_b_1()
             .border_color(colors.border)
             .font_weight(FontWeight::SEMIBOLD)
-            .child("Commit")
+            .child(ui::t!("repo.details.title"))
             .when_some(short, |this, hash| {
                 this.child(
                     div()
@@ -3471,7 +3512,9 @@ impl RepositoryView {
 
     fn render_info_content(&self, colors: ThemeColors, cx: &mut Context<Self>) -> AnyElement {
         match &self.details {
-            DetailsState::Empty => muted_note("Select a commit", colors).into_any_element(),
+            DetailsState::Empty => {
+                muted_note(ui::t!("repo.details.select_commit"), colors).into_any_element()
+            }
             DetailsState::Loading => div()
                 .flex()
                 .flex_col()
@@ -3491,7 +3534,7 @@ impl RepositoryView {
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Could not load the commit"),
+                        .child(ui::t!("repo.details.load_failed")),
                 )
                 .child(div().text_color(colors.error).child(message.clone()))
                 .into_any_element(),
@@ -3568,7 +3611,9 @@ impl RepositoryView {
             .child(hash);
 
         let parents = if details.parents.is_empty() {
-            div().text_color(colors.muted).child("none (root commit)")
+            div()
+                .text_color(colors.muted)
+                .child(ui::t!("repo.details.root_commit"))
         } else {
             let view = cx.entity();
             let mut row = div().flex().items_center().gap(px(6.));
@@ -3607,11 +3652,15 @@ impl RepositoryView {
                     .flex_col()
                     .gap(px(6.))
                     .text_size(FS_SM)
-                    .child(meta_row("Author", author, colors))
-                    .child(meta_row("Authored", authored, colors))
-                    .child(meta_row("Committer", committer, colors))
-                    .child(meta_row("Hash", hash, colors))
-                    .child(meta_row("Parents", parents, colors)),
+                    .child(meta_row(ui::t!("repo.details.author"), author, colors))
+                    .child(meta_row(ui::t!("repo.details.authored"), authored, colors))
+                    .child(meta_row(
+                        ui::t!("repo.details.committer"),
+                        committer,
+                        colors,
+                    ))
+                    .child(meta_row(ui::t!("repo.details.hash"), hash, colors))
+                    .child(meta_row(ui::t!("repo.details.parents"), parents, colors)),
             )
             .into_any_element()
     }
@@ -3639,7 +3688,7 @@ impl RepositoryView {
                 div()
                     .font_weight(FontWeight::BOLD)
                     .text_color(colors.text)
-                    .child("Changed files"),
+                    .child(ui::t!("repo.details.changed_files")),
             );
         if let Some(count) = count {
             header = header.child(CountPill::new(count.to_string()));
@@ -3649,8 +3698,8 @@ impl RepositoryView {
             header = header.child(
                 div()
                     .id("details-vs-parent")
-                    .tooltip(Tooltip::text("Combined diff against first parent"))
-                    .child("vs parent 1"),
+                    .tooltip(Tooltip::text(ui::t!("repo.details.vs_parent_tip")))
+                    .child(ui::t!("repo.details.vs_parent")),
             );
         }
 
@@ -3685,11 +3734,11 @@ impl RepositoryView {
                     .p(px(12.))
                     .text_color(colors.error)
                     .child(message.clone()),
-                _ => muted_note("No files changed", colors),
+                _ => muted_note(ui::t!("repo.details.no_files"), colors),
             };
         };
         if files.is_empty() {
-            return muted_note("No files changed", colors);
+            return muted_note(ui::t!("repo.details.no_files"), colors);
         }
 
         let view = cx.entity();
@@ -3782,12 +3831,12 @@ impl RepositoryView {
         let switch = Segmented::new("diff-layout")
             .small()
             .item(
-                SegmentItem::new("Unified")
+                SegmentItem::new(ui::t!("repo.diff.unified"))
                     .with_icon(IconName::Unified)
                     .id("diff-unified"),
             )
             .item(
-                SegmentItem::new("Side-by-side")
+                SegmentItem::new(ui::t!("repo.diff.side_by_side"))
                     .with_icon(IconName::Split)
                     .id("diff-split"),
             )
@@ -3803,7 +3852,7 @@ impl RepositoryView {
         toolbar = toolbar.child(no_shrink(switch));
 
         let body = match &self.diff {
-            DiffState::Empty => diff_note("Select a file", colors),
+            DiffState::Empty => diff_note(ui::t!("repo.diff.select_file"), colors),
             DiffState::Loading => div()
                 .flex_1()
                 .min_h_0()
@@ -3815,7 +3864,7 @@ impl RepositoryView {
                 .child(Skeleton::new("diff-skeleton-2", px(260.)))
                 .child(Skeleton::new("diff-skeleton-3", px(290.))),
             DiffState::Failed(message) if message.contains("too large") => {
-                diff_note("Diff too large to display", colors)
+                diff_note(ui::t!("repo.diff.too_large"), colors)
             }
             DiffState::Failed(message) => div()
                 .flex_1()
@@ -3825,9 +3874,9 @@ impl RepositoryView {
                 .child(message.clone()),
             DiffState::Loaded(data) => {
                 if data.diff.binary {
-                    diff_note("Binary file", colors)
+                    diff_note(ui::t!("repo.diff.binary"), colors)
                 } else if data.rows.is_empty() {
-                    diff_note("No changes", colors)
+                    diff_note(ui::t!("repo.diff.no_changes"), colors)
                 } else {
                     let data = data.clone();
                     let list = if layout == DiffLayout::Split {
@@ -4009,7 +4058,7 @@ impl RepositoryView {
                         .items_center()
                         .gap(px(8.))
                         .child(Spinner::new("status-spinner", px(12.)))
-                        .child("Loading changes…"),
+                        .child(ui::t!("repo.status.loading_changes")),
                 );
             } else if let Some(error) = changes.failure() {
                 bar = bar.child(
@@ -4022,10 +4071,10 @@ impl RepositoryView {
                 );
             }
             bar = bar.child(div().flex_1());
-            bar = bar.child(format!(
-                "{} unstaged · {} staged",
-                changes.unstaged_count(),
-                changes.staged_count()
+            bar = bar.child(ui::t!(
+                "repo.status.unstaged_staged",
+                unstaged = changes.unstaged_count(),
+                staged = changes.staged_count()
             ));
         } else {
             let history = self.history.read(cx);
@@ -4038,11 +4087,15 @@ impl RepositoryView {
                             .items_center()
                             .gap(px(8.))
                             .child(Spinner::new("status-spinner", px(12.)))
-                            .child("Loading history…"),
+                            .child(ui::t!("repo.status.loading_history")),
                     );
                 }
                 LoadState::Cancelled => {
-                    bar = bar.child(div().text_color(colors.muted).child("Loading cancelled"));
+                    bar = bar.child(
+                        div()
+                            .text_color(colors.muted)
+                            .child(ui::t!("repo.status.loading_cancelled")),
+                    );
                 }
                 LoadState::Failed(failure) => {
                     bar = bar.child(
@@ -4060,9 +4113,10 @@ impl RepositoryView {
             if fill {
                 bar = bar.child(div().flex_1());
             }
-            bar = bar.child(format!(
-                "{} commits loaded",
-                format_count(history.commit_count())
+            bar = bar.child(ui::i18n::t_count(
+                "repo.status.commits_loaded",
+                history.commit_count() as u64,
+                &[("n", &format_count(history.commit_count()))],
             ));
         }
 
@@ -4261,7 +4315,7 @@ fn switcher(
     name: Option<SharedString>,
     name_max: Option<f32>,
     padding: f32,
-    tooltip: (&'static str, Option<&'static str>),
+    tooltip: (SharedString, Option<&'static str>),
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     colors: ThemeColors,
@@ -4282,8 +4336,8 @@ fn switcher(
         .on_click(on_click)
         .child(Icon::new(icon).size(px(14.)).color(colors.muted));
     row = match tooltip.1 {
-        Some(kbd) => row.tooltip(Tooltip::with_kbd(tooltip.0, kbd)),
-        None => row.tooltip(Tooltip::text(tooltip.0)),
+        Some(kbd) => row.tooltip(Tooltip::with_kbd(tooltip.0.clone(), kbd)),
+        None => row.tooltip(Tooltip::text(tooltip.0.clone())),
     };
     if let (Some(name), Some(max)) = (name, name_max) {
         row = row.child(
@@ -4315,7 +4369,7 @@ fn no_shrink(child: impl IntoElement) -> Div {
 fn network_tool(
     id: &'static str,
     icon: IconName,
-    label: &'static str,
+    label: SharedString,
     tooltip: String,
     kbd: Option<String>,
     counter: Option<Counter>,
@@ -4347,11 +4401,6 @@ struct NetworkHints {
     behind: usize,
 }
 
-/// `1 commit` / `3 commits`.
-fn commits(count: usize) -> String {
-    format!("{count} commit{}", if count == 1 { "" } else { "s" })
-}
-
 /// The Pull / Push tooltips and counters, from the ahead/behind the refs
 /// already carry (as of the last fetch) — no git command runs per frame.
 fn network_hints(
@@ -4376,13 +4425,23 @@ fn network_hints(
         _ => (0, 0),
     };
     let pull_tip = match upstream {
-        _ if ahead > 0 && behind > 0 => "Pull — branches diverged; fast-forward only".to_owned(),
-        Some(upstream) if behind > 0 => format!("Pull {} from {upstream}", commits(behind)),
-        Some(_) => "Pull — nothing to pull".to_owned(),
-        None => "Pull — no upstream branch".to_owned(),
+        _ if ahead > 0 && behind > 0 => ui::t!("repo.network.pull_diverged").to_string(),
+        Some(upstream) if behind > 0 => ui::i18n::t_count(
+            "repo.network.pull_from",
+            behind as u64,
+            &[("upstream", &upstream)],
+        )
+        .to_string(),
+        Some(_) => ui::t!("repo.network.pull_nothing").to_string(),
+        None => ui::t!("repo.network.pull_no_upstream").to_string(),
     };
     let push_tip = match (upstream, branch) {
-        (Some(upstream), _) if ahead > 0 => format!("Push {} to {upstream}", commits(ahead)),
+        (Some(upstream), _) if ahead > 0 => ui::i18n::t_count(
+            "repo.network.push_to",
+            ahead as u64,
+            &[("upstream", &upstream)],
+        )
+        .to_string(),
         (None, Some(branch)) => {
             // Same remote the push itself picks: `origin`, else the first.
             let remote = remotes
@@ -4390,11 +4449,16 @@ fn network_hints(
                 .find(|remote| remote.as_str() == "origin")
                 .or_else(|| remotes.first());
             match remote {
-                Some(remote) => format!("Push and set upstream to {remote}/{branch}"),
-                None => "Push the current branch".to_owned(),
+                Some(remote) => ui::t!(
+                    "repo.network.push_set_upstream",
+                    remote = remote,
+                    branch = branch
+                )
+                .to_string(),
+                None => ui::t!("repo.network.push_current").to_string(),
             }
         }
-        _ => "Push the current branch".to_owned(),
+        _ => ui::t!("repo.network.push_current").to_string(),
     };
     NetworkHints {
         pull_tip,
@@ -4421,7 +4485,7 @@ const DIFF_GUTTER: f32 = 44.;
 const DIFF_MARKER: f32 = 16.;
 
 /// A muted, centred message for a diff that has nothing to paint.
-fn diff_note(text: &'static str, colors: ThemeColors) -> Div {
+fn diff_note(text: SharedString, colors: ThemeColors) -> Div {
     div()
         .flex_1()
         .min_h_0()
@@ -4745,7 +4809,7 @@ fn diff_text_run(len: usize, font: &gpui::Font, color: Hsla, background: Option<
 }
 
 /// A muted one-line note, for an empty pane or a cleared selection.
-fn muted_note(label: &'static str, colors: ThemeColors) -> Div {
+fn muted_note(label: SharedString, colors: ThemeColors) -> Div {
     div()
         .flex()
         .items_center()
@@ -4757,7 +4821,7 @@ fn muted_note(label: &'static str, colors: ThemeColors) -> Div {
 }
 
 /// One label/value row of the details metadata grid.
-fn meta_row(label: &'static str, value: impl IntoElement, colors: ThemeColors) -> Div {
+fn meta_row(label: SharedString, value: impl IntoElement, colors: ThemeColors) -> Div {
     div()
         .flex()
         .items_center()
