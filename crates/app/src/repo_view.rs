@@ -952,6 +952,41 @@ impl RepositoryView {
                     Ok((ui::ToastKind::Ok, format!("Popped stash@{{{index}}}")))
                 });
             }
+            SidebarAction::ViewStash(index) => {
+                let oid = self
+                    .sidebar_extras
+                    .as_ref()
+                    .and_then(|extras| extras.stashes.iter().find(|stash| stash.index == index))
+                    .map(|stash| stash.oid);
+                match oid {
+                    Some(oid) => self.start_details(oid, cx),
+                    None => {
+                        toast::show(
+                            ui::ToastKind::Warn,
+                            format!("stash@{{{index}}} no longer exists"),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
+            SidebarAction::UpdateSubmodule(path) => {
+                self.start_network_job(Job::UpdateSubmodule { path }, window, cx);
+            }
+            SidebarAction::OpenSubmodule(path) => {
+                let folder = self.root.join(&path);
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.open_repository_window(folder, window, cx);
+                    })
+                    .ok();
+                toast::show(
+                    ui::ToastKind::Ok,
+                    format!("Opened {path} in a new window"),
+                    window,
+                    cx,
+                );
+            }
             SidebarAction::DropStash(index) => {
                 let label = self
                     .sidebar_extras

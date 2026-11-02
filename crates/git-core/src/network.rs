@@ -292,6 +292,71 @@ pub fn pull(
     run_streaming(cmd, "pull", context, cancel, on_progress)
 }
 
+/// Initialises and updates one submodule (and its own submodules) to the
+/// commit the superproject records. This may clone, so it runs through the
+/// same streaming runner as fetch.
+pub fn update_submodule(
+    repo: &Repo,
+    path: &str,
+    context: &NetworkContext,
+    cancel: &CancelToken,
+    on_progress: impl FnMut(Progress),
+) -> Result<NetworkOutcome> {
+    let mut cmd = repo.command();
+    cmd.args([
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+        "--progress",
+        "--",
+        path,
+    ]);
+    run_streaming(cmd, "submodule update", context, cancel, on_progress)
+}
+
+/// The URL `.gitmodules` records for the submodule at `path`, if any.
+pub fn submodule_url(repo: &Repo, path: &str) -> Result<Option<String>> {
+    let out = repo
+        .command()
+        .args([
+            "config",
+            "--file",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ])
+        .output()
+        .map_err(Error::Spawn)?;
+    // Exit 1 means no match (or no .gitmodules): nothing to preflight.
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let name = text.lines().find_map(|line| {
+        let (key, value) = line.split_once(' ')?;
+        (value == path).then(|| {
+            key.strip_prefix("submodule.")
+                .and_then(|rest| rest.strip_suffix(".path"))
+                .map(str::to_owned)
+        })?
+    });
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let out = repo
+        .command()
+        .args(["config", "--file", ".gitmodules", "--get"])
+        .arg(format!("submodule.{name}.url"))
+        .output()
+        .map_err(Error::Spawn)?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    Ok((!url.is_empty()).then_some(url))
+}
+
 /// Pushes the current branch (or `options.refspec`) to `options.remote`.
 pub fn push(
     repo: &Repo,

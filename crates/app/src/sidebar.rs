@@ -220,6 +220,12 @@ pub enum SidebarAction {
     PushTags,
     /// Deletes a remote branch, e.g. `origin/feat/x`.
     DeleteRemoteBranch(String),
+    /// Shows a stash's files and diff in the details dock.
+    ViewStash(usize),
+    /// Initialises and updates a submodule, by path.
+    UpdateSubmodule(String),
+    /// Opens an initialised submodule's folder in a second window.
+    OpenSubmodule(String),
     /// Shows the Worktrees page.
     ShowWorktrees,
     /// Opens the add-worktree dialog.
@@ -392,9 +398,7 @@ pub fn sidebar_menu(
         return vec![
             item("Apply stash", IconName::Check).maybe_action(index.map(SidebarAction::ApplyStash)),
             item("Pop stash", IconName::Undo).maybe_action(index.map(SidebarAction::PopStash)),
-            // Viewing a stash needs the detail diff of a stash commit; that is
-            // part of the history work, not this stage.
-            item("View changes", IconName::Eye),
+            item("View changes", IconName::Eye).maybe_action(index.map(SidebarAction::ViewStash)),
             SidebarMenuEntry::Separator,
             item("Drop stash", IconName::Trash)
                 .danger()
@@ -437,10 +441,16 @@ pub fn sidebar_menu(
                 .action(SidebarAction::RemoveWorktree(path.to_owned())),
         ];
     }
-    if key.starts_with("sub:") {
+    if let Some(path) = key.strip_prefix("sub:") {
+        // A submodule that is not checked out has no folder with a `.git` to open.
+        let initialised = extras
+            .and_then(|extras| extras.submodules.iter().find(|sub| sub.path == path))
+            .is_some_and(|sub| sub.state != SubmoduleState::Uninitialized);
         return vec![
-            item("Update submodule", IconName::Fetch),
-            item("Open in new window", IconName::Folder),
+            item("Update submodule", IconName::Fetch)
+                .action(SidebarAction::UpdateSubmodule(path.to_owned())),
+            item("Open in new window", IconName::Folder)
+                .maybe_action(initialised.then(|| SidebarAction::OpenSubmodule(path.to_owned()))),
         ];
     }
     match key {
@@ -1894,6 +1904,37 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn submodule_menu_enables_open_only_when_initialised() {
+        let extras = SidebarExtras {
+            submodules: vec![
+                Submodule {
+                    path: "vendor/a".to_owned(),
+                    oid: Some(oid()),
+                    state: SubmoduleState::Clean,
+                },
+                Submodule {
+                    path: "vendor/b".to_owned(),
+                    oid: None,
+                    state: SubmoduleState::Uninitialized,
+                },
+            ],
+            ..Default::default()
+        };
+        let ready = sidebar_menu("sub:vendor/a", None, Some(&extras), None);
+        assert_eq!(
+            menu_item(&ready, "Update submodule").action,
+            SidebarAction::UpdateSubmodule("vendor/a".to_owned())
+        );
+        assert_eq!(
+            menu_item(&ready, "Open in new window").action,
+            SidebarAction::OpenSubmodule("vendor/a".to_owned())
+        );
+        let missing = sidebar_menu("sub:vendor/b", None, Some(&extras), None);
+        assert!(menu_item(&missing, "Update submodule").enabled);
+        assert!(!menu_item(&missing, "Open in new window").enabled);
+    }
+
     fn menu_item<'a>(entries: &'a [SidebarMenuEntry], label: &str) -> &'a SidebarMenuItem {
         entries
             .iter()
@@ -2166,7 +2207,10 @@ mod tests {
                     "Rename tag…",
                     "Delete tag",
                 ],
-                "stash:0" => &["Apply stash", "Pop stash", "Drop stash"],
+                "stash:0" => &["Apply stash", "Pop stash", "View changes", "Drop stash"],
+                // Open in new window stays disabled: this fixture has no
+                // initialised `vendor/a`.
+                "sub:vendor/a" => &["Update submodule"],
                 "remote:origin" => &["Fetch", "Edit remote…", "Remove remote"],
                 "wt:/tmp/wt" => &[
                     "Open in new window",
@@ -2253,7 +2297,10 @@ mod tests {
             SidebarAction::PushTag("v1".to_owned())
         );
         let stash_menu = sidebar_menu("stash:0", Some(&head), Some(&extras), None);
-        assert!(!menu_item(&stash_menu, "View changes").enabled);
+        assert_eq!(
+            menu_item(&stash_menu, "View changes").action,
+            SidebarAction::ViewStash(0)
+        );
         // The shortcut hints of the design are kept.
         assert_eq!(
             menu_item(&local_menu, "Checkout").shortcut.as_deref(),

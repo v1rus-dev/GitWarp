@@ -34,6 +34,10 @@ pub enum Job {
         remote: String,
         branch: String,
     },
+    /// Initialise and update one submodule, by path.
+    UpdateSubmodule {
+        path: String,
+    },
 }
 
 impl Job {
@@ -45,6 +49,7 @@ impl Job {
             Job::Push => "Pushing",
             Job::PushTag { .. } | Job::PushTags { .. } => "Pushing tags",
             Job::DeleteRemoteBranch { .. } => "Deleting remote branch",
+            Job::UpdateSubmodule { .. } => "Updating submodule",
         }
     }
 
@@ -66,6 +71,7 @@ impl Job {
             Job::PushTag { tag, .. } => format!("Pushed tag {tag}"),
             Job::PushTags { .. } => "Pushed all tags".to_owned(),
             Job::DeleteRemoteBranch { branch, .. } => format!("Deleted remote branch {branch}"),
+            Job::UpdateSubmodule { path } => format!("Updated submodule {path}"),
         }
     }
 
@@ -138,6 +144,9 @@ impl Job {
             }
             Job::DeleteRemoteBranch { remote, branch } => {
                 delete_remote_branch(repo, remote, branch, context, asker, cancel, on_progress)
+            }
+            Job::UpdateSubmodule { path } => {
+                update_submodule(repo, path, context, asker, cancel, on_progress)
             }
         }
     }
@@ -264,6 +273,21 @@ pub fn pull(
     };
     preflight(&urls, asker, cancel)?;
     network::pull(repo, remote, branch, context, cancel, on_progress)
+}
+
+/// Updates a submodule, preflighting its `.gitmodules` URL when it has one.
+pub fn update_submodule(
+    repo: &Repo,
+    path: &str,
+    context: &NetworkContext,
+    asker: &HostKeyAsker,
+    cancel: &CancelToken,
+    on_progress: impl FnMut(Progress),
+) -> Result<NetworkOutcome> {
+    if let Some(url) = network::submodule_url(repo, path)? {
+        preflight(&[url], asker, cancel)?;
+    }
+    network::update_submodule(repo, path, context, cancel, on_progress)
 }
 
 /// Pushes with the SSH preflight of the destination remote.
