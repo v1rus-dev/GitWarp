@@ -6,7 +6,10 @@
 
 use std::rc::Rc;
 
-use gpui::{div, px, App, AppContext, ClickEvent, Context, Entity, ParentElement, SharedString, Styled, Window};
+use gpui::{
+    div, px, App, AppContext, ClickEvent, Context, Entity, ParentElement, SharedString, Styled,
+    Window,
+};
 
 use ui::theme::ActiveTheme;
 use ui::{dialog, overlay, Button, Dialog, DialogFocus, IconName};
@@ -86,10 +89,7 @@ fn build(state: &Entity<CheckoutDialog>, cx: &App) -> Dialog {
         } else {
             Button::new(id)
         };
-        button
-            .label(label)
-            .focus_handle(focus)
-            .on_click(click)
+        button.label(label).focus_handle(focus).on_click(click)
     };
 
     let cancel = {

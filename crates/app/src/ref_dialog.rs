@@ -345,9 +345,9 @@ impl RefDialog {
         let name = self.name_text(cx);
         match &self.kind {
             RefDialogKind::RenameBranch { old } | RefDialogKind::RenameTag { old } => name == *old,
-            RefDialogKind::RenameWorktree { from } => {
-                from.file_name().is_some_and(|current| current == name.as_str())
-            }
+            RefDialogKind::RenameWorktree { from } => from
+                .file_name()
+                .is_some_and(|current| current == name.as_str()),
             _ => false,
         }
     }
@@ -367,11 +367,13 @@ impl RefDialog {
             | RefDialogKind::RenameWorktree { .. } => (
                 !name.is_empty() && name_error.is_none() && !rename_unchanged,
                 if name.is_empty() {
-                    Some(if matches!(self.kind, RefDialogKind::RenameWorktree { .. }) {
-                        "Enter a folder name"
-                    } else {
-                        "Enter a branch name"
-                    })
+                    Some(
+                        if matches!(self.kind, RefDialogKind::RenameWorktree { .. }) {
+                            "Enter a folder name"
+                        } else {
+                            "Enter a branch name"
+                        },
+                    )
                 } else if name_error.is_some() {
                     Some("Fix the name to continue")
                 } else if rename_unchanged {

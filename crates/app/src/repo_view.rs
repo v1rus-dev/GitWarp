@@ -782,10 +782,9 @@ impl RepositoryView {
             Some(SidebarAction::CheckoutBranch(name.to_owned()))
         } else if let Some(name) = key.strip_prefix("rbranch:") {
             Some(SidebarAction::CheckoutRemoteBranch(name.to_owned()))
-        } else if let Some(name) = key.strip_prefix("tag:") {
-            Some(SidebarAction::CheckoutTag(name.to_owned()))
         } else {
-            None
+            key.strip_prefix("tag:")
+                .map(|name| SidebarAction::CheckoutTag(name.to_owned()))
         };
         if let Some(action) = action {
             self.run_sidebar_action(action, window, cx);

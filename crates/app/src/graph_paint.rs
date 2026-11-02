@@ -9,8 +9,8 @@
 use git_core::Oid;
 use git_graph::{ColumnGeometry, Row, Segment};
 use gpui::{
-    fill, linear_color_stop, linear_gradient, point, px, Bounds, Hsla, PathBuilder, Pixels,
-    Point, Window,
+    fill, linear_color_stop, linear_gradient, point, px, Bounds, Hsla, PathBuilder, Pixels, Point,
+    Window,
 };
 use ui::Theme;
 

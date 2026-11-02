@@ -12,9 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use gpui::prelude::*;
 use gpui::{
-    actions, canvas, container_query, div, px, uniform_list, AnyElement, App, AsyncApp,
-    ClickEvent, ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, FocusHandle,
-    FontWeight,
+    actions, canvas, container_query, div, px, uniform_list, AnyElement, App, AsyncApp, ClickEvent,
+    ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, FocusHandle, FontWeight,
     IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, ScrollStrategy,
     SharedString, StyledText, Task, TextRun, TextStyle, UniformListScrollHandle, WeakEntity,
     Window,
@@ -1184,11 +1183,7 @@ impl HistoryView {
                     MenuItem::new("Checkout this commit")
                         .icon(IconName::Check)
                         .action(move |window, cx| {
-                            checkout(
-                                RefAction::CheckoutCommit(checkout_card.clone()),
-                                window,
-                                cx,
-                            );
+                            checkout(RefAction::CheckoutCommit(checkout_card.clone()), window, cx);
                         }),
                 ));
             }

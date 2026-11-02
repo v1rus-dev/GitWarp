@@ -528,7 +528,6 @@ impl Render for Workspace {
             .overflow_hidden()
             .child(body);
         let content = if let Some(settings) = settings {
-            let colors = colors;
             content.child(
                 div()
                     .absolute()
@@ -538,9 +537,12 @@ impl Render for Workspace {
                     .justify_center()
                     .p(px(32.))
                     .bg(colors.overlay)
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                        this.close_settings(window, cx);
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.close_settings(window, cx);
+                        }),
+                    )
                     .child(
                         div()
                             .w_full()
@@ -560,7 +562,8 @@ impl Render for Workspace {
         } else {
             content
         };
-        let frame = frame.child(content)
+        let frame = frame
+            .child(content)
             // Menus, dialogs and toasts live inside the frame, above the
             // content, so they cannot spill over the window's shadow band.
             .child(ui::overlay::render_overlays(window, cx));
