@@ -1,7 +1,7 @@
 {
   "welcome.action.clone": "Cloner un dépôt…",
   "welcome.action.clone_tooltip": "Cloner un dépôt depuis une URL",
-  "welcome.action.init": "Initialiser un nouveau dépôt…",
+  "welcome.action.init": "Nouveau dépôt…",
   "welcome.action.init_tooltip": "Créer un nouveau dépôt",
   "welcome.action.open": "Ouvrir un dépôt…",
   "welcome.action.open_tooltip": "Ouvrir un dépôt existant",

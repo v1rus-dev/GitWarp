@@ -1,7 +1,7 @@
 {
-  "welcome.action.clone": "リポジトリをクローン…",
+  "welcome.action.clone": "クローン…",
   "welcome.action.clone_tooltip": "URL からリポジトリをクローンします",
-  "welcome.action.init": "新しいリポジトリを初期化…",
+  "welcome.action.init": "新規作成…",
   "welcome.action.init_tooltip": "新しいリポジトリを作成します",
   "welcome.action.open": "リポジトリを開く…",
   "welcome.action.open_tooltip": "既存のリポジトリを開きます",
@@ -102,5 +102,5 @@
   "welcome.recent.no_matches_text": "「{filter}」に一致する最近のリポジトリはありません。",
   "welcome.recent.no_matches_title": "一致するものはありません",
   "welcome.recent.title": "最近のリポジトリ",
-  "welcome.tagline": "速くてキーボード中心の Git クライアント。"
+  "welcome.tagline": "速くてキーボード中心の Git クライアント"
 }

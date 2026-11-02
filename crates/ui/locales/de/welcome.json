@@ -1,7 +1,7 @@
 {
-  "welcome.action.clone": "Repository klonen…",
+  "welcome.action.clone": "Klonen…",
   "welcome.action.clone_tooltip": "Ein Repository per URL klonen",
-  "welcome.action.init": "Neues Repository initialisieren…",
+  "welcome.action.init": "Neues Repository…",
   "welcome.action.init_tooltip": "Ein neues Repository erstellen",
   "welcome.action.open": "Repository öffnen…",
   "welcome.action.open_tooltip": "Ein vorhandenes Repository öffnen",

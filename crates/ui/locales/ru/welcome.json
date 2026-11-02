@@ -1,9 +1,9 @@
 {
-  "welcome.action.clone": "Клонировать репозиторий…",
+  "welcome.action.clone": "Клонировать…",
   "welcome.action.clone_tooltip": "Клонировать репозиторий по адресу",
-  "welcome.action.init": "Создать новый репозиторий…",
+  "welcome.action.init": "Создать…",
   "welcome.action.init_tooltip": "Создать новый репозиторий",
-  "welcome.action.open": "Открыть репозиторий…",
+  "welcome.action.open": "Открыть…",
   "welcome.action.open_tooltip": "Открыть существующий репозиторий",
   "welcome.activity.all_recent": "Все недавние",
   "welcome.activity.all_tooltip.one": "Ваши коммиты в {n} доступном недавнем репозитории",
