@@ -5,15 +5,19 @@
 //! service (`forge::api::current_user`); rows show "Checking…" until the
 //! answer arrives.
 
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 use forge::ServiceKind;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, AnyElement, App, AppContext, ClickEvent, Context, ElementId, Entity, FontWeight,
-    InteractiveElement, IntoElement, ParentElement, Pixels, StatefulInteractiveElement, Styled,
-    Subscription, WeakEntity, Window,
+    div, px, AnyElement, App, AppContext, ClickEvent, Context, ElementId, Entity, FocusHandle,
+    FontWeight, HighlightStyle, InteractiveElement, IntoElement, ParentElement, Pixels,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, Subscription, WeakEntity, Window,
 };
+
+use ui::actions::Confirm;
+use ui::focus::{self, RingOffset};
 
 use ui::metrics::{FS_BASE, FS_SM, FS_XS, R_MD, R_XS};
 use ui::theme::ActiveTheme;
@@ -28,7 +32,7 @@ use crate::accounts::{self as logic, cached_store, AccountStatus, StoreResult};
 use crate::settings::{AccountMethod, AccountRecord};
 
 /// The service's icon: the GitHub mark, or a monogram badge for the others.
-pub(super) fn service_icon(kind: ServiceKind, cx: &App) -> AnyElement {
+pub(crate) fn service_icon(kind: ServiceKind, cx: &App) -> AnyElement {
     let colors = cx.theme().colors;
     let frame = div()
         .w(px(20.))
@@ -64,7 +68,7 @@ pub(super) fn service_icon(kind: ServiceKind, cx: &App) -> AnyElement {
 }
 
 /// A round avatar with the first letter of the login.
-pub(super) fn avatar(login: &str, size: Pixels, font: Pixels, cx: &App) -> AnyElement {
+pub(crate) fn avatar(login: &str, size: Pixels, font: Pixels, cx: &App) -> AnyElement {
     let colors = cx.theme().colors;
     let letter: String = login
         .chars()
@@ -174,7 +178,8 @@ impl SettingsView {
         let view = cx.entity().downgrade();
         self.account_dialog = Some(account_dialog::open(
             account_dialog::Open::Add,
-            view,
+            Some(view),
+            None,
             window,
             cx,
         ));
@@ -189,7 +194,8 @@ impl SettingsView {
         let view = cx.entity().downgrade();
         self.account_dialog = Some(account_dialog::open(
             account_dialog::Open::Reconnect(account),
-            view,
+            Some(view),
+            None,
             window,
             cx,
         ));
@@ -214,7 +220,10 @@ impl SettingsView {
         if let Some(counter) = self.account_checks.remove(&id) {
             counter.fetch_add(1, Ordering::SeqCst);
         }
-        crate::update_settings(cx, |settings| settings.accounts.retain(|a| a.id != id));
+        crate::update_settings(cx, |settings| {
+            settings.accounts.retain(|a| a.id != id);
+            settings.forget_account(&id);
+        });
         let cached = cached_store(cx);
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -227,10 +236,10 @@ impl SettingsView {
             this.update(cx, |view, cx| {
                 // The account is gone either way; say if its token may remain.
                 if let Err(error) = result {
-                    view.accounts_error = Some(
-                        format!("The account was removed, but its token could not be deleted from the keychain: {error}")
-                            .into(),
-                    );
+                    view.accounts_error = Some(ui::t!(
+                        "settings.accounts.remove.keychain_failed",
+                        error = error
+                    ));
                 }
                 cx.notify();
             })
@@ -243,28 +252,39 @@ impl SettingsView {
 
 fn status_view(status: &AccountStatus, id: &str, cx: &App) -> AnyElement {
     let colors = cx.theme().colors;
-    let (icon, text, color, tooltip): (Option<IconName>, &str, _, Option<String>) = match status {
-        AccountStatus::Connected => (Some(IconName::Check), "Connected", colors.success, None),
-        AccountStatus::Checking => (None, "Checking…", colors.muted, None),
-        AccountStatus::Invalid(detail) => (
-            Some(IconName::Err),
-            "Token invalid or revoked",
-            colors.error,
-            detail.clone(),
-        ),
-        AccountStatus::Unreachable(detail) => (
-            Some(IconName::Err),
-            "Instance unreachable",
-            colors.error,
-            detail.clone(),
-        ),
-        AccountStatus::Unchecked(why) => (
-            Some(IconName::Warn),
-            "Not checked",
-            colors.muted,
-            Some(why.clone()),
-        ),
-    };
+    let (icon, text, color, tooltip): (Option<IconName>, SharedString, _, Option<String>) =
+        match status {
+            AccountStatus::Connected => (
+                Some(IconName::Check),
+                ui::t!("settings.accounts.status.connected"),
+                colors.success,
+                None,
+            ),
+            AccountStatus::Checking => (
+                None,
+                ui::t!("settings.accounts.status.checking"),
+                colors.muted,
+                None,
+            ),
+            AccountStatus::Invalid(detail) => (
+                Some(IconName::Err),
+                ui::t!("settings.accounts.status.invalid"),
+                colors.error,
+                detail.clone(),
+            ),
+            AccountStatus::Unreachable(detail) => (
+                Some(IconName::Err),
+                ui::t!("settings.accounts.status.unreachable"),
+                colors.error,
+                detail.clone(),
+            ),
+            AccountStatus::Unchecked(why) => (
+                Some(IconName::Warn),
+                ui::t!("settings.accounts.status.unchecked"),
+                colors.muted,
+                Some(why.clone()),
+            ),
+        };
     div()
         .id(ElementId::Name(
             format!("settings-account-{id}-status").into(),
@@ -302,8 +322,8 @@ fn account_row(
     let label = account.display_label().to_owned();
     let host = logic::host_of(&account.base_url);
     let (method_icon, method_text) = match account.method {
-        AccountMethod::Token => (IconName::Key, "Token"),
-        AccountMethod::Browser => (IconName::Link, "Browser"),
+        AccountMethod::Token => (IconName::Key, ui::t!("settings.accounts.method.token")),
+        AccountMethod::Browser => (IconName::Link, ui::t!("settings.accounts.method.browser")),
     };
 
     let mut actions = div().flex().items_center().gap(px(6.)).flex_none();
@@ -313,7 +333,7 @@ fn account_row(
             let account = account.clone();
             actions = actions.child(
                 Button::primary(format!("settings-account-{id}-reconnect"))
-                    .label("Reconnect")
+                    .label(ui::t!("settings.accounts.action.reconnect"))
                     .size(ButtonSize::Small)
                     .on_click(move |_: &ClickEvent, window, cx| {
                         let account = account.clone();
@@ -326,7 +346,7 @@ fn account_row(
             let retry_id = id.clone();
             actions = actions.child(
                 Button::new(format!("settings-account-{id}-retry"))
-                    .label("Retry")
+                    .label(ui::t!("settings.accounts.action.retry"))
                     .icon(IconName::Fetch)
                     .size(ButtonSize::Small)
                     .on_click(move |_: &ClickEvent, _, cx| {
@@ -366,21 +386,21 @@ fn account_row(
             Button::ghost(format!("settings-account-{id}-rename"))
                 .icon_only(IconName::Edit)
                 .size(ButtonSize::Small)
-                .tooltip("Rename label")
+                .tooltip(ui::t!("settings.accounts.tooltip.rename"))
                 .on_click(rename),
         )
         .child(
             Button::ghost(format!("settings-account-{id}-profile"))
                 .icon_only(IconName::Link)
                 .size(ButtonSize::Small)
-                .tooltip("Open profile in browser")
+                .tooltip(ui::t!("settings.accounts.tooltip.profile"))
                 .on_click(profile),
         )
         .child(
             Button::ghost(format!("settings-account-{id}-remove"))
                 .icon_only(IconName::Trash)
                 .size(ButtonSize::Small)
-                .tooltip("Remove account")
+                .tooltip(ui::t!("settings.accounts.tooltip.remove"))
                 .on_click(remove),
         );
 
@@ -450,14 +470,17 @@ pub(super) fn render(
     let settings = view.settings(cx);
     let mut page = div().flex().flex_col();
     page = page.child(heading(
-        "Accounts",
-        "Sign in to GitHub, GitLab, Gitea / Forgejo, Bitbucket or Azure DevOps, on public or self-hosted instances. Used for private clones, HTTPS push and pull, pull requests and CI status.",
+        ui::t!("settings.accounts.page.title"),
+        ui::t!("settings.accounts.page.subtitle"),
     ));
     if let Some(error) = &view.accounts_error {
         page = page.child(
             div().max_w(px(760.)).mb(px(12.)).child(
-                Banner::new(BannerKind::Error, "The system keychain cannot be used")
-                    .body(error.clone()),
+                Banner::new(
+                    BannerKind::Error,
+                    ui::t!("settings.accounts.keychain.unusable.title"),
+                )
+                .body(error.clone()),
             ),
         );
     }
@@ -480,12 +503,12 @@ pub(super) fn render(
         .overflow_hidden();
     if settings.accounts.is_empty() {
         list = list.child(
-            EmptyState::new("No accounts yet")
+            EmptyState::new(ui::t!("settings.accounts.empty.title"))
                 .icon(IconName::Cloud)
-                .text("Accounts let GitWarp clone private repositories, push and pull over HTTPS, and show pull requests and CI status. You can add several, even for the same service.")
+                .text(ui::t!("settings.accounts.empty.text"))
                 .actions(
                     Button::primary("settings-accounts-add-empty")
-                        .label("Add account")
+                        .label(ui::t!("settings.accounts.add"))
                         .icon(IconName::Plus)
                         .on_click(add.clone()),
                 ),
@@ -526,15 +549,19 @@ pub(super) fn render(
                             .text_size(FS_XS)
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(if count > 0 {
-                                format!("ACCOUNTS · {count}")
+                                ui::i18n::t_count(
+                                    "settings.accounts.list.heading",
+                                    count as u64,
+                                    &[],
+                                )
                             } else {
-                                "ACCOUNTS".to_owned()
+                                ui::t!("settings.accounts.list.heading_empty")
                             }),
                     )
                     .when(count > 0, |this| {
                         this.child(
                             Button::primary("settings-accounts-add")
-                                .label("Add account")
+                                .label(ui::t!("settings.accounts.add"))
                                 .icon(IconName::Plus)
                                 .size(ButtonSize::Small)
                                 .on_click(add),
@@ -555,7 +582,7 @@ pub(super) fn render(
                             .mt(px(2.))
                             .child(Icon::new(IconName::Lock).size(px(14.)).color(colors.muted)),
                     )
-                    .child("Tokens are kept in the system keychain (libsecret on Linux, Credential Manager on Windows, Keychain on macOS), not in settings.json."),
+                    .child(ui::t!("settings.accounts.note.keychain")),
             ),
     );
     page.into_any_element()
@@ -618,7 +645,7 @@ fn open_prompt(
     let state = prompt.downgrade();
     let (layer, host) = dialog::open_with_view(window, cx, move |_, cx| match state.upgrade() {
         Some(state) => build_prompt(&state, cx),
-        None => Dialog::new("Account"),
+        None => Dialog::new(ui::t!("settings.accounts.prompt.fallback_title")),
     });
     prompt.update(cx, |prompt, _| {
         prompt.layer = Some(layer);
@@ -723,14 +750,12 @@ fn build_prompt(state: &Entity<AccountPrompt>, cx: &App) -> Dialog {
                             ),
                     ),
             )
-            .child("GitWarp forgets this account and deletes its token from the system keychain. Remotes that used it will ask you to pick another account.")
+            .child(ui::t!("settings.accounts.prompt.remove.body"))
             .child(
                 div()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child(format!(
-                        "The token stays valid on {host} until you revoke it there."
-                    )),
+                    .child(ui::t!("settings.accounts.prompt.remove.note", host = host)),
             )
             .into_any_element()
     } else {
@@ -742,7 +767,7 @@ fn build_prompt(state: &Entity<AccountPrompt>, cx: &App) -> Dialog {
                 div()
                     .text_size(FS_SM)
                     .font_weight(FontWeight::MEDIUM)
-                    .child("Label"),
+                    .child(ui::t!("settings.accounts.prompt.label")),
             )
             .child(div().w_full().h(px(26.)).child(prompt.input.clone()))
             .child(if empty {
@@ -753,15 +778,15 @@ fn build_prompt(state: &Entity<AccountPrompt>, cx: &App) -> Dialog {
                     .text_size(FS_SM)
                     .text_color(colors.error)
                     .child(Icon::new(IconName::Err).size(px(12.)).color(colors.error))
-                    .child("A label cannot be empty.")
+                    .child(ui::t!("settings.accounts.prompt.label_empty"))
                     .into_any_element()
             } else {
                 div()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child(format!(
-                        "Shown in clone, push and pull-request menus. The login name stays {}.",
-                        account.login
+                    .child(ui::t!(
+                        "settings.accounts.prompt.label_help",
+                        login = account.login
                     ))
                     .into_any_element()
             })
@@ -774,17 +799,18 @@ fn build_prompt(state: &Entity<AccountPrompt>, cx: &App) -> Dialog {
         .gap(px(8.))
         .child(
             Button::new("account-prompt-cancel")
-                .label("Cancel")
+                .label(ui::t!("dialogs.common.cancel"))
                 .min_width(px(72.))
                 .focus_handle(prompt.cancel_focus.clone())
                 .on_click(cancel),
         )
         .child(
             if remove {
-                Button::danger("account-prompt-confirm").label("Remove account")
+                Button::danger("account-prompt-confirm")
+                    .label(ui::t!("settings.accounts.prompt.remove.confirm"))
             } else {
                 Button::primary("account-prompt-confirm")
-                    .label("Save")
+                    .label(ui::t!("settings.accounts.prompt.save"))
                     .disabled(empty)
             }
             .min_width(px(96.))
@@ -808,9 +834,9 @@ fn build_prompt(state: &Entity<AccountPrompt>, cx: &App) -> Dialog {
         }
     };
     Dialog::new(if remove {
-        "Remove account"
+        ui::t!("settings.accounts.prompt.remove.title")
     } else {
-        "Rename label"
+        ui::t!("settings.accounts.prompt.rename.title")
     })
     .icon(if remove {
         IconName::Trash
@@ -830,4 +856,345 @@ fn build_prompt(state: &Entity<AccountPrompt>, cx: &App) -> Dialog {
     .default_button(prompt.primary_focus.clone())
     .default_danger(remove)
     .on_default(on_default)
+}
+
+/* --------------------- "Which account for <remote>?" --------------------- */
+
+/// Runs when the user confirms the picker, with the chosen account.
+pub(crate) type OnPicked = Rc<dyn Fn(&AccountRecord, &mut Window, &mut App)>;
+
+/// The picker opened from a remote's menu when several accounts match its
+/// host. The choice is remembered per repository by the caller.
+pub(crate) struct AccountPicker {
+    remote: String,
+    host: String,
+    accounts: Vec<AccountRecord>,
+    selected: Option<String>,
+    on_picked: OnPicked,
+    layer: Option<overlay::LayerId>,
+    _host: Option<Entity<DialogHost>>,
+    row_focus: Vec<FocusHandle>,
+    cancel_focus: FocusHandle,
+    primary_focus: FocusHandle,
+}
+
+/// Opens the picker with `current` preselected.
+pub(crate) fn open_picker(
+    remote: String,
+    host: String,
+    accounts: Vec<AccountRecord>,
+    current: Option<String>,
+    on_picked: OnPicked,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<AccountPicker> {
+    let picker = cx.new(|cx| AccountPicker {
+        row_focus: accounts
+            .iter()
+            .map(|_| cx.focus_handle().tab_stop(true))
+            .collect(),
+        remote,
+        host,
+        selected: current.filter(|id| accounts.iter().any(|a| a.id == *id)),
+        accounts,
+        on_picked,
+        layer: None,
+        _host: None,
+        cancel_focus: cx.focus_handle().tab_stop(true),
+        primary_focus: cx.focus_handle().tab_stop(true),
+    });
+    let state = picker.downgrade();
+    let (layer, host) =
+        dialog::open_with_view(window, cx, move |window, cx| match state.upgrade() {
+            Some(state) => build_picker(&state, window, cx),
+            None => Dialog::new(ui::t!("dialogs.account_picker.fallback_title")),
+        });
+    picker.update(cx, |picker, _| {
+        picker.layer = Some(layer);
+        picker._host = Some(host);
+    });
+    picker
+}
+
+impl AccountPicker {
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(layer) = self.layer.take() {
+            dialog::close(layer, window, cx);
+        }
+    }
+
+    fn select(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.selected = Some(id.to_owned());
+        cx.notify();
+    }
+
+    /// Use account: closes the dialog, then hands the choice to the opener.
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(account) = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.accounts.iter().find(|a| a.id == *id))
+            .cloned()
+        else {
+            return;
+        };
+        let on_picked = self.on_picked.clone();
+        self.close(window, cx);
+        on_picked(&account, window, cx);
+    }
+}
+
+/// The second line of a picker row: `@login · ` (only when the label hides
+/// the login) and how the account signs in.
+fn account_detail(account: &AccountRecord) -> String {
+    let method = match account.method {
+        AccountMethod::Token => ui::t!("dialogs.account_picker.method.token"),
+        AccountMethod::Browser => ui::t!("dialogs.account_picker.method.browser"),
+    };
+    if account.display_label() == account.login {
+        method.to_string()
+    } else {
+        ui::t!(
+            "dialogs.account_picker.detail",
+            login = account.login,
+            method = method
+        )
+        .to_string()
+    }
+}
+
+fn build_picker(state: &Entity<AccountPicker>, window: &Window, cx: &App) -> Dialog {
+    let colors = cx.theme().colors;
+    let picker = state.read(cx);
+
+    // One translated sentence with the host in bold: the translator controls
+    // the word order, so the highlight range follows the host's position.
+    let mut text = String::new();
+    let mut host_range = None;
+    for piece in ui::i18n::t_count_pieces(
+        "dialogs.account_picker.intro",
+        picker.accounts.len() as u64,
+        &[("remote", &picker.remote)],
+        &["host"],
+    ) {
+        match piece {
+            ui::i18n::Piece::Text(part) => text.push_str(&part),
+            ui::i18n::Piece::Slot(_) => {
+                host_range = Some(text.len()..text.len() + picker.host.len());
+                text.push_str(&picker.host);
+            }
+        }
+    }
+    let intro =
+        StyledText::new(SharedString::from(text)).with_highlights(host_range.map(|range| {
+            (
+                range,
+                HighlightStyle {
+                    font_weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                },
+            )
+        }));
+
+    let mut list = div().flex().flex_col().gap(px(4.));
+    for (index, account) in picker.accounts.iter().enumerate() {
+        let selected = picker.selected.as_deref() == Some(account.id.as_str());
+        let handle = picker.row_focus[index].clone();
+        let ring = focus::focus_visible(&handle, window, cx);
+        let kind = logic::kind_of(account).unwrap_or(ServiceKind::GitHub);
+        let id = account.id.clone();
+        let choose = {
+            let state = state.clone();
+            let id = id.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                state.update(cx, |picker, cx| picker.select(&id, cx));
+            }
+        };
+        let choose_key = {
+            let state = state.clone();
+            move |_: &Confirm, _: &mut Window, cx: &mut App| {
+                state.update(cx, |picker, cx| picker.select(&id, cx));
+            }
+        };
+        list = list.child(
+            div()
+                .id(ElementId::named_usize("account-picker-row", index))
+                .relative()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(R_MD)
+                .border_1()
+                .border_color(if selected {
+                    colors.accent
+                } else {
+                    colors.border_strong
+                })
+                .bg(if selected {
+                    colors.accent_soft
+                } else {
+                    colors.bg
+                })
+                .text_color(colors.text)
+                .cursor_pointer()
+                .when(!selected, |this| {
+                    let hover = colors.hover;
+                    this.hover(move |style| style.bg(hover))
+                })
+                .track_focus(&handle)
+                .on_click(choose)
+                .on_action(choose_key)
+                .child(service_icon(kind, cx))
+                .child(avatar(&account.login, px(28.), FS_SM, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .truncate()
+                                .child(account.display_label().to_owned()),
+                        )
+                        .child(
+                            div()
+                                .text_size(FS_SM)
+                                .text_color(colors.muted)
+                                .truncate()
+                                .child(account_detail(account)),
+                        ),
+                )
+                // The account's status is not known here, so the design's status
+                // column is skipped; only the check of the selected row is drawn.
+                .child(
+                    div()
+                        .w(px(14.))
+                        .h(px(14.))
+                        .flex_none()
+                        .when(selected, |this| {
+                            this.child(Icon::new(IconName::Check).size(px(14.)).color(colors.text))
+                        }),
+                )
+                .when(ring, |this| {
+                    this.child(focus::focus_ring(RingOffset::Outset1, R_MD, cx))
+                }),
+        );
+    }
+
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .child(intro)
+        .child(list)
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .gap(px(6.))
+                .text_size(FS_SM)
+                .text_color(colors.muted)
+                .child(
+                    div()
+                        .mt(px(2.))
+                        .child(Icon::new(IconName::Info).size(px(12.)).color(colors.muted)),
+                )
+                .child(ui::t!("dialogs.account_picker.help")),
+        );
+
+    let cancel = {
+        let state = state.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            state.update(cx, |picker, cx| picker.close(window, cx));
+        }
+    };
+    let confirm = {
+        let state = state.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            state.update(cx, |picker, cx| picker.confirm(window, cx));
+        }
+    };
+    let footer = div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            Button::new("account-picker-cancel")
+                .label(ui::t!("dialogs.common.cancel"))
+                .min_width(px(72.))
+                .focus_handle(picker.cancel_focus.clone())
+                .on_click(cancel),
+        )
+        .child(
+            Button::primary("account-picker-use")
+                .label(ui::t!("dialogs.account_picker.use"))
+                .min_width(px(96.))
+                .disabled(picker.selected.is_none())
+                .focus_handle(picker.primary_focus.clone())
+                .on_click(confirm),
+        );
+
+    let mut order: Vec<DialogFocus> = picker
+        .row_focus
+        .iter()
+        .map(|handle| DialogFocus::control(handle.clone()))
+        .collect();
+    order.push(DialogFocus::control(picker.cancel_focus.clone()));
+    order.push(DialogFocus::control(picker.primary_focus.clone()));
+
+    let on_default = {
+        let state = state.clone();
+        move |window: &mut Window, cx: &mut App| {
+            state.update(cx, |picker, cx| picker.confirm(window, cx));
+        }
+    };
+    let first_row = picker
+        .row_focus
+        .first()
+        .cloned()
+        .unwrap_or_else(|| picker.cancel_focus.clone());
+    Dialog::new(ui::t!(
+        "dialogs.account_picker.title",
+        remote = picker.remote
+    ))
+    .icon(IconName::User)
+    .width(px(500.))
+    .compact_body()
+    .body(body)
+    .footer(footer)
+    .focus_order(order)
+    .autofocus(first_row)
+    .default_button(picker.primary_focus.clone())
+    .on_default(on_default)
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+
+    fn record(login: &str, label: &str, method: AccountMethod) -> AccountRecord {
+        AccountRecord {
+            id: "a".into(),
+            kind: "github".into(),
+            base_url: "https://github.com".into(),
+            login: login.into(),
+            label: label.into(),
+            method,
+            ssh_host: None,
+        }
+    }
+
+    #[test]
+    fn the_detail_line_shows_the_login_only_when_the_label_differs() {
+        assert_eq!(
+            account_detail(&record("mira", "mira", AccountMethod::Token)),
+            "Token"
+        );
+        assert_eq!(
+            account_detail(&record("mira-k", "Acme work", AccountMethod::Browser)),
+            "@mira-k · Browser sign-in"
+        );
+    }
 }

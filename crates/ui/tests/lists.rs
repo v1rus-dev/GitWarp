@@ -828,3 +828,143 @@ fn a_list_row_fills_the_list_width_without_overflowing(cx: &mut TestAppContext) 
         );
     }
 }
+
+struct DecoratedTreeRoot {
+    focus: FocusHandle,
+    activates: Rc<Cell<u32>>,
+}
+
+impl Render for DecoratedTreeRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let activates = self.activates.clone();
+        let tree = Tree::new(
+            "decorated-tree",
+            vec![
+                TreeNodeData::new("origin")
+                    .icon(ui::IconName::Cloud)
+                    .chip(
+                        "a-very-long-account-label-that-must-be-cut",
+                        false,
+                        Some("github.com · account x".into()),
+                    )
+                    .tooltip("origin · github.com"),
+                TreeNodeData::new("work")
+                    .badge("GL")
+                    .chip("no account", true, None),
+                TreeNodeData::new("Add account for gitlab.example.com")
+                    .icon(ui::IconName::Plus)
+                    .accent(),
+            ],
+        )
+        .focus_handle(self.focus.clone())
+        .on_activate(move |_, _, _| activates.set(activates.get() + 1));
+        let content = div().size_full().relative().child(
+            div()
+                .absolute()
+                .left(px(40.))
+                .top(px(40.))
+                .w(px(300.))
+                .h(px(200.))
+                .child(tree),
+        );
+        focus::track_pointer(actions::tab_navigation(content))
+    }
+}
+
+#[gpui::test]
+fn chips_badges_and_accent_rows_lay_out_and_stay_clickable(cx: &mut TestAppContext) {
+    let (view, cx) = start(cx, |cx| DecoratedTreeRoot {
+        focus: cx.focus_handle().tab_stop(true),
+        activates: Rc::new(Cell::new(0)),
+    });
+
+    // A long chip is capped at 96 px.
+    let long = cx
+        .debug_bounds("decorated-tree-trailing-0")
+        .expect("no chip on the first row");
+    assert!(
+        f32::from(long.size.width) <= 96.0 + 0.5,
+        "chip is {} wide",
+        long.size.width
+    );
+    // The warn chip draws too, and sits at the right edge of its row.
+    let warn = cx
+        .debug_bounds("decorated-tree-trailing-1")
+        .expect("no chip on the second row");
+    let row = cx
+        .debug_bounds("decorated-tree-node-1")
+        .expect("no second row");
+    assert!(warn.right() <= row.right());
+    assert!(warn.left() > row.center().x - px(40.));
+
+    // The action row still activates on click.
+    let action = cx
+        .debug_bounds("decorated-tree-node-2")
+        .expect("no action row");
+    cx.simulate_click(action.center(), Modifiers::default());
+    assert_eq!(view.read_with(cx, |view, _| view.activates.get()), 1);
+}
+
+struct ChipScrollRoot {
+    focus: FocusHandle,
+}
+
+impl Render for ChipScrollRoot {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let tree = Tree::new(
+            "chip-scroll-tree",
+            vec![
+                TreeNodeData::new("a-very-long-remote-branch-label-without-any-chip-at-all"),
+                TreeNodeData::new("push \u{2192} a-very-long-host-name.example.com")
+                    .level(2)
+                    .chip("choose account", true, None),
+            ],
+        )
+        .horizontal_scroll()
+        .focus_handle(self.focus.clone());
+        div().size_full().relative().child(
+            div()
+                .absolute()
+                .left(px(40.))
+                .top(px(40.))
+                .w(px(200.))
+                .h(px(200.))
+                .child(tree),
+        )
+    }
+}
+
+#[gpui::test]
+fn a_chip_row_keeps_its_chip_inside_the_viewport_in_a_scrolling_tree(cx: &mut TestAppContext) {
+    let (_view, cx) = start(cx, |cx| ChipScrollRoot {
+        focus: cx.focus_handle().tab_stop(true),
+    });
+    let plain = cx
+        .debug_bounds("chip-scroll-tree-node-0")
+        .expect("no plain row");
+    let chip_row = cx
+        .debug_bounds("chip-scroll-tree-node-1")
+        .expect("no chip row");
+    let chip = cx
+        .debug_bounds("chip-scroll-tree-trailing-1")
+        .expect("no chip");
+    // The row without a chip still widens past the 200 px viewport...
+    assert!(
+        f32::from(plain.size.width) > 200.0,
+        "plain {:?}",
+        plain.size
+    );
+    // ...a chip row does not, and its chip ends at the row's right edge.
+    assert!(
+        f32::from(chip_row.size.width) <= 200.0 + 0.5,
+        "chip row {:?}",
+        chip_row.size
+    );
+    assert!(chip.right() <= chip_row.right() + px(0.5));
+    assert!(chip.right() >= chip_row.right() - px(10.));
+    assert!(
+        chip.size.width > px(40.),
+        "chip squeezed to {:?}",
+        chip.size
+    );
+}

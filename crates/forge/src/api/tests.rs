@@ -428,3 +428,118 @@ fn errors_never_contain_the_token() {
     assert!(!err.to_string().contains("sekret"));
     assert!(!format!("{err:?}").contains("sekret"));
 }
+
+// ---- repo_is_public ----
+
+fn coords(namespace: &[&str], repo: &str) -> RepoCoords {
+    RepoCoords {
+        namespace: namespace.iter().map(|s| s.to_string()).collect(),
+        repo: repo.to_string(),
+    }
+}
+
+fn is_public(kind: ServiceKind, stub: &Stub, c: &RepoCoords) -> Result<Option<bool>, ApiError> {
+    repo_is_public(&Client::for_tests(), &instance(kind, stub), c)
+}
+
+#[test]
+fn public_flag_reads_private_and_visibility() {
+    let json = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+    assert_eq!(
+        public_flag(ServiceKind::GitHub, &json(r#"{"private":false}"#)),
+        Some(true)
+    );
+    assert_eq!(
+        public_flag(ServiceKind::Gitea, &json(r#"{"private":true}"#)),
+        Some(false)
+    );
+    assert_eq!(
+        public_flag(ServiceKind::GitLab, &json(r#"{"visibility":"public"}"#)),
+        Some(true)
+    );
+    assert_eq!(
+        public_flag(ServiceKind::GitLab, &json(r#"{"visibility":"internal"}"#)),
+        Some(false)
+    );
+    assert_eq!(public_flag(ServiceKind::GitHub, &json(r#"{}"#)), None);
+}
+
+#[test]
+fn github_public_and_private_repositories() {
+    let stub = Stub::start(vec![
+        ("/api/v3/repos/acme/open", ok(r#"{"private":false}"#)),
+        ("/api/v3/repos/acme/closed", ok(r#"{"private":true}"#)),
+    ]);
+    let github = |c: &RepoCoords| is_public(ServiceKind::GitHub, &stub, c);
+    assert_eq!(github(&coords(&["acme"], "open")), Ok(Some(true)));
+    assert_eq!(github(&coords(&["acme"], "closed")), Ok(Some(false)));
+    // The service answers 404 for a private repository it hides.
+    assert_eq!(github(&coords(&["acme"], "hidden")), Ok(Some(false)));
+    // No token is ever sent.
+    assert_eq!(
+        stub.header("/api/v3/repos/acme/open", "authorization"),
+        None
+    );
+}
+
+#[test]
+fn gitlab_asks_for_the_encoded_full_path() {
+    let stub = Stub::start(vec![(
+        "/api/v4/projects/group%2Fsub%2Frepo",
+        ok(r#"{"visibility":"public"}"#),
+    )]);
+    let c = coords(&["group", "sub"], "repo");
+    assert_eq!(is_public(ServiceKind::GitLab, &stub, &c), Ok(Some(true)));
+}
+
+#[test]
+fn gitea_private_flag() {
+    let stub = Stub::start(vec![("/api/v1/repos/acme/repo", ok(r#"{"private":true}"#))]);
+    let c = coords(&["acme"], "repo");
+    assert_eq!(is_public(ServiceKind::Gitea, &stub, &c), Ok(Some(false)));
+}
+
+#[test]
+fn unauthorized_and_forbidden_mean_not_public_but_rate_limit_is_an_error() {
+    let stub = Stub::start(vec![
+        ("/api/v3/repos/acme/a", (401, vec![], "{}")),
+        ("/api/v3/repos/acme/b", (403, vec![], "{}")),
+        (
+            "/api/v3/repos/acme/c",
+            (403, vec![("x-ratelimit-remaining", "0")], "{}"),
+        ),
+    ]);
+    let github = |r: &str| is_public(ServiceKind::GitHub, &stub, &coords(&["acme"], r));
+    assert_eq!(github("a"), Ok(Some(false)));
+    assert_eq!(github("b"), Ok(Some(false)));
+    assert!(matches!(github("c"), Err(ApiError::RateLimited { .. })));
+}
+
+#[test]
+fn bitbucket_and_azure_have_no_anonymous_answer() {
+    let stub = Stub::start(vec![]);
+    let c = coords(&["acme"], "repo");
+    assert_eq!(is_public(ServiceKind::Bitbucket, &stub, &c), Ok(None));
+    assert_eq!(is_public(ServiceKind::AzureDevOps, &stub, &c), Ok(None));
+    assert!(stub.seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_body_without_visibility_is_a_decode_error() {
+    let stub = Stub::start(vec![("/api/v3/repos/acme/odd", ok(r#"{"name":"odd"}"#))]);
+    let c = coords(&["acme"], "odd");
+    assert!(matches!(
+        is_public(ServiceKind::GitHub, &stub, &c),
+        Err(ApiError::Decode(_))
+    ));
+}
+
+#[test]
+fn a_redirect_is_unknown_not_private() {
+    let stub = Stub::start(vec![(
+        "/api/v3/repos/acme/moved",
+        (301, vec![("location", "http://127.0.0.1:1/elsewhere")], ""),
+    )]);
+    let c = coords(&["acme"], "moved");
+    assert_eq!(is_public(ServiceKind::GitHub, &stub, &c), Ok(None));
+}

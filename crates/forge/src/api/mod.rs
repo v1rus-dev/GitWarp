@@ -1,9 +1,11 @@
-//! Blocking HTTP access to hosting services: instance probe and token check.
+//! Blocking HTTP access to hosting services: instance probe, token check and
+//! the anonymous public-repository check.
 //!
 //! Every function blocks; callers run them off the UI thread. No message or
 //! `Debug` output of this module ever contains a token.
 
-use crate::{known_kind_for_host, Instance, ServiceKind};
+use crate::encode::{encode_path, encode_segment};
+use crate::{known_kind_for_host, Instance, RepoCoords, ServiceKind};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fmt;
@@ -294,6 +296,65 @@ pub fn current_user(
         ServiceKind::Gitea => gitea_user(client, &api, token),
         ServiceKind::Bitbucket => bitbucket_user(client, &api, token),
         ServiceKind::AzureDevOps => azure_user(client, AZURE_PROFILE_URL, token),
+    }
+}
+
+/// Whether `coords` is a public repository on `instance`, asked without a
+/// token: GitHub and Gitea / Forgejo `GET /repos/{owner}/{repo}` (`private`),
+/// GitLab `GET /projects/{url-encoded path}` (`visibility`). A 401 / 403 / 404
+/// means the repository is not visible anonymously, so `Some(false)`.
+/// Bitbucket and Azure DevOps have no usable anonymous answer, nor does a
+/// redirect: `Ok(None)` (unknown).
+pub fn repo_is_public(
+    client: &Client,
+    instance: &Instance,
+    coords: &RepoCoords,
+) -> Result<Option<bool>, ApiError> {
+    let api = instance.api_base();
+    let owner = coords.namespace.join("/");
+    let url = match instance.kind {
+        ServiceKind::GitHub | ServiceKind::Gitea => format!(
+            "{api}/repos/{}/{}",
+            encode_path(&owner),
+            encode_segment(&coords.repo)
+        ),
+        ServiceKind::GitLab => format!(
+            "{api}/projects/{}",
+            encode_segment(&format!("{owner}/{}", coords.repo))
+        ),
+        ServiceKind::Bitbucket | ServiceKind::AzureDevOps => return Ok(None),
+    };
+    let mut response = client.get(&url, &[("Accept", "application/json".to_string())])?;
+    // Redirects are never followed (see `Client::new`): a moved or renamed
+    // repository is neither public nor private as far as we can tell.
+    if response.status().is_redirection() {
+        return Ok(None);
+    }
+    if response.status().is_success() {
+        let body = response
+            .body_mut()
+            .read_json::<Value>()
+            .map_err(|e| ApiError::Decode(e.to_string()))?;
+        return public_flag(instance.kind, &body)
+            .map(Some)
+            .ok_or_else(|| ApiError::Decode("no visibility in the response".into()));
+    }
+    match check_status(response) {
+        Err(ApiError::Unauthorized | ApiError::Forbidden | ApiError::NotFound) => Ok(Some(false)),
+        Err(other) => Err(other),
+        Ok(_) => Ok(Some(false)),
+    }
+}
+
+/// Reads the visibility out of a repository document: `private == false`
+/// (GitHub, Gitea) or `visibility == "public"` (GitLab).
+fn public_flag(kind: ServiceKind, body: &Value) -> Option<bool> {
+    match kind {
+        ServiceKind::GitLab => body
+            .get("visibility")
+            .and_then(Value::as_str)
+            .map(|v| v == "public"),
+        _ => body.get("private").and_then(Value::as_bool).map(|p| !p),
     }
 }
 

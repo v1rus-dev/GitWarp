@@ -17,9 +17,10 @@ use crate::actions::{
     Confirm, SelectNext, SelectPrev, TreeActivate, TreeCollapse, TreeDelete, TreeExpand, TreeRename,
 };
 use crate::components::counter::CountPill;
+use crate::components::tooltip::Tooltip;
 use crate::focus::{self, RingOffset};
 use crate::icon::{Icon, IconName};
-use crate::metrics::{FONT_UI, FS_XS, R_SM};
+use crate::metrics::{FONT_UI, FS_XS, R_SM, R_XS};
 use crate::theme::{ActiveTheme, ThemeColors};
 
 use super::tabular_font;
@@ -33,6 +34,14 @@ pub enum TreeNodeTrailing {
     Count(SharedString),
     /// Muted state text such as `locked`.
     State(SharedString),
+    /// A small label (an account name, "public"): muted, at most 96 px wide with an
+    /// ellipsis, 8 px from the label. `warn` draws it in the warning colour with a
+    /// warning icon; `tooltip` shows on hover.
+    Chip {
+        text: SharedString,
+        warn: bool,
+        tooltip: Option<SharedString>,
+    },
 }
 
 /// One visible row of a [`Tree`].
@@ -51,6 +60,12 @@ pub struct TreeNodeData {
     /// Section headers are uppercase, muted and have no icon.
     pub section: bool,
     pub trailing: Option<TreeNodeTrailing>,
+    /// An action row: the label and icon use the accent colour.
+    pub accent: bool,
+    /// Shown on hover over the row.
+    pub tooltip: Option<SharedString>,
+    /// A bordered monogram (e.g. `GL`) drawn instead of the icon.
+    pub badge: Option<SharedString>,
 }
 
 impl TreeNodeData {
@@ -67,6 +82,9 @@ impl TreeNodeData {
             current: false,
             section: false,
             trailing: None,
+            accent: false,
+            tooltip: None,
+            badge: None,
         }
     }
 
@@ -145,6 +163,39 @@ impl TreeNodeData {
 
     pub fn trailing(mut self, trailing: TreeNodeTrailing) -> Self {
         self.trailing = Some(trailing);
+        self
+    }
+
+    /// A trailing chip; see [`TreeNodeTrailing::Chip`].
+    pub fn chip(
+        mut self,
+        text: impl Into<SharedString>,
+        warn: bool,
+        tooltip: Option<SharedString>,
+    ) -> Self {
+        self.trailing = Some(TreeNodeTrailing::Chip {
+            text: text.into(),
+            warn,
+            tooltip,
+        });
+        self
+    }
+
+    /// Marks an action row (accent label and icon).
+    pub fn accent(mut self) -> Self {
+        self.accent = true;
+        self
+    }
+
+    /// The hover tooltip of the row.
+    pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(tooltip.into());
+        self
+    }
+
+    /// Draws a bordered monogram in the icon slot instead of the icon.
+    pub fn badge(mut self, badge: impl Into<SharedString>) -> Self {
+        self.badge = Some(badge.into());
         self
     }
 }
@@ -562,10 +613,13 @@ impl RenderOnce for Tree {
             let expanded = node.expanded;
             let marked = keyboard_index == Some(index) && ring_visible;
 
+            let accent = node.accent;
             let foreground = if selected {
                 colors.selection_fg
             } else if section {
                 colors.muted
+            } else if accent {
+                colors.accent
             } else {
                 colors.text
             };
@@ -574,7 +628,7 @@ impl RenderOnce for Tree {
             } else {
                 colors.muted
             };
-            let icon_color = if current {
+            let icon_color = if current || (accent && !selected) {
                 colors.accent
             } else if selected {
                 colors.selection_sub
@@ -595,19 +649,43 @@ impl RenderOnce for Tree {
                 div().w(px(12.)).h(px(12.)).into_any_element()
             };
 
+            let badge = node.badge.clone();
             let icon_slot = if section {
                 None
             } else {
                 Some(
                     div()
-                        .w(px(14.))
                         .h(px(14.))
                         .flex_none()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .when_some(node.icon, |this, icon| {
-                            this.child(Icon::new(icon).size(px(14.)).color(icon_color))
+                        // A monogram is wider than the 14 px icon it replaces.
+                        .when(badge.is_none(), |this| this.w(px(14.)))
+                        .when(badge.is_some(), |this| this.min_w(px(20.)))
+                        .when_some(badge, |this, text| {
+                            this.child(
+                                div()
+                                    .min_w(px(20.))
+                                    .h(px(14.))
+                                    .px(px(2.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .border_1()
+                                    .border_color(colors.border_strong)
+                                    .rounded(R_XS)
+                                    .text_color(icon_color)
+                                    .text_size(px(9.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .line_height(px(9.))
+                                    .child(text),
+                            )
+                        })
+                        .when(node.badge.is_none(), |this| {
+                            this.when_some(node.icon, |this, icon| {
+                                this.child(Icon::new(icon).size(px(14.)).color(icon_color))
+                            })
                         }),
                 )
             };
@@ -638,7 +716,13 @@ impl RenderOnce for Tree {
 
             let row_id = ElementId::named_usize(id_name.clone(), index);
             let debug_name = id_name.clone();
-            let label_element = if horizontal {
+            // A row with a chip must keep the chip visible at its right edge, so
+            // it never grows past the viewport: the label shrinks with an
+            // ellipsis instead of widening the row. Rows without a chip keep
+            // the sideways-scrolling behaviour.
+            let chip_row = matches!(node.trailing, Some(TreeNodeTrailing::Chip { .. }));
+            let widening = horizontal && !chip_row;
+            let label_element = if widening {
                 div()
                     .flex_none()
                     .whitespace_nowrap()
@@ -664,7 +748,8 @@ impl RenderOnce for Tree {
                 // this every row shrinks below its fixed height when the
                 // content overflows, instead of the tree scrolling.
                 .flex_none()
-                .when(horizontal, |this| this.min_w_full())
+                .when(widening, |this| this.min_w_full())
+                .when(horizontal && chip_row, |this| this.w_full())
                 .when(!horizontal, |this| this.ml(px(6.)).mr(px(6.)))
                 .pl(pad_left)
                 .pr(px(8.))
@@ -680,7 +765,16 @@ impl RenderOnce for Tree {
                 .child(label_element);
 
             if let Some(trailing) = node.trailing.as_ref() {
-                row = row.child(trailing_element(trailing, selected, secondary, colors));
+                row = row.child(trailing_element(
+                    trailing,
+                    ElementId::named_usize(format!("{id_name}-trailing"), index),
+                    selected,
+                    secondary,
+                    colors,
+                ));
+            }
+            if let Some(tooltip) = node.tooltip.clone() {
+                row = row.tooltip(Tooltip::text(tooltip));
             }
 
             if current {
@@ -774,6 +868,7 @@ impl RenderOnce for Tree {
 
 fn trailing_element(
     trailing: &TreeNodeTrailing,
+    id: ElementId,
     selected: bool,
     secondary: Hsla,
     colors: ThemeColors,
@@ -807,6 +902,41 @@ fn trailing_element(
         TreeNodeTrailing::Count(value) => CountPill::new(value.clone())
             .selected(selected)
             .into_any_element(),
+        TreeNodeTrailing::Chip {
+            text,
+            warn,
+            tooltip,
+        } => {
+            let color = if *warn && !selected {
+                colors.warning
+            } else {
+                secondary
+            };
+            let debug_name = id.to_string();
+            let chip = div()
+                .id(id)
+                .debug_selector(move || debug_name)
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(4.))
+                .max_w(px(96.))
+                // The row already leaves 6 px between its children.
+                .ml(px(2.))
+                .text_size(FS_XS)
+                .line_height(FS_XS)
+                .text_color(color)
+                .when(*warn, |this| {
+                    this.child(Icon::new(IconName::Warn).size(px(11.)).color(color))
+                })
+                .child(div().min_w(px(0.)).truncate().child(text.clone()));
+            match tooltip {
+                Some(tooltip) => chip
+                    .tooltip(Tooltip::text(tooltip.clone()))
+                    .into_any_element(),
+                None => chip.into_any_element(),
+            }
+        }
         TreeNodeTrailing::State(value) => div()
             .flex_none()
             .text_size(FS_XS)

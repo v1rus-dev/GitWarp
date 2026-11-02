@@ -11,7 +11,8 @@
 //! - [`web_url`] builds the browser URL of a repository, commit, branch, tag,
 //!   file or pull / merge request.
 //! - [`api::probe`] detects the service behind a URL, [`api::current_user`]
-//!   validates a token; [`secrets::SecretStore`] keeps tokens in the OS keychain.
+//!   validates a token, [`api::repo_is_public`] asks anonymously whether a
+//!   repository is public; [`secrets::SecretStore`] keeps tokens in the OS keychain.
 
 pub mod api;
 mod encode;

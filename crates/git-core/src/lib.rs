@@ -554,6 +554,13 @@ impl Repo {
         ops::remote_url(self, name)
     }
 
+    /// Every push URL of `name`: one per `remote.<name>.pushurl` entry, or the
+    /// fetch URL when none is set (git's own `get-url --push` semantics).
+    /// Empty when no such remote is configured.
+    pub fn remote_push_urls(&self, name: &str) -> Result<Vec<String>> {
+        ops::remote_push_urls(self, name)
+    }
+
     /// Applies `oid` on top of HEAD; a conflict is aborted and returned.
     pub fn cherry_pick(&self, oid: Oid) -> Result<()> {
         ops::cherry_pick(self, oid)

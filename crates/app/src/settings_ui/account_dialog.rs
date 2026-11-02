@@ -40,11 +40,22 @@ use crate::settings::AccountRecord;
 type CardAction = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// What the dialog is opened for.
-pub(super) enum Open {
+pub(crate) enum Open {
     Add,
+    /// Add an account for a service and instance known from a remote: starts
+    /// at the sign-in step. `base_url` is the public instance's URL or a
+    /// self-hosted one (probed like a typed address).
+    AddFor {
+        kind: ServiceKind,
+        base_url: String,
+    },
     /// Re-enter the token of this account.
     Reconnect(AccountRecord),
 }
+
+/// Runs after a new account is saved, with its record. Used when the dialog is
+/// opened from a remote instead of Settings.
+pub(crate) type OnSaved = Rc<dyn Fn(&AccountRecord, &mut Window, &mut App)>;
 
 /// A token the service accepted, waiting for the label and Done.
 type Connected = logic::Verified;
@@ -84,7 +95,9 @@ pub(crate) struct AccountDialog {
 
     layer: Option<overlay::LayerId>,
     _host: Option<Entity<DialogHost>>,
-    view: WeakEntity<SettingsView>,
+    /// The Settings page that opened the dialog; `None` when opened from a remote.
+    view: Option<WeakEntity<SettingsView>>,
+    on_saved: Option<OnSaved>,
 
     service_focus: Vec<FocusHandle>,
     public_focus: FocusHandle,
@@ -97,12 +110,22 @@ pub(crate) struct AccountDialog {
 }
 
 /// Opens the dialog.
-pub(super) fn open(
+pub(crate) fn open(
     what: Open,
-    view: WeakEntity<SettingsView>,
+    view: Option<WeakEntity<SettingsView>>,
+    on_saved: Option<OnSaved>,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<AccountDialog> {
+    // A self-hosted address to fill in and probe once the dialog exists.
+    let prefill = match &what {
+        Open::AddFor { kind, base_url }
+            if forge::Instance::new(*kind, base_url).is_ok_and(|i| !i.is_public()) =>
+        {
+            Some(base_url.clone())
+        }
+        _ => None,
+    };
     let existing = super::current_settings(cx).accounts;
     let store_error = match cached_store(cx) {
         Some(Err(error)) => Some(SharedString::from(error.to_string())),
@@ -117,7 +140,7 @@ pub(super) fn open(
         });
         let token = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
-            input.set_placeholder("Paste the token here", cx);
+            input.set_placeholder(ui::t!("settings.accounts.dialog.token.placeholder"), cx);
             input.set_font_family(FONT_MONO, cx);
             input.set_masked(true, cx);
             input
@@ -156,6 +179,12 @@ pub(super) fn open(
         );
         let (reconnect, step, kind, self_hosted) = match what {
             Open::Add => (None, Step::Service, None, false),
+            Open::AddFor { kind, base_url } => {
+                let self_hosted = forge::Instance::new(kind, &base_url)
+                    .map(|instance| !instance.is_public())
+                    .unwrap_or(false);
+                (None, Step::SignIn, Some(kind), self_hosted)
+            }
             Open::Reconnect(account) => {
                 let kind = logic::kind_of(&account);
                 let self_hosted = logic::instance_of(&account)
@@ -190,6 +219,7 @@ pub(super) fn open(
             layer: None,
             _host: None,
             view,
+            on_saved,
             service_focus: ServiceKind::ALL
                 .iter()
                 .map(|_| cx.focus_handle().tab_stop(true))
@@ -207,17 +237,30 @@ pub(super) fn open(
     let (layer, host) =
         dialog::open_with_view(window, cx, move |window, cx| match state.upgrade() {
             Some(state) => build(&state, window, cx),
-            None => Dialog::new("Add account"),
+            None => Dialog::new(ui::t!("settings.accounts.dialog.add.title")),
         });
     dialog.update(cx, |dialog, cx| {
         dialog.layer = Some(layer);
         dialog._host = Some(host);
-        // Reconnect opens on the token field.
+        // Reconnect and Add-for-a-remote open on the token field.
         if dialog.step == Step::SignIn {
             let handle = dialog.token.read(cx).focus_handle().clone();
             window.focus(&handle, cx);
         }
     });
+    if let Some(base_url) = prefill {
+        dialog.update(cx, |dialog, cx| {
+            dialog
+                .url
+                .update(cx, |input, cx| input.set_text(base_url, cx));
+        });
+        // Setting the text emits Changed, which resets the probe state; start
+        // the probe after that event has been handled.
+        let weak = dialog.downgrade();
+        cx.defer(move |cx| {
+            weak.update(cx, |dialog, cx| dialog.run_probe(cx)).ok();
+        });
+    }
     dialog
 }
 
@@ -453,9 +496,9 @@ impl AccountDialog {
         self.connected = Some(verified);
         let required = self.label_required(cx);
         let placeholder = if required {
-            "e.g. Personal, Acme work".to_owned()
+            ui::t!("settings.accounts.dialog.label.placeholder_required")
         } else {
-            login.clone()
+            SharedString::from(login.clone())
         };
         self.label
             .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
@@ -560,10 +603,17 @@ impl AccountDialog {
         }
         let id = record.id.clone();
         let message = if reconnect {
-            format!("Reconnected {}", record.display_label())
+            ui::t!(
+                "settings.accounts.dialog.toast.reconnected",
+                label = record.display_label()
+            )
         } else {
             let name = logic::kind_of(&record).map_or("", ServiceKind::display_name);
-            format!("Connected {name} account {}", record.display_label())
+            ui::t!(
+                "settings.accounts.dialog.toast.connected",
+                name = name,
+                label = record.display_label()
+            )
         };
         crate::update_settings(cx, |settings| {
             match settings.accounts.iter_mut().find(|a| a.id == record.id) {
@@ -572,15 +622,22 @@ impl AccountDialog {
                 None => settings.accounts.push(record.clone()),
             }
         });
-        if let Some(view) = self.view.upgrade() {
+        if let Some(view) = self.view.as_ref().and_then(WeakEntity::upgrade) {
             view.update(cx, |view, cx| {
                 view.account_status
                     .insert(id, crate::accounts::AccountStatus::Connected);
                 cx.notify();
             });
         }
+        let on_saved = self.on_saved.clone();
         self.close(window, cx);
-        ui::toast::show(ToastKind::Ok, message, window, cx);
+        match on_saved {
+            // The opener says what happened in its own words.
+            Some(on_saved) if !reconnect => on_saved(&record, window, cx),
+            _ => {
+                ui::toast::show(ToastKind::Ok, message, window, cx);
+            }
+        }
     }
 
     fn account_exists(&self, id: &str, cx: &App) -> bool {
@@ -592,9 +649,9 @@ impl AccountDialog {
 
     /// The account being reconnected was removed meanwhile: nothing is saved.
     fn account_removed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.view.upgrade() {
+        if let Some(view) = self.view.as_ref().and_then(WeakEntity::upgrade) {
             view.update(cx, |view, cx| {
-                view.accounts_error = Some("This account was removed".into());
+                view.accounts_error = Some(ui::t!("settings.accounts.dialog.removed"));
                 cx.notify();
             });
         }
@@ -721,7 +778,12 @@ fn stepper(current: usize, cx: &App) -> AnyElement {
         .gap(px(8.))
         .text_size(FS_SM)
         .text_color(colors.muted);
-    for (index, name) in ["Service", "Instance", "Sign in"].into_iter().enumerate() {
+    let names = [
+        ui::t!("settings.accounts.dialog.step.service"),
+        ui::t!("settings.accounts.dialog.step.instance"),
+        ui::t!("settings.accounts.dialog.step.sign_in"),
+    ];
+    for (index, name) in names.into_iter().enumerate() {
         let number = index + 1;
         let now = number == current;
         let done = number < current;
@@ -817,7 +879,7 @@ fn http_warning(base_url: Option<&str>) -> Option<AnyElement> {
     base_url.filter(|url| logic::is_plain_http(url)).map(|_| {
         Banner::new(
             BannerKind::Warn,
-            "This address uses plain HTTP — the token would be sent unencrypted.",
+            ui::t!("settings.accounts.dialog.http_warning"),
         )
         .into_any_element()
     })
@@ -834,24 +896,31 @@ fn probe_banner(
     match &dialog.probe {
         ProbeState::Idle if public => Some(
             Banner::new(BannerKind::Ok, format!("{name} · {host}"))
-                .body("Public instance, reachable.")
+                .body(ui::t!("settings.accounts.dialog.probe.public.body"))
                 .into_any_element(),
         ),
         ProbeState::Idle => None,
         ProbeState::Checking => Some(
-            Banner::new(BannerKind::Info, format!("Checking {host}…"))
-                .body("Looking for the service type and API version.")
-                .into_any_element(),
+            Banner::new(
+                BannerKind::Info,
+                ui::t!("settings.accounts.dialog.probe.checking.title", host = host),
+            )
+            .body(ui::t!("settings.accounts.dialog.probe.checking.body"))
+            .into_any_element(),
         ),
         ProbeState::Detected { version } => Some(
             Banner::new(
                 BannerKind::Ok,
                 match version {
-                    Some(version) => format!("Detected: {name} {version}"),
-                    None => format!("Detected: {name}"),
+                    Some(version) => ui::t!(
+                        "settings.accounts.dialog.probe.detected.title_version",
+                        name = name,
+                        version = version
+                    ),
+                    None => ui::t!("settings.accounts.dialog.probe.detected.title", name = name),
                 },
             )
-            .body("The address is reachable.")
+            .body(ui::t!("settings.accounts.dialog.probe.detected.body"))
             .into_any_element(),
         ),
         ProbeState::Other(other) => {
@@ -859,15 +928,23 @@ fn probe_banner(
             Some(
                 Banner::new(
                     BannerKind::Warn,
-                    format!("{host} is a {} server, not {name}", other.display_name()),
+                    ui::t!(
+                        "settings.accounts.dialog.probe.other.title",
+                        host = host,
+                        other = other.display_name(),
+                        name = name
+                    ),
                 )
-                .body(format!(
-                    "The address answered like {}. Switch the service type to keep going.",
-                    other.display_name()
+                .body(ui::t!(
+                    "settings.accounts.dialog.probe.other.body",
+                    other = other.display_name()
                 ))
                 .action(
                     Button::primary("account-switch-service")
-                        .label(format!("Switch to {}", other.display_name()))
+                        .label(ui::t!(
+                            "settings.accounts.dialog.probe.other.switch",
+                            other = other.display_name()
+                        ))
                         .size(ButtonSize::Small)
                         .focus_handle(dialog.action_focus.clone())
                         .on_click(act(state, move |d, _, cx| d.switch_service(other, cx))),
@@ -876,25 +953,32 @@ fn probe_banner(
             )
         }
         ProbeState::Unreachable(text) => Some(
-            Banner::new(BannerKind::Error, format!("Can’t reach {host}"))
-                .body(format!(
-                    "Check the address, your network or VPN, or the proxy settings. {text}"
-                ))
-                .action(
-                    Button::new("account-probe-retry")
-                        .label("Try again")
-                        .icon(IconName::Fetch)
-                        .size(ButtonSize::Small)
-                        .focus_handle(dialog.action_focus.clone())
-                        .on_click(act(state, |d, _, cx| d.run_probe(cx))),
-                )
-                .into_any_element(),
+            Banner::new(
+                BannerKind::Error,
+                ui::t!(
+                    "settings.accounts.dialog.probe.unreachable.title",
+                    host = host
+                ),
+            )
+            .body(ui::t!(
+                "settings.accounts.dialog.probe.unreachable.body",
+                error = text
+            ))
+            .action(
+                Button::new("account-probe-retry")
+                    .label(ui::t!("settings.accounts.dialog.try_again"))
+                    .icon(IconName::Fetch)
+                    .size(ButtonSize::Small)
+                    .focus_handle(dialog.action_focus.clone())
+                    .on_click(act(state, |d, _, cx| d.run_probe(cx))),
+            )
+            .into_any_element(),
         ),
         // The "Trust for this instance" action is not part of this step.
         ProbeState::Tls(text) => Some(
             Banner::new(
                 BannerKind::Warn,
-                format!("The certificate of {host} is not trusted"),
+                ui::t!("settings.accounts.dialog.probe.tls.title", host = host),
             )
             .body(text.clone())
             .into_any_element(),
@@ -902,9 +986,12 @@ fn probe_banner(
         ProbeState::NotRecognized => Some(
             Banner::new(
                 BannerKind::Error,
-                format!("No supported service found at {host}"),
+                ui::t!(
+                    "settings.accounts.dialog.probe.not_recognized.title",
+                    host = host
+                ),
             )
-            .body("Check that this is the web address of the service, without a path.")
+            .body(ui::t!("settings.accounts.dialog.probe.not_recognized.body"))
             .into_any_element(),
         ),
     }
@@ -921,11 +1008,15 @@ fn sign_in_banner(
     let name = kind.display_name();
     match dialog.sign_in_error.as_ref()? {
         SignInError::Wrong => Some(
-            Banner::new(BannerKind::Error, "That token was rejected")
-                .body(format!(
-                    "{name} answered 401 Bad credentials. Check that you pasted the whole token and that it has not been revoked or expired."
-                ))
-                .into_any_element(),
+            Banner::new(
+                BannerKind::Error,
+                ui::t!("settings.accounts.dialog.signin.wrong.title"),
+            )
+            .body(ui::t!(
+                "settings.accounts.dialog.signin.wrong.body",
+                name = name
+            ))
+            .into_any_element(),
         ),
         SignInError::Permissions(missing) => {
             let mut chips = div().flex().flex_wrap().gap(px(6.)).mt(px(4.));
@@ -956,12 +1047,13 @@ fn sign_in_banner(
                             .flex_col()
                             .gap(px(4.))
                             .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("The token is missing permissions"),
+                                div().font_weight(FontWeight::SEMIBOLD).child(ui::t!(
+                                    "settings.accounts.dialog.signin.permissions.title"
+                                )),
                             )
-                            .child(div().text_color(colors.muted).child(format!(
-                                "{name} accepted the token, but it cannot do everything GitWarp needs. Create a new token that includes:"
+                            .child(div().text_color(colors.muted).child(ui::t!(
+                                "settings.accounts.dialog.signin.permissions.body",
+                                name = name
                             )))
                             .child(chips),
                     )
@@ -969,24 +1061,31 @@ fn sign_in_banner(
             )
         }
         SignInError::Network(text) => Some(
-            Banner::new(BannerKind::Error, format!("Can’t reach {host}"))
-                .body(format!(
-                    "Check your network connection and try again. {text}"
-                ))
-                .action(
-                    Button::new("account-connect-retry")
-                        .label("Try again")
-                        .icon(IconName::Fetch)
-                        .size(ButtonSize::Small)
-                        .focus_handle(dialog.action_focus.clone())
-                        .on_click(act(state, |d, window, cx| d.connect(window, cx))),
-                )
-                .into_any_element(),
+            Banner::new(
+                BannerKind::Error,
+                ui::t!("settings.accounts.dialog.signin.network.title", host = host),
+            )
+            .body(ui::t!(
+                "settings.accounts.dialog.signin.network.body",
+                error = text
+            ))
+            .action(
+                Button::new("account-connect-retry")
+                    .label(ui::t!("settings.accounts.dialog.try_again"))
+                    .icon(IconName::Fetch)
+                    .size(ButtonSize::Small)
+                    .focus_handle(dialog.action_focus.clone())
+                    .on_click(act(state, |d, window, cx| d.connect(window, cx))),
+            )
+            .into_any_element(),
         ),
         SignInError::Other(text) => Some(
-            Banner::new(BannerKind::Error, "Could not check the token")
-                .body(text.clone())
-                .into_any_element(),
+            Banner::new(
+                BannerKind::Error,
+                ui::t!("settings.accounts.dialog.signin.other.title"),
+            )
+            .body(text.clone())
+            .into_any_element(),
         ),
     }
 }
@@ -1076,7 +1175,7 @@ fn instance_step(
         !dialog.self_hosted,
         service_icon(kind, cx),
         logic::public_host(kind),
-        "Public instance",
+        ui::t!("settings.accounts.dialog.instance.public.title"),
         Some(choose(false)),
         window,
         cx,
@@ -1089,10 +1188,10 @@ fn instance_step(
             .size(px(16.))
             .color(colors.text)
             .into_any_element(),
-        "Self-hosted",
-        format!(
-            "{} on your own domain or intranet",
-            logic::self_hosted_name(kind)
+        ui::t!("settings.accounts.dialog.instance.self.title"),
+        ui::t!(
+            "settings.accounts.dialog.instance.self.description",
+            name = logic::self_hosted_name(kind)
         ),
         Some(choose(true)),
         window,
@@ -1121,7 +1220,9 @@ fn instance_step(
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(field_label("Instance URL"))
+                    .child(field_label(ui::t!(
+                        "settings.accounts.dialog.instance.url.label"
+                    )))
                     .child(div().w_full().h(px(26.)).child(dialog.url.clone()))
                     .child(if url_invalid {
                         div()
@@ -1131,10 +1232,10 @@ fn instance_step(
                             .text_size(FS_SM)
                             .text_color(colors.error)
                             .child(Icon::new(IconName::Err).size(px(12.)).color(colors.error))
-                            .child("Enter a web address like https://git.example.com.")
+                            .child(ui::t!("settings.accounts.dialog.instance.url.invalid"))
                             .into_any_element()
                     } else {
-                        help_text("The address you open in the browser, without a path.", cx)
+                        help_text(ui::t!("settings.accounts.dialog.instance.url.help"), cx)
                             .into_any_element()
                     }),
             )
@@ -1172,8 +1273,8 @@ fn sign_in_step(
             .size(px(16.))
             .color(colors.text)
             .into_any_element(),
-        "Token",
-        "Paste a personal access token. Works everywhere.",
+        ui::t!("settings.accounts.method.token"),
+        ui::t!("settings.accounts.dialog.method.token.description"),
         Some(Rc::new(|_, _| {})),
         window,
         cx,
@@ -1181,14 +1282,14 @@ fn sign_in_step(
     // The browser option is drawn but not selectable: OAuth is a later step.
     let browser_description = if logic::has_oauth(kind) {
         if dialog.self_hosted {
-            "Uses an OAuth app registered on this instance.".to_owned()
+            ui::t!("settings.accounts.dialog.method.browser.description_self")
         } else {
-            "Approve GitWarp in your browser, no token to copy.".to_owned()
+            ui::t!("settings.accounts.dialog.method.browser.description_public")
         }
     } else {
-        format!(
-            "Not available for {}: it has no sign-in flow for desktop apps. Use a token.",
-            kind.display_name()
+        ui::t!(
+            "settings.accounts.dialog.method.browser.unavailable",
+            name = kind.display_name()
         )
     };
     let browser_card = card(
@@ -1199,25 +1300,27 @@ fn sign_in_step(
             .size(px(16.))
             .color(colors.muted)
             .into_any_element(),
-        "Sign in with browser",
+        ui::t!("settings.accounts.dialog.method.browser.title"),
         browser_description,
         None,
         window,
         cx,
     )
     .when(logic::has_oauth(kind), |this| {
-        this.tooltip(Tooltip::text("Coming soon"))
+        this.tooltip(Tooltip::text(ui::t!(
+            "settings.accounts.dialog.method.browser.coming_soon"
+        )))
     });
 
     let token_url = logic::token_page_url(kind, &base_url);
     let mut perms = div().flex().flex_wrap().gap(px(6.)).mt(px(4.));
     for permission in logic::required_permissions(kind) {
-        perms = perms.child(permission_chip(permission, None, cx));
+        perms = perms.child(permission_chip(&permission, None, cx));
     }
     let permissions_title = if kind == ServiceKind::GitHub {
-        "Required permissions (classic token scopes)"
+        ui::t!("settings.accounts.dialog.permissions.title_github")
     } else {
-        "Required permissions"
+        ui::t!("settings.accounts.dialog.permissions.title")
     };
     let show = dialog.show_token;
     div()
@@ -1232,9 +1335,14 @@ fn sign_in_step(
         })
         .when_some(dialog.store_error.clone(), |this, error| {
             this.child(
-                Banner::new(BannerKind::Error, "The system keychain is not available").body(
-                    format!("{error}. GitWarp does not store tokens anywhere else."),
-                ),
+                Banner::new(
+                    BannerKind::Error,
+                    ui::t!("settings.accounts.dialog.keychain.title"),
+                )
+                .body(ui::t!(
+                    "settings.accounts.dialog.keychain.body",
+                    error = error
+                )),
             )
         })
         .when_some(
@@ -1254,7 +1362,7 @@ fn sign_in_step(
                 .flex()
                 .flex_col()
                 .gap(px(4.))
-                .child(field_label("Access token"))
+                .child(field_label(ui::t!("settings.accounts.dialog.token.label")))
                 .child(
                     div()
                         .flex()
@@ -1271,7 +1379,11 @@ fn sign_in_step(
                             Button::new("account-token-show")
                                 .icon_only(IconName::Eye)
                                 .selected(show)
-                                .tooltip(if show { "Hide token" } else { "Show token" })
+                                .tooltip(if show {
+                                    ui::t!("settings.accounts.dialog.token.hide")
+                                } else {
+                                    ui::t!("settings.accounts.dialog.token.show")
+                                })
                                 .focus_handle(dialog.show_focus.clone())
                                 .on_click(act(state, |d, _, cx| {
                                     d.show_token = !d.show_token;
@@ -1297,7 +1409,7 @@ fn sign_in_step(
                 )
                 .child(
                     Button::new("account-token-create")
-                        .label("Create a token")
+                        .label(ui::t!("settings.accounts.dialog.token.create"))
                         .icon(IconName::Link)
                         .focus_handle(dialog.create_focus.clone())
                         .on_click(move |_: &ClickEvent, _, cx: &mut App| cx.open_url(&token_url)),
@@ -1333,22 +1445,29 @@ fn done_step(dialog: &AccountDialog, kind: ServiceKind, cx: &App) -> AnyElement 
                 .child(
                     div()
                         .min_w_0()
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(format!("Connected as {login}")),
-                        )
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(ui::t!(
+                            "settings.accounts.dialog.done.connected_as",
+                            login = login
+                        )))
                         .child(
                             div()
                                 .text_size(FS_SM)
                                 .text_color(colors.muted)
-                                .child(format!("{} · {host} · token", kind.display_name())),
+                                .child(ui::t!(
+                                    "settings.accounts.dialog.done.detail",
+                                    service = kind.display_name(),
+                                    host = host
+                                )),
                         ),
                 ),
         )
         .when_some(dialog.save_error.clone(), |this, error| {
             this.child(
-                Banner::new(BannerKind::Error, "The token could not be saved").body(error),
+                Banner::new(
+                    BannerKind::Error,
+                    ui::t!("settings.accounts.dialog.done.save_error"),
+                )
+                .body(error),
             )
         })
         .when(!dialog.reconnecting(), |this| {
@@ -1358,9 +1477,9 @@ fn done_step(dialog: &AccountDialog, kind: ServiceKind, cx: &App) -> AnyElement 
                     .flex_col()
                     .gap(px(4.))
                     .child(field_label(if required {
-                        "Label *"
+                        ui::t!("settings.accounts.dialog.label.required")
                     } else {
-                        "Label (optional)"
+                        ui::t!("settings.accounts.dialog.label.optional")
                     }))
                     .child(div().w_full().h(px(26.)).child(dialog.label.clone()))
                     .child(if dialog.label_error {
@@ -1371,18 +1490,17 @@ fn done_step(dialog: &AccountDialog, kind: ServiceKind, cx: &App) -> AnyElement 
                             .text_size(FS_SM)
                             .text_color(colors.error)
                             .child(Icon::new(IconName::Err).size(px(12.)).color(colors.error))
-                            .child("Enter a label for this account.")
+                            .child(ui::t!("settings.accounts.dialog.label.error"))
                             .into_any_element()
                     } else if required {
                         help_text(
-                            format!(
-                                "You already have an account on {host}. A label tells them apart in clone, push and pull-request menus."
-                            ),
+                            ui::t!("settings.accounts.dialog.label.help_required", host = host),
                             cx,
                         )
                         .into_any_element()
                     } else {
-                        help_text("Defaults to the login name.", cx).into_any_element()
+                        help_text(ui::t!("settings.accounts.dialog.label.help_default"), cx)
+                            .into_any_element()
                     }),
             )
         })
@@ -1393,9 +1511,9 @@ fn build(state: &Entity<AccountDialog>, window: &Window, cx: &App) -> Dialog {
     let dialog = state.read(cx);
     let reconnecting = dialog.reconnecting();
     let title = if reconnecting {
-        "Reconnect account"
+        ui::t!("settings.accounts.dialog.reconnect.title")
     } else {
-        "Add account"
+        ui::t!("settings.accounts.dialog.add.title")
     };
     let kind = dialog.kind;
 
@@ -1420,16 +1538,19 @@ fn build(state: &Entity<AccountDialog>, window: &Window, cx: &App) -> Dialog {
 
     // Footer: a secondary button (Back / Cancel) and the primary one.
     let (secondary_label, secondary_back) = match dialog.step {
-        Step::Service => ("Cancel", false),
-        Step::Instance => ("Back", true),
-        Step::SignIn if reconnecting => ("Cancel", false),
-        Step::SignIn => ("Back", true),
-        Step::Done => ("", false),
+        Step::Service => (ui::t!("dialogs.common.cancel"), false),
+        Step::Instance => (ui::t!("settings.accounts.dialog.back"), true),
+        Step::SignIn if reconnecting => (ui::t!("dialogs.common.cancel"), false),
+        Step::SignIn => (ui::t!("settings.accounts.dialog.back"), true),
+        Step::Done => (SharedString::default(), false),
     };
     let (primary_label, primary_enabled): (SharedString, bool) = match dialog.step {
-        Step::Service => ("Continue".into(), dialog.kind.is_some()),
+        Step::Service => (
+            ui::t!("settings.accounts.dialog.continue"),
+            dialog.kind.is_some(),
+        ),
         Step::Instance => (
-            continue_label(!dialog.self_hosted, &dialog.probe).into(),
+            continue_label(!dialog.self_hosted, &dialog.probe),
             continue_enabled(
                 !dialog.self_hosted,
                 dialog.base_url(cx).is_some(),
@@ -1438,16 +1559,15 @@ fn build(state: &Entity<AccountDialog>, window: &Window, cx: &App) -> Dialog {
         ),
         Step::SignIn => (
             if dialog.verifying {
-                "Checking…"
+                ui::t!("settings.accounts.dialog.checking")
             } else if reconnecting {
-                "Reconnect"
+                ui::t!("settings.accounts.dialog.reconnect")
             } else {
-                "Connect"
-            }
-            .into(),
+                ui::t!("settings.accounts.dialog.connect")
+            },
             dialog.can_connect(cx),
         ),
-        Step::Done => ("Done".into(), !dialog.saving),
+        Step::Done => (ui::t!("settings.accounts.dialog.done"), !dialog.saving),
     };
     let mut footer = div().flex().items_center().gap(px(8.));
     if dialog.step != Step::Done {

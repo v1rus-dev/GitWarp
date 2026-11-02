@@ -21,6 +21,7 @@ mod open_dialog;
 mod palette;
 mod ref_dialog;
 mod ref_ops;
+mod remote_accounts;
 mod repo_view;
 mod settings;
 mod settings_ui;

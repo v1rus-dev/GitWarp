@@ -1,4 +1,13 @@
 {
+  "dialogs.account_picker.detail": "@{login} · {method}",
+  "dialogs.account_picker.fallback_title": "Cuenta",
+  "dialogs.account_picker.help": "Se recuerda para este repositorio. Cámbiala luego desde el menú del remoto: Cuenta…",
+  "dialogs.account_picker.intro.one": "{remote} apunta a {host} y tienes {n} cuenta allí. Elige la que GitWarp usa para fetch, pull y push en este repositorio.",
+  "dialogs.account_picker.intro.other": "{remote} apunta a {host} y tienes {n} cuentas allí. Elige la que GitWarp usa para fetch, pull y push en este repositorio.",
+  "dialogs.account_picker.method.browser": "Inicio de sesión en el navegador",
+  "dialogs.account_picker.method.token": "Token",
+  "dialogs.account_picker.title": "¿Qué cuenta para {remote}?",
+  "dialogs.account_picker.use": "Usar cuenta",
   "dialogs.checkout.bring_changes": "Llevar los cambios",
   "dialogs.checkout.carry_hint": "Llevar los cambios falla cuando la otra rama modifica las mismas líneas.",
   "dialogs.checkout.discard": "Descartar",

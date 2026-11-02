@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use forge::ServiceKind;
 use git_core::{Git, Head, Oid, Ref, RefKind, Repo, Stash, Submodule, SubmoduleState, Worktree};
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -23,6 +24,7 @@ use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_SM};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{Button, Chip, CountPill, Icon, IconName, Skeleton, Tooltip, TreeNodeData};
 
+use crate::remote_accounts::{self, RemoteDisplay, RemoteTargets};
 use crate::worktree_glyphs::{main_worktree_tip, worktree_glyphs};
 use crate::worktrees_model::WorktreeEntry;
 
@@ -84,6 +86,11 @@ pub struct SidebarExtras {
     pub remotes: Vec<String>,
     /// The fetch URL of every remote, for the Edit remote dialog.
     pub remote_urls: Vec<(String, String)>,
+    /// Fetch and push URLs of every remote, for the account chips and menus.
+    pub remote_targets: Vec<RemoteTargets>,
+    /// The canonical common git dir: the key of the remembered remote accounts,
+    /// shared by every worktree of the repository.
+    pub common_dir: Option<PathBuf>,
     /// `user.signingkey`, for the tag dialog's signing option.
     pub signing_key: Option<String>,
     pub stashes: Vec<Stash>,
@@ -105,7 +112,7 @@ pub(crate) fn read_sidebar_extras(git: Arc<Git>, root: &Path) -> SidebarExtras {
         log::warn!("could not list the remotes: {error}");
         Vec::new()
     });
-    let remote_urls = remotes
+    let remote_urls: Vec<(String, String)> = remotes
         .iter()
         .filter_map(|name| match repo.remote_url(name) {
             Ok(Some(url)) => Some((name.clone(), url)),
@@ -116,6 +123,20 @@ pub(crate) fn read_sidebar_extras(git: Arc<Git>, root: &Path) -> SidebarExtras {
             }
         })
         .collect();
+    let remote_targets = remote_urls
+        .iter()
+        .map(|(name, fetch_url)| RemoteTargets {
+            name: name.clone(),
+            fetch_url: fetch_url.clone(),
+            push_urls: repo.remote_push_urls(name).unwrap_or_else(|error| {
+                log::warn!("could not read the push URLs of {name}: {error}");
+                Vec::new()
+            }),
+        })
+        .collect();
+    let common_dir = git_core::common_dir(&repo)
+        .map_err(|error| log::warn!("could not find the common git dir: {error}"))
+        .ok();
     let signing_key = repo.signing_key().unwrap_or_else(|error| {
         log::warn!("could not read the signing key: {error}");
         None
@@ -135,6 +156,8 @@ pub(crate) fn read_sidebar_extras(git: Arc<Git>, root: &Path) -> SidebarExtras {
     SidebarExtras {
         remotes,
         remote_urls,
+        remote_targets,
+        common_dir,
         signing_key,
         stashes,
         worktrees,
@@ -216,6 +239,12 @@ pub enum SidebarAction {
     CreateTag,
     /// Opens the add-remote dialog.
     AddRemote,
+    /// Account… of a remote: picker, Add account dialog or an info toast.
+    RemoteAccount(String),
+    /// "Accounts for push URLs…" of a multi-push remote: an info toast.
+    RemotePushAccounts(String),
+    /// "Add account for <host>" row under a remote.
+    AddAccountFor(String),
     EditRemote(String),
     RemoveRemote(String),
     /// Fetches one remote (`origin`, `upstream`, …).
@@ -456,11 +485,23 @@ pub fn sidebar_menu(
         ];
     }
     if let Some(name) = key.strip_prefix("remote:") {
+        let multi_push = extras
+            .and_then(|extras| extras.remote_targets.iter().find(|t| t.name == name))
+            .is_some_and(remote_accounts::is_multi_push);
         return vec![
             item(&ui::t!("sidebar.menu.fetch"), IconName::Fetch)
                 .action(SidebarAction::FetchRemote(name.to_owned())),
             item(&ui::t!("sidebar.menu.edit_remote"), IconName::Edit)
                 .action(SidebarAction::EditRemote(name.to_owned())),
+            SidebarMenuEntry::Separator,
+            if multi_push {
+                item(&ui::t!("sidebar.menu.push_accounts"), IconName::User)
+                    .action(SidebarAction::RemotePushAccounts(name.to_owned()))
+            } else {
+                item(&ui::t!("sidebar.menu.account"), IconName::User)
+                    .action(SidebarAction::RemoteAccount(name.to_owned()))
+            },
+            SidebarMenuEntry::Separator,
             item(&ui::t!("sidebar.menu.remove_remote"), IconName::Trash)
                 .danger()
                 .shortcut("Del")
@@ -605,10 +646,49 @@ fn item(label: &str, icon: IconName) -> SidebarMenuEntry {
 /// leaves that match (and the folders and remotes above them) are built, each
 /// section's count becomes its number of matches, and a section without one
 /// disappears; an empty result means "no matches at all".
+#[cfg(test)]
 pub fn sidebar_nodes(
     refs: Option<&[Ref]>,
     head: Option<&Head>,
     extras: Option<&SidebarExtras>,
+    expansion: &Expansion,
+    filter: &str,
+    selected: Option<&str>,
+) -> Vec<TreeNodeData> {
+    sidebar_nodes_with(
+        refs,
+        head,
+        extras,
+        &RemoteDisplays::new(),
+        expansion,
+        filter,
+        selected,
+    )
+}
+
+/// The icon of a remote row: the GitHub mark, a bordered monogram for the
+/// other services, the generic cloud when the service is unknown.
+fn service_icon(node: TreeNodeData, service: Option<ServiceKind>) -> TreeNodeData {
+    match service {
+        Some(ServiceKind::GitHub) => node.icon(IconName::Github),
+        Some(kind) => node
+            .icon(IconName::Cloud)
+            .badge(crate::accounts::monogram(kind)),
+        None => node.icon(IconName::Cloud),
+    }
+}
+
+/// What the sidebar shows per remote, by remote name; see
+/// [`remote_accounts::display`].
+pub type RemoteDisplays = HashMap<String, RemoteDisplay>;
+
+/// [`sidebar_nodes`] with the account chips, "Add account" rows and push URL
+/// rows of the remotes in `remotes`.
+pub fn sidebar_nodes_with(
+    refs: Option<&[Ref]>,
+    head: Option<&Head>,
+    extras: Option<&SidebarExtras>,
+    remotes: &RemoteDisplays,
     expansion: &Expansion,
     filter: &str,
     selected: Option<&str>,
@@ -619,6 +699,7 @@ pub fn sidebar_nodes(
         refs,
         head,
         extras,
+        remotes,
         expansion,
         filter,
         selected,
@@ -630,6 +711,7 @@ struct Builder<'a> {
     refs: Option<&'a [Ref]>,
     head: Option<&'a Head>,
     extras: Option<&'a SidebarExtras>,
+    remotes: &'a RemoteDisplays,
     expansion: &'a Expansion,
     /// Lowercased, trimmed and non-empty; `None` when not filtering.
     filter: Option<&'a str>,
@@ -889,6 +971,7 @@ impl Builder<'_> {
             // A remote with no branches is still shown, just empty.
             built.push(self.remote_node(name, &key, expanded));
             if expanded {
+                built.extend(self.remote_account_rows(name));
                 for (label, reference) in branches {
                     built.push(self.remote_branch(reference, label));
                 }
@@ -920,13 +1003,68 @@ impl Builder<'_> {
     }
 
     fn remote_node(&self, name: &str, key: &str, expanded: bool) -> TreeNodeData {
-        TreeNodeData::new(name.to_owned())
+        let display = self.remotes.get(name);
+        let node = TreeNodeData::new(name.to_owned())
             .key(key.to_owned())
             .level(1)
-            .icon(IconName::Cloud)
             .has_children(true)
             .expanded(expanded)
-            .selected(self.selected == Some(key))
+            .selected(self.selected == Some(key));
+        let mut node = service_icon(node, display.and_then(|d| d.service));
+        if let Some(chip) = display.and_then(|d| d.chip.as_ref()) {
+            node = node.chip(
+                chip.text.clone(),
+                chip.warn,
+                Some(chip.tooltip.clone().into()),
+            );
+        }
+        if let Some(tooltip) = display.and_then(|d| d.tooltip.as_ref()) {
+            node = node.tooltip(tooltip.clone());
+        }
+        node
+    }
+
+    /// The rows between a remote and its branches: "Add account for <host>",
+    /// or the `fetch →` and `push →` rows of a multi-push remote.
+    fn remote_account_rows(&self, name: &str) -> Vec<TreeNodeData> {
+        let Some(display) = self.remotes.get(name) else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        if let Some(add) = &display.add_account {
+            let key = format!("addacc:{name}");
+            rows.push(
+                TreeNodeData::new(add.label.clone())
+                    .key(key.clone())
+                    .level(2)
+                    .icon(IconName::Plus)
+                    .accent()
+                    .tooltip(add.tooltip.clone())
+                    .selected(self.selected == Some(key.as_str())),
+            );
+        }
+        let account_row = |key: String, row: &remote_accounts::PushRow| {
+            let node = TreeNodeData::new(row.label.clone())
+                .key(key.clone())
+                .level(2)
+                .selected(self.selected == Some(key.as_str()));
+            let mut node = service_icon(node, row.service);
+            if let Some(chip) = &row.chip {
+                node = node.chip(
+                    chip.text.clone(),
+                    chip.warn,
+                    Some(chip.tooltip.clone().into()),
+                );
+            }
+            node
+        };
+        if let Some(fetch) = &display.fetch {
+            rows.push(account_row(format!("fetchurl:{name}"), fetch));
+        }
+        for (index, push) in display.pushes.iter().enumerate() {
+            rows.push(account_row(format!("pushurl:{name}:{index}"), push));
+        }
+        rows
     }
 
     fn remote_branch(&self, reference: &Ref, label: &str) -> TreeNodeData {
@@ -2718,7 +2856,14 @@ mod tests {
                 Some(&extras),
                 None
             )),
-            vec!["Fetch", "Edit remote…", "Remove remote"]
+            vec![
+                "Fetch",
+                "Edit remote…",
+                "—",
+                "Account…",
+                "—",
+                "Remove remote"
+            ]
         );
         assert_eq!(
             menu_labels(&sidebar_menu(
@@ -2912,7 +3057,7 @@ mod tests {
                 // Open in new window stays disabled: this fixture has no
                 // initialised `vendor/a`.
                 "sub:vendor/a" => &["Update submodule"],
-                "remote:origin" => &["Fetch", "Edit remote…", "Remove remote"],
+                "remote:origin" => &["Fetch", "Edit remote…", "Account…", "Remove remote"],
                 "wt:/tmp/wt" => &[
                     "Open in new window",
                     "Rename worktree…",
@@ -3193,5 +3338,250 @@ mod tests {
         );
         // The separator sits between Copy path and Lock/Unlock.
         assert!(worktree_menu(&linked)[4].is_none());
+    }
+
+    fn targets(name: &str, fetch: &str, push: &[&str]) -> RemoteTargets {
+        RemoteTargets {
+            name: name.to_owned(),
+            fetch_url: fetch.to_owned(),
+            push_urls: push.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_remote_menu_names_account_for_a_plain_and_a_multi_push_remote() {
+        let extras = SidebarExtras {
+            remotes: vec!["origin".into(), "publish".into()],
+            remote_targets: vec![
+                targets(
+                    "origin",
+                    "https://github.com/a/b.git",
+                    &["https://github.com/a/b.git"],
+                ),
+                targets(
+                    "publish",
+                    "https://github.com/a/b.git",
+                    &["https://github.com/a/b.git", "https://codeberg.org/a/b.git"],
+                ),
+            ],
+            ..Default::default()
+        };
+        let plain = sidebar_menu("remote:origin", None, Some(&extras), None);
+        assert_eq!(
+            menu_labels(&plain),
+            vec![
+                "Fetch",
+                "Edit remote…",
+                "—",
+                "Account…",
+                "—",
+                "Remove remote"
+            ]
+        );
+        assert_eq!(
+            menu_item(&plain, "Account…").action,
+            SidebarAction::RemoteAccount("origin".into())
+        );
+        let multi = sidebar_menu("remote:publish", None, Some(&extras), None);
+        assert_eq!(
+            menu_labels(&multi),
+            vec![
+                "Fetch",
+                "Edit remote…",
+                "—",
+                "Accounts for push URLs…",
+                "—",
+                "Remove remote"
+            ]
+        );
+        assert_eq!(
+            menu_item(&multi, "Accounts for push URLs…").action,
+            SidebarAction::RemotePushAccounts("publish".into())
+        );
+    }
+
+    fn chip_of(text: &str, warn: bool) -> remote_accounts::Chip {
+        remote_accounts::Chip {
+            text: text.to_owned(),
+            warn,
+            tooltip: format!("tip {text}"),
+        }
+    }
+
+    fn display_with(chip: Option<&str>, add: bool) -> RemoteDisplay {
+        RemoteDisplay {
+            service: Some(ServiceKind::GitHub),
+            chip: chip.map(|text| chip_of(text, true)),
+            tooltip: Some("origin · github.com".into()),
+            add_account: add.then(|| remote_accounts::AddAccount {
+                kind: ServiceKind::GitHub,
+                host: "github.com".into(),
+                label: "Add account for github.com".into(),
+                tooltip: "Add an account for github.com and use it for origin".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_remote_row_carries_its_chip_and_an_add_account_row_comes_first() {
+        let refs = [reference(RefKind::RemoteBranch, "origin/main")];
+        let extras = SidebarExtras {
+            remotes: vec!["origin".to_owned()],
+            ..Default::default()
+        };
+        let mut remotes = RemoteDisplays::new();
+        remotes.insert("origin".into(), display_with(Some("no account"), true));
+        let nodes = sidebar_nodes_with(
+            Some(&refs),
+            None,
+            Some(&extras),
+            &remotes,
+            &Expansion::default(),
+            "",
+            None,
+        );
+        let origin = find(&nodes, "remote:origin").unwrap();
+        assert_eq!(origin.icon, Some(IconName::Github));
+        assert_eq!(
+            origin.trailing,
+            Some(TreeNodeTrailing::Chip {
+                text: "no account".into(),
+                warn: true,
+                tooltip: Some("tip no account".into())
+            })
+        );
+        assert_eq!(origin.tooltip.as_deref(), Some("origin · github.com"));
+        let add = find(&nodes, "addacc:origin").unwrap();
+        assert_eq!(add.label, "Add account for github.com");
+        assert_eq!((add.level, add.icon), (2, Some(IconName::Plus)));
+        assert!(add.accent);
+        assert_eq!(
+            add.tooltip.as_deref(),
+            Some("Add an account for github.com and use it for origin")
+        );
+        let at = |key: &str| nodes.iter().position(|n| n.key == key).unwrap();
+        assert!(at("remote:origin") < at("addacc:origin"));
+        assert!(at("addacc:origin") < at("rbranch:origin/main"));
+        // Without displays the row is the plain cloud, no chip.
+        let plain = sidebar_nodes(
+            Some(&refs),
+            None,
+            Some(&extras),
+            &Expansion::default(),
+            "",
+            None,
+        );
+        let origin = find(&plain, "remote:origin").unwrap();
+        assert_eq!(
+            (origin.icon, origin.trailing.clone()),
+            (Some(IconName::Cloud), None)
+        );
+        assert!(find(&plain, "addacc:origin").is_none());
+    }
+
+    #[test]
+    fn a_service_without_an_icon_gets_its_monogram_badge() {
+        let extras = SidebarExtras {
+            remotes: vec!["work".to_owned()],
+            ..Default::default()
+        };
+        let mut remotes = RemoteDisplays::new();
+        remotes.insert(
+            "work".into(),
+            RemoteDisplay {
+                service: Some(ServiceKind::GitLab),
+                ..Default::default()
+            },
+        );
+        let nodes = sidebar_nodes_with(
+            Some(&[]),
+            None,
+            Some(&extras),
+            &remotes,
+            &Expansion::default(),
+            "",
+            None,
+        );
+        let work = find(&nodes, "remote:work").unwrap();
+        assert_eq!(work.badge.as_deref(), Some("GL"));
+        assert_eq!(work.icon, Some(IconName::Cloud));
+    }
+
+    #[test]
+    fn a_multi_push_remote_lists_fetch_and_push_rows_before_the_branches() {
+        let refs = [reference(RefKind::RemoteBranch, "publish/main")];
+        let extras = SidebarExtras {
+            remotes: vec!["publish".to_owned()],
+            ..Default::default()
+        };
+        let row = |label: &str, service, chip: Option<&str>| remote_accounts::PushRow {
+            host: String::new(),
+            label: label.to_owned(),
+            service: Some(service),
+            chip: chip.map(|text| chip_of(text, false)),
+        };
+        let mut remotes = RemoteDisplays::new();
+        remotes.insert(
+            "publish".into(),
+            RemoteDisplay {
+                service: None,
+                chip: Some(chip_of("2 push URLs", false)),
+                tooltip: Some("publish · pushes to 2 targets".into()),
+                add_account: None,
+                fetch: Some(row(
+                    "fetch → github.com",
+                    ServiceKind::GitHub,
+                    Some("mira-k"),
+                )),
+                pushes: vec![
+                    row("push → github.com", ServiceKind::GitHub, Some("mira-k")),
+                    row("push → codeberg.org", ServiceKind::Gitea, None),
+                ],
+            },
+        );
+        let nodes = sidebar_nodes_with(
+            Some(&refs),
+            None,
+            Some(&extras),
+            &remotes,
+            &Expansion::default(),
+            "",
+            None,
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .skip(2)
+                .take(5)
+                .map(|n| (n.label.as_ref(), n.level))
+                .collect::<Vec<_>>(),
+            vec![
+                ("publish", 1),
+                ("fetch → github.com", 2),
+                ("push → github.com", 2),
+                ("push → codeberg.org", 2),
+                ("main", 2)
+            ]
+        );
+        let publish = find(&nodes, "remote:publish").unwrap();
+        assert_eq!(publish.icon, Some(IconName::Cloud));
+        assert_eq!(
+            publish.tooltip.as_deref(),
+            Some("publish · pushes to 2 targets")
+        );
+        let chip = |key: &str| match &find(&nodes, key).unwrap().trailing {
+            Some(TreeNodeTrailing::Chip { text, .. }) => Some(text.to_string()),
+            _ => None,
+        };
+        assert_eq!(chip("remote:publish").as_deref(), Some("2 push URLs"));
+        assert_eq!(chip("fetchurl:publish").as_deref(), Some("mira-k"));
+        assert_eq!(chip("pushurl:publish:0").as_deref(), Some("mira-k"));
+        assert_eq!(chip("pushurl:publish:1"), None);
+        // Gitea has no icon of its own: the badge stands in.
+        assert_eq!(
+            find(&nodes, "pushurl:publish:1").unwrap().badge.as_deref(),
+            Some("GT")
+        );
     }
 }

@@ -1,4 +1,12 @@
 {
+  "dialogs.account_picker.detail": "@{login} · {method}",
+  "dialogs.account_picker.fallback_title": "アカウント",
+  "dialogs.account_picker.help": "このリポジトリで記憶されます。後からリモートのメニュー「アカウント…」で変更できます。",
+  "dialogs.account_picker.intro.other": "{remote} は {host} を指しており、そこに {n} 件のアカウントがあります。このリポジトリで GitWarp が fetch、pull、push に使うアカウントを選んでください。",
+  "dialogs.account_picker.method.browser": "ブラウザーでサインイン",
+  "dialogs.account_picker.method.token": "トークン",
+  "dialogs.account_picker.title": "{remote} にどのアカウントを使いますか？",
+  "dialogs.account_picker.use": "このアカウントを使う",
   "dialogs.checkout.bring_changes": "変更を持ち越す",
   "dialogs.checkout.carry_hint": "もう一方のブランチが同じ行を編集している場合、変更の持ち越しは失敗します。",
   "dialogs.checkout.discard": "破棄",

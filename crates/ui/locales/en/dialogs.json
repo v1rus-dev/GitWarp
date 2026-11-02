@@ -1,4 +1,13 @@
 {
+  "dialogs.account_picker.detail": "@{login} · {method}",
+  "dialogs.account_picker.fallback_title": "Account",
+  "dialogs.account_picker.help": "Remembered for this repository. Change it later from the remote’s menu: Account…",
+  "dialogs.account_picker.intro.one": "{remote} points to {host}, and you have {n} account there. Pick the one GitWarp uses to fetch, pull and push in this repository.",
+  "dialogs.account_picker.intro.other": "{remote} points to {host}, and you have {n} accounts there. Pick the one GitWarp uses to fetch, pull and push in this repository.",
+  "dialogs.account_picker.method.browser": "Browser sign-in",
+  "dialogs.account_picker.method.token": "Token",
+  "dialogs.account_picker.title": "Which account for {remote}?",
+  "dialogs.account_picker.use": "Use account",
   "dialogs.checkout.bring_changes": "Bring changes",
   "dialogs.checkout.carry_hint": "Carrying the changes fails when the other branch edits the same lines.",
   "dialogs.checkout.discard": "Discard",

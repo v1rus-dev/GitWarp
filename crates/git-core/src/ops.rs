@@ -176,6 +176,27 @@ pub(crate) fn remote_url(repo: &Repo, name: &str) -> Result<Option<String>> {
     Ok((!url.is_empty()).then_some(url))
 }
 
+/// Every push URL of a configured remote, one per `remote.<name>.pushurl`
+/// entry. Git answers with the fetch URL when no `pushurl` is set, and so does
+/// this: the list is never empty for a configured remote. An unknown name
+/// gives an empty list.
+pub(crate) fn remote_push_urls(repo: &Repo, name: &str) -> Result<Vec<String>> {
+    let out = repo
+        .command()
+        .args(["remote", "get-url", "--push", "--all", name])
+        .output()
+        .map_err(Error::Spawn)?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 /// Applies one commit on top of HEAD as a new commit.
 ///
 /// A conflict is aborted before it reaches the UI: there is no conflict editor

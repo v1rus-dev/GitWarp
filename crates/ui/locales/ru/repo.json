@@ -97,5 +97,10 @@
   "repo.toolbar.view_history": "История",
   "repo.toolbar.view_worktrees": "Рабочие деревья",
   "repo.upstream.missing": "Пока нет {upstream}. Сначала отправьте {branch}, чтобы его создать.",
-  "repo.upstream.tracks": "{branch} теперь отслеживает {upstream}"
+  "repo.upstream.tracks": "{branch} теперь отслеживает {upstream}",
+  "repo.toast.account_push_urls": "У каждого push-URL свой аккаунт. Измените их в Настройки → Аккаунты.",
+  "repo.toast.account_one": "На {host} один аккаунт ({label}); {remote} уже его использует.",
+  "repo.toast.account_unknown_host": "В GitWarp нет аккаунта для {host}. Добавьте его в Настройки → Аккаунты.",
+  "repo.toast.account_picked": "{remote} будет использовать {label} в этом репозитории",
+  "repo.toast.account_added": "{label} подключён на {host}. {remote} теперь использует его."
 }

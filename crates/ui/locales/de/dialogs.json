@@ -1,4 +1,13 @@
 {
+  "dialogs.account_picker.detail": "@{login} · {method}",
+  "dialogs.account_picker.fallback_title": "Konto",
+  "dialogs.account_picker.help": "Wird für dieses Repository gemerkt. Später im Menü des Remotes ändern: Konto…",
+  "dialogs.account_picker.intro.one": "{remote} zeigt auf {host}, und du hast dort {n} Konto. Wähle das Konto, das GitWarp in diesem Repository für Fetch, Pull und Push verwendet.",
+  "dialogs.account_picker.intro.other": "{remote} zeigt auf {host}, und du hast dort {n} Konten. Wähle das Konto, das GitWarp in diesem Repository für Fetch, Pull und Push verwendet.",
+  "dialogs.account_picker.method.browser": "Browser-Anmeldung",
+  "dialogs.account_picker.method.token": "Token",
+  "dialogs.account_picker.title": "Welches Konto für {remote}?",
+  "dialogs.account_picker.use": "Konto verwenden",
   "dialogs.checkout.bring_changes": "Änderungen mitnehmen",
   "dialogs.checkout.carry_hint": "Das Mitnehmen der Änderungen schlägt fehl, wenn der andere Branch dieselben Zeilen bearbeitet.",
   "dialogs.checkout.discard": "Verwerfen",

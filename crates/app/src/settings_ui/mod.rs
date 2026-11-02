@@ -9,8 +9,8 @@
 //! on the background executor. Appearance changes additionally rebuild the
 //! theme global, so the whole window repaints at once.
 
-mod account_dialog;
-mod accounts;
+pub(crate) mod account_dialog;
+pub(crate) mod accounts;
 mod appearance;
 mod diff;
 mod form;

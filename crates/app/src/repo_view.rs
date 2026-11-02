@@ -44,14 +44,17 @@ use crate::network_service::NetworkService;
 use crate::palette::{self, Command};
 use crate::ref_dialog::{self, RefDialog, RefDialogContext, RefDialogKind, RemoteEdit};
 use crate::ref_ops::{CommitCard, RefAction};
+use crate::remote_accounts::{self, AccountAction, RemoteResolution};
 use crate::settings::{
     sidebar_width_limit, DiffLayout, Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX,
     SIDEBAR_WIDTH_MIN,
 };
+use crate::settings_ui::account_dialog::{self, Open as AccountOpen};
+use crate::settings_ui::accounts::open_picker;
 use crate::sidebar::{
-    commit_for, read_sidebar_extras, shortcut_action, sidebar_menu, sidebar_nodes, worktree_menu,
-    worktree_panel_rows, Expansion, PanelEvent, PanelState, SidebarAction, SidebarExtras,
-    SidebarMenuEntry, WorktreeAction, WorktreePanel,
+    commit_for, read_sidebar_extras, shortcut_action, sidebar_menu, sidebar_nodes_with,
+    worktree_menu, worktree_panel_rows, Expansion, PanelEvent, PanelState, RemoteDisplays,
+    SidebarAction, SidebarExtras, SidebarMenuEntry, WorktreeAction, WorktreePanel,
 };
 use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::workspace::{
@@ -467,6 +470,9 @@ pub struct RepositoryView {
     filter: String,
     /// The sidebar's own lists; `None` while they load.
     sidebar_extras: Option<SidebarExtras>,
+    /// The remote-account picker or Add account dialog opened from a remote's
+    /// menu, kept alive while it is open.
+    account_modal: Option<gpui::AnyEntity>,
     /// The root the lists belong to, so they load once per root.
     sidebar_root: Option<PathBuf>,
     /// Bumped per load; an older result that finishes later is dropped.
@@ -739,6 +745,7 @@ impl RepositoryView {
             sidebar: Expansion::default(),
             filter: String::new(),
             sidebar_extras: None,
+            account_modal: None,
             sidebar_root: None,
             sidebar_generation: 0,
             _sidebar_filter_events: sidebar_filter_events,
@@ -1425,6 +1432,26 @@ impl RepositoryView {
             SidebarAction::AddRemote => {
                 self.open_ref_dialog(RefDialogKind::Remote { editing: None }, window, cx);
             }
+            SidebarAction::RemoteAccount(name) => self.remote_account(name, window, cx),
+            SidebarAction::AddAccountFor(name) => {
+                let kind = self
+                    .resolution_of(&name, cx)
+                    .and_then(|r| match r.fetch.account {
+                        remote_accounts::UrlAccount::NoAccount(kind) => Some(kind),
+                        _ => None,
+                    });
+                if let Some(kind) = kind {
+                    self.open_add_account_for(name, kind, window, cx);
+                }
+            }
+            SidebarAction::RemotePushAccounts(_) => {
+                toast::show(
+                    ui::ToastKind::Info,
+                    ui::t!("repo.toast.account_push_urls"),
+                    window,
+                    cx,
+                );
+            }
             SidebarAction::EditRemote(name) => {
                 let url = self
                     .sidebar_extras
@@ -1630,6 +1657,267 @@ impl RepositoryView {
         }
     }
 
+    /// The configured accounts and this repository's remembered choices.
+    fn account_settings(
+        &self,
+        cx: &App,
+    ) -> (
+        Vec<crate::settings::AccountRecord>,
+        std::collections::BTreeMap<String, String>,
+    ) {
+        let Some(state) = cx.try_global::<crate::AppSettings>() else {
+            return Default::default();
+        };
+        let remembered = self
+            .repo_key()
+            .and_then(|key| state.settings.remote_accounts.get(&key).cloned())
+            .unwrap_or_default();
+        (state.settings.accounts.clone(), remembered)
+    }
+
+    /// The key of this repository in `Settings::remote_accounts`: the canonical
+    /// common git dir, the same for all its worktrees.
+    fn repo_key(&self) -> Option<String> {
+        self.sidebar_extras
+            .as_ref()?
+            .common_dir
+            .as_ref()
+            .map(|dir| dir.display().to_string())
+    }
+
+    /// Every remote resolved against the current accounts and choices. Pure
+    /// and cheap: no network, no keychain.
+    fn resolutions(&self, cx: &App) -> Vec<RemoteResolution> {
+        let Some(extras) = self.sidebar_extras.as_ref() else {
+            return Vec::new();
+        };
+        let (accounts, remembered) = self.account_settings(cx);
+        remote_accounts::resolve_all(&accounts, &extras.remote_targets, Some(&remembered))
+    }
+
+    fn resolution_of(&self, name: &str, cx: &App) -> Option<RemoteResolution> {
+        self.resolutions(cx).into_iter().find(|r| r.name == name)
+    }
+
+    /// What the sidebar shows per remote, resolved again on every render so a
+    /// change in Settings shows at once. Starts the anonymous public checks
+    /// the answer is waiting for (once per repository and process).
+    fn remote_displays(&mut self, cx: &mut Context<Self>) -> RemoteDisplays {
+        let resolutions = self.resolutions(cx);
+        if resolutions.is_empty() {
+            return RemoteDisplays::new();
+        }
+        for probe in remote_accounts::public_probes(&resolutions) {
+            self.start_public_check(probe, cx);
+        }
+        let (accounts, _) = self.account_settings(cx);
+        resolutions
+            .iter()
+            .map(|resolution| {
+                let display = remote_accounts::display(resolution, &accounts, &|probe| {
+                    remote_accounts::cached_public(&probe.key())
+                });
+                (resolution.name.clone(), display)
+            })
+            .collect()
+    }
+
+    /// Asks the service in the background whether the repository is public.
+    /// The sidebar shows nothing for it until the answer, or 5 seconds, came;
+    /// a failed request counts as "not public".
+    fn start_public_check(&mut self, probe: remote_accounts::PublicProbe, cx: &mut Context<Self>) {
+        let key = probe.key();
+        if !remote_accounts::claim_public_check(&key) {
+            return;
+        }
+        let timeout_key = key.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(5))
+                .await;
+            remote_accounts::expire_public_check(&timeout_key);
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    forge::api::repo_is_public(
+                        &forge::api::Client::new(),
+                        &probe.instance,
+                        &probe.coords,
+                    )
+                })
+                .await;
+            match result {
+                Ok(Some(public)) => remote_accounts::finish_public_check(&key, public),
+                // No usable answer: nothing is remembered as "private"; the
+                // question may be asked again after a minute.
+                Ok(None) => remote_accounts::release_public_check(&key),
+                Err(error) => {
+                    log::debug!("public check of {key} failed: {error}");
+                    remote_accounts::release_public_check(&key);
+                }
+            }
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+    }
+
+    /// Account… in a remote's menu.
+    fn remote_account(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(resolution) = self.resolution_of(&name, cx) else {
+            return;
+        };
+        let (accounts, _) = self.account_settings(cx);
+        match remote_accounts::account_action(&resolution, &accounts) {
+            AccountAction::Pick { host, ids, current } => {
+                let candidates: Vec<_> = ids
+                    .iter()
+                    .filter_map(|id| accounts.iter().find(|a| a.id == *id).cloned())
+                    .collect();
+                let view = cx.entity();
+                let remote = name.clone();
+                let picker = open_picker(
+                    name,
+                    host,
+                    candidates,
+                    current,
+                    std::rc::Rc::new(move |account, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.remember_account(&remote, account, window, cx)
+                        });
+                    }),
+                    window,
+                    cx,
+                );
+                self.account_modal = Some(picker.into_any());
+            }
+            AccountAction::Add { kind, .. } => self.open_add_account_for(name, kind, window, cx),
+            AccountAction::AlreadyOne { host, label } => {
+                toast::show(
+                    ui::ToastKind::Info,
+                    ui::t!(
+                        "repo.toast.account_one",
+                        host = host,
+                        label = label,
+                        remote = name
+                    ),
+                    window,
+                    cx,
+                );
+            }
+            AccountAction::NoService { host } => {
+                toast::show(
+                    ui::ToastKind::Info,
+                    ui::t!("repo.toast.account_unknown_host", host = host),
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Stores the account picked for `remote` in this repository.
+    fn remember_account(
+        &mut self,
+        remote: &str,
+        account: &crate::settings::AccountRecord,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.account_modal = None;
+        let Some(key) = self.repo_key() else {
+            return;
+        };
+        let (remote_name, id) = (remote.to_owned(), account.id.clone());
+        crate::update_settings(cx, move |settings| {
+            settings.set_remote_account(&key, &remote_name, &id)
+        });
+        toast::show(
+            ui::ToastKind::Ok,
+            ui::t!(
+                "repo.toast.account_picked",
+                remote = remote,
+                label = account.display_label()
+            ),
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Opens the Add account dialog for the service of `remote`, on its public
+    /// instance, at the sign-in step.
+    fn open_add_account_for(
+        &mut self,
+        remote: String,
+        kind: forge::ServiceKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let host = crate::accounts::public_host(kind).to_owned();
+        let dialog = account_dialog::open(
+            AccountOpen::AddFor {
+                kind,
+                base_url: format!("https://{host}"),
+            },
+            None,
+            Some(std::rc::Rc::new(move |account, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.account_added_for(&remote, &host, account, window, cx)
+                });
+            })),
+            window,
+            cx,
+        );
+        self.account_modal = Some(dialog.into_any());
+    }
+
+    /// An account was added from `remote`'s menu: it is the remote's choice
+    /// when it joined others on the host, otherwise it is picked up on its own.
+    fn account_added_for(
+        &mut self,
+        remote: &str,
+        host: &str,
+        account: &crate::settings::AccountRecord,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.account_modal = None;
+        let url = self.sidebar_extras.as_ref().and_then(|extras| {
+            extras
+                .remote_targets
+                .iter()
+                .find(|t| t.name == remote)
+                .map(|t| t.fetch_url.clone())
+        });
+        let (accounts, _) = self.account_settings(cx);
+        let choice = url
+            .and_then(|url| remote_accounts::choice_after_add(&accounts, &url, &account.id))
+            .zip(self.repo_key());
+        if let Some((id, key)) = choice {
+            let remote = remote.to_owned();
+            crate::update_settings(cx, move |settings| {
+                settings.set_remote_account(&key, &remote, &id)
+            });
+        }
+        toast::show(
+            ui::ToastKind::Ok,
+            ui::t!(
+                "repo.toast.account_added",
+                label = account.display_label(),
+                host = host,
+                remote = remote
+            ),
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
     /// `origin` when configured, otherwise the first remote, otherwise
     /// `origin` (the operation then reports the missing remote).
     fn default_remote_name(&self) -> String {
@@ -1771,8 +2059,17 @@ impl RepositoryView {
         }
         let context = self.ref_dialog_context(&kind, cx);
         let view = cx.entity();
+        // A removed remote must not leave its remembered account behind.
+        let removed_remote = match &kind {
+            RefDialogKind::RemoveRemote { name } => Some(name.clone()),
+            _ => None,
+        };
         let on_done = Rc::new(move |window: &mut Window, cx: &mut App| {
             view.update(cx, |view, cx| {
+                if let (Some(name), Some(key)) = (&removed_remote, view.repo_key()) {
+                    let name = name.clone();
+                    crate::update_settings(cx, move |settings| settings.forget_remote(&key, &name));
+                }
                 // The dialog entity stays owned until the next one replaces
                 // it: dropping it here would free the state that is running
                 // this callback.
@@ -2253,6 +2550,20 @@ impl RepositoryView {
         // A newer load owns the lists now; this older answer is stale.
         if generation != self.sidebar_generation {
             return;
+        }
+        // A remote renamed or removed since the last load takes its remembered
+        // account along (or drops it).
+        if let (Some(previous), Some(key)) = (&self.sidebar_extras, extras.common_dir.as_ref()) {
+            let before: Vec<String> = previous.remotes.clone();
+            let after = extras.remotes.clone();
+            // An empty list may be a failed read, not a repository without
+            // remotes: the explicit Remove remote path covers the last one.
+            if before != after && !after.is_empty() {
+                let key = key.display().to_string();
+                crate::update_settings(cx, move |settings| {
+                    settings.reconcile_remote_accounts(&key, &before, &after)
+                });
+            }
         }
         self.sidebar_extras = Some(extras);
         cx.notify();
@@ -3174,7 +3485,8 @@ impl RepositoryView {
         let nodes = if worktrees_mode {
             Vec::new()
         } else {
-            self.tree_nodes(cx)
+            let remotes = self.remote_displays(cx);
+            self.tree_nodes(&remotes, cx)
         };
         if let Some(index) = nodes.iter().position(|node| node.current) {
             // ScrollHandle applies this during prepaint, so asking during
@@ -3194,12 +3506,18 @@ impl RepositoryView {
         let activate = {
             let rows = rows.clone();
             let view = view.clone();
-            move |index: usize, _: &mut Window, cx: &mut App| {
+            move |index: usize, window: &mut Window, cx: &mut App| {
                 let Some((key, has_children, expanded)) = rows.get(index).cloned() else {
                     return;
                 };
                 view.update(cx, |view, cx| {
-                    if has_children {
+                    if let Some(remote) = key.strip_prefix("addacc:") {
+                        // "Add account for <host>" is an action row, not a node to reveal.
+                        let remote = remote.to_owned();
+                        view.selected_node = Some(key.clone());
+                        view.run_sidebar_action(SidebarAction::AddAccountFor(remote), window, cx);
+                        cx.notify();
+                    } else if has_children {
                         view.toggle_node(&key, expanded, cx);
                     } else {
                         view.activate_node(&key, cx);
@@ -3341,12 +3659,13 @@ impl RepositoryView {
             )
     }
 
-    fn tree_nodes(&self, cx: &Context<Self>) -> Vec<TreeNodeData> {
+    fn tree_nodes(&self, remotes: &RemoteDisplays, cx: &Context<Self>) -> Vec<TreeNodeData> {
         let history = self.history.read(cx);
-        sidebar_nodes(
+        sidebar_nodes_with(
             history.refs(),
             history.head(),
             self.sidebar_extras.as_ref(),
+            remotes,
             &self.sidebar,
             &self.filter,
             self.selected_node.as_deref(),
@@ -5915,7 +6234,7 @@ mod tests {
     ) {
         let index = view
             .update(cx, |view, cx| {
-                view.tree_nodes(cx)
+                view.tree_nodes(&RemoteDisplays::new(), cx)
                     .iter()
                     .position(|node| node.key.as_ref() == key)
             })

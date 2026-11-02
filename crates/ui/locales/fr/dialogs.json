@@ -1,4 +1,13 @@
 {
+  "dialogs.account_picker.detail": "@{login} · {method}",
+  "dialogs.account_picker.fallback_title": "Compte",
+  "dialogs.account_picker.help": "Mémorisé pour ce dépôt. Modifiable plus tard depuis le menu du remote : Compte…",
+  "dialogs.account_picker.intro.one": "{remote} pointe vers {host}, et vous y avez {n} compte. Choisissez celui que GitWarp utilise pour fetch, pull et push dans ce dépôt.",
+  "dialogs.account_picker.intro.other": "{remote} pointe vers {host}, et vous y avez {n} comptes. Choisissez celui que GitWarp utilise pour fetch, pull et push dans ce dépôt.",
+  "dialogs.account_picker.method.browser": "Connexion par navigateur",
+  "dialogs.account_picker.method.token": "Jeton",
+  "dialogs.account_picker.title": "Quel compte pour {remote} ?",
+  "dialogs.account_picker.use": "Utiliser le compte",
   "dialogs.checkout.bring_changes": "Emporter les modifications",
   "dialogs.checkout.carry_hint": "Emporter les modifications échoue si l’autre branche modifie les mêmes lignes.",
   "dialogs.checkout.discard": "Abandonner",

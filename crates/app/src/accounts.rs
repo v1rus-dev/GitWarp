@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use forge::api::{ApiError, Client, Probe, TokenCheck, TokenKind};
 use forge::secrets::{KeychainStore, SecretError, SecretStore};
 use forge::{Instance, ServiceKind};
-use gpui::{App, Global};
+use gpui::{App, Global, SharedString};
 
 use crate::settings::{AccountRecord, LEGACY_ACCOUNT_ID_PREFIX};
 
@@ -96,22 +96,25 @@ pub(crate) fn public_host(kind: ServiceKind) -> &'static str {
 }
 
 /// What the self-hosted flavour of `kind` is called.
-pub(crate) fn self_hosted_name(kind: ServiceKind) -> &'static str {
+pub(crate) fn self_hosted_name(kind: ServiceKind) -> SharedString {
     match kind {
-        ServiceKind::GitHub => "GitHub Enterprise Server",
-        ServiceKind::GitLab => "GitLab self-managed",
-        ServiceKind::Gitea => "Gitea / Forgejo",
-        ServiceKind::Bitbucket => "Bitbucket",
-        ServiceKind::AzureDevOps => "Azure DevOps Server",
+        ServiceKind::GitHub => ui::t!("settings.accounts.service.self_hosted.github"),
+        ServiceKind::GitLab => ui::t!("settings.accounts.service.self_hosted.gitlab"),
+        ServiceKind::Gitea => ui::t!("settings.accounts.service.self_hosted.gitea"),
+        ServiceKind::Bitbucket => ui::t!("settings.accounts.service.self_hosted.bitbucket"),
+        ServiceKind::AzureDevOps => ui::t!("settings.accounts.service.self_hosted.azure"),
     }
 }
 
 /// The card text under a service on the first step.
-pub(crate) fn service_blurb(kind: ServiceKind) -> String {
+pub(crate) fn service_blurb(kind: ServiceKind) -> SharedString {
     match kind {
-        ServiceKind::Gitea => "Codeberg, Gitea and Forgejo servers".to_owned(),
-        ServiceKind::AzureDevOps => "Azure DevOps Services and Server".to_owned(),
-        other => format!("{} or your own server", public_host(other)),
+        ServiceKind::Gitea => ui::t!("settings.accounts.service.blurb.gitea"),
+        ServiceKind::AzureDevOps => ui::t!("settings.accounts.service.blurb.azure"),
+        other => ui::t!(
+            "settings.accounts.service.blurb.public",
+            host = public_host(other)
+        ),
     }
 }
 
@@ -125,27 +128,35 @@ pub(crate) fn has_oauth(kind: ServiceKind) -> bool {
 }
 
 /// The permissions GitWarp asks for in a token.
-pub(crate) fn required_permissions(kind: ServiceKind) -> &'static [&'static str] {
+pub(crate) fn required_permissions(kind: ServiceKind) -> Vec<String> {
+    // GitHub and GitLab list token scope names, which are identifiers and stay
+    // as they are; the others name permissions as the service's UI words them.
+    let literal = |scopes: &[&str]| scopes.iter().map(|s| (*s).to_owned()).collect();
     match kind {
-        ServiceKind::GitHub => &["repo", "read:user", "workflow"],
-        ServiceKind::GitLab => &["api", "read_repository", "write_repository"],
-        ServiceKind::Gitea => &["repository: read and write", "user: read and write"],
-        ServiceKind::Bitbucket => &[
-            "Repositories: read and write",
-            "Pull requests: read and write",
+        ServiceKind::GitHub => literal(&["repo", "read:user", "workflow"]),
+        ServiceKind::GitLab => literal(&["api", "read_repository", "write_repository"]),
+        ServiceKind::Gitea => vec![
+            ui::t!("settings.accounts.permission.gitea.repository").to_string(),
+            ui::t!("settings.accounts.permission.gitea.user").to_string(),
         ],
-        ServiceKind::AzureDevOps => &["Code: read and write"],
+        ServiceKind::Bitbucket => vec![
+            ui::t!("settings.accounts.permission.bitbucket.repositories").to_string(),
+            ui::t!("settings.accounts.permission.bitbucket.pull_requests").to_string(),
+        ],
+        ServiceKind::AzureDevOps => {
+            vec![ui::t!("settings.accounts.permission.azure.code").to_string()]
+        }
     }
 }
 
 /// Where in the service's settings tokens are created.
-pub(crate) fn token_where(kind: ServiceKind) -> &'static str {
+pub(crate) fn token_where(kind: ServiceKind) -> SharedString {
     match kind {
-        ServiceKind::GitHub => "Settings → Developer settings → Personal access tokens",
-        ServiceKind::GitLab => "Preferences → Access tokens",
-        ServiceKind::Gitea => "Settings → Applications → Generate new token",
-        ServiceKind::Bitbucket => "Personal settings → API tokens (Bitbucket API token)",
-        ServiceKind::AzureDevOps => "User settings → Personal access tokens",
+        ServiceKind::GitHub => ui::t!("settings.accounts.token_where.github"),
+        ServiceKind::GitLab => ui::t!("settings.accounts.token_where.gitlab"),
+        ServiceKind::Gitea => ui::t!("settings.accounts.token_where.gitea"),
+        ServiceKind::Bitbucket => ui::t!("settings.accounts.token_where.bitbucket"),
+        ServiceKind::AzureDevOps => ui::t!("settings.accounts.token_where.azure"),
     }
 }
 
@@ -192,7 +203,13 @@ pub(crate) fn kind_of(account: &AccountRecord) -> Option<ServiceKind> {
 
 /// The record as a `forge` instance.
 pub(crate) fn instance_of(account: &AccountRecord) -> Result<Instance, String> {
-    let kind = kind_of(account).ok_or_else(|| format!("unknown service `{}`", account.kind))?;
+    let kind = kind_of(account).ok_or_else(|| {
+        ui::t!(
+            "settings.accounts.error.unknown_service",
+            kind = account.kind
+        )
+        .to_string()
+    })?;
     let mut instance = Instance::new(kind, &account.base_url).map_err(|e| e.to_string())?;
     instance.ssh_host = account.ssh_host.clone();
     Ok(instance)
@@ -314,7 +331,7 @@ pub(crate) fn check_account(
     }
     let Some(token) = secret else {
         return CheckOutcome::status(AccountStatus::Invalid(Some(
-            "No token is stored in the system keychain for this account.".to_owned(),
+            ui::t!("settings.accounts.status.no_token").to_string(),
         )));
     };
     let result = forge::api::current_user(&Client::new(), &instance, &token, TokenKind::Pat);
@@ -455,12 +472,12 @@ pub(crate) fn is_plain_http(base_url: &str) -> bool {
 }
 
 /// Label of the primary button on the instance step.
-pub(crate) fn continue_label(public: bool, probe: &ProbeState) -> &'static str {
+pub(crate) fn continue_label(public: bool, probe: &ProbeState) -> SharedString {
     match probe {
-        ProbeState::Checking => "Checking…",
-        ProbeState::Detected { .. } => "Continue",
-        _ if public => "Continue",
-        _ => "Check address",
+        ProbeState::Checking => ui::t!("settings.accounts.dialog.checking"),
+        ProbeState::Detected { .. } => ui::t!("settings.accounts.dialog.continue"),
+        _ if public => ui::t!("settings.accounts.dialog.continue"),
+        _ => ui::t!("settings.accounts.dialog.check_address"),
     }
 }
 
@@ -497,12 +514,7 @@ pub(crate) fn sign_in_outcome(
         Err(ApiError::Unauthorized) => Err(SignInError::Wrong),
         // 403 means the token was understood but is not allowed to read the
         // profile: it lacks permissions, but the service did not say which.
-        Err(ApiError::Forbidden) => Err(SignInError::Permissions(
-            required_permissions(kind)
-                .iter()
-                .map(|p| (*p).to_owned())
-                .collect(),
-        )),
+        Err(ApiError::Forbidden) => Err(SignInError::Permissions(required_permissions(kind))),
         Err(error @ (ApiError::Unreachable(_) | ApiError::TlsUntrusted(_))) => {
             Err(SignInError::Network(error.to_string()))
         }
@@ -616,10 +628,16 @@ mod tests {
     #[test]
     fn the_instance_step_gates_its_button() {
         let detected = ProbeState::Detected { version: None };
-        assert_eq!(continue_label(true, &ProbeState::Idle), "Continue");
-        assert_eq!(continue_label(false, &ProbeState::Idle), "Check address");
-        assert_eq!(continue_label(false, &ProbeState::Checking), "Checking…");
-        assert_eq!(continue_label(false, &detected), "Continue");
+        assert_eq!(continue_label(true, &ProbeState::Idle).as_ref(), "Continue");
+        assert_eq!(
+            continue_label(false, &ProbeState::Idle).as_ref(),
+            "Check address"
+        );
+        assert_eq!(
+            continue_label(false, &ProbeState::Checking).as_ref(),
+            "Checking…"
+        );
+        assert_eq!(continue_label(false, &detected).as_ref(), "Continue");
 
         assert!(continue_enabled(true, false, &ProbeState::Idle));
         assert!(!continue_enabled(false, false, &ProbeState::Idle));

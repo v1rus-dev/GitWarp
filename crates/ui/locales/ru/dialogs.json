@@ -151,5 +151,15 @@
   "dialogs.remote_name.spaces": "Имя не может содержать пробелы.",
   "dialogs.remote_url.bad": "Это не адрес Git. Используйте https://host/user/repo.git или git@host:user/repo.git",
   "dialogs.remote_url.https": "HTTPS · использует сохранённый аккаунт",
-  "dialogs.remote_url.ssh": "SSH · использует ваши SSH-ключи"
+  "dialogs.remote_url.ssh": "SSH · использует ваши SSH-ключи",
+  "dialogs.account_picker.fallback_title": "Аккаунт",
+  "dialogs.account_picker.title": "Какой аккаунт для {remote}?",
+  "dialogs.account_picker.intro.one": "{remote} указывает на {host}, и у вас там {n} аккаунт. Выберите тот, который GitWarp использует для fetch, pull и push в этом репозитории.",
+  "dialogs.account_picker.intro.few": "{remote} указывает на {host}, и у вас там {n} аккаунта. Выберите тот, который GitWarp использует для fetch, pull и push в этом репозитории.",
+  "dialogs.account_picker.intro.many": "{remote} указывает на {host}, и у вас там {n} аккаунтов. Выберите тот, который GitWarp использует для fetch, pull и push в этом репозитории.",
+  "dialogs.account_picker.help": "Запоминается для этого репозитория. Изменить позже можно в меню remote: Аккаунт…",
+  "dialogs.account_picker.use": "Использовать аккаунт",
+  "dialogs.account_picker.method.token": "Токен",
+  "dialogs.account_picker.method.browser": "Вход через браузер",
+  "dialogs.account_picker.detail": "@{login} · {method}"
 }
