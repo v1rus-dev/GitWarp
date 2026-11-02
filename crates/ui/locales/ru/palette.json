@@ -40,5 +40,7 @@
   "palette.group.commits": "КОММИТЫ",
   "palette.group.files": "ФАЙЛЫ",
   "palette.placeholder": "Введите команду, ветку, хеш коммита или файл…",
-  "palette.row.current": "текущая"
+  "palette.row.current": "текущая",
+  "palette.command.create_pull_request": "Создать pull request…",
+  "palette.command.create_merge_request": "Создать merge request…"
 }

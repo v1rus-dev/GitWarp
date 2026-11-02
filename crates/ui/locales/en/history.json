@@ -69,6 +69,8 @@
   "history.menu.checkout_commit": "Checkout this commit",
   "history.menu.cherry_pick": "Cherry-pick",
   "history.menu.copy_hash": "Copy commit hash",
+  "history.menu.open_on_host": "Open on {service}",
+  "history.menu.open_on_host_remote": "Open on {service} ({remote})",
   "history.menu.create_branch_here": "Create branch here…",
   "history.menu.create_tag_here": "Create tag here…",
   "history.menu.remote_tag": "remote",

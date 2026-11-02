@@ -27,33 +27,44 @@ use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
 use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    menu, toast, Avatar, Button, CountPill, Counter, FileRow, Icon, IconName, MenuEntry, MenuItem,
-    Scrollbar, SearchField, SegmentItem, Segmented, Skeleton, Spinner, Splitter, TextInput,
-    TextInputEvent, Tooltip, Tree, TreeNodeData,
+    menu, toast, Avatar, Banner, BannerKind, Button, ButtonSize, CiGlyph, CountPill, Counter,
+    EmptyState, FileRow, Icon, IconName, MenuEntry, MenuItem, PrBadge, Scrollbar, SearchField,
+    SegmentItem, Segmented, Skeleton, Spinner, Splitter, TextInput, TextInputEvent, Tooltip, Tree,
+    TreeNodeData, TreePr,
 };
 
 use crate::activity_strip::ActivityStrip;
 use crate::changes_view::{ChangesEvent, ChangesView};
+use crate::create_pr_dialog::{self, CreatePrDialog, PrDialogContext, PushRun};
 use crate::details::{read_details, read_diff, DetailsState, DiffState};
 use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
 use crate::format::{absolute_time, format_count, relative_time};
 use crate::history_state::LoadState;
 use crate::history_view::HistoryView;
+use crate::hosting_status::{
+    self, CiEntry, ErrorEffect, HostingState, HostingView, PrPopover, PrTrigger, Request, Target,
+};
 use crate::network_ops::{self, Job};
 use crate::network_service::NetworkService;
 use crate::palette::{self, Command};
+use crate::pr_logic::{self, PrTarget};
+use crate::pr_panel::{PrEvent, PrModel, PrPanel};
 use crate::ref_dialog::{self, RefDialog, RefDialogContext, RefDialogKind, RemoteEdit};
 use crate::ref_ops::{CommitCard, RefAction};
+use crate::remote_accounts::{self, AccountAction, RemoteResolution};
 use crate::settings::{
     sidebar_width_limit, DiffLayout, Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX,
     SIDEBAR_WIDTH_MIN,
 };
+use crate::settings_ui::account_dialog::{self, Open as AccountOpen};
+use crate::settings_ui::accounts::open_picker;
 use crate::sidebar::{
-    commit_for, read_sidebar_extras, shortcut_action, sidebar_menu, sidebar_nodes, worktree_menu,
-    worktree_panel_rows, Expansion, PanelEvent, PanelState, SidebarAction, SidebarExtras,
-    SidebarMenuEntry, WorktreeAction, WorktreePanel,
+    commit_for, read_sidebar_extras, shortcut_action, sidebar_menu_with_links, sidebar_nodes_with,
+    worktree_menu, worktree_panel_rows, Expansion, PanelEvent, PanelState, RemoteDisplays,
+    SidebarAction, SidebarExtras, SidebarMenuEntry, WorktreeAction, WorktreePanel,
 };
 use crate::syntax::{self, HighlightSpan, Highlighted, Token};
+use crate::web_links::{self, HostLink};
 use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
@@ -89,6 +100,14 @@ pub enum ViewMode {
     History,
     Changes,
     Worktrees,
+}
+
+/// What the sidebar shows besides its filter field: the repository tree or
+/// the pull request panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarTab {
+    Repository,
+    PullRequests,
 }
 
 /// Binds the search field's own keys in its `history-search` context, so
@@ -467,6 +486,9 @@ pub struct RepositoryView {
     filter: String,
     /// The sidebar's own lists; `None` while they load.
     sidebar_extras: Option<SidebarExtras>,
+    /// The remote-account picker or Add account dialog opened from a remote's
+    /// menu, kept alive while it is open.
+    account_modal: Option<gpui::AnyEntity>,
     /// The root the lists belong to, so they load once per root.
     sidebar_root: Option<PathBuf>,
     /// Bumped per load; an older result that finishes later is dropped.
@@ -514,6 +536,14 @@ pub struct RepositoryView {
     _worktree_switcher_release: Option<Subscription>,
     /// The stage 7 dialog currently open, if any.
     ref_dialog: Option<Entity<RefDialog>>,
+    /// The "Create pull request" dialog while it is open.
+    pr_dialog: Option<Entity<CreatePrDialog>>,
+    /// The loaded pull requests of the sidebar's panel.
+    pr_model: Entity<PrModel>,
+    _pr_events: Subscription,
+    _pr_redraw: Subscription,
+    /// Repository tree or pull request panel.
+    sidebar_tab: SidebarTab,
     /// A ref operation without a dialog (checkout, stash apply, …) is running.
     ref_action_running: bool,
     /// The network action that is running, if any.
@@ -528,6 +558,26 @@ pub struct RepositoryView {
     background_fetch_task: Option<Task<()>>,
     /// A background fetch is in flight; the next tick skips while it runs.
     background_fetch_running: bool,
+    /// Pull request badges and CI status of the primary remote's repository.
+    hosting: HostingState,
+    /// What the rows were last given, to skip a redraw that changes nothing.
+    hosting_view: Arc<HostingView>,
+    /// The `meta_version` of the history the tracking was last read at.
+    hosting_meta_version: u64,
+    /// What the next sidebar reload means for the pull request map: the
+    /// first load is the repository opening, later ones only refresh when the
+    /// map is stale, unless a fetch or the user's refresh says otherwise.
+    hosting_trigger: PrTrigger,
+    /// The open pull request popover, to update its review line.
+    pr_popover: Option<Entity<PrPopover>>,
+    /// Refreshes the pull request map when the window gets focus again.
+    _window_activation: Subscription,
+    /// The selected commit's checks request waits for the selection to settle;
+    /// replacing the task cancels the earlier wait.
+    ci_debounce: Option<Task<()>>,
+    /// Asks again every 30 s while commits on screen have pending checks and
+    /// the window is active.
+    ci_timer: Option<Task<()>>,
 }
 
 /// What the status bar and the toolbar show while git is talking to a remote.
@@ -538,6 +588,25 @@ struct NetworkActivity {
 }
 
 /// One event from the worker to the UI.
+/// What a job's result toasts need, known when it starts.
+struct JobMeta {
+    /// The accounts the job answered prompts with.
+    used: Vec<remote_accounts::UsedAccount>,
+    /// The remote's remembered account choice, for naming push targets.
+    remembered: Option<String>,
+    /// The branch or tag a push result names.
+    subject: String,
+}
+
+/// What a background git network call needs besides the repository: the git
+/// environment with the accounts' askpass, the guard that keeps them
+/// registered and the SSH host-key asker.
+struct JobEnv {
+    context: git_core::network::NetworkContext,
+    guard: Option<crate::network_service::JobGuard>,
+    asker: crate::network_service::HostKeyAsker,
+}
+
 enum NetworkEvent {
     Progress(Progress),
     Done(Result<git_core::network::NetworkOutcome, Error>),
@@ -587,6 +656,14 @@ impl RepositoryView {
                 sidebar_view.update(cx, |view, cx| view.run_sidebar_action(action, window, cx));
             }));
         });
+        let pr_view = cx.entity();
+        history.update(cx, |history, _| {
+            history.set_pr_click_handler(Rc::new(move |branch, position, window, cx| {
+                pr_view.update(cx, |view, cx| {
+                    view.open_pr_popover(&branch, position, window, cx)
+                });
+            }));
+        });
         let observer = cx.observe(&history, |this, history, cx| {
             // A repository opened from a subdirectory is remembered by its
             // root, so the switcher's "current" marker must follow it.
@@ -607,6 +684,13 @@ impl RepositoryView {
                 // The sidebar's own lists need the root: load them once, when
                 // the history first reports it.
                 this.ensure_sidebar(cx);
+            }
+            // HEAD and the refs were read again: the branches that track the
+            // primary remote may have changed.
+            let version = history.read(cx).meta_version();
+            if version != this.hosting_meta_version {
+                this.hosting_meta_version = version;
+                this.hosting_sync(PrTrigger::Focus, cx);
             }
             this.sync_details(selected, cx);
             // The branch filter clears the history's search from inside the
@@ -649,11 +733,18 @@ impl RepositoryView {
                     // changes all read the same repository.
                     this.reload_history(cx);
                     this.changes.update(cx, |changes, cx| changes.refresh(cx));
-                    this.refresh(cx);
+                    this.refresh_with(hosting_status::INTERNAL_RELOAD, cx);
                     cx.notify();
                 }
             },
         );
+        let pr_model = cx.new(|_| PrModel::new());
+        let pr_events =
+            cx.subscribe_in(&pr_model, window, |this, _, event: &PrEvent, window, cx| {
+                this.pr_event(event.clone(), window, cx)
+            });
+        // The panel redraws when a list arrives.
+        let pr_redraw = cx.observe(&pr_model, |_, _, cx| cx.notify());
         let worktrees_redraw = cx.observe(&worktrees_model, |_, _, cx| cx.notify());
         let worktrees_leave = cx.subscribe_in(
             &worktrees,
@@ -705,6 +796,12 @@ impl RepositoryView {
             .map(|size| clamp_details(size, dock))
             .unwrap_or_else(|| dock_default(dock));
         let focus = cx.focus_handle().tab_stop(false);
+        let window_activation = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.hosting_sync(PrTrigger::Focus, cx);
+                this.ensure_ci_timer(window, cx);
+            }
+        });
 
         let mut view = Self {
             path,
@@ -739,6 +836,7 @@ impl RepositoryView {
             sidebar: Expansion::default(),
             filter: String::new(),
             sidebar_extras: None,
+            account_modal: None,
             sidebar_root: None,
             sidebar_generation: 0,
             _sidebar_filter_events: sidebar_filter_events,
@@ -772,6 +870,11 @@ impl RepositoryView {
             worktree_switcher: None,
             _worktree_switcher_release: None,
             ref_dialog: None,
+            pr_dialog: None,
+            pr_model,
+            _pr_events: pr_events,
+            _pr_redraw: pr_redraw,
+            sidebar_tab: SidebarTab::Repository,
             ref_action_running: false,
             network: None,
             network_generation: 0,
@@ -781,6 +884,14 @@ impl RepositoryView {
             ),
             background_fetch_task: None,
             background_fetch_running: false,
+            hosting: HostingState::default(),
+            hosting_view: Arc::default(),
+            hosting_meta_version: 0,
+            hosting_trigger: PrTrigger::Open,
+            pr_popover: None,
+            _window_activation: window_activation,
+            ci_debounce: None,
+            ci_timer: None,
         };
         view.start_background_fetch(cx);
         view
@@ -1190,15 +1301,26 @@ impl RepositoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let model = {
+        let links = self.host_links(cx);
+        let mut model = {
             let history = self.history.read(cx);
-            sidebar_menu(
+            sidebar_menu_with_links(
                 key,
                 history.head(),
                 self.sidebar_extras.as_ref(),
                 history.refs(),
+                &links,
             )
         };
+        // "Create pull request…" for a local branch when a remote can take one.
+        if let Some(branch) = key.strip_prefix("local:") {
+            // The noun of the target the dialog will preselect for this branch.
+            let targets = self.pr_targets(cx);
+            let upstream = self.branch_upstream_remote(branch, cx);
+            if let Some(target) = pr_logic::default_target(&targets, upstream.as_deref()) {
+                crate::sidebar::with_create_pull_request(&mut model, branch, target.kind());
+            }
+        }
         if model.is_empty() {
             return;
         }
@@ -1248,6 +1370,7 @@ impl RepositoryView {
             SidebarAction::CopyText(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
+            SidebarAction::OpenUrl { url, host } => self.open_on_host(&url, &host, window, cx),
             SidebarAction::Refresh => {
                 self.refresh(cx);
                 self.worktrees
@@ -1255,6 +1378,9 @@ impl RepositoryView {
             }
             SidebarAction::CheckoutBranch(name) => {
                 self.checkout_branch(name, window, cx);
+            }
+            SidebarAction::CreatePullRequest(branch) => {
+                self.open_create_pr(Some(branch), window, cx);
             }
             SidebarAction::CheckoutRemoteBranch(remote) => {
                 let label = remote.clone();
@@ -1424,6 +1550,26 @@ impl RepositoryView {
             }
             SidebarAction::AddRemote => {
                 self.open_ref_dialog(RefDialogKind::Remote { editing: None }, window, cx);
+            }
+            SidebarAction::RemoteAccount(name) => self.remote_account(name, window, cx),
+            SidebarAction::AddAccountFor(name) => {
+                let kind = self
+                    .resolution_of(&name, cx)
+                    .and_then(|r| match r.fetch.account {
+                        remote_accounts::UrlAccount::NoAccount(kind) => Some(kind),
+                        _ => None,
+                    });
+                if let Some(kind) = kind {
+                    self.open_add_account_for(name, kind, window, cx);
+                }
+            }
+            SidebarAction::RemotePushAccounts(_) => {
+                toast::show(
+                    ui::ToastKind::Info,
+                    ui::t!("repo.toast.account_push_urls"),
+                    window,
+                    cx,
+                );
             }
             SidebarAction::EditRemote(name) => {
                 let url = self
@@ -1630,6 +1776,319 @@ impl RepositoryView {
         }
     }
 
+    /// The hosts the remotes point at (see [`web_links::host_links`]), the
+    /// current branch's upstream first. Pure: no network, no keychain.
+    fn host_links(&self, cx: &App) -> Vec<HostLink> {
+        let Some(extras) = self.sidebar_extras.as_ref() else {
+            return Vec::new();
+        };
+        let (accounts, _) = self.account_settings(cx);
+        let history = self.history.read(cx);
+        let preferred = web_links::upstream_remote(
+            history.head(),
+            history.refs().unwrap_or(&[]),
+            &extras.remote_targets,
+        );
+        web_links::host_links(
+            &remote_accounts::account_refs(&accounts),
+            &extras.remote_targets,
+            preferred.as_deref(),
+        )
+    }
+
+    /// Opens `url` in the browser and says which host it was.
+    fn open_on_host(&mut self, url: &str, host: &str, window: &mut Window, cx: &mut Context<Self>) {
+        cx.open_url(url);
+        toast::show(
+            ui::ToastKind::Info,
+            ui::t!("repo.toast.opened_host", host = host),
+            window,
+            cx,
+        );
+    }
+
+    /// Copies `url` to the clipboard and confirms with `message`.
+    fn copy_link(
+        &mut self,
+        url: String,
+        message: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(ClipboardItem::new_string(url));
+        toast::show(ui::ToastKind::Ok, message, window, cx);
+    }
+
+    /// The configured accounts and this repository's remembered choices.
+    fn account_settings(
+        &self,
+        cx: &App,
+    ) -> (
+        Vec<crate::settings::AccountRecord>,
+        std::collections::BTreeMap<String, String>,
+    ) {
+        let Some(state) = cx.try_global::<crate::AppSettings>() else {
+            return Default::default();
+        };
+        let remembered = self
+            .repo_key()
+            .and_then(|key| state.settings.remote_accounts.get(&key).cloned())
+            .unwrap_or_default();
+        (state.settings.accounts.clone(), remembered)
+    }
+
+    /// The key of this repository in `Settings::remote_accounts`: the canonical
+    /// common git dir, the same for all its worktrees.
+    fn repo_key(&self) -> Option<String> {
+        self.sidebar_extras
+            .as_ref()?
+            .common_dir
+            .as_ref()
+            .map(|dir| dir.display().to_string())
+    }
+
+    /// Every remote resolved against the current accounts and choices. Pure
+    /// and cheap: no network, no keychain.
+    fn resolutions(&self, cx: &App) -> Vec<RemoteResolution> {
+        let Some(extras) = self.sidebar_extras.as_ref() else {
+            return Vec::new();
+        };
+        let (accounts, remembered) = self.account_settings(cx);
+        remote_accounts::resolve_all(&accounts, &extras.remote_targets, Some(&remembered))
+    }
+
+    fn resolution_of(&self, name: &str, cx: &App) -> Option<RemoteResolution> {
+        self.resolutions(cx).into_iter().find(|r| r.name == name)
+    }
+
+    /// What the sidebar shows per remote, resolved again on every render so a
+    /// change in Settings shows at once. Starts the anonymous public checks
+    /// the answer is waiting for (once per repository and process).
+    fn remote_displays(&mut self, cx: &mut Context<Self>) -> RemoteDisplays {
+        let resolutions = self.resolutions(cx);
+        if resolutions.is_empty() {
+            return RemoteDisplays::new();
+        }
+        for probe in remote_accounts::public_probes(&resolutions) {
+            self.start_public_check(probe, cx);
+        }
+        let (accounts, _) = self.account_settings(cx);
+        resolutions
+            .iter()
+            .map(|resolution| {
+                let display = remote_accounts::display(resolution, &accounts, &|probe| {
+                    remote_accounts::cached_public(&probe.key())
+                });
+                (resolution.name.clone(), display)
+            })
+            .collect()
+    }
+
+    /// Asks the service in the background whether the repository is public.
+    /// The sidebar shows nothing for it until the answer, or 5 seconds, came;
+    /// a failed request counts as "not public".
+    fn start_public_check(&mut self, probe: remote_accounts::PublicProbe, cx: &mut Context<Self>) {
+        let key = probe.key();
+        if !remote_accounts::claim_public_check(&key) {
+            return;
+        }
+        let timeout_key = key.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(5))
+                .await;
+            remote_accounts::expire_public_check(&timeout_key);
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    forge::api::repo_is_public(
+                        &forge::api::Client::new(),
+                        &probe.instance,
+                        &probe.coords,
+                    )
+                })
+                .await;
+            match result {
+                Ok(Some(public)) => remote_accounts::finish_public_check(&key, public),
+                // No usable answer: nothing is remembered as "private"; the
+                // question may be asked again after a minute.
+                Ok(None) => remote_accounts::release_public_check(&key),
+                Err(error) => {
+                    log::debug!("public check of {key} failed: {error}");
+                    remote_accounts::release_public_check(&key);
+                }
+            }
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
+    }
+
+    /// Account… in a remote's menu.
+    fn remote_account(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(resolution) = self.resolution_of(&name, cx) else {
+            return;
+        };
+        let (accounts, _) = self.account_settings(cx);
+        match remote_accounts::account_action(&resolution, &accounts) {
+            AccountAction::Pick { host, ids, current } => {
+                let candidates: Vec<_> = ids
+                    .iter()
+                    .filter_map(|id| accounts.iter().find(|a| a.id == *id).cloned())
+                    .collect();
+                let view = cx.entity();
+                let remote = name.clone();
+                let picker = open_picker(
+                    name,
+                    host,
+                    candidates,
+                    current,
+                    std::rc::Rc::new(move |account, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.remember_account(&remote, account, window, cx)
+                        });
+                    }),
+                    window,
+                    cx,
+                );
+                self.account_modal = Some(picker.into_any());
+            }
+            AccountAction::Add { kind, .. } => self.open_add_account_for(name, kind, window, cx),
+            AccountAction::AlreadyOne { host, label } => {
+                toast::show(
+                    ui::ToastKind::Info,
+                    ui::t!(
+                        "repo.toast.account_one",
+                        host = host,
+                        label = label,
+                        remote = name
+                    ),
+                    window,
+                    cx,
+                );
+            }
+            AccountAction::NoService { host } => {
+                toast::show(
+                    ui::ToastKind::Info,
+                    ui::t!("repo.toast.account_unknown_host", host = host),
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Stores the account picked for `remote` in this repository.
+    fn remember_account(
+        &mut self,
+        remote: &str,
+        account: &crate::settings::AccountRecord,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.account_modal = None;
+        let Some(key) = self.repo_key() else {
+            // Without a repository key the choice cannot be stored; a job that
+            // waited for it must not start on a guess.
+            toast::show(
+                ui::ToastKind::Error,
+                ui::t!("repo.toast.account_not_saved", remote = remote),
+                window,
+                cx,
+            );
+            return false;
+        };
+        let (remote_name, id) = (remote.to_owned(), account.id.clone());
+        crate::update_settings(cx, move |settings| {
+            settings.set_remote_account(&key, &remote_name, &id)
+        });
+        toast::show(
+            ui::ToastKind::Ok,
+            ui::t!(
+                "repo.toast.account_picked",
+                remote = remote,
+                label = account.display_label()
+            ),
+            window,
+            cx,
+        );
+        cx.notify();
+        true
+    }
+
+    /// Opens the Add account dialog for the service of `remote`, on its public
+    /// instance, at the sign-in step.
+    fn open_add_account_for(
+        &mut self,
+        remote: String,
+        kind: forge::ServiceKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity();
+        let host = crate::accounts::public_host(kind).to_owned();
+        let dialog = account_dialog::open(
+            AccountOpen::AddFor {
+                kind,
+                base_url: format!("https://{host}"),
+            },
+            None,
+            Some(std::rc::Rc::new(move |account, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.account_added_for(&remote, &host, account, window, cx)
+                });
+            })),
+            window,
+            cx,
+        );
+        self.account_modal = Some(dialog.into_any());
+    }
+
+    /// An account was added from `remote`'s menu: it is the remote's choice
+    /// when it joined others on the host, otherwise it is picked up on its own.
+    fn account_added_for(
+        &mut self,
+        remote: &str,
+        host: &str,
+        account: &crate::settings::AccountRecord,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.account_modal = None;
+        let url = self.sidebar_extras.as_ref().and_then(|extras| {
+            extras
+                .remote_targets
+                .iter()
+                .find(|t| t.name == remote)
+                .map(|t| t.fetch_url.clone())
+        });
+        let (accounts, _) = self.account_settings(cx);
+        let choice = url
+            .and_then(|url| remote_accounts::choice_after_add(&accounts, &url, &account.id))
+            .zip(self.repo_key());
+        if let Some((id, key)) = choice {
+            let remote = remote.to_owned();
+            crate::update_settings(cx, move |settings| {
+                settings.set_remote_account(&key, &remote, &id)
+            });
+        }
+        toast::show(
+            ui::ToastKind::Ok,
+            ui::t!(
+                "repo.toast.account_added",
+                label = account.display_label(),
+                host = host,
+                remote = remote
+            ),
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
     /// `origin` when configured, otherwise the first remote, otherwise
     /// `origin` (the operation then reports the missing remote).
     fn default_remote_name(&self) -> String {
@@ -1771,8 +2230,17 @@ impl RepositoryView {
         }
         let context = self.ref_dialog_context(&kind, cx);
         let view = cx.entity();
+        // A removed remote must not leave its remembered account behind.
+        let removed_remote = match &kind {
+            RefDialogKind::RemoveRemote { name } => Some(name.clone()),
+            _ => None,
+        };
         let on_done = Rc::new(move |window: &mut Window, cx: &mut App| {
             view.update(cx, |view, cx| {
+                if let (Some(name), Some(key)) = (&removed_remote, view.repo_key()) {
+                    let name = name.clone();
+                    crate::update_settings(cx, move |settings| settings.forget_remote(&key, &name));
+                }
                 // The dialog entity stays owned until the next one replaces
                 // it: dropping it here would free the state that is running
                 // this callback.
@@ -1885,7 +2353,7 @@ impl RepositoryView {
         self.changes.update(cx, |changes, cx| changes.refresh(cx));
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.refresh(cx));
-        self.refresh(cx);
+        self.refresh_with(hosting_status::INTERNAL_RELOAD, cx);
         cx.notify();
     }
 
@@ -1986,15 +2454,28 @@ impl RepositoryView {
             Ok(git) => git.clone(),
             Err(_) => return,
         };
-        let context = cx
-            .try_global::<NetworkService>()
-            .map(|service| service.context(false))
-            .unwrap_or_default();
+        // Account hosts are answered from the keychain; a prompt for anything
+        // else is cancelled (the fetch never opens a dialog), and a remote
+        // that needs a choice is skipped.
+        let (_, credentials) = self.job_credentials(&Job::Fetch(FetchOptions::default()), cx);
+        let store = match crate::accounts::cached_store(cx) {
+            Some(Ok(store)) => Some(store),
+            _ => None,
+        };
+        let (context, guard) = match cx.try_global::<NetworkService>() {
+            Some(service) => service.job_context(crate::network_service::JobAuth {
+                interactive: false,
+                accounts: credentials.accounts,
+                store,
+            }),
+            None => Default::default(),
+        };
         self.background_fetch_running = true;
         cx.spawn(async move |this, cx| {
             let changed = cx
                 .background_executor()
                 .spawn(async move {
+                    let _guard = guard;
                     let repo = match Repo::open(git, &root) {
                         Ok(repo) => repo,
                         Err(error) => {
@@ -2054,13 +2535,26 @@ impl RepositoryView {
                 return;
             }
         };
-        let (context, asker) = match cx.try_global::<NetworkService>() {
-            Some(service) => (service.context(true), service.host_keys()),
-            None => (
-                git_core::network::NetworkContext::default(),
-                crate::network_service::HostKeyAsker::unavailable(),
-            ),
+        let (uses, credentials) = self.job_credentials(&job, cx);
+        // Several accounts fit a remote and none was chosen: ask first, then
+        // start again (it asks about the next remote, if any).
+        if let Some(remote) = credentials.choose.first() {
+            self.pick_account_for_job(remote.clone(), job, window, cx);
+            return;
+        }
+        let (accounts, remembered) = self.account_settings(cx);
+        let meta = JobMeta {
+            used: remote_accounts::used_accounts(&credentials, &accounts),
+            remembered: uses
+                .first()
+                .and_then(|u| remembered.get(&u.remote).cloned()),
+            subject: self.job_subject(&job, cx),
         };
+        let JobEnv {
+            context,
+            guard,
+            asker,
+        } = Self::job_environment(credentials.accounts, cx);
         let root = self.root.clone();
         self.network_generation = self.network_generation.wrapping_add(1);
         let generation = self.network_generation;
@@ -2075,6 +2569,8 @@ impl RepositoryView {
         let worker_job = job.clone();
         cx.background_executor()
             .spawn(async move {
+                // The job's accounts stay registered until the job ended.
+                let _guard = guard;
                 let result = Repo::open(git, &root).and_then(|repo| {
                     worker_job.run(
                         &repo,
@@ -2094,7 +2590,7 @@ impl RepositoryView {
             cx.background_executor().timer(NETWORK_POLL).await;
             let done = this
                 .update_in(cx, |view, window, cx| {
-                    view.poll_network(&rx, generation, &job, window, cx)
+                    view.poll_network(&rx, generation, &job, &meta, window, cx)
                 })
                 .unwrap_or(true);
             if done {
@@ -2104,12 +2600,47 @@ impl RepositoryView {
         .detach();
     }
 
+    /// The environment of an interactive network call that may answer git's
+    /// prompts with `accounts`.
+    fn job_environment(
+        accounts: HashMap<
+            crate::network_service::HostKey,
+            crate::network_service::AccountCredential,
+        >,
+        cx: &App,
+    ) -> JobEnv {
+        match cx.try_global::<NetworkService>() {
+            Some(service) => {
+                let store = match crate::accounts::cached_store(cx) {
+                    Some(Ok(store)) => Some(store),
+                    _ => None,
+                };
+                let (context, guard) = service.job_context(crate::network_service::JobAuth {
+                    interactive: true,
+                    accounts,
+                    store,
+                });
+                JobEnv {
+                    context,
+                    guard,
+                    asker: service.host_keys(),
+                }
+            }
+            None => JobEnv {
+                context: git_core::network::NetworkContext::default(),
+                guard: None,
+                asker: crate::network_service::HostKeyAsker::unavailable(),
+            },
+        }
+    }
+
     /// Returns whether the job finished.
     fn poll_network(
         &mut self,
         rx: &Receiver<NetworkEvent>,
         generation: u64,
         job: &Job,
+        meta: &JobMeta,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -2136,18 +2667,23 @@ impl RepositoryView {
         if let Some(result) = finished {
             self.network = None;
             match result {
+                Ok(outcome) if !outcome.targets.is_empty() => {
+                    self.show_push_result(&outcome, meta, window, cx);
+                    if outcome.targets.iter().any(|t| t.result.is_ok()) {
+                        self.reload_after_network(cx);
+                    }
+                }
+                Ok(_) if matches!(job, Job::FetchPullRequest { .. }) => {
+                    self.reload_after_network(cx);
+                    if let Job::FetchPullRequest { branch, number, .. } = job {
+                        self.checkout_pr_branch(branch.clone(), *number, window, cx);
+                    }
+                }
                 Ok(outcome) => {
                     toast::show(ui::ToastKind::Ok, job.done_message(&outcome), window, cx);
                     self.reload_after_network(cx);
                 }
-                Err(error) => {
-                    toast::show(
-                        ui::ToastKind::Error,
-                        network_ops::friendly_error(&error),
-                        window,
-                        cx,
-                    );
-                }
+                Err(error) => self.show_job_error(&error, meta, window, cx),
             }
             return true;
         }
@@ -2155,11 +2691,452 @@ impl RepositoryView {
         false
     }
 
+    /// The remotes `job` contacts and the accounts git may answer with.
+    fn job_credentials(
+        &self,
+        job: &Job,
+        cx: &App,
+    ) -> (
+        Vec<remote_accounts::RemoteUse>,
+        remote_accounts::JobCredentials,
+    ) {
+        let Some(extras) = self.sidebar_extras.as_ref() else {
+            return Default::default();
+        };
+        let (accounts, remembered) = self.account_settings(cx);
+        let history = self.history.read(cx);
+        let uses =
+            network_ops::job_remote_uses(job, history.head(), history.refs(), &extras.remotes);
+        let credentials =
+            remote_accounts::job_credentials(&accounts, &extras.remote_targets, &uses, &remembered);
+        (uses, credentials)
+    }
+
+    /// What a push result names: the branch, the tag, or all tags.
+    fn job_subject(&self, job: &Job, cx: &App) -> String {
+        match job {
+            Job::PushTag { tag, .. } => tag.clone(),
+            Job::PushTags { .. } => ui::t!("network.push.subject_tags").to_string(),
+            Job::DeleteRemoteBranch { branch, .. } => branch.clone(),
+            _ => match self.history.read(cx).head() {
+                Some(git_core::Head::Branch { name, .. }) => name.clone(),
+                _ => String::new(),
+            },
+        }
+    }
+
+    /// Asks which account answers for `remote`, then starts `job` again. Cancel
+    /// starts nothing.
+    fn pick_account_for_job(
+        &mut self,
+        remote: String,
+        job: Job,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (accounts, _) = self.account_settings(cx);
+        let Some(resolution) = self.resolution_of(&remote, cx) else {
+            return;
+        };
+        let target = std::iter::once(&resolution.fetch)
+            .chain(resolution.pushes.iter())
+            .find(|t| matches!(t.account, remote_accounts::UrlAccount::Choose(_)))
+            .cloned();
+        let Some(target) = target else {
+            return;
+        };
+        let candidates: Vec<_> = target
+            .matching
+            .iter()
+            .filter_map(|id| accounts.iter().find(|a| a.id == *id).cloned())
+            .collect();
+        let view = cx.entity();
+        let name = remote.clone();
+        let picker = open_picker(
+            remote,
+            target.host.clone(),
+            candidates,
+            None,
+            std::rc::Rc::new(move |account, window, cx| {
+                let job = job.clone();
+                let name = name.clone();
+                view.update(cx, |view, cx| {
+                    if view.remember_account(&name, account, window, cx) {
+                        view.start_network_job(job, window, cx);
+                    }
+                });
+            }),
+            window,
+            cx,
+        );
+        self.account_modal = Some(picker.into_any());
+    }
+
+    /// The account dialog on the token step of `id`.
+    fn reconnect_account(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (accounts, _) = self.account_settings(cx);
+        let Some(account) = accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        let dialog = account_dialog::open(AccountOpen::Reconnect(account), None, None, window, cx);
+        self.account_modal = Some(dialog.into_any());
+    }
+
+    fn reconnect_action(&self, id: String, cx: &mut Context<Self>) -> ui::ToastAction {
+        let view = cx.entity();
+        ui::ToastAction::new(ui::t!("network.push.reconnect"), move |window, cx| {
+            let id = id.clone();
+            view.update(cx, |view, cx| view.reconnect_account(&id, window, cx));
+        })
+    }
+
+    /// The error toast of a failed job; a refused account token gets a
+    /// Reconnect button.
+    fn show_job_error(
+        &mut self,
+        error: &Error,
+        meta: &JobMeta,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if network_ops::is_auth_error(error) {
+            if let Some(account) = remote_accounts::failed_account(&meta.used, &error.to_string()) {
+                let body = ui::ToastBody {
+                    lines: Vec::new(),
+                    action: Some(self.reconnect_action(account.account_id.clone(), cx)),
+                };
+                toast::show_with(
+                    ui::ToastKind::Error,
+                    ui::t!(
+                        "network.toast.token_rejected",
+                        host = account.host,
+                        label = account.label
+                    ),
+                    Some(body),
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
+        toast::show(
+            ui::ToastKind::Error,
+            network_ops::friendly_error(error),
+            window,
+            cx,
+        );
+    }
+
+    /// The result of a push that went to each of several URLs.
+    fn show_push_result(
+        &mut self,
+        outcome: &git_core::network::NetworkOutcome,
+        meta: &JobMeta,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use git_core::network::PushStatus;
+        let (accounts, _) = self.account_settings(cx);
+        let total = outcome.targets.len();
+        let ok = outcome.targets.iter().filter(|t| t.result.is_ok()).count();
+        let mut lines = Vec::with_capacity(total);
+        for target in &outcome.targets {
+            let (host, account) = remote_accounts::push_target_info(
+                &accounts,
+                &target.url,
+                meta.remembered.as_deref(),
+            );
+            let label = account
+                .as_ref()
+                .map_or_else(|| "\u{2014}".to_owned(), |(_, label)| label.clone());
+            let text = format!("{host} \u{b7} {label}");
+            lines.push(match &target.result {
+                Ok(status) => ui::ToastLine {
+                    ok: true,
+                    text: text.into(),
+                    detail: Some(match status {
+                        PushStatus::Pushed { commits: Some(n) } => {
+                            ui::i18n::t_count("network.push.commits", *n as u64, &[])
+                        }
+                        PushStatus::Pushed { commits: None } => ui::t!("network.push.pushed"),
+                        PushStatus::NewBranch => ui::t!("network.push.new_branch"),
+                        PushStatus::NewTag => ui::t!("network.push.new_tag"),
+                        PushStatus::Deleted => ui::t!("network.push.deleted"),
+                        PushStatus::UpToDate => ui::t!("network.push.up_to_date"),
+                    }),
+                    action: None,
+                },
+                Err(text_err) => {
+                    let (reason, auth) = network_ops::target_failure(text_err);
+                    // Some refs of the push went through, some were refused.
+                    let reason = if target.partial {
+                        ui::t!("network.push.partial", reason = reason).to_string()
+                    } else {
+                        reason
+                    };
+                    ui::ToastLine {
+                        ok: false,
+                        text: text.into(),
+                        detail: Some(reason.into()),
+                        action: account
+                            .filter(|_| auth)
+                            .map(|(id, _)| self.reconnect_action(id, cx)),
+                    }
+                }
+            });
+        }
+        let (kind, title) = if ok == total {
+            (
+                ui::ToastKind::Ok,
+                ui::i18n::t_count(
+                    "network.push.title_all",
+                    total as u64,
+                    &[("subject", &meta.subject)],
+                ),
+            )
+        } else {
+            (
+                ui::ToastKind::Error,
+                ui::i18n::t_count(
+                    "network.push.title_some",
+                    total as u64,
+                    &[("subject", &meta.subject), ("ok", &ok)],
+                ),
+            )
+        };
+        toast::show_with(
+            kind,
+            title,
+            Some(ui::ToastBody {
+                lines,
+                action: None,
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /* ------------------------ pull / merge requests ------------------------ */
+
+    /// The remotes that can take a pull request, the current branch's
+    /// upstream first. Pure: no network, no keychain.
+    fn pr_targets(&self, cx: &App) -> Vec<PrTarget> {
+        let Some(extras) = self.sidebar_extras.as_ref() else {
+            return Vec::new();
+        };
+        let (accounts, remembered) = self.account_settings(cx);
+        let history = self.history.read(cx);
+        let preferred = web_links::upstream_remote(
+            history.head(),
+            history.refs().unwrap_or(&[]),
+            &extras.remote_targets,
+        );
+        pr_logic::pr_targets(
+            &accounts,
+            &extras.remote_targets,
+            &remembered,
+            preferred.as_deref(),
+        )
+    }
+
+    /// Hands the panel the remotes it can list. Cheap when nothing changed.
+    fn sync_pr_targets(&mut self, cx: &mut Context<Self>) {
+        let targets = self.pr_targets(cx);
+        self.pr_model
+            .update(cx, |model, cx| model.set_targets(targets, cx));
+    }
+
+    fn set_sidebar_tab(&mut self, tab: SidebarTab, cx: &mut Context<Self>) {
+        if self.sidebar_tab != tab {
+            self.sidebar_tab = tab;
+            cx.notify();
+        }
+    }
+
+    fn pr_event(&mut self, event: PrEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            PrEvent::Reconnect(id) => self.reconnect_pr_account(&id, window, cx),
+            PrEvent::Open { url, host } => self.open_on_host(&url, &host, window, cx),
+            PrEvent::Checkout(request) => {
+                let (pr, target) = *request;
+                self.start_pr_checkout(&pr, target.remote.clone(), target.kind(), window, cx);
+            }
+        }
+    }
+
+    /// The account dialog on the token step; the panel reloads once saved.
+    fn reconnect_pr_account(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (accounts, _) = self.account_settings(cx);
+        let Some(account) = accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        let view = cx.entity();
+        let dialog = account_dialog::open(
+            AccountOpen::Reconnect(account),
+            None,
+            Some(Rc::new(move |_, _, cx| {
+                view.update(cx, |view, cx| {
+                    view.pr_model.update(cx, |model, cx| model.invalidate(cx));
+                });
+            })),
+            window,
+            cx,
+        );
+        self.account_modal = Some(dialog.into_any());
+    }
+
+    /// A push of `branch` to `remote` (setting the upstream) with that
+    /// remote's account, ready to run on the background executor.
+    fn prepare_push(&self, remote: &str, branch: &str, cx: &App) -> Option<PushRun> {
+        let git = self.git.as_ref().ok()?.clone();
+        let extras = self.sidebar_extras.as_ref()?;
+        let (accounts, remembered) = self.account_settings(cx);
+        let uses = [remote_accounts::RemoteUse {
+            remote: remote.to_owned(),
+            direction: remote_accounts::Direction::Push,
+        }];
+        let credentials =
+            remote_accounts::job_credentials(&accounts, &extras.remote_targets, &uses, &remembered);
+        let env = Self::job_environment(credentials.accounts, cx);
+        let root = self.root.clone();
+        let options = git_core::network::PushOptions {
+            remote: Some(remote.to_owned()),
+            refspec: Some(branch.to_owned()),
+            set_upstream: true,
+        };
+        Some(Box::new(move || {
+            // The account stays registered until the push ended.
+            let _guard = env.guard;
+            let repo = Repo::open(git, &root)?;
+            network_ops::push(
+                &repo,
+                &options,
+                &env.context,
+                &env.asker,
+                &git_core::network::CancelToken::new(),
+                |_| {},
+            )
+        }))
+    }
+
+    /// The remote the local branch `branch` tracks, if it is a configured one.
+    fn branch_upstream_remote(&self, branch: &str, cx: &App) -> Option<String> {
+        let remote_targets: &[remote_accounts::RemoteTargets] = self
+            .sidebar_extras
+            .as_ref()
+            .map_or(&[], |extras| &extras.remote_targets);
+        self.history
+            .read(cx)
+            .refs()
+            .unwrap_or(&[])
+            .iter()
+            .find(|r| r.kind == RefKind::LocalBranch && r.name == branch)
+            .and_then(|r| r.upstream.as_deref())
+            .and_then(|upstream| web_links::split_remote_ref(upstream, remote_targets))
+            .map(|(remote, _)| remote.to_owned())
+    }
+
+    /// Opens "Create pull request" for `branch`, or for the current branch.
+    /// Does nothing without a remote that has an account.
+    pub(crate) fn open_create_pr(
+        &mut self,
+        branch: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets = self.pr_targets(cx);
+        if targets.is_empty() {
+            return;
+        }
+        let head = match branch {
+            Some(branch) => branch,
+            None => match self.history.read(cx).head() {
+                Some(Head::Branch { name, .. }) => name.clone(),
+                _ => {
+                    toast::show(
+                        ui::ToastKind::Info,
+                        ui::t!("repo.toast.detached_no_branch"),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            },
+        };
+        let upstream_remote = self.branch_upstream_remote(&head, cx);
+        let remote_branches = {
+            let history = self.history.read(cx);
+            let refs = history.refs().unwrap_or(&[]);
+            let branches: HashMap<String, Vec<String>> = targets
+                .iter()
+                .map(|target| {
+                    let prefix = format!("{}/", target.remote);
+                    let names = refs
+                        .iter()
+                        .filter(|r| r.kind == RefKind::RemoteBranch)
+                        .filter_map(|r| r.name.strip_prefix(&prefix))
+                        .filter(|name| *name != "HEAD")
+                        .map(str::to_owned)
+                        .collect();
+                    (target.remote.clone(), names)
+                })
+                .collect();
+            branches
+        };
+        let target = pr_logic::default_target(&targets, upstream_remote.as_deref())
+            .and_then(|default| targets.iter().position(|t| t == default))
+            .unwrap_or(0);
+        let view = cx.entity();
+        let context = PrDialogContext {
+            root: self.root.clone(),
+            git: self.git.clone(),
+            targets,
+            target,
+            head,
+            remote_branches,
+            prepare_push: Rc::new({
+                let view = view.clone();
+                move |remote, branch, cx| view.read(cx).prepare_push(remote, branch, cx)
+            }),
+            reconnect: Rc::new({
+                let view = view.clone();
+                move |id, window, cx| {
+                    view.update(cx, |view, cx| view.reconnect_pr_account(&id, window, cx));
+                }
+            }),
+            open_url: Rc::new({
+                let view = view.clone();
+                move |url, host, window, cx| {
+                    view.update(cx, |view, cx| view.open_on_host(&url, &host, window, cx));
+                }
+            }),
+            changed: Rc::new({
+                let view = view.clone();
+                move |pushed, created, _, cx| {
+                    view.update(cx, |view, cx| {
+                        // Forget the lists first: the reload below then finds
+                        // them stale and loads them once.
+                        if created {
+                            view.pr_model.update(cx, |model, cx| model.invalidate(cx));
+                        }
+                        if pushed {
+                            view.reload_after_network(cx);
+                        }
+                    });
+                }
+            }),
+            closed: Rc::new(move |cx| {
+                view.update(cx, |view, _| view.pr_dialog = None);
+            }),
+        };
+        self.pr_dialog = Some(create_pr_dialog::open(context, window, cx));
+    }
+
     /// Reloads everything a remote change can affect.
     fn reload_after_network(&mut self, cx: &mut Context<Self>) {
         self.reload_history(cx);
         self.changes.update(cx, |changes, cx| changes.refresh(cx));
-        self.refresh(cx);
+        self.refresh_with(PrTrigger::AfterNetwork, cx);
         cx.notify();
     }
 
@@ -2202,6 +3179,12 @@ impl RepositoryView {
 
     /// Re-runs the sidebar's background load (the "Refresh list" action).
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_with(PrTrigger::Manual, cx);
+    }
+
+    /// [`Self::refresh`] that also says why, for the pull request map.
+    fn refresh_with(&mut self, trigger: PrTrigger, cx: &mut Context<Self>) {
+        self.hosting_trigger = trigger;
         let root = self.sidebar_root.clone().or_else(|| {
             self.history
                 .read(cx)
@@ -2211,6 +3194,10 @@ impl RepositoryView {
         if let Some(root) = root {
             self.start_sidebar(root, cx);
         }
+        // Only the user's own refresh bypasses the 60 s staleness window.
+        let force = trigger.resets_health();
+        self.pr_model
+            .update(cx, |model, cx| model.refresh(force, cx));
     }
 
     /// Reads the four sidebar lists in the background. Each failure is logged
@@ -2254,7 +3241,26 @@ impl RepositoryView {
         if generation != self.sidebar_generation {
             return;
         }
+        // A remote renamed or removed since the last load takes its remembered
+        // account along (or drops it).
+        if let (Some(previous), Some(key)) = (&self.sidebar_extras, extras.common_dir.as_ref()) {
+            let before: Vec<String> = previous.remotes.clone();
+            let after = extras.remotes.clone();
+            // An empty list may be a failed read, not a repository without
+            // remotes: the explicit Remove remote path covers the last one.
+            if before != after && !after.is_empty() {
+                let key = key.display().to_string();
+                crate::update_settings(cx, move |settings| {
+                    settings.reconcile_remote_accounts(&key, &before, &after)
+                });
+            }
+        }
+        let targets = extras.remote_targets.clone();
+        self.history
+            .update(cx, |history, _| history.set_remote_targets(targets));
         self.sidebar_extras = Some(extras);
+        let trigger = std::mem::replace(&mut self.hosting_trigger, PrTrigger::Focus);
+        self.hosting_sync(trigger, cx);
         cx.notify();
     }
 
@@ -2298,6 +3304,7 @@ impl RepositoryView {
         self.details_generation = self.details_generation.wrapping_add(1);
         let generation = self.details_generation;
         self.details = DetailsState::Loading;
+        self.schedule_selected_ci(cx);
         let git = match &self.git {
             Ok(git) => git.clone(),
             Err(error) => {
@@ -2538,10 +3545,15 @@ impl RepositoryView {
 
     /// Opens the command palette (Ctrl P) over this repository.
     pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pr_targets = self.pr_targets(cx);
         let history = self.history.read(cx);
         let state = palette::ViewState {
             idle_lanes_collapsed: history.idle_lanes_collapsed(),
             activity_collapsed: self.activity.read(cx).is_collapsed(),
+            pull_requests: !pr_targets.is_empty(),
+            merge_requests: pr_targets
+                .first()
+                .is_some_and(|target| target.kind() == forge::ServiceKind::GitLab),
         };
         let sources = palette::Sources::new(
             state,
@@ -2613,6 +3625,7 @@ impl RepositoryView {
             },
             Command::AddRemote => self.run_sidebar_action(SidebarAction::AddRemote, window, cx),
             Command::AddWorktree => self.run_sidebar_action(SidebarAction::AddWorktree, window, cx),
+            Command::CreatePullRequest => self.open_create_pr(None, window, cx),
             Command::Refresh => self.run_sidebar_action(SidebarAction::Refresh, window, cx),
             Command::ToggleSidebar => self.toggle_sidebar(cx),
             Command::ToggleDetails => self.toggle_details(cx),
@@ -3170,11 +4183,21 @@ impl RepositoryView {
         let colors = cx.theme().colors;
         let worktrees_mode = self.view == ViewMode::Worktrees;
         let panel = worktrees_mode.then(|| self.worktree_panel(cx));
-        // The tree is not built while the worktree panel stands in for it.
-        let nodes = if worktrees_mode {
+        // The Repository / PRs tabs exist while a remote can take requests;
+        // the PRs tab replaces the filter and the tree.
+        self.sync_pr_targets(cx);
+        let has_prs = self.pr_model.read(cx).has_target();
+        let show_prs = has_prs && !worktrees_mode && self.sidebar_tab == SidebarTab::PullRequests;
+        self.pr_model
+            .update(cx, |model, cx| model.set_active(show_prs, cx));
+        let tabs = (has_prs && !worktrees_mode).then(|| self.sidebar_tabs(cx));
+        // The tree is not built while the worktree panel or the PR panel
+        // stands in for it.
+        let nodes = if worktrees_mode || show_prs {
             Vec::new()
         } else {
-            self.tree_nodes(cx)
+            let remotes = self.remote_displays(cx);
+            self.tree_nodes(&remotes, cx)
         };
         if let Some(index) = nodes.iter().position(|node| node.current) {
             // ScrollHandle applies this during prepaint, so asking during
@@ -3182,7 +4205,7 @@ impl RepositoryView {
             self.sidebar_scroll.scroll_to_item(index);
         }
         let filtering = !self.filter.trim().is_empty();
-        let no_matches = !worktrees_mode && filtering && nodes.is_empty();
+        let no_matches = !worktrees_mode && !show_prs && filtering && nodes.is_empty();
         // Every row's identity and expansion, so a click, Enter/Space or
         // ←/→ can toggle any expandable node, not only the sections.
         let rows: Vec<(SharedString, bool, bool)> = nodes
@@ -3194,12 +4217,18 @@ impl RepositoryView {
         let activate = {
             let rows = rows.clone();
             let view = view.clone();
-            move |index: usize, _: &mut Window, cx: &mut App| {
+            move |index: usize, window: &mut Window, cx: &mut App| {
                 let Some((key, has_children, expanded)) = rows.get(index).cloned() else {
                     return;
                 };
                 view.update(cx, |view, cx| {
-                    if has_children {
+                    if let Some(remote) = key.strip_prefix("addacc:") {
+                        // "Add account for <host>" is an action row, not a node to reveal.
+                        let remote = remote.to_owned();
+                        view.selected_node = Some(key.clone());
+                        view.run_sidebar_action(SidebarAction::AddAccountFor(remote), window, cx);
+                        cx.notify();
+                    } else if has_children {
                         view.toggle_node(&key, expanded, cx);
                     } else {
                         view.activate_node(&key, cx);
@@ -3269,6 +4298,24 @@ impl RepositoryView {
             }
         };
 
+        // A click on a branch row's pull request badge opens its popover.
+        let pr_click = {
+            let rows = rows.clone();
+            let view = view.clone();
+            move |index: usize, position: Point<Pixels>, window: &mut Window, cx: &mut App| {
+                let Some((key, _, _)) = rows.get(index).cloned() else {
+                    return;
+                };
+                let Some(branch) = key.strip_prefix("local:") else {
+                    return;
+                };
+                let branch = branch.to_owned();
+                view.update(cx, |view, cx| {
+                    view.open_pr_popover(&branch, position, window, cx)
+                });
+            }
+        };
+
         div()
             .w(px(width))
             .flex_none()
@@ -3282,17 +4329,12 @@ impl RepositoryView {
             .bg(colors.sidebar)
             .border_r_1()
             .border_color(colors.border)
-            .child(
-                div()
-                    .w_full()
-                    .px(px(10.))
-                    .pt(px(12.))
-                    .pb(px(8.))
-                    .child(SearchField::new(
-                        "sidebar-filter",
-                        self.sidebar_filter.clone(),
-                    )),
-            )
+            .when_some(tabs, |this, tabs| this.child(tabs))
+            .when(!show_prs, |this| {
+                this.child(div().w_full().px(px(10.)).pt(px(12.)).pb(px(8.)).child(
+                    SearchField::new("sidebar-filter", self.sidebar_filter.clone()),
+                ))
+            })
             .child(
                 div()
                     .w_full()
@@ -3302,6 +4344,9 @@ impl RepositoryView {
                     .flex()
                     .flex_col()
                     .when_some(panel, |this, panel| this.child(panel))
+                    .when(show_prs, |this| {
+                        this.child(PrPanel::new(self.pr_model.clone()))
+                    })
                     .when(no_matches, |this| {
                         this.child(
                             div()
@@ -3316,7 +4361,7 @@ impl RepositoryView {
                                 .child(ui::t!("repo.sidebar.no_matches")),
                         )
                     })
-                    .when(!no_matches && !worktrees_mode, |this| {
+                    .when(!no_matches && !worktrees_mode && !show_prs, |this| {
                         this.child(
                             div().w_full().flex_1().min_w_0().min_h_0().child(
                                 Tree::new("sidebar-tree", nodes)
@@ -3330,7 +4375,8 @@ impl RepositoryView {
                                     .on_rename(rename)
                                     .on_delete(delete)
                                     .on_open(open)
-                                    .on_context_menu(context_menu),
+                                    .on_context_menu(context_menu)
+                                    .on_pr_click(pr_click),
                             ),
                         )
                         .child(Scrollbar::horizontal(
@@ -3341,16 +4387,65 @@ impl RepositoryView {
             )
     }
 
-    fn tree_nodes(&self, cx: &Context<Self>) -> Vec<TreeNodeData> {
+    /// The Repository / PRs switch above the sidebar's filter field.
+    fn sidebar_tabs(&self, cx: &Context<Self>) -> Div {
+        let model = self.pr_model.read(cx);
+        let short = model.kind().map_or_else(
+            || pr_logic::noun_short(forge::ServiceKind::GitHub),
+            pr_logic::noun_short,
+        );
+        let label = match model.open_count() {
+            Some(count) => format!("{short} {count}"),
+            None => short.to_string(),
+        };
+        let view = cx.entity();
+        div().w_full().flex_none().px(px(10.)).pt(px(12.)).child(
+            Segmented::new("sidebar-tabs")
+                .items([
+                    SegmentItem::new(ui::t!("sidebar.prs.tab_repository")),
+                    SegmentItem::new(label),
+                ])
+                .selected(match self.sidebar_tab {
+                    SidebarTab::Repository => 0,
+                    SidebarTab::PullRequests => 1,
+                })
+                .on_select(move |index, _, cx| {
+                    let tab = if index == 0 {
+                        SidebarTab::Repository
+                    } else {
+                        SidebarTab::PullRequests
+                    };
+                    view.update(cx, |view, cx| view.set_sidebar_tab(tab, cx));
+                }),
+        )
+    }
+
+    fn tree_nodes(&self, remotes: &RemoteDisplays, cx: &Context<Self>) -> Vec<TreeNodeData> {
         let history = self.history.read(cx);
-        sidebar_nodes(
+        let mut nodes = sidebar_nodes_with(
             history.refs(),
             history.head(),
             self.sidebar_extras.as_ref(),
+            remotes,
             &self.sidebar,
             &self.filter,
             self.selected_node.as_deref(),
-        )
+        );
+        // A local branch with a pull request carries its badge.
+        for node in &mut nodes {
+            let badge = node
+                .key
+                .strip_prefix("local:")
+                .and_then(|name| self.hosting_view.badge(name));
+            if let Some(badge) = badge {
+                node.pr = Some(TreePr {
+                    state: badge.state,
+                    text: badge.text.clone(),
+                    tooltip: badge.tooltip.clone(),
+                });
+            }
+        }
+        nodes
     }
 
     fn render_sidebar_splitter(
@@ -3708,6 +4803,8 @@ impl RepositoryView {
             row
         };
 
+        let tools = self.render_host_tools(details.id.to_string(), cx);
+        let checks = self.render_checks(details.id, cx);
         column
             .child(
                 div()
@@ -3725,7 +4822,160 @@ impl RepositoryView {
                     .child(meta_row(ui::t!("repo.details.hash"), hash, colors))
                     .child(meta_row(ui::t!("repo.details.parents"), parents, colors)),
             )
+            .children(tools)
+            .children(checks)
             .into_any_element()
+    }
+
+    /// "Open on <Service>" and "Copy link" for the commit, under its metadata;
+    /// none when no remote points at a known host.
+    fn render_host_tools(&self, sha: String, cx: &mut Context<Self>) -> Option<Div> {
+        let links = self.host_links(cx);
+        let link = links.first()?;
+        let url = link.url(&forge::WebTarget::Commit(sha))?;
+        let host = link.host().to_owned();
+        let view = cx.entity();
+        let copy_view = view.clone();
+        let pr_view = view.clone();
+        let copy_url = url.clone();
+        // The pull request of the local branch that stands on this commit.
+        let pr = self
+            .details_oid
+            .and_then(|oid| self.hosting.pr_branch_at(oid))
+            .and_then(|branch| {
+                self.hosting_view
+                    .badge(branch)
+                    .map(|badge| (branch.to_owned(), badge.clone()))
+            });
+        Some(
+            div()
+                .mt(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    Button::new("details-open-on-host")
+                        .size(ButtonSize::Small)
+                        .icon(IconName::External)
+                        .label(ui::t!(
+                            "repo.details.open_on_host",
+                            service = link.service_name()
+                        ))
+                        .on_click(move |_, window, cx| {
+                            view.update(cx, |view, cx| view.open_on_host(&url, &host, window, cx));
+                        }),
+                )
+                .child(
+                    Button::new("details-copy-link")
+                        .size(ButtonSize::Small)
+                        .icon(IconName::Copy)
+                        .label(ui::t!("repo.details.copy_link"))
+                        .on_click(move |_, window, cx| {
+                            copy_view.update(cx, |view, cx| {
+                                view.copy_link(
+                                    copy_url.clone(),
+                                    ui::t!("repo.toast.copied_link"),
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }),
+                )
+                .children(pr.map(|(branch, badge)| {
+                    PrBadge::new("details-pr", badge.state, badge.text.clone())
+                        .review(badge.review)
+                        .tooltip(badge.tooltip.clone())
+                        .on_click(move |event, window, cx| {
+                            pr_view.update(cx, |view, cx| {
+                                view.open_pr_popover(&branch, event.position(), window, cx)
+                            });
+                        })
+                })),
+        )
+    }
+
+    /// Right-click on a changed file: its page, blame and permalink on the
+    /// host (at the selected commit), and Copy path.
+    fn open_file_menu(
+        &mut self,
+        index: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some((path, deleted)), Some(sha)) = (
+            self.details
+                .files()
+                .and_then(|files| files.get(index))
+                .map(|file| {
+                    (
+                        file.path.clone(),
+                        file.kind == git_core::ChangeKind::Deleted,
+                    )
+                }),
+            self.details.details().map(|details| details.id.to_string()),
+        ) else {
+            return;
+        };
+        let links = self.host_links(cx);
+        let view = cx.entity();
+        let mut entries: Vec<MenuEntry> = Vec::new();
+        // A file deleted by the commit has no page at that commit: only Copy path.
+        if let Some(link) = links.first().filter(|_| !deleted) {
+            let file = forge::WebTarget::File {
+                rev: sha.clone(),
+                path: path.clone(),
+            };
+            let blame = forge::WebTarget::Blame {
+                rev: sha,
+                path: path.clone(),
+            };
+            let service = link.service_name();
+            let open = |label: SharedString, url: String| {
+                let (view, host) = (view.clone(), link.host().to_owned());
+                MenuEntry::Item(MenuItem::new(label).icon(IconName::External).action(
+                    move |window, cx| {
+                        view.update(cx, |view, cx| view.open_on_host(&url, &host, window, cx));
+                    },
+                ))
+            };
+            if let Some(url) = link.url(&file) {
+                entries.push(open(
+                    ui::t!("repo.details.open_file_on_host", service = service),
+                    url.clone(),
+                ));
+                // The URL is pinned to the commit's hash, so it is a permalink.
+                let permalink_view = view.clone();
+                let permalink = MenuItem::new(ui::t!("repo.details.copy_permalink"))
+                    .icon(IconName::Link)
+                    .action(move |window, cx| {
+                        permalink_view.update(cx, |view, cx| {
+                            view.copy_link(
+                                url.clone(),
+                                ui::t!("repo.toast.copied_permalink"),
+                                window,
+                                cx,
+                            )
+                        });
+                    });
+                if let Some(blame_url) = link.url(&blame) {
+                    entries.push(open(
+                        ui::t!("repo.details.open_blame_on_host", service = service),
+                        blame_url,
+                    ));
+                }
+                entries.push(MenuEntry::Item(permalink));
+                entries.push(MenuEntry::Separator);
+            }
+        }
+        entries.push(MenuEntry::Item(
+            MenuItem::new(ui::t!("repo.details.copy_path"))
+                .icon(IconName::Copy)
+                .action(move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                }),
+        ));
+        menu::open_context_menu(position, entries, window, cx);
     }
 
     /// The changed-file header and rows.
@@ -3825,9 +5075,18 @@ impl RepositoryView {
             .on_action(cx.listener(|view, _: &SelectLast, _, cx| view.step_file(isize::MAX, cx)));
         for (index, file) in files.iter().enumerate() {
             let view = view.clone();
+            let menu_view = view.clone();
             list = list.child(
                 div()
                     .debug_selector(move || format!("details-file-{index}"))
+                    .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                        menu_view.update(cx, |view, cx| {
+                            view.select_file(index, cx);
+                            view.open_file_menu(index, event.position, window, cx);
+                        });
+                        // Keep the menu that just took focus.
+                        window.prevent_default();
+                    })
                     .child(
                         FileRow::new(
                             SharedString::from(format!("details-file-{index}")),
@@ -4207,6 +5466,639 @@ impl RepositoryView {
                 .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
                 .child(self.git_label.clone()),
         )
+    }
+}
+
+/* ----------------------- pull requests and CI status ---------------------- */
+
+impl RepositoryView {
+    /// Works out which remote speaks for the repository and which branches
+    /// track it, then starts whatever requests the policy says are due.
+    /// Cheap and non-blocking: the requests run on the background executor.
+    fn hosting_sync(&mut self, trigger: PrTrigger, cx: &mut Context<Self>) {
+        let Some(extras) = self.sidebar_extras.as_ref() else {
+            return;
+        };
+        let (accounts, remembered) = self.account_settings(cx);
+        let account_refs = remote_accounts::account_refs(&accounts);
+        let (target, tracked, remote_tips) = {
+            let history = self.history.read(cx);
+            let refs = history.refs().unwrap_or(&[]);
+            let target = hosting_status::primary_target(
+                &account_refs,
+                &extras.remote_targets,
+                history.head(),
+                refs,
+                &remembered,
+            );
+            let tracked = target
+                .as_ref()
+                .map(|t| hosting_status::tracked_branches(refs, &extras.remote_targets, t))
+                .unwrap_or_default();
+            let remote_tips = target
+                .as_ref()
+                .map(|t| hosting_status::primary_remote_tips(refs, &t.remote))
+                .unwrap_or_default();
+            (target, tracked, remote_tips)
+        };
+        if trigger.resets_health() {
+            // The user asked again: a token rejected before may be new now.
+            self.hosting.health.manual_retry();
+        }
+        self.hosting.retarget(target, tracked, remote_tips);
+        let now = std::time::Instant::now();
+        if self
+            .hosting
+            .wants_prs(trigger, now, hosting_status::unix_now())
+        {
+            self.hosting_fetch_prs(cx);
+        }
+        self.hosting_fetch_ci(cx);
+        self.publish_hosting(cx);
+    }
+
+    fn hosting_request(&self, target: &Target, cx: &App) -> Request {
+        let store = match crate::accounts::cached_store(cx) {
+            Some(Ok(store)) => Some(store),
+            _ => None,
+        };
+        Request::new(self.hosting.client.clone(), target, store)
+    }
+
+    fn hosting_fetch_prs(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.hosting.target.clone() else {
+            return;
+        };
+        let branches = self.hosting.pr_branches();
+        self.hosting.begin_prs(std::time::Instant::now());
+        let request = self.hosting_request(&target, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { request.pull_requests(&branches) })
+                .await;
+            this.update_in(cx, |view, window, cx| {
+                view.finish_prs(target, result, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_prs(
+        &mut self,
+        target: Target,
+        result: Result<
+            std::collections::HashMap<String, forge::api::PullRequest>,
+            forge::api::ApiError,
+        >,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The repository's primary remote changed while this was running.
+        if self.hosting.target.as_ref() != Some(&target) {
+            return;
+        }
+        let effect = self.hosting.finish_prs(result, hosting_status::unix_now());
+        if let Some(effect) = effect {
+            log::debug!("pull requests of {}: {effect:?}", target.link.host());
+            self.hosting_failed(&target, effect, window, cx);
+        }
+        self.hosting_fetch_ci(cx);
+        self.publish_hosting(cx);
+        self.ensure_ci_timer(window, cx);
+    }
+
+    /// Recomputes which commits the host is known to have, from the commits
+    /// the history has loaded and the primary remote's remote-tracking tips.
+    /// Pure memory work, redone only when the loaded commits changed.
+    fn refresh_reach(&mut self, cx: &mut Context<Self>) {
+        let loaded = self.history.read(cx).loaded_len();
+        if self.hosting.target.is_none() || !self.hosting.reach_outdated(loaded) {
+            return;
+        }
+        let reach = self
+            .history
+            .read(cx)
+            .reachable_from(self.hosting.remote_tips());
+        self.hosting.set_reach(reach, loaded);
+    }
+
+    /// Asks for the selected commit's checks once the selection has rested for
+    /// 300 ms; a newer selection cancels the wait.
+    fn schedule_selected_ci(&mut self, cx: &mut Context<Self>) {
+        self.ci_debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            this.update(cx, |view, cx| {
+                view.ci_debounce = None;
+                view.hosting_fetch_ci(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Starts the 30 s re-check while a commit on screen has pending checks and
+    /// the window is active. The loop ends itself when neither holds.
+    fn ensure_ci_timer(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.ci_timer.is_some()
+            || !window.is_window_active()
+            || !self
+                .hosting
+                .has_pending_ci(self.details_oid, self.head_oid(cx))
+        {
+            return;
+        }
+        self.ci_timer = Some(cx.spawn(async move |this, cx| loop {
+            // A second of slack: an answer is re-asked once it is 30 s old.
+            cx.background_executor()
+                .timer(hosting_status::CI_PENDING_REFETCH + Duration::from_secs(1))
+                .await;
+            let keep = this
+                .update_in(cx, |view, window, cx| view.ci_timer_tick(window, cx))
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        }));
+    }
+
+    /// One tick of the re-check; says whether the timer goes on.
+    fn ci_timer_tick(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
+        let pending = self
+            .hosting
+            .has_pending_ci(self.details_oid, self.head_oid(cx));
+        if !window.is_window_active() || !pending {
+            self.ci_timer = None;
+            return false;
+        }
+        self.hosting_fetch_ci(cx);
+        true
+    }
+
+    /// Asks for the checks of the commits that are due: the selected one and
+    /// HEAD when the host has them, and the heads of branches with a pull
+    /// request.
+    fn hosting_fetch_ci(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.hosting.target.clone() else {
+            return;
+        };
+        self.refresh_reach(cx);
+        let due = self.hosting.ci_due(
+            self.details_oid,
+            self.head_oid(cx),
+            std::time::Instant::now(),
+            hosting_status::unix_now(),
+        );
+        if due.is_empty() {
+            return;
+        }
+        let shas: Vec<String> = due.iter().map(Oid::to_string).collect();
+        for sha in &shas {
+            self.hosting.ci.mark_inflight(sha);
+        }
+        let request = self.hosting_request(&target, cx);
+        cx.spawn(async move |this, cx| {
+            let asked = shas.clone();
+            let answers = cx
+                .background_executor()
+                .spawn(async move { request.checks(&asked) })
+                .await;
+            this.update_in(cx, |view, window, cx| {
+                view.finish_ci(target, shas, answers, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+        // The details pane shows its loading rows for the selected commit.
+        cx.notify();
+    }
+
+    fn finish_ci(
+        &mut self,
+        target: Target,
+        asked: Vec<String>,
+        answers: Vec<(
+            String,
+            Result<forge::api::CommitChecks, forge::api::ApiError>,
+        )>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hosting.target.as_ref() != Some(&target) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let now_unix = hosting_status::unix_now();
+        // Commits the batch stopped before reaching were never asked.
+        for sha in &asked {
+            if !answers.iter().any(|(answered, _)| answered == sha) {
+                self.hosting.ci.release(sha);
+            }
+        }
+        let mut effect = None;
+        for (sha, result) in answers {
+            match &result {
+                Ok(_) => self.hosting.health.succeeded(),
+                Err(error) => effect = Some(self.hosting.record(error, now_unix)),
+            }
+            self.hosting.ci.store(&sha, result, now);
+        }
+        if let Some(effect) = effect {
+            log::debug!("checks of {}: {effect:?}", target.link.host());
+            self.hosting_failed(&target, effect, window, cx);
+        }
+        self.publish_hosting(cx);
+        self.ensure_ci_timer(window, cx);
+    }
+
+    /// What a failure asks of the UI: a rejected token is announced once per
+    /// session; every other kind is silent (the badges just stay or go).
+    fn hosting_failed(
+        &mut self,
+        target: &Target,
+        effect: ErrorEffect,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if effect != ErrorEffect::TokenRejected {
+            return;
+        }
+        let Some(id) = target.account_id.clone() else {
+            return;
+        };
+        if !hosting_status::session_rejections().first(&id) {
+            return;
+        }
+        let (accounts, _) = self.account_settings(cx);
+        let Some(account) = accounts.iter().find(|a| a.id == id) else {
+            return;
+        };
+        let body = ui::ToastBody {
+            lines: Vec::new(),
+            action: Some(self.reconnect_action(id.clone(), cx)),
+        };
+        toast::show_with(
+            ui::ToastKind::Error,
+            ui::t!(
+                "network.toast.token_rejected",
+                host = target.link.host(),
+                label = account.label.as_str()
+            ),
+            Some(body),
+            window,
+            cx,
+        );
+    }
+
+    /// Gives the history rows and the sidebar the current badges and dots.
+    fn publish_hosting(&mut self, cx: &mut Context<Self>) {
+        let view = HostingView::from(&self.hosting);
+        if view == *self.hosting_view {
+            return;
+        }
+        let view = Arc::new(view);
+        self.hosting_view = view.clone();
+        self.history
+            .update(cx, |history, cx| history.set_hosting(view, cx));
+        cx.notify();
+    }
+
+    /// Opens the popover of the pull request on local branch `branch` and
+    /// asks for its review state.
+    fn open_pr_popover(
+        &mut self,
+        branch: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pr) = self.hosting.pr_for_local(branch).cloned() else {
+            return;
+        };
+        let Some(model) = self.popover_model_for(pr.number, None) else {
+            return;
+        };
+        let weak = cx.weak_entity();
+        let popover = cx.new(|_| PrPopover::new(model, weak));
+        let layer = ui::overlay::open_popover(position, popover.clone().into(), window, cx);
+        popover.update(cx, |popover, _| popover.set_layer(layer));
+        self.pr_popover = Some(popover);
+
+        let Some(target) = self.hosting.target.clone() else {
+            return;
+        };
+        if self.hosting.review(pr.number).is_some()
+            || !self.hosting.health.can_request(hosting_status::unix_now())
+        {
+            return;
+        }
+        let number = pr.number;
+        let request = self.hosting_request(&target, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { request.review(number) })
+                .await;
+            this.update_in(cx, |view, window, cx| {
+                view.finish_review(target, number, result, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The popover of pull request `number`; `review` overrides the cached
+    /// review state (the answer that just arrived, or "none" after a failure).
+    fn popover_model_for(
+        &self,
+        number: u64,
+        review: Option<forge::api::ReviewState>,
+    ) -> Option<hosting_status::PopoverModel> {
+        let pr = self.hosting.pr_by_number(number)?;
+        let checks = self
+            .hosting
+            .tip_of_pr(number)
+            .and_then(|tip| self.hosting.ci.checks(&tip.to_string()));
+        Some(hosting_status::popover_model(
+            pr,
+            review.or_else(|| self.hosting.review(number)),
+            checks,
+            &self.hosting.service_name(),
+            hosting_status::unix_now(),
+        ))
+    }
+
+    fn finish_review(
+        &mut self,
+        target: Target,
+        number: u64,
+        result: Result<forge::api::ReviewState, forge::api::ApiError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hosting.target.as_ref() != Some(&target) {
+            return;
+        }
+        let review = match result {
+            Ok(review) => {
+                self.hosting.set_review(number, review);
+                self.hosting.health.succeeded();
+                review
+            }
+            Err(error) => {
+                let effect = self.hosting.record(&error, hosting_status::unix_now());
+                self.hosting_failed(&target, effect, window, cx);
+                // Not cached: the next popover asks again. The popover stops
+                // saying "loading".
+                forge::api::ReviewState::None
+            }
+        };
+        if let Some(popover) = self.pr_popover.clone() {
+            if popover.read(cx).number() == number {
+                if let Some(model) = self.popover_model_for(number, Some(review)) {
+                    popover.update(cx, |popover, cx| popover.set_model(model, cx));
+                }
+            }
+        }
+        self.publish_hosting(cx);
+    }
+
+    /// "Open on <Service>" from the popover.
+    pub(crate) fn open_hosting_url(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let host = self
+            .hosting
+            .target
+            .as_ref()
+            .map(|t| t.link.host().to_owned())
+            .unwrap_or_default();
+        self.open_on_host(url, &host, window, cx);
+    }
+
+    /// Checkout from the popover: fetch the pull request's head ref into a
+    /// local branch, then check that branch out.
+    pub(crate) fn checkout_pull_request(
+        &mut self,
+        number: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(pr), Some(target)) = (
+            self.hosting.pr_by_number(number).cloned(),
+            self.hosting.target.clone(),
+        ) else {
+            return;
+        };
+        self.start_pr_checkout(&pr, target.remote, target.link.instance.kind, window, cx);
+    }
+
+    /// Fetches `pr`'s head ref from `remote` into a local branch (not forced)
+    /// and checks it out; shared by the popover and the pull request panel.
+    fn start_pr_checkout(
+        &mut self,
+        pr: &forge::api::PullRequest,
+        remote: String,
+        kind: forge::ServiceKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // `start_network_job` ignores a second job: say so instead.
+        if self.network.is_some() {
+            toast::show(ui::ToastKind::Warn, ui::t!("sidebar.prs.busy"), window, cx);
+            return;
+        }
+        let locals: Vec<String> = self
+            .history
+            .read(cx)
+            .refs()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|r| r.kind == RefKind::LocalBranch)
+            .map(|r| r.name.clone())
+            .collect();
+        let branch = hosting_status::checkout_branch_name(pr, &locals);
+        let Ok(refspec) = hosting_status::checkout_refspec(kind, pr.number, &branch) else {
+            return;
+        };
+        self.start_network_job(
+            Job::FetchPullRequest {
+                remote,
+                refspec,
+                branch,
+                number: pr.number,
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// The branch a pull request was fetched into becomes the current one.
+    fn checkout_pr_branch(
+        &mut self,
+        branch: String,
+        number: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label = branch.clone();
+        self.checkout_guarded(
+            ui::t!("repo.checkout.switch_title", name = label).to_string(),
+            move |repo| {
+                repo.checkout_branch(&branch)?;
+                Ok((
+                    ui::ToastKind::Ok,
+                    ui::t!(
+                        "repo.hosting.toast.checked_out",
+                        branch = branch,
+                        number = number
+                    )
+                    .to_string(),
+                ))
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// "Try again" under the checks of the selected commit.
+    fn retry_checks(&mut self, cx: &mut Context<Self>) {
+        if let Some(oid) = self.details_oid {
+            self.hosting.ci.forget(&oid.to_string());
+        }
+        self.hosting.health.manual_retry();
+        self.hosting_fetch_ci(cx);
+        self.publish_hosting(cx);
+    }
+
+    /// The checks of the commit in the details pane: the list, or its loading,
+    /// empty and failed state. `None` when the repository has no service with
+    /// an API, or nothing was asked yet.
+    fn render_checks(&self, oid: Oid, cx: &mut Context<Self>) -> Option<Div> {
+        let target = self.hosting.target.as_ref()?;
+        if !self.hosting.health.badges_visible() {
+            return None;
+        }
+        let colors = cx.theme().colors;
+        let sha = oid.to_string();
+        let service = target.link.service_name();
+        let body = match self.hosting.ci.get(&sha) {
+            None if self.hosting.ci.is_inflight(&sha) => div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .children(
+                    [60., 72., 48., 66.]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, width)| {
+                            Skeleton::new(format!("checks-skeleton-{i}"), px(width * 2.5))
+                        }),
+                )
+                .into_any_element(),
+            // Not pushed, or never reached: nothing to show.
+            None | Some(CiEntry::Absent { .. } | CiEntry::Offline { .. }) => return None,
+            Some(CiEntry::Failed { message, .. }) => {
+                let view = cx.entity();
+                Banner::new(BannerKind::Error, ui::t!("repo.hosting.checks.error_title"))
+                    .body(message.clone())
+                    .action(
+                        Button::new("checks-retry")
+                            .size(ButtonSize::Small)
+                            .icon(IconName::Sync)
+                            .label(ui::t!("repo.hosting.checks.retry"))
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |view, cx| view.retry_checks(cx));
+                            }),
+                    )
+                    .into_any_element()
+            }
+            Some(CiEntry::Loaded { checks, .. }) if checks.overall == forge::api::CiState::None => {
+                EmptyState::new(ui::t!("repo.hosting.checks.none_title"))
+                    .text(ui::t!("repo.hosting.checks.none_body", service = service))
+                    .into_any_element()
+            }
+            Some(CiEntry::Loaded { checks, .. }) => {
+                let header_glyph = hosting_status::ci_glyph(checks.overall);
+                let title = ui::t!(
+                    "repo.hosting.checks.title",
+                    summary = hosting_status::checks_summary(checks)
+                )
+                .to_uppercase();
+                let rows = checks.checks.iter().enumerate().map(|(index, check)| {
+                    let glyph = hosting_status::ci_glyph(check.state);
+                    let open = check.web_url.clone().map(|url| {
+                        Button::ghost(format!("check-open-{index}"))
+                            .size(ButtonSize::Small)
+                            .icon_only(IconName::External)
+                            .tooltip(ui::t!("repo.hosting.checks.open_on", service = service))
+                            .on_click(move |_, _, cx| cx.open_url(&url))
+                    });
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .h(px(26.))
+                        .px(px(8.))
+                        .text_size(FS_SM)
+                        .when(index > 0, |row| {
+                            row.border_t_1().border_color(colors.border)
+                        })
+                        .child(match glyph {
+                            Some(glyph) => CiGlyph::new(format!("check-glyph-{index}"), glyph)
+                                .tooltip(hosting_status::ci_label(glyph))
+                                .into_any_element(),
+                            None => div().w(px(12.)).into_any_element(),
+                        })
+                        .child(
+                            div()
+                                .id(format!("check-name-{index}"))
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .tooltip(Tooltip::text(check.name.clone()))
+                                .child(check.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_color(colors.muted)
+                                .child(hosting_status::format_duration(check.duration_secs)),
+                        )
+                        .child(div().w(px(24.)).children(open))
+                });
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_size(ui::metrics::FS_XS)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors.muted)
+                            .children(
+                                header_glyph.map(|glyph| CiGlyph::new("checks-header", glyph)),
+                            )
+                            .child(title),
+                    )
+                    .child(div().flex().flex_col().children(rows))
+                    .into_any_element()
+            }
+        };
+        Some(div().mt(px(14.)).child(body))
+    }
+}
+
+impl From<&HostingState> for HostingView {
+    fn from(state: &HostingState) -> Self {
+        state.view()
     }
 }
 
@@ -5579,6 +7471,132 @@ mod tests {
         });
     }
 
+    /// A repository whose `origin` is on a service with an account gets the
+    /// Repository / PRs tabs; the PRs tab draws the (cached) requests, and
+    /// "Create pull request…" opens the dialog on the current branch.
+    #[gpui::test]
+    fn a_remote_with_an_account_gets_the_pull_request_panel(cx: &mut gpui::TestAppContext) {
+        use forge::api::{PrState, PullRequest, ReviewState};
+
+        let repo = crate::test_support::TempRepo::new("pr-panel");
+        commit(repo.path(), "a.txt", "one\n");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success());
+        };
+        git(&["remote", "add", "origin", "https://github.com/o/r.git"]);
+        let mut settings = crate::settings::Settings::default();
+        settings.accounts.push(crate::settings::AccountRecord {
+            id: "a1".to_owned(),
+            kind: "github".to_owned(),
+            base_url: "https://github.com".to_owned(),
+            login: "mira-k".to_owned(),
+            label: "mira-k".to_owned(),
+            method: crate::settings::AccountMethod::Token,
+            ssh_host: None,
+            imported_from: None,
+        });
+        cx.update(|cx| {
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings,
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+        // A fresh list in the shared cache: the panel needs no network.
+        let key = "https://github.com|o/r|a1";
+        let listing = |numbers: &[u64]| crate::pr_logic::Listing {
+            items: numbers
+                .iter()
+                .map(|&number| PullRequest {
+                    number,
+                    title: format!("PR {number}"),
+                    state: PrState::Open,
+                    review: ReviewState::None,
+                    author: "mira-k".to_owned(),
+                    head_branch: format!("feat/{number}"),
+                    head_repo_full_name: None,
+                    base_branch: "main".to_owned(),
+                    updated_at: 0,
+                    web_url: String::new(),
+                })
+                .collect(),
+            has_next: false,
+            fetched: std::time::Instant::now(),
+        };
+        {
+            let mut cache = crate::pr_logic::cache().lock().unwrap();
+            cache.put(key, crate::pr_logic::PrTab::Mine, listing(&[1, 2]));
+            cache.put(key, crate::pr_logic::PrTab::All, listing(&[1, 2, 3]));
+        }
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+
+        // The tabs exist, the tree is still shown.
+        assert!(cx.debug_bounds("sidebar-tabs-segment-0").is_some());
+        assert!(cx.debug_bounds("sidebar-tree-node-0").is_some());
+        view.update(&mut cx, |view, cx| {
+            view.set_sidebar_tab(SidebarTab::PullRequests, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            let model = view.pr_model.read(cx);
+            assert!(model.has_target());
+            assert_eq!(model.open_count(), Some(3));
+        });
+        assert!(cx.debug_bounds("pr-filter-segment-0").is_some());
+        assert!(cx.debug_bounds("sidebar-tree-node-0").is_none());
+
+        // "Create pull request…" on the current branch.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_create_pr(None, window, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert!(view.pr_dialog.is_some()));
+
+        // Closing the dialog (here by its own close) clears the view's handle.
+        let dialog = view.read_with(&cx, |view, _| view.pr_dialog.clone().unwrap());
+        cx.update(|window, cx| dialog.update(cx, |dialog, cx| dialog.close(window, cx)));
+        drop(dialog);
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert!(view.pr_dialog.is_none()));
+    }
+
+    /// Without an account there is nothing to list or create: no tabs.
+    #[gpui::test]
+    fn a_remote_without_an_account_has_no_pull_request_tabs(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("pr-no-account");
+        commit(repo.path(), "a.txt", "one\n");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["remote", "add", "origin", "https://github.com/o/r.git"])
+            .output()
+            .expect("git runs");
+        assert!(out.status.success());
+        cx.update(|cx| {
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings: crate::settings::Settings::default(),
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sidebar-tabs-segment-0").is_none());
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_create_pr(None, window, cx));
+        });
+        view.read_with(&cx, |view, _| assert!(view.pr_dialog.is_none()));
+    }
+
     /// The layout toggle switches the pane to side-by-side rows and stores the
     /// choice in the settings.
     #[gpui::test]
@@ -5915,7 +7933,7 @@ mod tests {
     ) {
         let index = view
             .update(cx, |view, cx| {
-                view.tree_nodes(cx)
+                view.tree_nodes(&RemoteDisplays::new(), cx)
                     .iter()
                     .position(|node| node.key.as_ref() == key)
             })

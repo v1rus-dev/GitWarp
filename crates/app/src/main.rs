@@ -3,12 +3,15 @@
 // still work: piped stdout/stdin handles are inherited either way.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod accounts;
 mod activity_strip;
 mod app_icon;
 mod changes_view;
 mod checkout_dialog;
+mod cli_import;
 mod clone_dialog;
 mod confirm_dialog;
+mod create_pr_dialog;
 mod credential_dialog;
 mod details;
 mod diff_model;
@@ -18,13 +21,17 @@ mod history_search;
 mod history_state;
 mod history_view;
 mod host_key_dialog;
+mod hosting_status;
 mod init_flow;
 mod network_ops;
 mod network_service;
 mod open_dialog;
 mod palette;
+mod pr_logic;
+mod pr_panel;
 mod ref_dialog;
 mod ref_ops;
+mod remote_accounts;
 mod repo_view;
 mod settings;
 mod settings_ui;
@@ -35,6 +42,7 @@ mod telemetry;
 mod test_support;
 mod text_runs;
 mod theme;
+mod web_links;
 mod welcome;
 mod welcome_activity;
 mod workspace;
@@ -349,6 +357,7 @@ fn main() {
                 save_in_flight: false,
                 dirty: false,
             });
+            accounts::init_secret_store(cx);
             cx.set_global(network_service::NetworkService::start());
             // A background save may still be in flight when the user quits;
             // closing the last window does reach `on_app_quit` on Linux, so

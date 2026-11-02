@@ -2,7 +2,8 @@
 
 GitWarp is a desktop Git client written in Rust with [GPUI](https://www.gpui.rs) (the UI
 framework of Zed). The minimum supported Rust version is **1.89** (`rust-version` in
-`Cargo.toml`; `sentry` 0.49 and `gix` 0.90 need it).
+`Cargo.toml`): `uuid` 1.29 (via GPUI) and `aes` 0.9 (via the Linux keychain store)
+require it; `gix` 0.90 alone needs 1.88.
 
 ## Layout
 

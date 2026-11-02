@@ -29,24 +29,18 @@
   const S = GLS, G = GL, ic = G.ic, esc = G.esc;
   /* Signing keys are the SSH keys from ~/.ssh (no GPG, no expired-key state). */
   const KEYS = [['', 'No signing key'], ['id_ed25519', 'id_ed25519'], ['id_ed25519_work', 'id_ed25519_work']];
-  const HOSTS = { github: ['GitHub', 'github.com'], gitlab: ['GitLab', 'gitlab.com'] };
   const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   /* Presentation switcher: the page-level error banner and its messages. */
   const ERRS = { none: 'No error', norepo: 'Scope is repository, opened from welcome', nogit: 'Git is not available', cred: 'Credential helper did not store the token' };
   const ERR_TEXT = { norepo: 'Open a repository to edit its identity.', nogit: 'Git is not available.', cred: 'Your git credential helper did not store the token. Configure one (for example credential.helper=store) and try again.' };
-  let acc = S.get('accounts2', { github: { user: 'mira-k' }, gitlab: null }), err = 'none', saving = false, touched = false, timer = null;
-  const saveAcc = () => S.set('accounts2', acc);
+  let err = 'none', saving = false, touched = false, timer = null;
   const nameMsg = (n) => (touched && !n.trim() ? ['err', 'Name is required — git refuses to commit without it.'] : ['help', 'Visible in every commit you create.']);
   const mailMsg = (m) => (touched && !EMAIL_RE.test(m) ? ['err', 'Enter a valid email address, like name@example.com.'] : ['help', 'Visible in every commit you create.']);
   const msgHTML = (m) => (m[0] === 'err' ? `<div class="field-error">${ic('err', 12)}${m[1]}</div>` : `<div class="field-help">${m[1]}</div>`);
   const ctx = S.mount('settings-identity.html', 'Identity', () => {
     const scope = S.get('id-scope', 'global'), sign = S.get('id-sign', false), key = S.get('id-key', 'id_ed25519');
     const name = S.get('id-name', 'Mira Kovalenko'), email = S.get('id-email', 'mira@kovalenko.dev');
-    const acct = (id) => {
-      const a = acc[id], [label, host] = HOSTS[id];
-      return `<div class="acct"><span class="av">${ic('cloud', 16)}</span><div><div class="nm">${label}</div><div class="st ${a ? 'ok' : 'no'}">${a ? ic('check', 12) + 'Connected as ' + esc(a.user) : ic('cloud', 12) + 'Not connected'}</div></div><div class="btns">${a ? `<button class="btn btn-sm" data-adis="${id}">Disconnect</button>` : `<button class="btn btn-sm" data-acon="${id}">Connect</button>`}</div><span class="host">${host}</span></div>`;
-    };
-    return `<h2>Identity</h2><p class="lead">Who your commits are attributed to, how they are signed, and which hosting accounts GitWarp can use.</p>
+    return `<h2>Identity</h2><p class="lead">Who your commits are attributed to and how they are signed.</p>
       ${err !== 'none' ? S.banner('error', 'Could not read or save the identity', ERR_TEXT[err]) : ''}
       <section class="sgroup"><h3>Commit author</h3><div class="slist">
         <div class="fld"><div class="field-label">Apply to</div><div>${S.seg('id-scope', scope, [['global', 'All repositories'], ['repo', 'This repository only']])}</div><div class="field-help">${scope === 'global' ? 'Written to ~/.gitconfig. A repository can still override it.' : 'Written to .git/config of the open repository.'}</div></div>
@@ -58,7 +52,7 @@
         S.row('Sign commits', 'Adds a verified badge on hosts that know your key.', S.sw('id-sign', sign, 'Sign commits')),
         S.row('Signing key', 'Used for commits and tags. SSH keys from ~/.ssh.', S.sel('id-key', key, KEYS, 'Signing key', !sign), !sign)
       ])}
-      <section class="sgroup"><h3>Hosting accounts</h3><div class="slist">${acct('github')}${acct('gitlab')}</div><div class="field-help" style="margin-top:6px">Used for cloning private repositories and for push credentials. Tokens are stored by your git credential helper, not in settings.json.</div></section>`;
+      <section class="sgroup"><h3>Hosting accounts</h3><div class="field-help">Accounts for GitHub, GitLab and other services now live in <a class="link" href="settings-accounts.html" style="color:var(--accent)">Settings → Accounts</a>.</div></section>`;
   }, null, { stagebar: `<label class="scn">Page state <select id="errsel" aria-label="Page state">${Object.entries(ERRS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select></label>` });
   document.getElementById('errsel').addEventListener('change', (e) => { err = e.target.value; if (err === 'norepo') S.set('id-scope', 'repo'); ctx.draw(); });
   const pane = ctx.pane;
@@ -73,28 +67,6 @@
     timer = setTimeout(() => { const el = pane.querySelector('[data-saving]'); if (el) el.hidden = true; }, 1400);
     /* the Saving… line stays up while the write runs, then disappears */
   });
-  pane.addEventListener('click', (e) => {
-    const c = e.target.closest('[data-acon]'), d = e.target.closest('[data-adis]');
-    if (c) connectDialog(c.dataset.acon);
-    if (d) { acc[d.dataset.adis] = null; saveAcc(); ctx.draw(); } /* Disconnect rejects the credential, no confirmation, no toast */
-  });
-  /* "Connect an account": the token goes to the git credential helper. Submit closes at once; a failure lands in the page banner, success turns the row to Connected. No toast. */
-  function connectDialog(id) {
-    const [label, host] = HOSTS[id];
-    S.dialog(ctx.win, {
-      st: { user: '', token: '', showErr: false }, width: 520,
-      view: (s) => {
-        const miss = !s.user.trim() || !s.token.trim();
-        return { title: 'Connect an account', icon: 'cloud', body: `<div class="col10">
-            ${S.dbanner('info', 'Connect ' + label, `The token is handed to your git credential helper for ${host}. It is not written to settings.json.`)}
-            ${S.dfield('User name', 'user', S.din('user', s.user, 'Your user name'))}
-            ${S.dfield('Personal access token', 'token', S.din('token', s.token, 'Personal access token', { type: 'password' }))}
-            ${s.showErr && miss ? '<div class="derr">Enter both the user name and a token.</div>' : ''}</div>`,
-          foot: S.dbtn('Cancel') + S.dbtn('Connect', { kind: 'primary', act: 'go', dis: miss, def: 1 }) };
-      },
-      actions: { go: (s, api) => { if (!s.user.trim() || !s.token.trim()) { s.showErr = true; return; } api.close(); acc[id] = { user: s.user.trim() }; saveAcc(); ctx.draw(); return false; } }
-    });
-  }
 })();
 </script>
 </body>

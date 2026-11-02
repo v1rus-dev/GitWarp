@@ -32,7 +32,11 @@ both themes are in `screens/` (`<page>.dark.png` and `<page>.light.png`).
 | `settings-git.html` | Settings → Git: Auto / Bundled / System / Custom, with all warning and error states (scenario switcher). | 10 — settings |
 | `settings-keybindings.html` | Settings → Keybindings: searchable shortcut table, recording, conflicts, reset and export. | 10 — settings |
 | `settings-diff.html` | Settings → Diff & merge: layout, whitespace, context, merge tool with command validation, live preview. | 10 — settings |
-| `settings-identity.html` | Settings → Identity: author, signing key, GitHub / GitLab accounts, validation states. | 10 — settings |
+| `settings-identity.html` | Settings → Identity: author, signing key, validation states; hosting accounts moved to Settings → Accounts. | 10 — settings |
+| `settings-accounts.html` | Settings → Accounts: any number of hosting accounts (several of one type, self-hosted), statuses, import from gh / glab. | H3 — hosting accounts |
+| `dialogs-account.html` | Add / Reconnect account: service → instance (probe, TLS trust) → token or browser sign-in (device code, redirect), results. | H4–H5 — hosting accounts |
+| `remotes-accounts.html` | Sidebar remotes with service + account, account picker per remote, Add account for host, remote with several push URLs. | H6 — remotes ↔ accounts |
+| `hosting-features.html` | Open on host, Clone From account, PR badges and popover, CI status and checks, Create PR, PR panel. | H7–H10 — hosting features |
 | `settings-ssh.html` | Settings → SSH keys: key list, generate / import / delete, connection test, trusted hosts. | 10 — settings |
 | `palette.html` | Command palette: Ctrl+P quick launcher for commands, branches, commits, files. | 11 — command palette |
 | `dialogs-checkout.html` | Checkout with uncommitted changes: stash / bring changes / discard, for branch, remote branch, tag and commit. | 7 — ref operations |
@@ -83,3 +87,6 @@ Both themes share one geometry and differ only in colour.
 10. Settings pages
 11. Command palette
 12. Not designed yet: merge/rebase + conflict editor, interactive rebase, blame, file history
+
+Hosting services (GitHub, GitLab, Gitea / Forgejo, Bitbucket, Azure DevOps, self-hosted) are planned
+separately as steps H1–H10; spec in `docs/specs/hosting-services-spec.md`.

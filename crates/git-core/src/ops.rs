@@ -176,6 +176,27 @@ pub(crate) fn remote_url(repo: &Repo, name: &str) -> Result<Option<String>> {
     Ok((!url.is_empty()).then_some(url))
 }
 
+/// Every push URL of a configured remote, one per `remote.<name>.pushurl`
+/// entry. Git answers with the fetch URL when no `pushurl` is set, and so does
+/// this: the list is never empty for a configured remote. An unknown name
+/// gives an empty list.
+pub(crate) fn remote_push_urls(repo: &Repo, name: &str) -> Result<Vec<String>> {
+    let out = repo
+        .command()
+        .args(["remote", "get-url", "--push", "--all", name])
+        .output()
+        .map_err(Error::Spawn)?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 /// Applies one commit on top of HEAD as a new commit.
 ///
 /// A conflict is aborted before it reaches the UI: there is no conflict editor
@@ -280,4 +301,64 @@ fn failure(command: &'static str, out: Output) -> Error {
         code: out.status.code(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
+}
+
+/// The subjects of the commits in `base..head`, oldest first, at most the 500
+/// newest of them. `base` and `head` are any revisions git accepts.
+pub(crate) fn commit_subjects(repo: &Repo, base: &str, head: &str) -> Result<Vec<String>> {
+    let out = repo
+        .command()
+        .args(["log", "--reverse", "--max-count=500", "--format=%s"])
+        .arg(format!("{base}..{head}"))
+        .arg("--")
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "log")?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+/// How many commits `head` has that `base` lacks (ahead) and the other way
+/// round (behind).
+pub(crate) fn ahead_behind(repo: &Repo, base: &str, head: &str) -> Result<(usize, usize)> {
+    let out = repo
+        .command()
+        .args(["rev-list", "--left-right", "--count"])
+        .arg(format!("{base}...{head}"))
+        .arg("--")
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "rev-list")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut numbers = text.split_whitespace().map(|n| n.parse::<usize>().ok());
+    match (numbers.next().flatten(), numbers.next().flatten()) {
+        // `--left-right` prints the commits only in `base` first.
+        (Some(behind), Some(ahead)) => Ok((ahead, behind)),
+        _ => Err(Error::Parse("rev-list --count")),
+    }
+}
+
+/// The branch `refs/remotes/<remote>/HEAD` points at (`main` for
+/// `origin/main`), or `None` when the remote has no such pointer (a remote
+/// that was added, not cloned, never gets one until `git remote set-head`).
+pub(crate) fn remote_default_branch(repo: &Repo, remote: &str) -> Result<Option<String>> {
+    let out = repo
+        .command()
+        .args(["symbolic-ref", "--quiet", "--short"])
+        .arg(format!("refs/remotes/{remote}/HEAD"))
+        .output()
+        .map_err(Error::Spawn)?;
+    // Exit code 1 is "not a symbolic ref" / missing, which is a plain `None`.
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text
+        .trim()
+        .strip_prefix(remote)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned))
 }

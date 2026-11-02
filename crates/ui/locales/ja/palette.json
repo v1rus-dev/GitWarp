@@ -5,6 +5,8 @@
   "palette.command.close_repository": "リポジトリを閉じる",
   "palette.command.collapse_idle_lanes": "グラフの未使用レーンを折りたたむ",
   "palette.command.create_branch": "ここにブランチを作成…",
+  "palette.command.create_merge_request": "マージリクエストを作成…",
+  "palette.command.create_pull_request": "プルリクエストを作成…",
   "palette.command.create_tag": "ここにタグを作成…",
   "palette.command.expand_idle_lanes": "グラフの未使用レーンを展開",
   "palette.command.fetch_all": "すべてのリモートをフェッチ",

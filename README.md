@@ -51,8 +51,24 @@
 **🌳 Worktrees**
 - Worktree switcher and a worktree manager: add, move, lock, unlock, remove and prune
 
+**🔗 Hosting services**
+- Accounts for GitHub, GitLab, Gitea/Forgejo (Codeberg), Bitbucket and Azure DevOps,
+  including self-hosted instances and several accounts on the same service
+- Sign in with a personal access token, or with the browser for github.com; import logins
+  from the `gh` and `glab` command-line tools
+- Each remote shows its service and the account in use; git over HTTPS uses that account's
+  token automatically. Remotes with several push URLs push to each and report every result
+- Open a commit, branch, tag, file, blame or remote on its host (no account needed)
+- Clone from an account's repository list
+- Pull request badges on branches, CI status on commits and checks in commit details
+- Create pull requests from a branch and browse them in a sidebar panel (mine, review
+  requested, all), with checkout of a pull request into a local branch
+
+Pull requests, CI status and creating pull requests work with GitHub, GitLab and Gitea/Forgejo;
+Bitbucket and Azure DevOps support accounts, git over HTTPS and opening links on the host.
+
 **🔐 Credentials and SSH**
-- Credential prompts for HTTPS remotes and a trust-on-first-use dialog for SSH host keys
+- Credential prompts for HTTPS remotes without an account, and a trust-on-first-use dialog for SSH host keys
 - Settings page for SSH keys: list, generate and import keys, ssh-agent status, trusted hosts
 
 **🎨 Interface**
@@ -134,6 +150,15 @@ GitWarp can send **crash reports** (panics) to [Sentry](https://sentry.io), and 
 - Switch it off in **Settings → General → Privacy**. The change takes effect immediately,
   without a restart. The switch is on by default.
 - Builds from source send nothing: the Sentry address is compiled in only by the release workflow.
+
+Hosting services:
+
+- GitWarp contacts a hosting service only for the remotes of the open repository, for
+  accounts you add, and when you sign in. Nothing goes through a GitWarp server.
+- Account tokens are stored in the OS keychain (macOS Keychain, Windows Credential Manager,
+  Secret Service on Linux), never in `settings.json`. On Linux a Secret Service provider
+  such as GNOME Keyring or KWallet must be running to add accounts.
+- A token is sent only to the instance of its own account.
 
 ## Languages
 

@@ -642,9 +642,10 @@
   };
 
   /* ---------- gallery page: one main window, a scenario switcher, the dialog on top ---------- */
-  D.page = function (title, scenes, centerFn) {
+  D.page = function (title, scenes, centerFn, o) {
+    o = o || {};
     document.title = 'GitWarp — ' + title;
-    const sel = `<label class="scn" style="display:inline-flex;gap:8px;align-items:center;font-size:12px">Dialog state <select id="scn" aria-label="Dialog state" style="height:24px;background:var(--bg);color:var(--text);border:1px solid var(--border-strong);border-radius:var(--r-sm)">${scenes.map((s, i) => `<option value="${i}">${esc(s[0])}</option>`).join('')}</select></label><button class="btn btn-sm" id="reopen">Reopen dialog</button>`;
+    const sel = `<label class="scn" style="display:inline-flex;gap:8px;align-items:center;font-size:12px">${o.label || 'Dialog state'} <select id="scn" aria-label="${o.label || 'Dialog state'}" style="height:24px;background:var(--bg);color:var(--text);border:1px solid var(--border-strong);border-radius:var(--r-sm)">${scenes.map((s, i) => `<option value="${i}">${esc(s[0])}</option>`).join('')}</select></label><button class="btn btn-sm" id="reopen">${o.reopen || 'Reopen dialog'}</button>`;
     G.stagebar(sel);
     const stage = G.h('<div class="stage"><div class="winwrap"></div></div>'); document.body.appendChild(stage);
     const sh = G.shell({ host: stage.firstChild, w: 1200, h: 800, view: 'history' });

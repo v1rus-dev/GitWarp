@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use forge::ServiceKind;
 use git_core::{Git, Head, Oid, Ref, RefKind, Repo, Stash, Submodule, SubmoduleState, Worktree};
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -23,6 +24,8 @@ use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_SM};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{Button, Chip, CountPill, Icon, IconName, Skeleton, Tooltip, TreeNodeData};
 
+use crate::remote_accounts::{self, RemoteDisplay, RemoteTargets};
+use crate::web_links::{self, HostLink};
 use crate::worktree_glyphs::{main_worktree_tip, worktree_glyphs};
 use crate::worktrees_model::WorktreeEntry;
 
@@ -84,6 +87,11 @@ pub struct SidebarExtras {
     pub remotes: Vec<String>,
     /// The fetch URL of every remote, for the Edit remote dialog.
     pub remote_urls: Vec<(String, String)>,
+    /// Fetch and push URLs of every remote, for the account chips and menus.
+    pub remote_targets: Vec<RemoteTargets>,
+    /// The canonical common git dir: the key of the remembered remote accounts,
+    /// shared by every worktree of the repository.
+    pub common_dir: Option<PathBuf>,
     /// `user.signingkey`, for the tag dialog's signing option.
     pub signing_key: Option<String>,
     pub stashes: Vec<Stash>,
@@ -105,7 +113,7 @@ pub(crate) fn read_sidebar_extras(git: Arc<Git>, root: &Path) -> SidebarExtras {
         log::warn!("could not list the remotes: {error}");
         Vec::new()
     });
-    let remote_urls = remotes
+    let remote_urls: Vec<(String, String)> = remotes
         .iter()
         .filter_map(|name| match repo.remote_url(name) {
             Ok(Some(url)) => Some((name.clone(), url)),
@@ -116,6 +124,20 @@ pub(crate) fn read_sidebar_extras(git: Arc<Git>, root: &Path) -> SidebarExtras {
             }
         })
         .collect();
+    let remote_targets = remote_urls
+        .iter()
+        .map(|(name, fetch_url)| RemoteTargets {
+            name: name.clone(),
+            fetch_url: fetch_url.clone(),
+            push_urls: repo.remote_push_urls(name).unwrap_or_else(|error| {
+                log::warn!("could not read the push URLs of {name}: {error}");
+                Vec::new()
+            }),
+        })
+        .collect();
+    let common_dir = git_core::common_dir(&repo)
+        .map_err(|error| log::warn!("could not find the common git dir: {error}"))
+        .ok();
     let signing_key = repo.signing_key().unwrap_or_else(|error| {
         log::warn!("could not read the signing key: {error}");
         None
@@ -135,6 +157,8 @@ pub(crate) fn read_sidebar_extras(git: Arc<Git>, root: &Path) -> SidebarExtras {
     SidebarExtras {
         remotes,
         remote_urls,
+        remote_targets,
+        common_dir,
         signing_key,
         stashes,
         worktrees,
@@ -192,6 +216,11 @@ pub enum SidebarAction {
     None,
     /// Writes this text to the clipboard.
     CopyText(String),
+    /// Opens `url` in the browser and toasts that `host` was opened.
+    OpenUrl {
+        url: String,
+        host: String,
+    },
     /// Reloads the sidebar's lists ([`RepositoryView::refresh`]).
     ///
     /// [`RepositoryView::refresh`]: crate::repo_view::RepositoryView::refresh
@@ -204,6 +233,8 @@ pub enum SidebarAction {
     CheckoutTag(String),
     /// Opens "Create branch here" at `oid`.
     CreateBranchAt(Oid),
+    /// Opens "Create pull request" for a local branch.
+    CreatePullRequest(String),
     RenameBranch(String),
     DeleteBranch(String),
     RenameTag(String),
@@ -216,6 +247,12 @@ pub enum SidebarAction {
     CreateTag,
     /// Opens the add-remote dialog.
     AddRemote,
+    /// Account… of a remote: picker, Add account dialog or an info toast.
+    RemoteAccount(String),
+    /// "Accounts for push URLs…" of a multi-push remote: an info toast.
+    RemotePushAccounts(String),
+    /// "Add account for <host>" row under a remote.
+    AddAccountFor(String),
     EditRemote(String),
     RemoveRemote(String),
     /// Fetches one remote (`origin`, `upstream`, …).
@@ -346,6 +383,41 @@ pub fn sidebar_menu(
     extras: Option<&SidebarExtras>,
     refs: Option<&[Ref]>,
 ) -> Vec<SidebarMenuEntry> {
+    sidebar_menu_with_links(key, head, extras, refs, &[])
+}
+
+/// "Open on <Service>" for `target` on the host of `link`; `None` when the
+/// service has no such page.
+fn open_item(link: &HostLink, target: &forge::WebTarget) -> Option<SidebarMenuEntry> {
+    let url = link.url(target)?;
+    Some(
+        item(
+            &ui::t!("sidebar.menu.open_on_host", service = link.service_name()),
+            IconName::External,
+        )
+        .action(SidebarAction::OpenUrl {
+            url,
+            host: link.host().to_owned(),
+        }),
+    )
+}
+
+/// [`sidebar_menu`] plus the "Open on <Service>" items of the repository's
+/// hosts (`links`, see [`web_links::host_links`]); an empty list hides them.
+pub fn sidebar_menu_with_links(
+    key: &str,
+    head: Option<&Head>,
+    extras: Option<&SidebarExtras>,
+    refs: Option<&[Ref]>,
+    links: &[HostLink],
+) -> Vec<SidebarMenuEntry> {
+    let targets: &[RemoteTargets] = extras.map_or(&[], |e| &e.remote_targets);
+    // The branch's own page on its host; hidden without a host, and for a
+    // local branch without an upstream.
+    let branch_open = |key: &str| {
+        let (link, target) = web_links::branch_target(links, targets, refs.unwrap_or(&[]), key)?;
+        open_item(link, &target)
+    };
     let head = match head {
         Some(Head::Branch { name, .. }) => name.as_str(),
         Some(Head::Detached(_)) | None => "HEAD",
@@ -355,7 +427,7 @@ pub fn sidebar_menu(
     // stay shown-but-disabled.
     if let Some(name) = key.strip_prefix("local:") {
         let current = name == head;
-        return vec![
+        let mut entries = vec![
             item(&ui::t!("sidebar.menu.checkout"), IconName::Check)
                 .shortcut("Enter")
                 .maybe_action((!current).then(|| SidebarAction::CheckoutBranch(name.to_owned()))),
@@ -383,12 +455,19 @@ pub fn sidebar_menu(
                 .shortcut("Del")
                 .maybe_action((!current).then(|| SidebarAction::DeleteBranch(name.to_owned()))),
             SidebarMenuEntry::Separator,
+        ];
+        if let Some(open) = branch_open(key) {
+            entries.push(open);
+            entries.push(SidebarMenuEntry::Separator);
+        }
+        entries.push(
             item(&ui::t!("sidebar.menu.copy_branch_name"), IconName::Copy)
                 .action(SidebarAction::CopyText(name.to_owned())),
-        ];
+        );
+        return entries;
     }
     if let Some(name) = key.strip_prefix("rbranch:") {
-        return vec![
+        let mut entries = vec![
             item(
                 &ui::t!("sidebar.menu.checkout_as_local_branch"),
                 IconName::Check,
@@ -411,9 +490,18 @@ pub fn sidebar_menu(
             )
             .danger()
             .action(SidebarAction::DeleteRemoteBranch(name.to_owned())),
+        ];
+        // Set apart from the group above only when there is something to set apart.
+        if let Some(open) = branch_open(key) {
+            entries.push(SidebarMenuEntry::Separator);
+            entries.push(open);
+            entries.push(SidebarMenuEntry::Separator);
+        }
+        entries.push(
             item(&ui::t!("sidebar.menu.copy_branch_name"), IconName::Copy)
                 .action(SidebarAction::CopyText(name.to_owned())),
-        ];
+        );
+        return entries;
     }
     if let Some(name) = key.strip_prefix("tag:") {
         let target = refs.and_then(|refs| {
@@ -421,7 +509,7 @@ pub fn sidebar_menu(
                 .find(|r| r.kind == RefKind::Tag && r.name == name)
                 .map(|r| r.target)
         });
-        return vec![
+        let mut entries = vec![
             item(&ui::t!("sidebar.menu.checkout"), IconName::Check)
                 .shortcut("Enter")
                 .action(SidebarAction::CheckoutTag(name.to_owned())),
@@ -430,6 +518,16 @@ pub fn sidebar_menu(
             item(&ui::t!("sidebar.menu.push_tag_to_origin"), IconName::Up)
                 .action(SidebarAction::PushTag(name.to_owned())),
             SidebarMenuEntry::Separator,
+        ];
+        // Tags are opened on the first host (the upstream's, else origin's).
+        if let Some(open) = links
+            .first()
+            .and_then(|link| open_item(link, &forge::WebTarget::Tag(name.to_owned())))
+        {
+            entries.push(open);
+            entries.push(SidebarMenuEntry::Separator);
+        }
+        entries.extend([
             item(&ui::t!("sidebar.menu.rename_tag"), IconName::Edit)
                 .shortcut("F2")
                 .action(SidebarAction::RenameTag(name.to_owned())),
@@ -437,7 +535,8 @@ pub fn sidebar_menu(
                 .danger()
                 .shortcut("Del")
                 .action(SidebarAction::DeleteTag(name.to_owned())),
-        ];
+        ]);
+        return entries;
     }
     if let Some(index) = key.strip_prefix("stash:") {
         let index = index.parse::<usize>().ok();
@@ -456,16 +555,34 @@ pub fn sidebar_menu(
         ];
     }
     if let Some(name) = key.strip_prefix("remote:") {
-        return vec![
+        let multi_push = extras
+            .and_then(|extras| extras.remote_targets.iter().find(|t| t.name == name))
+            .is_some_and(remote_accounts::is_multi_push);
+        let mut entries = vec![
             item(&ui::t!("sidebar.menu.fetch"), IconName::Fetch)
                 .action(SidebarAction::FetchRemote(name.to_owned())),
             item(&ui::t!("sidebar.menu.edit_remote"), IconName::Edit)
                 .action(SidebarAction::EditRemote(name.to_owned())),
-            item(&ui::t!("sidebar.menu.remove_remote"), IconName::Trash)
+            SidebarMenuEntry::Separator,
+            if multi_push {
+                item(&ui::t!("sidebar.menu.push_accounts"), IconName::User)
+                    .action(SidebarAction::RemotePushAccounts(name.to_owned()))
+            } else {
+                item(&ui::t!("sidebar.menu.account"), IconName::User)
+                    .action(SidebarAction::RemoteAccount(name.to_owned()))
+            },
+        ];
+        // The repository page of the remote's own host.
+        let remote_link = links.iter().find(|link| link.fetches(name));
+        entries.extend(remote_link.and_then(|link| open_item(link, &forge::WebTarget::Repo)));
+        entries.push(SidebarMenuEntry::Separator);
+        entries.extend(
+            [item(&ui::t!("sidebar.menu.remove_remote"), IconName::Trash)
                 .danger()
                 .shortcut("Del")
-                .action(SidebarAction::RemoveRemote(name.to_owned())),
-        ];
+                .action(SidebarAction::RemoveRemote(name.to_owned()))],
+        );
+        return entries;
     }
     if let Some(path) = key.strip_prefix("wt:") {
         let locked = extras
@@ -593,6 +710,40 @@ fn item(label: &str, icon: IconName) -> SidebarMenuEntry {
     SidebarMenuEntry::Item(SidebarMenuItem::new(label, icon))
 }
 
+/// Adds "Create pull request…" (GitLab: "Create merge request…") to the menu
+/// of the local branch `branch`: right after "Open on <Service>" when the menu
+/// has one, else in the group above "Copy branch name".
+pub fn with_create_pull_request(
+    entries: &mut Vec<SidebarMenuEntry>,
+    branch: &str,
+    kind: forge::ServiceKind,
+) {
+    let label = match kind {
+        forge::ServiceKind::GitLab => ui::t!("sidebar.menu.create_merge_request"),
+        _ => ui::t!("sidebar.menu.create_pull_request"),
+    };
+    let create =
+        item(&label, IconName::Pr).action(SidebarAction::CreatePullRequest(branch.to_owned()));
+    let open = entries.iter().position(|entry| {
+        matches!(
+            entry,
+            SidebarMenuEntry::Item(SidebarMenuItem {
+                action: SidebarAction::OpenUrl { .. },
+                ..
+            })
+        )
+    });
+    match open {
+        Some(index) => entries.insert(index + 1, create),
+        // `…, Separator, Copy branch name`: the item joins a group of its own.
+        None => {
+            let at = entries.len().saturating_sub(1);
+            entries.insert(at, SidebarMenuEntry::Separator);
+            entries.insert(at, create);
+        }
+    }
+}
+
 /// Builds the visible sidebar rows.
 ///
 /// `refs` is `None` while they load or after a failure: then the ref-based
@@ -605,10 +756,49 @@ fn item(label: &str, icon: IconName) -> SidebarMenuEntry {
 /// leaves that match (and the folders and remotes above them) are built, each
 /// section's count becomes its number of matches, and a section without one
 /// disappears; an empty result means "no matches at all".
+#[cfg(test)]
 pub fn sidebar_nodes(
     refs: Option<&[Ref]>,
     head: Option<&Head>,
     extras: Option<&SidebarExtras>,
+    expansion: &Expansion,
+    filter: &str,
+    selected: Option<&str>,
+) -> Vec<TreeNodeData> {
+    sidebar_nodes_with(
+        refs,
+        head,
+        extras,
+        &RemoteDisplays::new(),
+        expansion,
+        filter,
+        selected,
+    )
+}
+
+/// The icon of a remote row: the GitHub mark, a bordered monogram for the
+/// other services, the generic cloud when the service is unknown.
+fn service_icon(node: TreeNodeData, service: Option<ServiceKind>) -> TreeNodeData {
+    match service {
+        Some(ServiceKind::GitHub) => node.icon(IconName::Github),
+        Some(kind) => node
+            .icon(IconName::Cloud)
+            .badge(crate::accounts::monogram(kind)),
+        None => node.icon(IconName::Cloud),
+    }
+}
+
+/// What the sidebar shows per remote, by remote name; see
+/// [`remote_accounts::display`].
+pub type RemoteDisplays = HashMap<String, RemoteDisplay>;
+
+/// [`sidebar_nodes`] with the account chips, "Add account" rows and push URL
+/// rows of the remotes in `remotes`.
+pub fn sidebar_nodes_with(
+    refs: Option<&[Ref]>,
+    head: Option<&Head>,
+    extras: Option<&SidebarExtras>,
+    remotes: &RemoteDisplays,
     expansion: &Expansion,
     filter: &str,
     selected: Option<&str>,
@@ -619,6 +809,7 @@ pub fn sidebar_nodes(
         refs,
         head,
         extras,
+        remotes,
         expansion,
         filter,
         selected,
@@ -630,6 +821,7 @@ struct Builder<'a> {
     refs: Option<&'a [Ref]>,
     head: Option<&'a Head>,
     extras: Option<&'a SidebarExtras>,
+    remotes: &'a RemoteDisplays,
     expansion: &'a Expansion,
     /// Lowercased, trimmed and non-empty; `None` when not filtering.
     filter: Option<&'a str>,
@@ -889,6 +1081,7 @@ impl Builder<'_> {
             // A remote with no branches is still shown, just empty.
             built.push(self.remote_node(name, &key, expanded));
             if expanded {
+                built.extend(self.remote_account_rows(name));
                 for (label, reference) in branches {
                     built.push(self.remote_branch(reference, label));
                 }
@@ -920,13 +1113,68 @@ impl Builder<'_> {
     }
 
     fn remote_node(&self, name: &str, key: &str, expanded: bool) -> TreeNodeData {
-        TreeNodeData::new(name.to_owned())
+        let display = self.remotes.get(name);
+        let node = TreeNodeData::new(name.to_owned())
             .key(key.to_owned())
             .level(1)
-            .icon(IconName::Cloud)
             .has_children(true)
             .expanded(expanded)
-            .selected(self.selected == Some(key))
+            .selected(self.selected == Some(key));
+        let mut node = service_icon(node, display.and_then(|d| d.service));
+        if let Some(chip) = display.and_then(|d| d.chip.as_ref()) {
+            node = node.chip(
+                chip.text.clone(),
+                chip.warn,
+                Some(chip.tooltip.clone().into()),
+            );
+        }
+        if let Some(tooltip) = display.and_then(|d| d.tooltip.as_ref()) {
+            node = node.tooltip(tooltip.clone());
+        }
+        node
+    }
+
+    /// The rows between a remote and its branches: "Add account for <host>",
+    /// or the `fetch →` and `push →` rows of a multi-push remote.
+    fn remote_account_rows(&self, name: &str) -> Vec<TreeNodeData> {
+        let Some(display) = self.remotes.get(name) else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        if let Some(add) = &display.add_account {
+            let key = format!("addacc:{name}");
+            rows.push(
+                TreeNodeData::new(add.label.clone())
+                    .key(key.clone())
+                    .level(2)
+                    .icon(IconName::Plus)
+                    .accent()
+                    .tooltip(add.tooltip.clone())
+                    .selected(self.selected == Some(key.as_str())),
+            );
+        }
+        let account_row = |key: String, row: &remote_accounts::PushRow| {
+            let node = TreeNodeData::new(row.label.clone())
+                .key(key.clone())
+                .level(2)
+                .selected(self.selected == Some(key.as_str()));
+            let mut node = service_icon(node, row.service);
+            if let Some(chip) = &row.chip {
+                node = node.chip(
+                    chip.text.clone(),
+                    chip.warn,
+                    Some(chip.tooltip.clone().into()),
+                );
+            }
+            node
+        };
+        if let Some(fetch) = &display.fetch {
+            rows.push(account_row(format!("fetchurl:{name}"), fetch));
+        }
+        for (index, push) in display.pushes.iter().enumerate() {
+            rows.push(account_row(format!("pushurl:{name}:{index}"), push));
+        }
+        rows
     }
 
     fn remote_branch(&self, reference: &Ref, label: &str) -> TreeNodeData {
@@ -2599,6 +2847,215 @@ mod tests {
             .collect()
     }
 
+    fn hosted_ref(name: &str, kind: RefKind, upstream: Option<&str>) -> Ref {
+        Ref {
+            full_name: format!("refs/{name}"),
+            name: name.to_owned(),
+            kind,
+            target: oid_of(0x01),
+            upstream: upstream.map(str::to_owned),
+            ahead: 0,
+            behind: 0,
+            upstream_gone: false,
+        }
+    }
+
+    fn hosted_extras(urls: &[(&str, &str)]) -> SidebarExtras {
+        SidebarExtras {
+            remote_targets: urls
+                .iter()
+                .map(|(name, url)| RemoteTargets {
+                    name: (*name).to_owned(),
+                    fetch_url: (*url).to_owned(),
+                    push_urls: vec![(*url).to_owned()],
+                })
+                .collect(),
+            ..SidebarExtras::default()
+        }
+    }
+
+    #[test]
+    fn create_pull_request_follows_open_on_host_or_joins_the_copy_group() {
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: None,
+        };
+        let extras = hosted_extras(&[("origin", "git@github.com:o/r.git")]);
+        let refs = [
+            hosted_ref("main", RefKind::LocalBranch, Some("origin/main")),
+            hosted_ref("loose", RefKind::LocalBranch, None),
+        ];
+        let links = web_links::host_links(&[], &extras.remote_targets, None);
+
+        // A branch with an upstream has "Open on GitHub": the new item follows it.
+        let mut with_open = sidebar_menu_with_links(
+            "local:main",
+            Some(&head),
+            Some(&extras),
+            Some(&refs),
+            &links,
+        );
+        with_create_pull_request(&mut with_open, "main", forge::ServiceKind::GitHub);
+        let labels = menu_labels(&with_open);
+        let open = labels.iter().position(|l| *l == "Open on GitHub").unwrap();
+        assert_eq!(labels[open + 1], "Create pull request…");
+        assert_eq!(labels.last(), Some(&"Copy branch name"));
+
+        // Without an upstream there is no "Open on": a group of its own above Copy.
+        let mut without = sidebar_menu_with_links(
+            "local:loose",
+            Some(&head),
+            Some(&extras),
+            Some(&refs),
+            &links,
+        );
+        with_create_pull_request(&mut without, "loose", forge::ServiceKind::GitLab);
+        let labels = menu_labels(&without);
+        let n = labels.len();
+        assert_eq!(
+            &labels[n - 4..],
+            ["—", "Create merge request…", "—", "Copy branch name"]
+        );
+        let SidebarMenuEntry::Item(item) = &without[n - 3] else {
+            panic!("an item")
+        };
+        assert!(item.enabled);
+        assert_eq!(
+            item.action,
+            SidebarAction::CreatePullRequest("loose".to_owned())
+        );
+    }
+
+    #[test]
+    fn open_on_host_items_follow_the_design_order() {
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: None,
+        };
+        let extras = hosted_extras(&[("origin", "git@github.com:o/r.git")]);
+        let refs = [
+            hosted_ref("main", RefKind::LocalBranch, Some("origin/main")),
+            hosted_ref("loose", RefKind::LocalBranch, None),
+            hosted_ref("v1", RefKind::Tag, None),
+        ];
+        let links = web_links::host_links(&[], &extras.remote_targets, None);
+        let menu = |key: &str| {
+            sidebar_menu_with_links(key, Some(&head), Some(&extras), Some(&refs), &links)
+        };
+        let labels = |key: &str| {
+            menu(key)
+                .iter()
+                .map(|entry| match entry {
+                    SidebarMenuEntry::Item(item) => item.label.clone(),
+                    SidebarMenuEntry::Separator => "—".to_owned(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let local = labels("local:main");
+        assert_eq!(
+            local[local.len() - 4..],
+            ["—", "Open on GitHub", "—", "Copy branch name"]
+        );
+        // No upstream, no page on the host.
+        assert!(!labels("local:loose")
+            .iter()
+            .any(|l| l.starts_with("Open on")));
+        assert_eq!(
+            labels("rbranch:origin/dev")[3..],
+            [
+                "—",
+                "Delete remote branch…",
+                "—",
+                "Open on GitHub",
+                "—",
+                "Copy branch name"
+            ]
+        );
+        let tag = labels("tag:v1");
+        assert_eq!(
+            tag[2..],
+            [
+                "Push tag to origin",
+                "—",
+                "Open on GitHub",
+                "—",
+                "Rename tag…",
+                "Delete tag"
+            ]
+        );
+        assert_eq!(
+            labels("remote:origin"),
+            [
+                "Fetch",
+                "Edit remote…",
+                "—",
+                "Account…",
+                "Open on GitHub",
+                "—",
+                "Remove remote"
+            ]
+        );
+
+        let open = |key: &str| {
+            menu(key).into_iter().find_map(|entry| match entry {
+                SidebarMenuEntry::Item(item) => match item.action {
+                    SidebarAction::OpenUrl { url, host } => Some((url, host)),
+                    _ => None,
+                },
+                SidebarMenuEntry::Separator => None,
+            })
+        };
+        let github = |url: &str| Some((url.to_owned(), "github.com".to_owned()));
+        assert_eq!(
+            open("local:main"),
+            github("https://github.com/o/r/tree/main")
+        );
+        assert_eq!(
+            open("rbranch:origin/dev"),
+            github("https://github.com/o/r/tree/dev")
+        );
+        assert_eq!(
+            open("tag:v1"),
+            github("https://github.com/o/r/releases/tag/v1")
+        );
+        assert_eq!(open("remote:origin"), github("https://github.com/o/r"));
+    }
+
+    #[test]
+    fn without_a_known_host_the_menus_are_unchanged() {
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: None,
+        };
+        let extras = hosted_extras(&[("origin", "https://git.corp.example/o/r.git")]);
+        let refs = [hosted_ref(
+            "main",
+            RefKind::LocalBranch,
+            Some("origin/main"),
+        )];
+        let links = web_links::host_links(&[], &extras.remote_targets, None);
+        assert!(links.is_empty());
+        for key in [
+            "local:main",
+            "rbranch:origin/main",
+            "tag:v1",
+            "remote:origin",
+        ] {
+            assert_eq!(
+                menu_labels(&sidebar_menu_with_links(
+                    key,
+                    Some(&head),
+                    Some(&extras),
+                    Some(&refs),
+                    &links
+                )),
+                menu_labels(&sidebar_menu(key, Some(&head), Some(&extras), Some(&refs))),
+                "{key}"
+            );
+        }
+    }
+
     #[test]
     fn submodule_menu_enables_open_only_when_initialised() {
         let extras = SidebarExtras {
@@ -2718,7 +3175,14 @@ mod tests {
                 Some(&extras),
                 None
             )),
-            vec!["Fetch", "Edit remote…", "Remove remote"]
+            vec![
+                "Fetch",
+                "Edit remote…",
+                "—",
+                "Account…",
+                "—",
+                "Remove remote"
+            ]
         );
         assert_eq!(
             menu_labels(&sidebar_menu(
@@ -2912,7 +3376,7 @@ mod tests {
                 // Open in new window stays disabled: this fixture has no
                 // initialised `vendor/a`.
                 "sub:vendor/a" => &["Update submodule"],
-                "remote:origin" => &["Fetch", "Edit remote…", "Remove remote"],
+                "remote:origin" => &["Fetch", "Edit remote…", "Account…", "Remove remote"],
                 "wt:/tmp/wt" => &[
                     "Open in new window",
                     "Rename worktree…",
@@ -3193,5 +3657,250 @@ mod tests {
         );
         // The separator sits between Copy path and Lock/Unlock.
         assert!(worktree_menu(&linked)[4].is_none());
+    }
+
+    fn targets(name: &str, fetch: &str, push: &[&str]) -> RemoteTargets {
+        RemoteTargets {
+            name: name.to_owned(),
+            fetch_url: fetch.to_owned(),
+            push_urls: push.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_remote_menu_names_account_for_a_plain_and_a_multi_push_remote() {
+        let extras = SidebarExtras {
+            remotes: vec!["origin".into(), "publish".into()],
+            remote_targets: vec![
+                targets(
+                    "origin",
+                    "https://github.com/a/b.git",
+                    &["https://github.com/a/b.git"],
+                ),
+                targets(
+                    "publish",
+                    "https://github.com/a/b.git",
+                    &["https://github.com/a/b.git", "https://codeberg.org/a/b.git"],
+                ),
+            ],
+            ..Default::default()
+        };
+        let plain = sidebar_menu("remote:origin", None, Some(&extras), None);
+        assert_eq!(
+            menu_labels(&plain),
+            vec![
+                "Fetch",
+                "Edit remote…",
+                "—",
+                "Account…",
+                "—",
+                "Remove remote"
+            ]
+        );
+        assert_eq!(
+            menu_item(&plain, "Account…").action,
+            SidebarAction::RemoteAccount("origin".into())
+        );
+        let multi = sidebar_menu("remote:publish", None, Some(&extras), None);
+        assert_eq!(
+            menu_labels(&multi),
+            vec![
+                "Fetch",
+                "Edit remote…",
+                "—",
+                "Accounts for push URLs…",
+                "—",
+                "Remove remote"
+            ]
+        );
+        assert_eq!(
+            menu_item(&multi, "Accounts for push URLs…").action,
+            SidebarAction::RemotePushAccounts("publish".into())
+        );
+    }
+
+    fn chip_of(text: &str, warn: bool) -> remote_accounts::Chip {
+        remote_accounts::Chip {
+            text: text.to_owned(),
+            warn,
+            tooltip: format!("tip {text}"),
+        }
+    }
+
+    fn display_with(chip: Option<&str>, add: bool) -> RemoteDisplay {
+        RemoteDisplay {
+            service: Some(ServiceKind::GitHub),
+            chip: chip.map(|text| chip_of(text, true)),
+            tooltip: Some("origin · github.com".into()),
+            add_account: add.then(|| remote_accounts::AddAccount {
+                kind: ServiceKind::GitHub,
+                host: "github.com".into(),
+                label: "Add account for github.com".into(),
+                tooltip: "Add an account for github.com and use it for origin".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_remote_row_carries_its_chip_and_an_add_account_row_comes_first() {
+        let refs = [reference(RefKind::RemoteBranch, "origin/main")];
+        let extras = SidebarExtras {
+            remotes: vec!["origin".to_owned()],
+            ..Default::default()
+        };
+        let mut remotes = RemoteDisplays::new();
+        remotes.insert("origin".into(), display_with(Some("no account"), true));
+        let nodes = sidebar_nodes_with(
+            Some(&refs),
+            None,
+            Some(&extras),
+            &remotes,
+            &Expansion::default(),
+            "",
+            None,
+        );
+        let origin = find(&nodes, "remote:origin").unwrap();
+        assert_eq!(origin.icon, Some(IconName::Github));
+        assert_eq!(
+            origin.trailing,
+            Some(TreeNodeTrailing::Chip {
+                text: "no account".into(),
+                warn: true,
+                tooltip: Some("tip no account".into())
+            })
+        );
+        assert_eq!(origin.tooltip.as_deref(), Some("origin · github.com"));
+        let add = find(&nodes, "addacc:origin").unwrap();
+        assert_eq!(add.label, "Add account for github.com");
+        assert_eq!((add.level, add.icon), (2, Some(IconName::Plus)));
+        assert!(add.accent);
+        assert_eq!(
+            add.tooltip.as_deref(),
+            Some("Add an account for github.com and use it for origin")
+        );
+        let at = |key: &str| nodes.iter().position(|n| n.key == key).unwrap();
+        assert!(at("remote:origin") < at("addacc:origin"));
+        assert!(at("addacc:origin") < at("rbranch:origin/main"));
+        // Without displays the row is the plain cloud, no chip.
+        let plain = sidebar_nodes(
+            Some(&refs),
+            None,
+            Some(&extras),
+            &Expansion::default(),
+            "",
+            None,
+        );
+        let origin = find(&plain, "remote:origin").unwrap();
+        assert_eq!(
+            (origin.icon, origin.trailing.clone()),
+            (Some(IconName::Cloud), None)
+        );
+        assert!(find(&plain, "addacc:origin").is_none());
+    }
+
+    #[test]
+    fn a_service_without_an_icon_gets_its_monogram_badge() {
+        let extras = SidebarExtras {
+            remotes: vec!["work".to_owned()],
+            ..Default::default()
+        };
+        let mut remotes = RemoteDisplays::new();
+        remotes.insert(
+            "work".into(),
+            RemoteDisplay {
+                service: Some(ServiceKind::GitLab),
+                ..Default::default()
+            },
+        );
+        let nodes = sidebar_nodes_with(
+            Some(&[]),
+            None,
+            Some(&extras),
+            &remotes,
+            &Expansion::default(),
+            "",
+            None,
+        );
+        let work = find(&nodes, "remote:work").unwrap();
+        assert_eq!(work.badge.as_deref(), Some("GL"));
+        assert_eq!(work.icon, Some(IconName::Cloud));
+    }
+
+    #[test]
+    fn a_multi_push_remote_lists_fetch_and_push_rows_before_the_branches() {
+        let refs = [reference(RefKind::RemoteBranch, "publish/main")];
+        let extras = SidebarExtras {
+            remotes: vec!["publish".to_owned()],
+            ..Default::default()
+        };
+        let row = |label: &str, service, chip: Option<&str>| remote_accounts::PushRow {
+            host: String::new(),
+            label: label.to_owned(),
+            service: Some(service),
+            chip: chip.map(|text| chip_of(text, false)),
+        };
+        let mut remotes = RemoteDisplays::new();
+        remotes.insert(
+            "publish".into(),
+            RemoteDisplay {
+                service: None,
+                chip: Some(chip_of("2 push URLs", false)),
+                tooltip: Some("publish · pushes to 2 targets".into()),
+                add_account: None,
+                fetch: Some(row(
+                    "fetch → github.com",
+                    ServiceKind::GitHub,
+                    Some("mira-k"),
+                )),
+                pushes: vec![
+                    row("push → github.com", ServiceKind::GitHub, Some("mira-k")),
+                    row("push → codeberg.org", ServiceKind::Gitea, None),
+                ],
+            },
+        );
+        let nodes = sidebar_nodes_with(
+            Some(&refs),
+            None,
+            Some(&extras),
+            &remotes,
+            &Expansion::default(),
+            "",
+            None,
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .skip(2)
+                .take(5)
+                .map(|n| (n.label.as_ref(), n.level))
+                .collect::<Vec<_>>(),
+            vec![
+                ("publish", 1),
+                ("fetch → github.com", 2),
+                ("push → github.com", 2),
+                ("push → codeberg.org", 2),
+                ("main", 2)
+            ]
+        );
+        let publish = find(&nodes, "remote:publish").unwrap();
+        assert_eq!(publish.icon, Some(IconName::Cloud));
+        assert_eq!(
+            publish.tooltip.as_deref(),
+            Some("publish · pushes to 2 targets")
+        );
+        let chip = |key: &str| match &find(&nodes, key).unwrap().trailing {
+            Some(TreeNodeTrailing::Chip { text, .. }) => Some(text.to_string()),
+            _ => None,
+        };
+        assert_eq!(chip("remote:publish").as_deref(), Some("2 push URLs"));
+        assert_eq!(chip("fetchurl:publish").as_deref(), Some("mira-k"));
+        assert_eq!(chip("pushurl:publish:0").as_deref(), Some("mira-k"));
+        assert_eq!(chip("pushurl:publish:1"), None);
+        // Gitea has no icon of its own: the badge stands in.
+        assert_eq!(
+            find(&nodes, "pushurl:publish:1").unwrap().badge.as_deref(),
+            Some("GT")
+        );
     }
 }

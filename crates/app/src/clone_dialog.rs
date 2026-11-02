@@ -8,26 +8,57 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, App, AppContext, ClickEvent, Context, Entity, ParentElement, SharedString, Styled,
-    Subscription, WeakEntity, Window,
+    div, px, AnyElement, App, AppContext, ClickEvent, Context, ElementId, Entity, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window,
 };
+
+use forge::api::{RepoListing, RepoSummary};
 
 use git_core::network::{self, CancelToken, CloneKind, CloneOptions, CloneTarget, NetworkContext};
 use git_core::{Error, Git, Repo};
-use ui::metrics::{FONT_MONO, FS_SM};
+use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
+use ui::metrics::{FONT_MONO, FS_SM, R_MD};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    dialog, overlay, toast, Banner, BannerKind, Button, Checkbox, Dialog, DialogFocus, DialogHost,
-    Icon, IconName, Progress, Spinner, TextInput, TextInputEvent, ToastKind,
+    dialog, overlay, toast, Banner, BannerKind, Button, Checkbox, Chip, Dialog, DialogFocus,
+    DialogHost, Icon, IconName, Progress, SegmentItem, Segmented, Select, Skeleton, Spinner,
+    TextInput, TextInputEvent, ToastKind,
 };
 
-use crate::format::{display_path, expand_home, home_dir};
+use crate::accounts::{self, CloneTab, RepoListError};
+use crate::format::{display_path, expand_home, home_dir, relative_time};
 use crate::network_ops::{self, friendly_error};
-use crate::network_service::{HostKeyAsker, NetworkService};
+use crate::network_service::{HostKeyAsker, JobAuth, NetworkService};
 use crate::open_dialog::{pick_folder, Browse};
+use crate::settings::AccountRecord;
+use crate::settings_ui::account_dialog::{self, AccountDialog, Open as AccountOpen};
 use crate::workspace::{repo_name, Workspace};
 
 const CLONE_TIMEOUT: Duration = Duration::from_millis(80);
+
+/// How the keyboard moves the selection in the repository list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Move {
+    Next,
+    Prev,
+    First,
+    Last,
+}
+
+/// The repository selected after `movement`, from the indexes the search
+/// shows. A selection the search hides counts as none; the ends clamp.
+fn next_selection(visible: &[usize], current: Option<usize>, movement: Move) -> Option<usize> {
+    let last = visible.len().checked_sub(1)?;
+    let position = current.and_then(|c| visible.iter().position(|i| *i == c));
+    let target = match (movement, position) {
+        (Move::First, _) | (Move::Next, None) => 0,
+        (Move::Last, _) | (Move::Prev, None) => last,
+        (Move::Next, Some(p)) => (p + 1).min(last),
+        (Move::Prev, Some(p)) => p.saturating_sub(1),
+    };
+    visible.get(target).copied()
+}
 
 /// What the dialog is doing.
 enum Phase {
@@ -35,6 +66,17 @@ enum Phase {
     Cloning,
     Done(CloneDone),
     Failed(CloneFailure),
+}
+
+/// What the "From account" list shows for the selected account.
+enum RepoList {
+    Loading,
+    Loaded {
+        repos: Vec<RepoSummary>,
+        /// The account has more repositories than were fetched.
+        truncated: bool,
+    },
+    Failed(RepoListError),
 }
 
 struct CloneFailure {
@@ -85,12 +127,35 @@ pub(crate) struct CloneDialog {
     recurse: bool,
     shallow: bool,
 
+    tab: CloneTab,
+    accounts: Vec<AccountRecord>,
+    account_index: usize,
+    repos: RepoList,
+    /// Indexes of the repositories the search shows; recomputed when the
+    /// query changes or a list loads, not on every render.
+    visible: Vec<usize>,
+    /// Index into the loaded repositories (not into the filtered list).
+    repo_selected: Option<usize>,
+    query: Entity<TextInput>,
+    _query_events: Subscription,
+    query_text: String,
+    /// Bumped by every load and account switch; a late answer is dropped.
+    list_generation: u64,
+    /// Keeps the Reconnect dialog alive; its layer holds only a weak handle.
+    account_dialog: Option<Entity<AccountDialog>>,
+    list_scroll: ScrollHandle,
+
     phase: Phase,
     progress: Option<f32>,
     phase_text: SharedString,
     cancel: CancelToken,
     generation: u64,
 
+    url_tab_focus: gpui::FocusHandle,
+    account_tab_focus: gpui::FocusHandle,
+    account_focus: gpui::FocusHandle,
+    query_focus: gpui::FocusHandle,
+    list_focus: gpui::FocusHandle,
     url_focus: gpui::FocusHandle,
     dest_focus: gpui::FocusHandle,
     browse_focus: gpui::FocusHandle,
@@ -145,6 +210,22 @@ impl CloneDialog {
             input.set_placeholder("1", cx);
             input
         });
+        let query = cx.new(|cx| {
+            let mut input = TextInput::new(window, cx);
+            input.set_placeholder(ui::t!("welcome.clone.search_placeholder"), cx);
+            input.set_disabled(true, cx);
+            input
+        });
+        let query_focus = query.read(cx).focus_handle().clone();
+        let query_events = cx.subscribe(&query, |this, _, event: &TextInputEvent, cx| {
+            if let TextInputEvent::Changed(text) = event {
+                this.query_text = text.clone();
+                this.refresh_visible();
+                cx.notify();
+            }
+        });
+        let accounts = crate::settings_ui::current_settings(cx).accounts;
+        let tab = accounts::default_clone_tab(accounts.len());
         let url_focus = url.read(cx).focus_handle().clone();
         let dest_focus = dest.read(cx).focus_handle().clone();
         let name_focus = name.read(cx).focus_handle().clone();
@@ -189,7 +270,7 @@ impl CloneDialog {
             }
         });
 
-        Self {
+        let mut this = Self {
             layer: None,
             host: None,
             workspace,
@@ -215,11 +296,28 @@ impl CloneDialog {
             updating_name: false,
             recurse: false,
             shallow: false,
+            tab,
+            accounts,
+            account_index: 0,
+            repos: RepoList::Loading,
+            visible: Vec::new(),
+            repo_selected: None,
+            query,
+            _query_events: query_events,
+            query_text: String::new(),
+            list_generation: 0,
+            account_dialog: None,
+            list_scroll: ScrollHandle::new(),
             phase: Phase::Form,
             progress: None,
             phase_text: SharedString::default(),
             cancel: CancelToken::new(),
             generation: 0,
+            url_tab_focus: cx.focus_handle().tab_stop(true),
+            account_tab_focus: cx.focus_handle().tab_stop(true),
+            account_focus: cx.focus_handle().tab_stop(true),
+            query_focus,
+            list_focus: cx.focus_handle().tab_stop(true),
             url_focus,
             dest_focus,
             browse_focus: cx.focus_handle().tab_stop(true),
@@ -231,6 +329,186 @@ impl CloneDialog {
             cancel_focus: cx.focus_handle().tab_stop(true),
             primary_focus: cx.focus_handle().tab_stop(true),
             secondary_focus: cx.focus_handle().tab_stop(true),
+        };
+        if this.tab == CloneTab::Account {
+            this.load_repos(cx);
+        }
+        this
+    }
+
+    /// The address that will be cloned: the typed one on the URL tab, the
+    /// selected repository's HTTPS address on the account tab.
+    fn current_url(&self) -> String {
+        match self.tab {
+            CloneTab::Url => self.url_text.clone(),
+            CloneTab::Account => self
+                .selected_repo()
+                .map(|repo| repo.clone_https.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn selected_repo(&self) -> Option<&RepoSummary> {
+        match &self.repos {
+            RepoList::Loaded { repos, .. } => repos.get(self.repo_selected?),
+            _ => None,
+        }
+    }
+
+    /// Indexes of the repositories the search lets through.
+    fn visible_repos(&self) -> &[usize] {
+        &self.visible
+    }
+
+    fn refresh_visible(&mut self) {
+        self.visible = match &self.repos {
+            RepoList::Loaded { repos, .. } => accounts::filter_repos(repos, &self.query_text),
+            _ => Vec::new(),
+        };
+    }
+
+    /// Whether the list is shown with rows to pick from.
+    fn list_has_rows(&self) -> bool {
+        !self.visible.is_empty()
+    }
+
+    fn current_account(&self) -> Option<&AccountRecord> {
+        self.accounts.get(self.account_index)
+    }
+
+    /// Starts loading the repositories of the selected account. The token is
+    /// read and used on the background executor only.
+    fn load_repos(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = self.current_account().cloned() else {
+            return;
+        };
+        self.list_generation = self.list_generation.wrapping_add(1);
+        let generation = self.list_generation;
+        self.repos = RepoList::Loading;
+        self.refresh_visible();
+        self.repo_selected = None;
+        self.query
+            .update(cx, |input, cx| input.set_disabled(true, cx));
+        let store = accounts::cached_store(cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = store.unwrap_or_else(accounts::resolve_store);
+                    accounts::list_account_repos(&store, &account)
+                })
+                .await;
+            this.update(cx, |dialog, cx| dialog.finish_load(generation, result, cx))
+                .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_load(
+        &mut self,
+        generation: u64,
+        result: Result<RepoListing, RepoListError>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.list_generation {
+            return;
+        }
+        let loaded = result.is_ok();
+        self.repos = match result {
+            Ok(listing) => RepoList::Loaded {
+                repos: listing.repos,
+                truncated: listing.truncated,
+            },
+            Err(error) => RepoList::Failed(error),
+        };
+        self.refresh_visible();
+        self.query
+            .update(cx, |input, cx| input.set_disabled(!loaded, cx));
+        cx.notify();
+    }
+
+    /// Switches account: selection and search start over, the list reloads.
+    fn select_account(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index == self.account_index || index >= self.accounts.len() {
+            return;
+        }
+        self.account_index = index;
+        self.reset_selection(cx);
+        self.load_repos(cx);
+    }
+
+    fn reset_selection(&mut self, cx: &mut Context<Self>) {
+        self.repo_selected = None;
+        self.query_text.clear();
+        self.refresh_visible();
+        self.query.update(cx, |input, cx| input.set_text("", cx));
+        self.name_edited = false;
+        self.apply_suggested_name(cx);
+    }
+
+    fn set_tab(&mut self, tab: CloneTab, cx: &mut Context<Self>) {
+        if tab == self.tab || (tab == CloneTab::Account && self.accounts.is_empty()) {
+            return;
+        }
+        self.tab = tab;
+        if !self.name_edited {
+            self.apply_suggested_name(cx);
+        }
+        cx.notify();
+    }
+
+    fn select_repo(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !matches!(&self.repos, RepoList::Loaded { repos, .. } if index < repos.len()) {
+            return;
+        }
+        self.repo_selected = Some(index);
+        // A new repository brings its own folder name.
+        self.name_edited = false;
+        self.apply_suggested_name(cx);
+        if let Some(position) = self.visible.iter().position(|i| *i == index) {
+            self.list_scroll.scroll_to_item(position);
+        }
+        cx.notify();
+    }
+
+    /// ↑ / ↓ / Home / End in the list move the selection through the
+    /// repositories the search shows.
+    fn move_selection(&mut self, movement: Move, cx: &mut Context<Self>) {
+        if let Some(index) = next_selection(&self.visible, self.repo_selected, movement) {
+            self.select_repo(index, cx);
+        }
+    }
+
+    /// Opens the account dialog on the token step; the list reloads when the
+    /// new token is saved.
+    fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(account) = self.current_account().cloned() else {
+            return;
+        };
+        let this = cx.weak_entity();
+        let on_saved: account_dialog::OnSaved = std::rc::Rc::new(move |record, _, cx| {
+            let id = record.id.clone();
+            this.update(cx, |dialog, cx| dialog.reconnected(&id, cx))
+                .ok();
+        });
+        self.account_dialog = Some(account_dialog::open(
+            AccountOpen::Reconnect(account),
+            None,
+            Some(on_saved),
+            window,
+            cx,
+        ));
+    }
+
+    /// The token of account `id` was replaced: reload its list.
+    fn reconnected(&mut self, id: &str, cx: &mut Context<Self>) {
+        // The login follows the token on Reconnect: take the saved record.
+        let saved = crate::settings_ui::current_settings(cx).accounts;
+        if let Some(index) = saved.iter().position(|account| account.id == id) {
+            self.accounts = saved;
+            self.account_index = index;
+            self.load_repos(cx);
         }
     }
 
@@ -280,7 +558,7 @@ impl CloneDialog {
     }
 
     fn apply_suggested_name(&mut self, cx: &mut Context<Self>) {
-        let suggested = network::suggested_folder(&self.url_text).unwrap_or_default();
+        let suggested = network::suggested_folder(&self.current_url()).unwrap_or_default();
         if suggested == self.name_text {
             return;
         }
@@ -292,11 +570,11 @@ impl CloneDialog {
     }
 
     fn target(&self) -> Option<CloneTarget> {
-        network::clone_target(&self.url_text)
+        network::clone_target(&self.current_url())
     }
 
     fn url_error(&self) -> Option<SharedString> {
-        if self.url_text.trim().is_empty() {
+        if self.current_url().trim().is_empty() {
             return None;
         }
         if self.target().is_none() {
@@ -331,7 +609,9 @@ impl CloneDialog {
     }
 
     fn depth_value(&self) -> Result<Option<u32>, ()> {
-        if !self.shallow {
+        // The account tab has no depth field: a shallow flag left over from
+        // the URL tab must not apply to it.
+        if !self.shallow || self.tab == CloneTab::Account {
             return Ok(None);
         }
         match self.depth_text.trim().parse::<u32>() {
@@ -341,7 +621,7 @@ impl CloneDialog {
     }
 
     fn ready(&self) -> bool {
-        !self.url_text.trim().is_empty()
+        !self.current_url().trim().is_empty()
             && self.target().is_some()
             && !self.name_text.trim().is_empty()
             && self.name_error().is_none()
@@ -360,7 +640,8 @@ impl CloneDialog {
                 return;
             }
         };
-        let raw_url = self.url_text.trim();
+        let current = self.current_url();
+        let raw_url = current.trim();
         let url = if raw_url.starts_with('~') {
             expand_home(raw_url, self.home.as_deref())
                 .display()
@@ -368,19 +649,41 @@ impl CloneDialog {
         } else {
             raw_url.to_owned()
         };
+        // The account tab clones with default options: its fields are only
+        // the repository, the folder and the folder name.
+        let from_account = self.tab == CloneTab::Account;
         let options = CloneOptions {
             url,
             dest: self.destination(),
             branch: {
                 let branch = self.branch_text.trim();
-                (!branch.is_empty()).then(|| branch.to_owned())
+                (!branch.is_empty() && !from_account).then(|| branch.to_owned())
             },
             depth: self.depth_value().ok().flatten(),
-            recurse_submodules: self.recurse,
+            recurse_submodules: self.recurse && !from_account,
         };
-        let (context, asker) = match cx.try_global::<NetworkService>() {
-            Some(service) => (service.context(true), service.host_keys()),
-            None => (NetworkContext::default(), HostKeyAsker::unavailable()),
+        // The selected account answers git's credential prompts for its host,
+        // so a private repository clones without a password dialog.
+        let credential = self
+            .current_account()
+            .filter(|_| from_account)
+            .and_then(|account| accounts::clone_credential(account, &options.url));
+        let (context, asker, guard) = match cx.try_global::<NetworkService>() {
+            Some(service) => {
+                let (context, guard) = match credential {
+                    Some((host, credential)) => service.job_context(JobAuth {
+                        interactive: true,
+                        accounts: std::collections::HashMap::from([(host, credential)]),
+                        store: match accounts::cached_store(cx) {
+                            Some(Ok(store)) => Some(store),
+                            _ => None,
+                        },
+                    }),
+                    None => (service.context(true), None),
+                };
+                (context, service.host_keys(), guard)
+            }
+            None => (NetworkContext::default(), HostKeyAsker::unavailable(), None),
         };
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
@@ -394,6 +697,8 @@ impl CloneDialog {
         let (tx, rx) = mpsc::channel();
         let progress_tx = tx.clone();
         let worker = cx.background_executor().spawn(async move {
+            // Keeps the account registered until the clone has ended.
+            let _guard = guard;
             let result =
                 network_ops::clone(&git, &options, &context, &asker, &cancel, |progress| {
                     let _ = progress_tx.send(Event::Progress(progress));
@@ -642,7 +947,7 @@ fn build(state: &Entity<CloneDialog>, cx: &App) -> Dialog {
                     div()
                         .text_size(FS_SM)
                         .text_color(colors.muted)
-                        .child(dialog.url_text.clone()),
+                        .child(dialog.current_url()),
                 )
                 .child(match dialog.progress {
                     Some(value) => Progress::new("clone-progress", value).dialog().fill(),
@@ -826,6 +1131,120 @@ fn build_form(
     cx: &App,
 ) -> Dialog {
     let dialog = state.read(cx);
+    let has_tabs = !dialog.accounts.is_empty();
+    let account_tab_active = dialog.tab == CloneTab::Account;
+
+    let mut body = div().flex().flex_col().gap(px(12.));
+    if has_tabs {
+        body = body.child(source_tabs(state, dialog));
+    }
+    body = body.child(if account_tab_active {
+        account_tab(state, dialog, colors).into_any_element()
+    } else {
+        url_tab(state, dialog, colors).into_any_element()
+    });
+
+    if let Phase::Failed(failure) = &dialog.phase {
+        body = body.child(
+            Banner::new(
+                if failure.cancelled {
+                    BannerKind::Info
+                } else {
+                    BannerKind::Error
+                },
+                ui::t!("welcome.clone.failed"),
+            )
+            .body(failure.message.clone()),
+        );
+    }
+
+    let ready = dialog.ready();
+    let footer = div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            Button::new("clone-cancel")
+                .label(ui::t!("welcome.common.cancel"))
+                .min_width(px(72.))
+                .focus_handle(dialog.cancel_focus.clone())
+                .on_click(cancel),
+        )
+        .child(
+            Button::primary("clone-start")
+                .label(if matches!(dialog.phase, Phase::Failed(_)) {
+                    ui::t!("welcome.clone.retry")
+                } else {
+                    ui::t!("welcome.clone.start")
+                })
+                .min_width(px(72.))
+                .disabled(!ready)
+                .focus_handle(dialog.primary_focus.clone())
+                .on_click(start),
+        );
+
+    let mut focus_order = Vec::new();
+    if has_tabs {
+        focus_order.push(DialogFocus::control(if account_tab_active {
+            dialog.account_tab_focus.clone()
+        } else {
+            dialog.url_tab_focus.clone()
+        }));
+    }
+    if account_tab_active {
+        focus_order.push(DialogFocus::control(dialog.account_focus.clone()));
+        // Only what is rendered and enabled: the search once a list is
+        // loaded, the list once it has rows.
+        if matches!(dialog.repos, RepoList::Loaded { .. }) {
+            focus_order.push(DialogFocus::input(dialog.query_focus.clone()));
+        }
+        if dialog.list_has_rows() {
+            focus_order.push(DialogFocus::control(dialog.list_focus.clone()));
+        }
+        if dialog.selected_repo().is_some() {
+            focus_order.push(DialogFocus::input(dialog.dest_focus.clone()));
+            focus_order.push(DialogFocus::control(dialog.browse_focus.clone()));
+            focus_order.push(DialogFocus::input(dialog.name_focus.clone()));
+        }
+    } else {
+        focus_order.extend([
+            DialogFocus::input(dialog.url_focus.clone()),
+            DialogFocus::input(dialog.dest_focus.clone()),
+            DialogFocus::control(dialog.browse_focus.clone()),
+            DialogFocus::input(dialog.name_focus.clone()),
+            DialogFocus::input(dialog.branch_focus.clone()),
+            DialogFocus::input(dialog.depth_focus.clone()),
+            DialogFocus::control(dialog.checkbox_focus.clone()),
+            DialogFocus::control(dialog.shallow_focus.clone()),
+        ]);
+    }
+    focus_order.push(DialogFocus::control(dialog.cancel_focus.clone()));
+    focus_order.push(DialogFocus::control(dialog.primary_focus.clone()));
+
+    Dialog::new(ui::t!("welcome.clone.title"))
+        .icon(IconName::Clone)
+        // The design's dialog is 600 wide once it has the source tabs.
+        .width(px(if has_tabs { 600. } else { 560. }))
+        .compact_body()
+        .body(body)
+        .footer(footer)
+        .busy(false)
+        .focus_order(focus_order)
+        .autofocus(match (account_tab_active, has_tabs) {
+            (true, _) => dialog.account_focus.clone(),
+            (false, _) => dialog.url_focus.clone(),
+        })
+        .default_button(dialog.primary_focus.clone())
+        .on_default({
+            let state = state.clone();
+            move |window: &mut Window, cx: &mut App| {
+                state.update(cx, |dialog, cx| dialog.start(window, cx));
+            }
+        })
+}
+
+/// The "URL" tab: the dialog as it was before accounts.
+fn url_tab(state: &Entity<CloneDialog>, dialog: &CloneDialog, colors: ThemeColors) -> gpui::Div {
     let browse = {
         let state = state.clone();
         move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
@@ -991,73 +1410,483 @@ fn build_form(
             ),
     );
 
-    if let Phase::Failed(failure) = &dialog.phase {
-        body = body.child(
-            Banner::new(
-                if failure.cancelled {
-                    BannerKind::Info
-                } else {
-                    BannerKind::Error
-                },
-                ui::t!("welcome.clone.failed"),
-            )
-            .body(failure.message.clone()),
-        );
-    }
+    body
+}
 
-    let ready = dialog.ready();
-    let footer = div()
+/// The "URL | From account" switch, shown when there is an account to list.
+fn source_tabs(state: &Entity<CloneDialog>, dialog: &CloneDialog) -> gpui::Div {
+    let on_select = {
+        let state = state.clone();
+        move |index: usize, _: &mut Window, cx: &mut App| {
+            let tab = if index == 0 {
+                CloneTab::Url
+            } else {
+                CloneTab::Account
+            };
+            state.update(cx, |dialog, cx| dialog.set_tab(tab, cx));
+        }
+    };
+    div().flex().child(
+        Segmented::new("clone-source")
+            .item(
+                SegmentItem::new(ui::t!("welcome.clone.tab_url"))
+                    .id("clone-source-url")
+                    .with_icon(IconName::Link)
+                    .focus_handle(dialog.url_tab_focus.clone()),
+            )
+            .item(
+                SegmentItem::new(ui::t!("welcome.clone.tab_account"))
+                    .id("clone-source-account")
+                    .with_icon(IconName::User)
+                    .focus_handle(dialog.account_tab_focus.clone()),
+            )
+            .selected(match dialog.tab {
+                CloneTab::Url => 0,
+                CloneTab::Account => 1,
+            })
+            .on_select(on_select),
+    )
+}
+
+/// The "From account" tab: account, search, the repository list and, once a
+/// repository is selected, its address, folder and folder name.
+fn account_tab(
+    state: &Entity<CloneDialog>,
+    dialog: &CloneDialog,
+    colors: ThemeColors,
+) -> gpui::Div {
+    let label = |text: SharedString| div().text_size(FS_SM).text_color(colors.muted).child(text);
+    let field = |text: SharedString, control: AnyElement| {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(label(text))
+            .child(control)
+    };
+
+    let account_select = Select::new("clone-account")
+        .options(
+            dialog
+                .accounts
+                .iter()
+                .map(accounts::account_option_label)
+                .collect::<Vec<_>>(),
+        )
+        .selected(dialog.account_index)
+        .focus_handle(dialog.account_focus.clone())
+        .on_change({
+            let state = state.clone();
+            move |index, _, cx| state.update(cx, |dialog, cx| dialog.select_account(index, cx))
+        });
+
+    let mut tab = div().flex().flex_col().gap(px(12.)).child(
+        div()
+            .flex()
+            .gap(px(12.))
+            .child(field(
+                ui::t!("welcome.clone.account"),
+                account_select.into_any_element(),
+            ))
+            .child(field(
+                ui::t!("welcome.clone.search"),
+                dialog.query.clone().into_any_element(),
+            )),
+    );
+    tab = tab.child(repo_list(state, dialog, colors));
+
+    let Some(repo) = dialog.selected_repo() else {
+        return tab.child(
+            div()
+                .text_size(FS_SM)
+                .text_color(colors.muted)
+                .child(ui::t!("welcome.clone.select_hint")),
+        );
+    };
+    let browse = {
+        let state = state.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            state.update(cx, |dialog, cx| dialog.browse(window, cx));
+        }
+    };
+    let name_error = dialog.name_error();
+    tab.child(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(label(ui::t!("welcome.clone.url")))
+            .child(
+                // The address comes from the selection; it is shown, not edited.
+                div()
+                    .h(ui::metrics::CTL)
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .rounded(ui::metrics::R_SM)
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.bg)
+                    .font_family(FONT_MONO)
+                    .text_size(FS_SM)
+                    .text_color(colors.text)
+                    .child(div().min_w_0().truncate().child(repo.clone_https.clone())),
+            ),
+    )
+    .child(
+        div()
+            .flex()
+            .gap(px(12.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(label(ui::t!("welcome.open.folder")))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().flex_1().min_w_0().child(dialog.dest.clone()))
+                            .child(
+                                Button::new("clone-browse")
+                                    .label(ui::t!("welcome.open.browse"))
+                                    .icon(IconName::Folder)
+                                    .focus_handle(dialog.browse_focus.clone())
+                                    .on_click(browse),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(200.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(label(ui::t!("welcome.clone.folder_name")))
+                    .child(dialog.name.clone())
+                    .when_some(name_error, |this, message| {
+                        this.child(
+                            div()
+                                .text_size(FS_SM)
+                                .text_color(colors.error)
+                                .child(message),
+                        )
+                    }),
+            ),
+    )
+}
+
+/// A bordered, centred note inside the list frame.
+fn list_note(colors: ThemeColors, title: SharedString, text: SharedString) -> AnyElement {
+    list_frame(colors)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(4.))
+                .px(px(12.))
+                .py(px(24.))
+                .text_size(FS_SM)
+                .text_center()
+                .when(!title.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .text_color(colors.text)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                })
+                .child(div().text_color(colors.muted).child(text)),
+        )
+        .into_any_element()
+}
+
+fn list_frame(colors: ThemeColors) -> gpui::Div {
+    div()
+        .border_1()
+        .border_color(colors.border)
+        .rounded(R_MD)
+        .bg(colors.bg)
+        .overflow_hidden()
+}
+
+/// The repository list of the selected account in its current state.
+fn repo_list(state: &Entity<CloneDialog>, dialog: &CloneDialog, colors: ThemeColors) -> AnyElement {
+    let Some(account) = dialog.current_account() else {
+        return div().into_any_element();
+    };
+    let host = accounts::host_of(&account.base_url);
+    match &dialog.repos {
+        RepoList::Loading => {
+            let widths = [230., 300., 180., 270.];
+            let rows = widths.iter().enumerate().map(|(index, width)| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .min_h(px(40.))
+                    .px(px(10.))
+                    .child(Skeleton::new(("clone-skel-icon", index), px(16.)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Skeleton::new(("clone-skel", index), px(*width))),
+                    )
+                    .child(Skeleton::new(("clone-skel-when", index), px(48.)))
+            });
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(list_frame(colors).children(rows))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(FS_SM)
+                        .text_color(colors.muted)
+                        .child(Spinner::new("clone-repos-spinner", px(14.)))
+                        .child(ui::t!("welcome.clone.repos_loading", host = host)),
+                )
+                .into_any_element()
+        }
+        RepoList::Failed(RepoListError::Unsupported) => list_note(
+            colors,
+            SharedString::default(),
+            ui::t!(
+                "welcome.clone.repos_unsupported",
+                service = accounts::kind_of(account).map_or("", forge::ServiceKind::display_name)
+            ),
+        ),
+        RepoList::Failed(error) => {
+            let (body, action) = match error {
+                RepoListError::Revoked => (
+                    ui::t!(
+                        "welcome.clone.repos_revoked",
+                        login = account.login,
+                        host = host
+                    ),
+                    Button::primary("clone-reconnect")
+                        .label(ui::t!("welcome.clone.repos_reconnect"))
+                        .on_click({
+                            let state = state.clone();
+                            move |_, window, cx| {
+                                state.update(cx, |dialog, cx| dialog.reconnect(window, cx));
+                            }
+                        }),
+                ),
+                other => (
+                    match other {
+                        RepoListError::Other(text) => text.clone().into(),
+                        _ => ui::t!("welcome.clone.repos_network", host = host),
+                    },
+                    Button::primary("clone-reload")
+                        .label(ui::t!("welcome.clone.retry"))
+                        .on_click({
+                            let state = state.clone();
+                            move |_, _, cx| state.update(cx, |dialog, cx| dialog.load_repos(cx))
+                        }),
+                ),
+            };
+            Banner::new(BannerKind::Error, ui::t!("welcome.clone.repos_error_title"))
+                .body(body)
+                .action(action)
+                .into_any_element()
+        }
+        RepoList::Loaded { repos, .. } if repos.is_empty() => list_note(
+            colors,
+            ui::t!("welcome.clone.repos_empty_title"),
+            ui::t!(
+                "welcome.clone.repos_empty",
+                login = account.login,
+                host = host
+            ),
+        ),
+        RepoList::Loaded { repos, truncated } => {
+            let visible = dialog.visible_repos();
+            if visible.is_empty() {
+                return list_note(
+                    colors,
+                    ui::t!(
+                        "welcome.clone.repos_none_title",
+                        query = dialog.query_text.trim()
+                    ),
+                    ui::t!("welcome.clone.repos_none", n = repos.len()),
+                );
+            }
+            let now = crate::history_view::unix_now();
+            let count = visible.len();
+            let rows = visible
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(position, index)| {
+                    repo_row(
+                        state,
+                        &repos[index],
+                        index,
+                        dialog.repo_selected == Some(index),
+                        position + 1 < count,
+                        now,
+                        colors,
+                    )
+                });
+            let list = list_frame(colors)
+                .id("clone-repolist")
+                .key_context("clone-repolist")
+                .track_focus(&dialog.list_focus)
+                .max_h(px(250.))
+                .overflow_y_scroll()
+                .track_scroll(&dialog.list_scroll)
+                .on_action(move_handler::<SelectNext>(state, Move::Next))
+                .on_action(move_handler::<SelectPrev>(state, Move::Prev))
+                .on_action(move_handler::<SelectFirst>(state, Move::First))
+                .on_action(move_handler::<SelectLast>(state, Move::Last))
+                .children(rows);
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(list)
+                .when(*truncated, |this| {
+                    this.child(
+                        div()
+                            .text_size(FS_SM)
+                            .text_color(colors.muted)
+                            .child(ui::t!("welcome.clone.repos_truncated", n = repos.len())),
+                    )
+                })
+                .into_any_element()
+        }
+    }
+}
+
+/// A list action that moves the selection.
+fn move_handler<A: gpui::Action>(
+    state: &Entity<CloneDialog>,
+    movement: Move,
+) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+    let state = state.clone();
+    move |_, _, cx| state.update(cx, |dialog, cx| dialog.move_selection(movement, cx))
+}
+
+fn repo_row(
+    state: &Entity<CloneDialog>,
+    repo: &RepoSummary,
+    index: usize,
+    selected: bool,
+    divider: bool,
+    now: u64,
+    colors: ThemeColors,
+) -> impl IntoElement {
+    let icon = if repo.archived {
+        IconName::Archive
+    } else if repo.fork {
+        IconName::RepoForked
+    } else {
+        IconName::Repo
+    };
+    let id = |name: &'static str| ElementId::NamedInteger(name.into(), index as u64);
+    let chips = div()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .when(repo.private, |this| {
+            this.child(
+                Chip::new(
+                    id("clone-chip-private"),
+                    ui::t!("welcome.clone.repo_private"),
+                )
+                .icon(IconName::Lock),
+            )
+        })
+        .when(repo.fork, |this| {
+            this.child(
+                Chip::new(id("clone-chip-fork"), ui::t!("welcome.clone.repo_fork"))
+                    .icon(IconName::RepoForked),
+            )
+        })
+        .when(repo.archived, |this| {
+            this.child(
+                Chip::new(
+                    id("clone-chip-archived"),
+                    ui::t!("welcome.clone.repo_archived"),
+                )
+                .icon(IconName::Archive),
+            )
+        });
+    let state = state.clone();
+    div()
+        .id(id("clone-repo"))
         .flex()
         .items_center()
         .gap(px(8.))
+        .min_h(px(40.))
+        .px(px(10.))
+        .py(px(4.))
+        .cursor_pointer()
+        .when(divider, |this| {
+            this.border_b_1().border_color(colors.border)
+        })
+        .when(selected, |this| this.bg(colors.accent_soft))
+        .when(!selected, |this| {
+            this.hover(move |style| style.bg(colors.hover))
+        })
+        .on_click(move |_, _, cx| state.update(cx, |dialog, cx| dialog.select_repo(index, cx)))
+        .child(Icon::new(icon).size(px(16.)))
         .child(
-            Button::new("clone-cancel")
-                .label(ui::t!("welcome.common.cancel"))
-                .min_width(px(72.))
-                .focus_handle(dialog.cancel_focus.clone())
-                .on_click(cancel),
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(
+                            div()
+                                .flex()
+                                .min_w_0()
+                                .truncate()
+                                .child(
+                                    div()
+                                        .text_color(colors.muted)
+                                        .font_weight(FontWeight::NORMAL)
+                                        .child(format!("{}/", repo.owner)),
+                                )
+                                .child(repo.name.clone()),
+                        )
+                        .child(chips),
+                )
+                .when_some(repo.description.clone(), |this, description| {
+                    this.child(
+                        div()
+                            .text_size(FS_SM)
+                            .text_color(colors.muted)
+                            .truncate()
+                            .child(description),
+                    )
+                }),
         )
-        .child(
-            Button::primary("clone-start")
-                .label(if matches!(dialog.phase, Phase::Failed(_)) {
-                    ui::t!("welcome.clone.retry")
-                } else {
-                    ui::t!("welcome.clone.start")
-                })
-                .min_width(px(72.))
-                .disabled(!ready)
-                .focus_handle(dialog.primary_focus.clone())
-                .on_click(start),
-        );
-
-    let focus_order = vec![
-        DialogFocus::input(dialog.url_focus.clone()),
-        DialogFocus::input(dialog.dest_focus.clone()),
-        DialogFocus::control(dialog.browse_focus.clone()),
-        DialogFocus::input(dialog.name_focus.clone()),
-        DialogFocus::input(dialog.branch_focus.clone()),
-        DialogFocus::input(dialog.depth_focus.clone()),
-        DialogFocus::control(dialog.checkbox_focus.clone()),
-        DialogFocus::control(dialog.shallow_focus.clone()),
-        DialogFocus::control(dialog.cancel_focus.clone()),
-        DialogFocus::control(dialog.primary_focus.clone()),
-    ];
-
-    Dialog::new(ui::t!("welcome.clone.title"))
-        .icon(IconName::Clone)
-        .width(px(560.))
-        .compact_body()
-        .body(body)
-        .footer(footer)
-        .busy(false)
-        .focus_order(focus_order)
-        .autofocus(dialog.url_focus.clone())
-        .default_button(dialog.primary_focus.clone())
-        .on_default({
-            let state = state.clone();
-            move |window: &mut Window, cx: &mut App| {
-                state.update(cx, |dialog, cx| dialog.start(window, cx));
-            }
+        .when(repo.updated_at > 0, |this| {
+            this.child(
+                div()
+                    .flex_none()
+                    .text_size(FS_SM)
+                    .text_color(colors.muted)
+                    .child(relative_time(now, repo.updated_at)),
+            )
         })
 }
 
@@ -1128,5 +1957,149 @@ mod tests {
             dialog.read_with(&cx, |dialog, _| dialog.name_text.clone()),
             manual
         );
+    }
+
+    #[test]
+    fn the_keyboard_moves_through_the_visible_repositories() {
+        let visible = [2, 5, 7];
+        let go = |current, movement| next_selection(&visible, current, movement);
+        assert_eq!(go(None, Move::Next), Some(2));
+        assert_eq!(go(None, Move::Prev), Some(7));
+        assert_eq!(go(Some(2), Move::Next), Some(5));
+        assert_eq!(go(Some(7), Move::Next), Some(7));
+        assert_eq!(go(Some(2), Move::Prev), Some(2));
+        assert_eq!(go(Some(7), Move::Prev), Some(5));
+        assert_eq!(go(Some(5), Move::First), Some(2));
+        assert_eq!(go(Some(2), Move::Last), Some(7));
+        // A selection the search hides counts as none.
+        assert_eq!(go(Some(3), Move::Next), Some(2));
+        assert_eq!(next_selection(&[], Some(1), Move::Next), None);
+    }
+
+    fn account(id: &str, kind: &str, url: &str) -> AccountRecord {
+        AccountRecord {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            base_url: url.to_owned(),
+            login: "mira-k".to_owned(),
+            label: "mira-k".to_owned(),
+            method: crate::settings::AccountMethod::Token,
+            ssh_host: None,
+            imported_from: None,
+        }
+    }
+
+    fn summary(owner: &str, name: &str) -> RepoSummary {
+        RepoSummary {
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+            description: None,
+            private: false,
+            fork: false,
+            archived: false,
+            updated_at: 0,
+            clone_https: format!("https://github.com/{owner}/{name}.git"),
+        }
+    }
+
+    fn with_accounts(cx: &mut gpui::TestAppContext, accounts: Vec<AccountRecord>) {
+        cx.update(|cx| {
+            crate::accounts::set_test_store(cx);
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings: crate::settings::Settings {
+                    accounts,
+                    ..Default::default()
+                },
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+    }
+
+    /// With accounts the dialog opens on "From account"; picking a repository
+    /// fills the address and the folder name, and switching account starts
+    /// the selection and the search over.
+    #[gpui::test]
+    fn the_account_tab_selects_a_repository_and_resets_on_account_switch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        with_accounts(
+            cx,
+            vec![
+                account("a1", "github", "https://github.com"),
+                account("a2", "gitlab", "https://gitlab.com"),
+            ],
+        );
+        let git = crate::test_support::git();
+        let (mut cx, workspace) = crate::test_support::open_workspace(git.clone(), cx);
+        let dialog = cx.update(|window, cx| {
+            cx.new(|cx| CloneDialog::new(Ok(git), workspace.downgrade(), window, cx))
+        });
+        cx.run_until_parked();
+        dialog.read_with(&cx, |dialog, _| {
+            assert_eq!(dialog.tab, CloneTab::Account);
+            // The empty in-memory keychain holds no token.
+            assert!(matches!(
+                dialog.repos,
+                RepoList::Failed(RepoListError::Revoked)
+            ));
+            assert!(!dialog.ready());
+        });
+
+        dialog.update(&mut cx, |dialog, cx| {
+            let generation = dialog.list_generation;
+            dialog.finish_load(
+                generation,
+                Ok(RepoListing {
+                    repos: vec![summary("acme", "one"), summary("acme", "two")],
+                    truncated: false,
+                }),
+                cx,
+            );
+            dialog.select_repo(1, cx);
+            dialog
+                .query
+                .update(cx, |input, cx| input.set_text("tw", cx));
+        });
+        cx.run_until_parked();
+        dialog.read_with(&cx, |dialog, _| {
+            assert_eq!(dialog.current_url(), "https://github.com/acme/two.git");
+            assert_eq!(dialog.name_text, "two");
+            assert_eq!(dialog.visible_repos(), &[1]);
+            assert!(dialog.ready());
+        });
+
+        dialog.update(&mut cx, |dialog, cx| dialog.select_account(1, cx));
+        cx.run_until_parked();
+        dialog.read_with(&cx, |dialog, _| {
+            assert_eq!(dialog.account_index, 1);
+            assert_eq!(dialog.repo_selected, None);
+            assert_eq!(dialog.query_text, "");
+            assert_eq!(dialog.name_text, "");
+            assert!(!dialog.ready());
+        });
+
+        // The URL tab keeps its own, untouched address.
+        dialog.update(&mut cx, |dialog, cx| dialog.set_tab(CloneTab::Url, cx));
+        dialog.read_with(&cx, |dialog, _| {
+            assert_eq!(dialog.current_url(), "");
+        });
+    }
+
+    /// Without an account there is no "From account" tab.
+    #[gpui::test]
+    fn without_accounts_the_dialog_is_the_url_form(cx: &mut gpui::TestAppContext) {
+        with_accounts(cx, Vec::new());
+        let git = crate::test_support::git();
+        let (mut cx, workspace) = crate::test_support::open_workspace(git.clone(), cx);
+        let dialog = cx.update(|window, cx| {
+            cx.new(|cx| CloneDialog::new(Ok(git), workspace.downgrade(), window, cx))
+        });
+        dialog.update(&mut cx, |dialog, cx| {
+            assert_eq!(dialog.tab, CloneTab::Url);
+            dialog.set_tab(CloneTab::Account, cx);
+            assert_eq!(dialog.tab, CloneTab::Url);
+        });
     }
 }

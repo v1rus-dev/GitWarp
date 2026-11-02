@@ -121,6 +121,54 @@ const FILES: &[(&str, &[u8])] = &[
         "icons/palette.svg",
         include_bytes!("../assets/icons/palette.svg"),
     ),
+    (
+        "icons/github.svg",
+        include_bytes!("../assets/icons/github.svg"),
+    ),
+    (
+        "icons/external.svg",
+        include_bytes!("../assets/icons/external.svg"),
+    ),
+    ("icons/pr.svg", include_bytes!("../assets/icons/pr.svg")),
+    (
+        "icons/pr-draft.svg",
+        include_bytes!("../assets/icons/pr-draft.svg"),
+    ),
+    (
+        "icons/merge.svg",
+        include_bytes!("../assets/icons/merge.svg"),
+    ),
+    (
+        "icons/pr-closed.svg",
+        include_bytes!("../assets/icons/pr-closed.svg"),
+    ),
+    (
+        "icons/check-circle-fill.svg",
+        include_bytes!("../assets/icons/check-circle-fill.svg"),
+    ),
+    (
+        "icons/x-circle-fill.svg",
+        include_bytes!("../assets/icons/x-circle-fill.svg"),
+    ),
+    ("icons/sync.svg", include_bytes!("../assets/icons/sync.svg")),
+    (
+        "icons/hourglass.svg",
+        include_bytes!("../assets/icons/hourglass.svg"),
+    ),
+    ("icons/skip.svg", include_bytes!("../assets/icons/skip.svg")),
+    (
+        "icons/comment.svg",
+        include_bytes!("../assets/icons/comment.svg"),
+    ),
+    ("icons/repo.svg", include_bytes!("../assets/icons/repo.svg")),
+    (
+        "icons/repo-forked.svg",
+        include_bytes!("../assets/icons/repo-forked.svg"),
+    ),
+    (
+        "icons/archive.svg",
+        include_bytes!("../assets/icons/archive.svg"),
+    ),
 ];
 
 /// The embedded asset source.
