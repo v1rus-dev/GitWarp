@@ -29,8 +29,9 @@ use ui::focus::{self, RingOffset};
 use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD, R_SM};
 use ui::theme::ThemeColors;
 use ui::{
-    menu, ActiveTheme, Avatar, Button, ButtonSize, EmptyState, Icon, IconName, ListRow, MenuEntry,
-    MenuItem, Progress, RefBadge, RefKind, Skeleton, Spinner, ToastKind, Tooltip,
+    menu, ActiveTheme, Avatar, Button, ButtonSize, CiGlyph, EmptyState, Icon, IconName, ListRow,
+    MenuEntry, MenuItem, PrBadge, Progress, RefBadge, RefKind, Skeleton, Spinner, ToastKind,
+    Tooltip,
 };
 
 use crate::format::{format_count, relative_time};
@@ -48,11 +49,15 @@ pub(crate) type RefActionHandler = Rc<dyn Fn(RefAction, &mut Window, &mut App)>;
 /// What the shell does with a sidebar action chosen from a ref's menu.
 pub(crate) type SidebarActionHandler = Rc<dyn Fn(SidebarAction, &mut Window, &mut App)>;
 
+/// Opens the pull request popover of a local branch at a window position.
+pub(crate) type PrClickHandler = Rc<dyn Fn(String, Point<Pixels>, &mut Window, &mut App)>;
+
 /// Sets (`Some`) or clears (`None`) the History's branch filter.
 type FilterSetter = Rc<dyn Fn(Option<String>, &mut App)>;
 
 /// A sidebar node key's context-menu model.
 type RefMenuSource = Rc<dyn Fn(&str) -> Vec<SidebarMenuEntry>>;
+use crate::hosting_status::{ci_label, HostingView, PrBadgeView};
 use crate::remote_accounts::RemoteTargets;
 use crate::settings::{GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MAX, GRAPH_WIDTH_MIN};
 use crate::sidebar::{sidebar_menu_with_links, SidebarAction, SidebarExtras, SidebarMenuEntry};
@@ -168,6 +173,24 @@ pub(crate) fn bind_history_keys(cx: &mut App, settings: &crate::settings::Settin
 }
 
 type Page = Result<Vec<(CommitInfo, Row<Oid>)>, Failure>;
+
+/// Width reserved for a row's pull request badge: icon, `#1234` and padding.
+const PR_BADGE_WIDTH: f32 = 46.;
+
+/// The pull request badge of a local branch badge (the current branch's HEAD
+/// badge included), with the branch it belongs to.
+fn pr_badge_of<'a>(
+    hosting: &'a HostingView,
+    spec: &'a BadgeSpec,
+) -> Option<(&'a str, &'a PrBadgeView)> {
+    matches!(spec.kind, RefKind::Local | RefKind::Head)
+        .then(|| {
+            hosting
+                .badge(&spec.label)
+                .map(|badge| (spec.label.as_ref(), badge))
+        })
+        .flatten()
+}
 
 /// One ref badge on a history row, derived from HEAD and the refs once they
 /// load — never per frame.
@@ -638,6 +661,13 @@ pub struct HistoryView {
     /// The repository's remotes, for the "Open on <host>" menu items; set by
     /// the shell whenever it reloads them.
     remote_targets: Vec<RemoteTargets>,
+    /// The pull request badges and CI dots, pushed by the shell.
+    hosting: Arc<HostingView>,
+    /// What a click on a pull request badge does; installed by the shell.
+    pr_click: Option<PrClickHandler>,
+    /// Bumped whenever HEAD and the refs were read again, so the shell knows
+    /// to look at its branch tracking once more.
+    meta_version: u64,
     /// The branch last picked in a row-menu picker, for the whole session. It
     /// is listed first in the next picker and never applied by itself.
     last_picked_branch: Rc<RefCell<Option<String>>>,
@@ -1276,6 +1306,9 @@ impl HistoryView {
             on_action,
             sidebar_action: None,
             remote_targets: Vec::new(),
+            hosting: Arc::default(),
+            pr_click: None,
+            meta_version: 0,
             last_picked_branch: Rc::new(RefCell::new(None)),
             root: None,
             items: Vec::new(),
@@ -2054,6 +2087,40 @@ impl HistoryView {
         self.sidebar_action = Some(handler);
     }
 
+    /// Installs what a click on a pull request badge does.
+    pub(crate) fn set_pr_click_handler(&mut self, handler: PrClickHandler) {
+        self.pr_click = Some(handler);
+    }
+
+    /// Replaces the pull request badges and CI dots the rows draw.
+    pub(crate) fn set_hosting(&mut self, hosting: Arc<HostingView>, cx: &mut Context<Self>) {
+        self.hosting = hosting;
+        cx.notify();
+    }
+
+    /// How many commits are loaded.
+    pub(crate) fn loaded_len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Every loaded commit reachable from `tips` (the tips themselves
+    /// included), following parents through the loaded commits only.
+    pub(crate) fn reachable_from(&self, tips: &[Oid]) -> HashSet<Oid> {
+        let index: HashMap<Oid, &CommitInfo> = self
+            .items
+            .iter()
+            .map(|item| (item.commit.id, item.commit.as_ref()))
+            .collect();
+        crate::hosting_status::reachable(tips, |oid| {
+            index.get(&oid).map(|commit| commit.parents.clone())
+        })
+    }
+
+    /// How many times HEAD and the refs have been (re)read.
+    pub(crate) fn meta_version(&self) -> u64 {
+        self.meta_version
+    }
+
     /// Tells the History which remotes the repository has, so its menus can
     /// offer "Open on <host>".
     pub(crate) fn set_remote_targets(&mut self, targets: Vec<RemoteTargets>) {
@@ -2296,6 +2363,7 @@ impl HistoryView {
             RefsState::Loading | RefsState::Failed => &[],
         };
         self.badges = build_badges(head, refs);
+        self.meta_version = self.meta_version.wrapping_add(1);
         // HEAD may have arrived after the first rows: the initial selection
         // can now move to its row.
         self.settle_initial_selection(cx);
@@ -3070,6 +3138,7 @@ impl HistoryView {
             .as_ref()
             .filter(|_| self.day_rows.is_none());
         let badges = &self.badges;
+        let hosting = self.hosting.clone();
         let badge_widths = &mut self.badge_widths;
         let search_matches = &self.search_matches;
         range
@@ -3212,7 +3281,17 @@ impl HistoryView {
                     let widths: Vec<f32> = specs
                         .iter()
                         .map(|spec| {
-                            f32::from(measure_badge(window, &spec.label, spec.kind, badge_widths))
+                            let width = f32::from(measure_badge(
+                                window,
+                                &spec.label,
+                                spec.kind,
+                                badge_widths,
+                            ));
+                            // A branch with a pull request also carries its badge.
+                            match pr_badge_of(&hosting, spec) {
+                                Some(_) => width + PR_BADGE_WIDTH + BADGE_GAP,
+                                None => width,
+                            }
                         })
                         .collect();
                     // The most hidden badges the "+N" label can stand for.
@@ -3276,6 +3355,28 @@ impl HistoryView {
                                 .tooltip(spec.tooltip.clone()),
                             ),
                     );
+                    if let Some((branch, badge)) = pr_badge_of(&hosting, spec) {
+                        let branch = branch.to_owned();
+                        summary = summary.child(
+                            PrBadge::new(
+                                format!("history-pr-{ix}-{index}"),
+                                badge.state,
+                                badge.text.clone(),
+                            )
+                            .review(badge.review)
+                            .tooltip(badge.tooltip.clone())
+                            .on_click(cx.listener(
+                                move |view, event: &ClickEvent, window, cx| {
+                                    let focus = view.focus.clone();
+                                    window.focus(&focus, cx);
+                                    view.select_row(ix, cx);
+                                    if let Some(handler) = view.pr_click.clone() {
+                                        handler(branch.clone(), event.position(), window, cx);
+                                    }
+                                },
+                            )),
+                        );
+                    }
                 }
                 if fit.collapsed {
                     let hidden = specs[fit.shown..]
@@ -3306,6 +3407,11 @@ impl HistoryView {
                             cx.stop_propagation();
                             view.set_branch_filter(Some(target.clone()), cx);
                         })),
+                    );
+                }
+                if let Some(state) = hosting.ci.get(&c.id) {
+                    summary = summary.child(
+                        CiGlyph::new(format!("history-ci-{ix}"), *state).tooltip(ci_label(*state)),
                     );
                 }
                 row_div = row_div.child(

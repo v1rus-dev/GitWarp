@@ -310,6 +310,25 @@ pub fn fetch(
     run_streaming(cmd, label, context, cancel, on_progress)
 }
 
+/// Fetches one refspec of one remote, e.g. a pull request's head ref into a
+/// local branch (`refs/pull/5/head:refs/heads/feat`). The remote and the
+/// refspec come after `--`, so neither can be read as an option.
+pub fn fetch_refspec(
+    repo: &Repo,
+    remote: &str,
+    refspec: &str,
+    context: &NetworkContext,
+    cancel: &CancelToken,
+    on_progress: impl FnMut(Progress),
+) -> Result<NetworkOutcome> {
+    let mut cmd = repo.command();
+    cmd.args(context.config_args());
+    cmd.args(["fetch", "--progress", "--"])
+        .arg(remote)
+        .arg(refspec);
+    run_streaming(cmd, "fetch", context, cancel, on_progress)
+}
+
 /// Pulls the current branch, fast-forward only.
 ///
 /// Merging is not implemented yet (stage 12 owns the conflict editor), so a

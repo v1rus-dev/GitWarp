@@ -40,13 +40,23 @@ pub enum Job {
     UpdateSubmodule {
         path: String,
     },
+    /// Fetch a pull request's head ref into the local branch `branch` (no
+    /// force: a diverged branch fails instead of losing commits); the caller
+    /// checks the branch out afterwards.
+    FetchPullRequest {
+        remote: String,
+        /// `refs/pull/<n>/head:refs/heads/<branch>`.
+        refspec: String,
+        branch: String,
+        number: u64,
+    },
 }
 
 impl Job {
     /// The word shown in the status bar and in toasts.
     pub fn verb(&self) -> SharedString {
         match self {
-            Job::Fetch(_) => ui::t!("network.verb.fetching"),
+            Job::Fetch(_) | Job::FetchPullRequest { .. } => ui::t!("network.verb.fetching"),
             Job::Pull => ui::t!("network.verb.pulling"),
             Job::Push => ui::t!("network.verb.pushing"),
             Job::PushTag { .. } | Job::PushTags { .. } => ui::t!("network.verb.pushing_tags"),
@@ -78,6 +88,7 @@ impl Job {
             Job::UpdateSubmodule { path } => {
                 ui::t!("network.done.update_submodule", path = path).to_string()
             }
+            Job::FetchPullRequest { .. } => ui::t!("network.done.fetch").to_string(),
         }
     }
 
@@ -153,6 +164,9 @@ impl Job {
             Job::UpdateSubmodule { path } => {
                 update_submodule(repo, path, context, asker, cancel, on_progress)
             }
+            Job::FetchPullRequest {
+                remote, refspec, ..
+            } => fetch_refspec(repo, remote, refspec, context, asker, cancel, on_progress),
         }
     }
 }
@@ -243,6 +257,7 @@ pub fn job_remote_uses(
         Job::PushTag { remote, .. }
         | Job::PushTags { remote }
         | Job::DeleteRemoteBranch { remote, .. } => one(remote, Direction::Push),
+        Job::FetchPullRequest { remote, .. } => one(remote, Direction::Fetch),
         Job::UpdateSubmodule { .. } => Vec::new(),
     }
 }
@@ -324,6 +339,21 @@ pub fn fetch(
     let urls = remote_urls(repo, options.remote.as_deref())?;
     preflight(&urls, asker, cancel)?;
     network::fetch(repo, options, context, cancel, on_progress)
+}
+
+/// Fetches one refspec with the SSH preflight in front of it.
+pub fn fetch_refspec(
+    repo: &Repo,
+    remote: &str,
+    refspec: &str,
+    context: &NetworkContext,
+    asker: &HostKeyAsker,
+    cancel: &CancelToken,
+    on_progress: impl FnMut(Progress),
+) -> Result<NetworkOutcome> {
+    let urls = remote_urls(repo, Some(remote))?;
+    preflight(&urls, asker, cancel)?;
+    network::fetch_refspec(repo, remote, refspec, context, cancel, on_progress)
 }
 
 /// Pulls with the SSH preflight of the upstream remote.
@@ -801,5 +831,23 @@ mod tests {
             assert!(!git(dir, &["branch", "--list"]).contains("topic"));
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fetching_a_pull_request_contacts_its_remote_over_the_fetch_url() {
+        let job = Job::FetchPullRequest {
+            remote: "origin".into(),
+            refspec: "refs/pull/5/head:refs/heads/feat".into(),
+            branch: "feat".into(),
+            number: 5,
+        };
+        let uses = job_remote_uses(&job, None, None, &["origin".into(), "fork".into()]);
+        assert_eq!(
+            uses,
+            vec![RemoteUse {
+                remote: "origin".into(),
+                direction: Direction::Fetch
+            }]
+        );
     }
 }

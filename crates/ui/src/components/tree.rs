@@ -17,6 +17,7 @@ use crate::actions::{
     Confirm, SelectNext, SelectPrev, TreeActivate, TreeCollapse, TreeDelete, TreeExpand, TreeRename,
 };
 use crate::components::counter::CountPill;
+use crate::components::pull_request::{PrBadge, PrBadgeState};
 use crate::components::tooltip::Tooltip;
 use crate::focus::{self, RingOffset};
 use crate::icon::{Icon, IconName};
@@ -44,6 +45,15 @@ pub enum TreeNodeTrailing {
     },
 }
 
+/// The pull request badge a branch row carries after its label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreePr {
+    pub state: PrBadgeState,
+    /// The badge text, e.g. `#142`.
+    pub text: SharedString,
+    pub tooltip: SharedString,
+}
+
 /// One visible row of a [`Tree`].
 #[derive(Clone, Debug)]
 pub struct TreeNodeData {
@@ -66,6 +76,8 @@ pub struct TreeNodeData {
     pub tooltip: Option<SharedString>,
     /// A bordered monogram (e.g. `GL`) drawn instead of the icon.
     pub badge: Option<SharedString>,
+    /// A pull request badge between the label and the trailing marker.
+    pub pr: Option<TreePr>,
 }
 
 impl TreeNodeData {
@@ -85,6 +97,7 @@ impl TreeNodeData {
             accent: false,
             tooltip: None,
             badge: None,
+            pr: None,
         }
     }
 
@@ -193,6 +206,13 @@ impl TreeNodeData {
         self
     }
 
+    /// A pull request badge after the label; clicking it calls
+    /// [`Tree::on_pr_click`].
+    pub fn pr(mut self, pr: TreePr) -> Self {
+        self.pr = Some(pr);
+        self
+    }
+
     /// Draws a bordered monogram in the icon slot instead of the icon.
     pub fn badge(mut self, badge: impl Into<SharedString>) -> Self {
         self.badge = Some(badge.into());
@@ -257,6 +277,7 @@ pub struct Tree {
     on_collapse: Option<NodeHandler>,
     on_open: Option<NodeHandler>,
     on_context_menu: Option<ContextHandler>,
+    on_pr_click: Option<ContextHandler>,
 }
 
 impl Tree {
@@ -277,7 +298,17 @@ impl Tree {
             on_collapse: None,
             on_open: None,
             on_context_menu: None,
+            on_pr_click: None,
         }
+    }
+
+    /// A click on a row's pull request badge, with the pointer position.
+    pub fn on_pr_click(
+        mut self,
+        listener: impl Fn(usize, Point<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_pr_click = Some(Rc::new(listener));
+        self
     }
 
     /// The settings-navigation variant: no indentation, 10px left padding.
@@ -764,6 +795,22 @@ impl RenderOnce for Tree {
                 .when_some(icon_slot, |this, slot| this.child(slot))
                 .child(label_element);
 
+            if let Some(pr) = node.pr.clone() {
+                let on_pr_click = self.on_pr_click.clone();
+                row = row.child(
+                    PrBadge::new(
+                        ElementId::named_usize(format!("{id_name}-pr"), index),
+                        pr.state,
+                        pr.text,
+                    )
+                    .tooltip(pr.tooltip)
+                    .on_click(move |event, window, cx| {
+                        if let Some(listener) = &on_pr_click {
+                            listener(index, event.position(), window, cx);
+                        }
+                    }),
+                );
+            }
             if let Some(trailing) = node.trailing.as_ref() {
                 row = row.child(trailing_element(
                     trailing,

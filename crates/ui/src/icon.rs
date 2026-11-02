@@ -58,11 +58,21 @@ pub enum IconName {
     Palette,
     Github,
     External,
+    Pr,
+    PrDraft,
+    PrClosed,
+    Merge,
+    CheckFill,
+    XFill,
+    Sync,
+    Hourglass,
+    Skip,
+    Comment,
 }
 
 impl IconName {
-    /// All 49 icons, in the design's order.
-    pub const ALL: [IconName; 49] = [
+    /// All 59 icons, in the design's order.
+    pub const ALL: [IconName; 59] = [
         Self::Branch,
         Self::Tag,
         Self::Cloud,
@@ -112,6 +122,16 @@ impl IconName {
         Self::Palette,
         Self::Github,
         Self::External,
+        Self::Pr,
+        Self::PrDraft,
+        Self::PrClosed,
+        Self::Merge,
+        Self::CheckFill,
+        Self::XFill,
+        Self::Sync,
+        Self::Hourglass,
+        Self::Skip,
+        Self::Comment,
     ];
 
     /// Asset path, e.g. `icons/chev-r.svg`.
@@ -166,6 +186,16 @@ impl IconName {
             Self::Palette => "icons/palette.svg",
             Self::Github => "icons/github.svg",
             Self::External => "icons/external.svg",
+            Self::Pr => "icons/pr.svg",
+            Self::PrDraft => "icons/pr-draft.svg",
+            Self::PrClosed => "icons/pr-closed.svg",
+            Self::Merge => "icons/merge.svg",
+            Self::CheckFill => "icons/check-circle-fill.svg",
+            Self::XFill => "icons/x-circle-fill.svg",
+            Self::Sync => "icons/sync.svg",
+            Self::Hourglass => "icons/hourglass.svg",
+            Self::Skip => "icons/skip.svg",
+            Self::Comment => "icons/comment.svg",
         }
     }
 }

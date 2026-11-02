@@ -15,6 +15,7 @@ mod history_search;
 mod history_state;
 mod history_view;
 mod host_key_dialog;
+mod hosting_status;
 mod init_flow;
 mod network_ops;
 mod network_service;
