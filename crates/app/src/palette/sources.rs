@@ -187,9 +187,9 @@ impl Command {
             Command::FocusSearch => "search",
             Command::OpenSettings(Page::General) => "settings",
             // Bound in `main.rs` without an entry on the Keybindings page.
-            Command::StashChanges => return Some("Ctrl Shift S".into()),
-            Command::OpenRepository => return Some("Ctrl O".into()),
-            Command::Clone => return Some("Ctrl Shift O".into()),
+            Command::StashChanges => return Some("Ctrl+Shift+S".into()),
+            Command::OpenRepository => return Some("Ctrl+O".into()),
+            Command::Clone => return Some("Ctrl+Shift+O".into()),
             _ => return None,
         };
         crate::settings_ui::keybindings::key_cap(cx, id)
@@ -326,13 +326,19 @@ impl Sources {
 /// The hits for `query`, grouped in display order and capped per group.
 /// An empty query lists the habitual commands and branches instead.
 pub fn search(query: &str, sources: &Sources, recent: &Recent) -> Vec<Hit> {
-    let query = query.trim();
+    let (scope, query) = split_scope(query);
     if query.is_empty() {
-        return default_hits(sources, recent);
+        let mut hits = default_hits(sources, recent);
+        hits.retain(|hit| scope.includes(hit.group));
+        return hits;
     }
     let mut hits = Vec::new();
 
-    let commands = Command::all();
+    let commands = if scope.includes(Group::Commands) {
+        Command::all()
+    } else {
+        Vec::new()
+    };
     let titles: Vec<String> = commands
         .iter()
         .map(|command| command.title(sources.state))
@@ -351,13 +357,17 @@ pub fn search(query: &str, sources: &Sources, recent: &Recent) -> Vec<Hit> {
         });
     }
 
-    for scored in top(sources
-        .branches
+    let branches: &[BranchSource] = if scope.includes(Group::Branches) {
+        &sources.branches
+    } else {
+        &[]
+    };
+    for scored in top(branches
         .iter()
         .enumerate()
         .filter_map(|(order, b)| scored(matcher::fuzzy(query, &b.name), &b.name, order)))
     {
-        let branch = &sources.branches[scored.order];
+        let branch = &branches[scored.order];
         hits.push(Hit {
             group: Group::Branches,
             target: Target::Branch {
@@ -370,7 +380,12 @@ pub fn search(query: &str, sources: &Sources, recent: &Recent) -> Vec<Hit> {
         });
     }
 
-    for scored in top(sources.commits.iter().enumerate().filter_map(|(order, c)| {
+    let commit_sources: &[CommitSource] = if scope.includes(Group::Commits) {
+        &sources.commits
+    } else {
+        &[]
+    };
+    for scored in top(commit_sources.iter().enumerate().filter_map(|(order, c)| {
         let by_hash = matcher::hash_prefix(query, &c.hex);
         let by_summary = matcher::fuzzy(query, &c.info.summary);
         // Positions index the displayed `hash  summary`, not the summary.
@@ -400,7 +415,7 @@ pub fn search(query: &str, sources: &Sources, recent: &Recent) -> Vec<Hit> {
             positions: best.positions,
         })
     })) {
-        let commit = &sources.commits[scored.order];
+        let commit = &commit_sources[scored.order];
         hits.push(Hit {
             group: Group::Commits,
             target: Target::Commit(commit.oid),
@@ -410,21 +425,61 @@ pub fn search(query: &str, sources: &Sources, recent: &Recent) -> Vec<Hit> {
         });
     }
 
-    for scored in top(sources
-        .files
+    let files: &[String] = if scope.includes(Group::Files) {
+        &sources.files
+    } else {
+        &[]
+    };
+    for scored in top(files
         .iter()
         .enumerate()
         .filter_map(|(order, path)| scored(matcher::fuzzy(query, path), path, order)))
     {
         hits.push(Hit {
             group: Group::Files,
-            target: Target::File(sources.files[scored.order].clone()),
-            title: sources.files[scored.order].clone(),
+            target: Target::File(files[scored.order].clone()),
+            title: files[scored.order].clone(),
             positions: scored.positions,
             current: false,
         });
     }
     hits
+}
+
+/// Which groups a query searches: a leading `>`, `@` or `#` narrows it to the
+/// commands, the branches or the commits (the design's palette footer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    Commands,
+    Branches,
+    Commits,
+}
+
+impl Scope {
+    fn includes(self, group: Group) -> bool {
+        matches!(
+            (self, group),
+            (Scope::All, _)
+                | (Scope::Commands, Group::Commands)
+                | (Scope::Branches, Group::Branches)
+                | (Scope::Commits, Group::Commits)
+        )
+    }
+}
+
+/// Splits the scope prefix off `query`; the rest is trimmed, so `> fetch` and
+/// `>fetch` both match "fetch" against the commands only.
+pub fn split_scope(query: &str) -> (Scope, &str) {
+    let query = query.trim();
+    let scope = match query.chars().next() {
+        Some('>') => Scope::Commands,
+        Some('@') => Scope::Branches,
+        Some('#') => Scope::Commits,
+        _ => return (Scope::All, query),
+    };
+    // The prefixes are one byte each.
+    (scope, query[1..].trim())
 }
 
 fn commit_title(commit: &CommitSource) -> String {
@@ -619,6 +674,44 @@ mod tests {
             .filter(|h| h.group == group)
             .map(|h| h.title.as_str())
             .collect()
+    }
+
+    #[test]
+    fn scope_prefix_is_split_off_and_trimmed() {
+        assert_eq!(split_scope("fe"), (Scope::All, "fe"));
+        assert_eq!(split_scope(" >  fetch "), (Scope::Commands, "fetch"));
+        assert_eq!(split_scope("@main"), (Scope::Branches, "main"));
+        assert_eq!(split_scope("#a1"), (Scope::Commits, "a1"));
+        assert_eq!(split_scope("#"), (Scope::Commits, ""));
+    }
+
+    #[test]
+    fn prefixes_search_one_group_only() {
+        let mut s = sources(&[commit(0xa1, "Fix the main picker")]);
+        s.set_files(vec!["src/main.rs".into()]);
+        let recent = Recent::default();
+
+        let all = search("main", &s, &recent);
+        assert!(all.iter().any(|h| h.group == Group::Branches));
+        assert!(all.iter().any(|h| h.group == Group::Commits));
+        assert!(all.iter().any(|h| h.group == Group::Files));
+
+        let branches = search("@main", &s, &recent);
+        assert!(!branches.is_empty());
+        assert!(branches.iter().all(|h| h.group == Group::Branches));
+
+        let commits = search("#main", &s, &recent);
+        assert_eq!(titles(&commits, Group::Commits).len(), 1);
+        assert!(commits.iter().all(|h| h.group == Group::Commits));
+        // The prefix is stripped before matching: `#` alone is not a query.
+        assert!(search("#", &s, &recent)
+            .iter()
+            .all(|h| h.group == Group::Commits));
+
+        let commands = search(">fetch", &s, &recent);
+        assert!(!commands.is_empty());
+        assert!(commands.iter().all(|h| h.group == Group::Commands));
+        assert!(search(">main", &s, &recent).is_empty());
     }
 
     #[test]

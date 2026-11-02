@@ -1548,7 +1548,9 @@ impl RenderOnce for WorktreePanel {
             PanelState::Ready => {
                 let mut list = div()
                     .id("worktree-panel-list")
-                    .flex_1()
+                    // Shrinks to scroll but does not grow: "New worktree…"
+                    // sits right under the rows (design `.add-row`).
+                    .flex_initial()
                     .min_h_0()
                     .flex()
                     .flex_col()
@@ -1586,7 +1588,7 @@ impl RenderOnce for WorktreePanel {
         // "New worktree…" focuses the quick-create input of the centre pane.
         let on_event = self.on_event.clone();
         root.child(
-            div().flex_none().px(px(8.)).py(px(8.)).child(
+            div().flex_none().px(px(8.)).pt(px(6.)).pb(px(8.)).child(
                 div().w_full().child(
                     Button::new("worktree-panel-new")
                         .icon(IconName::Plus)

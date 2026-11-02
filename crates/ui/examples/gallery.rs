@@ -1752,7 +1752,7 @@ fn inputs_section(
                     .child(input_field(
                         "Search",
                         colors,
-                        SearchField::new("gallery-search", search).hint("Ctrl K"),
+                        SearchField::new("gallery-search", search).hint("Ctrl+K"),
                     )),
             ),
         )

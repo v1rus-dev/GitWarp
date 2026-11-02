@@ -147,6 +147,12 @@ impl ActivityStrip {
         self.load(cx);
     }
 
+    /// The day the strip counted up to (tests aim the keyboard cursor with it).
+    #[cfg(test)]
+    pub(crate) fn today(&self) -> i32 {
+        self.today
+    }
+
     pub(crate) fn is_collapsed(&self) -> bool {
         self.collapsed
     }
@@ -757,7 +763,12 @@ impl ActivityStrip {
         let keys = |text: &'static str| Kbd::new(text);
         side.child("Click a day to show its commits in History.")
             .child(
-                line()
+                // One line, as in the design: the hint never wraps `filter`.
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .whitespace_nowrap()
                     .child(keys("↑"))
                     .child(keys("↓"))
                     .child("day ·")

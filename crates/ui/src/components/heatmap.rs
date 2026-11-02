@@ -36,6 +36,8 @@ const MONTH_H: f32 = 14.;
 const RADIUS: f32 = 2.;
 /// Width of the box the tooltip label is centred in (the label shrinks to its text).
 const TIP_BOX_W: f32 = 280.;
+/// The room a tooltip needs above a cell: its height plus the 6 px gap.
+const TIP_FLIP_ROOM: f32 = 34.;
 
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -345,6 +347,10 @@ impl RenderOnce for Heatmap {
             .w(px(grid_w))
             .h(px(grid_h))
             .key_context("ui-heatmap")
+            .debug_selector({
+                let name = format!("{id_name}-grid");
+                move || name
+            })
             .track_focus(&focus);
 
         // Pointer: focus the grid on any press so the keyboard continues from there.
@@ -404,6 +410,7 @@ impl RenderOnce for Heatmap {
             );
             let (confirm, space) = (activate.clone(), activate);
             let on_clear = self.on_clear.clone();
+            let clear_focus = focus.clone();
             grid = grid
                 .on_action(move |_: &SelectPrev, window, cx| up(Some(-1), None, window, cx))
                 .on_action(move |_: &SelectNext, window, cx| down(Some(1), None, window, cx))
@@ -418,7 +425,12 @@ impl RenderOnce for Heatmap {
                 .on_action(move |_: &Confirm, window, cx| confirm(window, cx))
                 .on_action(move |_: &HeatmapActivate, window, cx| space(window, cx))
                 .on_action(move |_: &Cancel, window, cx| match &on_clear {
-                    Some(listener) => listener(window, cx),
+                    // The clear re-renders the strip; keep the grid focused so
+                    // the keyboard continues from the day (activity.js refocus).
+                    Some(listener) => {
+                        listener(window, cx);
+                        clear_focus.focus(window, cx);
+                    }
                     // Nothing to clear: let an enclosing dialog or panel see Esc.
                     None => cx.propagate(),
                 });
@@ -523,7 +535,15 @@ impl RenderOnce for Heatmap {
                 div()
                     .absolute()
                     .left(px(left))
-                    .bottom(px(grid_h - top + 6.))
+                    // Above the cell; the top rows have no room for it inside
+                    // the strip (it would be clipped), so it flips below.
+                    .map(|this| {
+                        if top < TIP_FLIP_ROOM {
+                            this.top(px(top + cell_f + 6.))
+                        } else {
+                            this.bottom(px(grid_h - top + 6.))
+                        }
+                    })
                     .w(px(TIP_BOX_W))
                     .flex()
                     .map(|this| {

@@ -336,6 +336,22 @@ pub fn effective_details_width(stored: f32, window_width: f32, sidebar_width: f3
     clamp_details(stored, Dock::Right).min(details_width_limit(window_width, sidebar_width))
 }
 
+/// The tallest a bottom-docked details panel may render: half of the window
+/// height (the same share the right dock gets of the width), within the panel's
+/// own 220–560 range, so History keeps its rows in a short window.
+pub fn details_height_limit(window_height: f32) -> f32 {
+    let (min, max) = dock_bounds(Dock::Bottom);
+    (DETAILS_MAX_SHARE * window_height).clamp(min, max)
+}
+
+/// The height a bottom-docked details panel renders at: its stored size,
+/// capped by [`details_height_limit`] and never below its 220 px minimum.
+///
+/// The stored size is not rewritten; only the rendered height shrinks.
+pub fn effective_details_height(stored: f32, window_height: f32) -> f32 {
+    clamp_details(stored, Dock::Bottom).min(details_height_limit(window_height))
+}
+
 /// The width the sidebar renders at: its stored width, capped to half the
 /// visible area and never below its own 160 px minimum.
 ///
@@ -2660,7 +2676,7 @@ impl RepositoryView {
         entries.push(MenuEntry::Item(
             MenuItem::new("Open repository…")
                 .icon(IconName::Folder)
-                .shortcut("Ctrl O")
+                .shortcut("Ctrl+O")
                 .action(move |window, cx| {
                     workspace
                         .update(cx, |workspace, cx| {
@@ -2803,7 +2819,7 @@ impl RepositoryView {
 
         let sidebar_toggle = Button::ghost("sidebar-toggle")
             .icon_only(IconName::Sidebar)
-            .tooltip_kbd("Toggle sidebar", "Ctrl B")
+            .tooltip_kbd("Toggle sidebar", "Ctrl+B")
             .on_click(cx.listener(|view, _, _, cx| view.toggle_sidebar(cx)));
 
         let repo_click = {
@@ -2836,7 +2852,7 @@ impl RepositoryView {
             Some(branch),
             layout.branch_name,
             layout.item_pad,
-            ("Switch branch", Some("Ctrl Shift B")),
+            ("Switch branch", Some("Ctrl+Shift+B")),
             self.branch_bounds.clone(),
             branch_click,
             colors,
@@ -2878,7 +2894,7 @@ impl RepositoryView {
         let stash_view = cx.entity();
         let mut stash_button = Button::tool("toolbar-stash")
             .icon(IconName::Stash)
-            .tooltip_kbd("Stash local changes", "Ctrl Shift S")
+            .tooltip_kbd("Stash local changes", "Ctrl+Shift+S")
             .on_click(move |_, window, cx| {
                 stash_view.update(cx, |view, cx| view.stash_changes(window, cx));
             });
@@ -3003,7 +3019,7 @@ impl RepositoryView {
         match self.history.read(cx).search_status() {
             // A query replaces the key hint with its count (or "No matches").
             Some(status) => field = field.trailing_text(status),
-            None if layout.search_kbd => field = field.hint("Ctrl K"),
+            None if layout.search_kbd => field = field.hint("Ctrl+K"),
             None => {}
         }
         bar = bar.child(
@@ -3025,7 +3041,7 @@ impl RepositoryView {
                 }))
                 .tooltip(Tooltip::with_kbd(
                     "Search commits, authors, hashes",
-                    "Ctrl K",
+                    "Ctrl+K",
                 ))
                 .child(field),
         );
@@ -3039,7 +3055,7 @@ impl RepositoryView {
         bar = bar.child(no_shrink(
             Button::ghost("settings-button")
                 .icon_only(IconName::Gear)
-                .tooltip_kbd("Settings", "Ctrl ,")
+                .tooltip_kbd("Settings", "Ctrl+,")
                 .on_click(settings_click),
         ));
 
@@ -3815,7 +3831,7 @@ impl RepositoryView {
                 } else {
                     let data = data.clone();
                     let list = if layout == DiffLayout::Split {
-                        let row_width = split_width(self.mono_cell, data.columns, width);
+                        let row_width = split_width(width);
                         uniform_list(
                             "details-diff",
                             data.split_rows.len(),
@@ -4082,6 +4098,7 @@ impl Render for RepositoryView {
         let client = matches!(window.window_decorations(), Decorations::Client { .. });
         let colors = cx.theme().colors;
         let width = f32::from(window.viewport_size().width);
+        let height = f32::from(window.viewport_size().height);
         let layout = toolbar_layout(width);
 
         // Until the user picks a side, the dock follows the window width, so
@@ -4110,12 +4127,12 @@ impl Render for RepositoryView {
         };
         let details_limit = match self.dock {
             Dock::Right => details_width_limit(width, sidebar_width),
-            Dock::Bottom => dock_bounds(Dock::Bottom).1,
+            Dock::Bottom => details_height_limit(height),
         };
         let details_width = if self.details_open {
             match self.dock {
                 Dock::Right => effective_details_width(self.details_size, width, sidebar_width),
-                Dock::Bottom => clamp_details(self.details_size, Dock::Bottom),
+                Dock::Bottom => effective_details_height(self.details_size, height),
             }
         } else {
             0.
@@ -4544,9 +4561,10 @@ fn diff_marker(kind: RowKind, background: Option<Hsla>, colors: ThemeColors) -> 
 }
 
 /// The width of one side-by-side row: two gutters and two equal text halves.
-fn split_width(cell: Pixels, columns: usize, pane: f32) -> Pixels {
-    let half = columns as f32 * f32::from(cell) + 12.;
-    px((2. * DIFF_GUTTER + 2. * half).max(pane))
+fn split_width(pane: f32) -> Pixels {
+    // Two equal halves that fill the pane whatever the content width; each
+    // half clips its own lines (design: `.sbs { overflow: hidden }`).
+    px(pane)
 }
 
 /// One side-by-side row: a hunk header, a note, or an old/new cell pair.
@@ -5015,6 +5033,17 @@ mod tests {
         // On a tiny window the 220 px minimum beats the half rule.
         assert_eq!(effective_details_width(900., 500., 300.), 220.);
         assert_eq!(details_width_limit(500., 300.), 220.);
+    }
+
+    #[test]
+    fn the_bottom_dock_is_capped_to_half_the_window_height() {
+        // A stored 560 in an 800 px window renders at 400.
+        assert_eq!(effective_details_height(560., 800.), 400.);
+        // A tall window keeps the stored size, within the 220–560 range.
+        assert_eq!(effective_details_height(300., 1386.), 300.);
+        assert_eq!(effective_details_height(900., 1386.), 560.);
+        // Never below the minimum.
+        assert_eq!(effective_details_height(560., 300.), 220.);
     }
 
     #[test]
@@ -6024,6 +6053,70 @@ mod tests {
         strip.update(&mut cx, |strip, cx| strip.pick_day(day + 1, cx));
         cx.run_until_parked();
         history.read_with(&cx, |history, _| assert!(history.day_filter().is_none()));
+    }
+
+    /// Enter on a keyboard-selected day filters History; Esc then clears the
+    /// filter and the heatmap keeps the focus (a second Enter picks again).
+    #[gpui::test]
+    fn escape_after_a_keyboard_pick_clears_the_filter_and_keeps_the_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (repo, day) = day_filter_repo("strip-esc");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        let (strip, history) =
+            view.read_with(&cx, |view, _| (view.activity.clone(), view.history.clone()));
+        let today = strip.read_with(&cx, |strip, _| strip.today());
+
+        // Tab to the grid: its keyboard ring (and tooltip) shows once it has
+        // the focus.
+        for _ in 0..60 {
+            if cx.debug_bounds("activity-heatmap-tip").is_some() {
+                break;
+            }
+            cx.simulate_keystrokes("tab");
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("activity-heatmap-tip").is_some(),
+            "Tab never reached the heatmap"
+        );
+
+        // End jumps to today; ← steps a week back, ↑ a day back.
+        let back = today - day;
+        cx.simulate_keystrokes("end");
+        for _ in 0..back / 7 {
+            cx.simulate_keystrokes("left");
+        }
+        for _ in 0..back % 7 {
+            cx.simulate_keystrokes("up");
+        }
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert_eq!(history.day_filter().expect("Enter picked the day").day, day);
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert!(history.day_filter().is_none(), "Esc left the filter on");
+        });
+
+        // The focus stayed on the grid: its ring is still drawn, and Enter
+        // picks the same day again.
+        assert!(
+            cx.debug_bounds("activity-heatmap-tip").is_some(),
+            "the heatmap lost the focus after Esc"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        history.read_with(&cx, |history, _| {
+            assert!(
+                history.day_filter().is_some(),
+                "the heatmap lost the focus after Esc"
+            );
+        });
     }
 
     /// The strip starts collapsed when the settings say so, and collapsing it

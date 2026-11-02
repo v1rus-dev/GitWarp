@@ -595,7 +595,7 @@ impl WorktreeSwitcher {
                         false,
                         colors,
                     ))
-                    .when_some(badge, |row, n| row.child(Kbd::new(format!("Alt {n}")))),
+                    .when_some(badge, |row, n| row.child(Kbd::new(format!("Alt+{n}")))),
             )
     }
 

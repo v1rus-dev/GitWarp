@@ -562,6 +562,8 @@ impl WorktreesView {
                         .size(ButtonSize::Small)
                         .icon(IconName::Branch)
                         .label(branch)
+                        // Design `.bchip` is set in the mono font.
+                        .mono(true)
                         .disabled(creating)
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.create(&name, window, cx)

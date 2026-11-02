@@ -527,7 +527,6 @@ fn key_card(view: &SettingsView, key: &SshKey, cx: &Context<SettingsView>) -> An
         .flex()
         .items_start()
         .gap(px(12.))
-        .border_b_1()
         .child(
             div()
                 .w(px(28.))
@@ -650,7 +649,6 @@ fn host_row(
         .flex()
         .items_center()
         .gap(px(12.))
-        .border_b_1()
         .child(
             div()
                 .flex_1()

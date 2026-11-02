@@ -1242,7 +1242,7 @@ impl ChangesView {
                 } else if data.rows.is_empty() {
                     diff_note("No changes", colors)
                 } else if layout == DiffLayout::Split {
-                    let row_width = split_width(self.mono_cell, data.columns, pane_width);
+                    let row_width = split_width(pane_width);
                     let data = data.clone();
                     let list = uniform_list(
                         "changes-diff",
@@ -1774,9 +1774,10 @@ fn diff_width(cell: Pixels, columns: usize, pane: f32) -> Pixels {
     px((DIFF_GUTTER * 2. + DIFF_MARKER + text).max(pane))
 }
 
-fn split_width(cell: Pixels, columns: usize, pane: f32) -> Pixels {
-    let half = columns as f32 * f32::from(cell) + 12.;
-    px((2. * DIFF_GUTTER + 2. * half).max(pane))
+fn split_width(pane: f32) -> Pixels {
+    // Two equal halves that fill the pane whatever the content width; each
+    // half clips its own lines (design: `.sbs { overflow: hidden }`).
+    px(pane)
 }
 
 /// One 44 px line-number gutter.
@@ -1940,6 +1941,7 @@ fn split_content(cell: Option<&SplitCell>, width: Pixels, colors: ThemeColors) -
         .items_center()
         .pl(px(6.))
         .pr(px(6.))
+        .overflow_hidden()
         .when_some(background, |this, background| this.bg(background))
         .text_color(colors.text);
     match cell {
@@ -1977,7 +1979,7 @@ mod tests {
     #[test]
     fn a_single_line_diff_is_never_narrower_than_the_pane() {
         assert!(diff_width(px(7.), 4, 400.) >= px(400.));
-        assert!(split_width(px(7.), 4, 400.) >= px(400.));
+        assert!(split_width(400.) >= px(400.));
     }
 
     /// Writes `content` to `file` under `dir`, creating parent directories.

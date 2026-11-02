@@ -309,7 +309,6 @@ pub(super) fn render(
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .border_b_1()
                     .child(
                         div()
                             .text_size(FS_SM)
@@ -379,7 +378,6 @@ pub(super) fn render(
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .border_b_1()
                     .child(div().text_size(FS_SM).child("Command"))
                     .child(
                         div()

@@ -30,7 +30,6 @@ pub fn row(
         .flex()
         .items_center()
         .gap(px(16.))
-        .border_b_1()
         .child(
             div()
                 .flex_1()
@@ -77,7 +76,6 @@ pub fn field_row(
         .gap(px(6.))
         .px(px(12.))
         .py(px(10.))
-        .border_b_1()
         .child(div().text_size(FS_SM).child(title.into()))
         .child(control)
         .when_some(description, |this, description| {

@@ -1043,6 +1043,8 @@ fn add_body(
             div()
                 .flex()
                 .flex_col()
+                // Content-width segmented control, not stretched to the row.
+                .items_start()
                 .gap(px(6.))
                 .child(
                     div()

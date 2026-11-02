@@ -345,7 +345,7 @@ impl PaletteView {
             .children(trailing)
     }
 
-    fn render_footer(colors: ui::ThemeColors) -> impl IntoElement {
+    fn render_footer(&self, colors: ui::ThemeColors) -> impl IntoElement {
         let hint = |keys: Vec<&'static str>, label: &'static str| {
             div()
                 .flex()
@@ -367,7 +367,14 @@ impl PaletteView {
             .text_color(colors.muted)
             .child(hint(vec!["↑", "↓"], "navigate"))
             .child(hint(vec!["Enter"], "run"))
-            .child(hint(vec!["Esc"], "close"))
+            .child(hint(vec![">"], "commands"))
+            .child(hint(vec!["@"], "branches"))
+            .child(hint(vec!["#"], "commits"))
+            .child(div().flex_1())
+            .child(match self.hits.len() {
+                1 => "1 result".to_owned(),
+                n => format!("{n} results"),
+            })
     }
 }
 
@@ -516,7 +523,7 @@ impl Render for PaletteView {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(input_row)
             .child(results)
-            .child(Self::render_footer(colors));
+            .child(self.render_footer(colors));
 
         // The modal layer centres its view; the palette sits 72px from the top
         // instead, so the view fills the layer and aligns the panel itself.

@@ -573,7 +573,6 @@ pub(super) fn render(
                 .flex()
                 .items_center()
                 .gap(px(12.))
-                .border_b_1()
                 .child(
                     div()
                         .w(px(32.))

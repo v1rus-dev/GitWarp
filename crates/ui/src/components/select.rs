@@ -148,7 +148,7 @@ impl RenderOnce for Select {
                 .absolute()
                 .inset_0(),
             )
-            .child(div().flex_1().min_w_0().child(label))
+            .child(div().flex_1().min_w_0().truncate().child(label))
             .child(Icon::new(IconName::ChevD).size(px(12.)).color(colors.muted));
 
         if self.disabled {

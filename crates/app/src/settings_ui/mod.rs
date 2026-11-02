@@ -25,7 +25,7 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, AnyElement, App, AppContext, ClickEvent, Context, Div, Entity, FocusHandle,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    InteractiveElement, IntoElement, ParentElement, Render, RenderOnce, SharedString,
     StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window,
 };
 
@@ -555,28 +555,53 @@ pub(crate) fn heading(title: &'static str, lead: impl Into<SharedString>) -> Div
 }
 
 /// One section: an uppercase label and the bordered list around it.
-pub(crate) fn group(title: &'static str, rows: Vec<AnyElement>) -> Div {
-    let mut list = div()
-        .flex()
-        .flex_col()
-        .border_1()
-        .rounded(R_MD)
-        .overflow_hidden();
-    for row in rows {
-        list = list.child(row);
+pub(crate) fn group(title: &'static str, rows: Vec<AnyElement>) -> Group {
+    Group { title, rows }
+}
+
+/// A titled section card (design `.slist`): surface fill, 1px border, and a
+/// divider under every row but the last (`.srow:last-child { border: 0 }`).
+/// It is a component because the colours come from the theme at render time.
+#[derive(IntoElement)]
+pub(crate) struct Group {
+    title: &'static str,
+    rows: Vec<AnyElement>,
+}
+
+impl RenderOnce for Group {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let last = self.rows.len().saturating_sub(1);
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.surface)
+            .rounded(R_MD)
+            .overflow_hidden();
+        for (index, row) in self.rows.into_iter().enumerate() {
+            list = list.child(
+                div()
+                    .when(index != last, |this| {
+                        this.border_b_1().border_color(colors.border)
+                    })
+                    .child(row),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .mb(px(20.))
+            .w_full()
+            .max_w(px(760.))
+            .child(
+                div()
+                    .text_size(ui::metrics::FS_XS)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(self.title.to_uppercase()),
+            )
+            .child(list)
     }
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.))
-        .mb(px(20.))
-        .w_full()
-        .max_w(px(760.))
-        .child(
-            div()
-                .text_size(ui::metrics::FS_XS)
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(title.to_uppercase()),
-        )
-        .child(list)
 }
