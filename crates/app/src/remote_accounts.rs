@@ -819,6 +819,7 @@ mod tests {
             label: login.to_owned(),
             method: AccountMethod::Token,
             ssh_host: None,
+            imported_from: None,
         }
     }
 

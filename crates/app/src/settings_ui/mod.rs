@@ -165,6 +165,12 @@ pub struct SettingsView {
     pub(crate) accounts_error: Option<SharedString>,
     pub(crate) account_dialog: Option<Entity<account_dialog::AccountDialog>>,
     pub(crate) account_prompt: Option<Entity<accounts::AccountPrompt>>,
+    /// Accounts found in the `gh` / `glab` CLIs (detected once per page open),
+    /// the state of their Import rows and the detection generation (an answer
+    /// for an earlier page open is dropped).
+    pub(crate) cli_imports: Vec<crate::cli_import::Candidate>,
+    pub(crate) cli_import_rows: std::collections::HashMap<String, accounts::ImportRow>,
+    pub(crate) cli_detect_generation: u64,
 
     /// Diff & merge: the editable merge command.
     pub(crate) merge_command: Entity<ui::TextInput>,
@@ -283,6 +289,9 @@ impl SettingsView {
             accounts_error: None,
             account_dialog: None,
             account_prompt: None,
+            cli_imports: Vec::new(),
+            cli_import_rows: std::collections::HashMap::new(),
+            cli_detect_generation: 0,
             merge_command,
             _merge_command_events: merge_command_events,
             merge_test: None,

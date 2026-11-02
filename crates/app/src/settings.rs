@@ -85,6 +85,10 @@ pub struct AccountRecord {
     /// Host used for git over SSH when it differs from the web host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_host: Option<String>,
+    /// The command-line tool this account was imported from (`"gh"` or
+    /// `"glab"`); `None` for accounts added in GitWarp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_from: Option<String>,
 }
 
 impl AccountRecord {
@@ -178,6 +182,9 @@ pub struct Settings {
     pub signing_key: String,
     /// Hosting-service accounts (Settings → Accounts); secrets are in the keychain.
     pub accounts: Vec<AccountRecord>,
+    /// `gh` / `glab` logins the user dismissed on Settings → Accounts, as
+    /// `tool|host|login` keys (see `cli_import::dismiss_key`).
+    pub dismissed_imports: Vec<String>,
     /// The account chosen for a remote when several match its host: repository
     /// (canonical common git dir, shared by all its worktrees) → remote name →
     /// account id. Kept here, not in the repository's `.git/config`, so GitWarp
@@ -238,6 +245,7 @@ impl Default for Settings {
             sign_commits: false,
             signing_key: String::new(),
             accounts: Vec::new(),
+            dismissed_imports: Vec::new(),
             remote_accounts: BTreeMap::new(),
             git_mode: GitMode::default(),
             git_path: String::new(),
@@ -880,6 +888,7 @@ fn settings_from_value(value: Value) -> Settings {
         sign_commits: take(&mut object, "sign_commits", defaults.sign_commits),
         signing_key: take(&mut object, "signing_key", defaults.signing_key),
         accounts: take_accounts(&mut object),
+        dismissed_imports: take(&mut object, "dismissed_imports", defaults.dismissed_imports),
         remote_accounts: take(&mut object, "remote_accounts", defaults.remote_accounts),
         git_mode: take(&mut object, "git_mode", defaults.git_mode),
         git_path: take(&mut object, "git_path", defaults.git_path),
@@ -934,6 +943,7 @@ fn take_accounts(object: &mut Map<String, Value>) -> Vec<AccountRecord> {
                 login,
                 method: AccountMethod::Token,
                 ssh_host: None,
+                imported_from: None,
             });
         }
     }
@@ -1388,7 +1398,9 @@ mod tests {
                 label: "Work".to_owned(),
                 method: AccountMethod::Token,
                 ssh_host: Some("ssh.modsen.app".to_owned()),
+                imported_from: Some("gh".to_owned()),
             }],
+            dismissed_imports: vec!["gh|github.com|mira-k".to_owned()],
             git_mode: GitMode::Custom,
             git_path: "/opt/git/bin/git".to_owned(),
             ..Settings::default()
@@ -1499,6 +1511,7 @@ mod tests {
             label: login.to_owned(),
             method: AccountMethod::Token,
             ssh_host: None,
+            imported_from: None,
         }
     }
 
@@ -1520,6 +1533,33 @@ mod tests {
         let json = fs::read_to_string(settings_path(dir.path())).unwrap();
         assert!(json.contains(r#""method": "browser""#), "{json}");
         assert!(!json.contains("token\":"), "no secret field: {json}");
+    }
+
+    #[test]
+    fn import_origin_and_dismissed_imports_round_trip() {
+        let dir = TempDir::new("accounts-import-origin");
+        let store = SettingsStore::new(settings_path(dir.path()));
+        let mut imported = account("a1", "github", "https://github.com", "mira-k");
+        imported.imported_from = Some("glab".to_owned());
+        let settings = Settings {
+            accounts: vec![
+                imported,
+                account("a2", "gitea", "https://codeberg.org", "m"),
+            ],
+            dismissed_imports: vec!["gh|github.com|old".to_owned()],
+            ..Settings::default()
+        };
+        store.save(&settings).unwrap();
+        assert_eq!(store.load(), settings);
+        let json = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert_eq!(json.matches("imported_from").count(), 1, "{json}");
+        // Files written before the fields existed load with the defaults.
+        let old = load_json(
+            dir.path(),
+            r#"{"accounts":[{"id":"a1","kind":"github","base_url":"https://github.com","login":"m","label":"m","method":"token"}]}"#,
+        );
+        assert_eq!(old.accounts[0].imported_from, None);
+        assert!(old.dismissed_imports.is_empty());
     }
 
     #[test]

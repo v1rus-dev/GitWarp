@@ -338,6 +338,58 @@ pub(crate) fn check_account(
     outcome_of(&account.login, result)
 }
 
+/* ------------------------------ CLI import ------------------------------- */
+
+/// Why importing a `gh` / `glab` login failed. Carries no token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ImportFailure {
+    Cli(crate::cli_import::CliError),
+    /// The service answered 401 for the token.
+    Rejected,
+    /// The token works but lacks these permissions.
+    Scopes(Vec<String>),
+    /// Any other failure of the check.
+    Api(String),
+    Keychain(String),
+}
+
+/// Imports one login: reads its token from the tool, verifies it with the
+/// service, stores it in the keychain like the Add dialog's token path and
+/// returns the record to add. Blocking; the token never leaves this function.
+pub(crate) fn import_cli_account(
+    store: &StoreResult,
+    candidate: &crate::cli_import::Candidate,
+) -> Result<AccountRecord, ImportFailure> {
+    let token = crate::cli_import::fetch_token(candidate).map_err(ImportFailure::Cli)?;
+    let instance = Instance::new(candidate.kind, &candidate.base_url)
+        .map_err(|e| ImportFailure::Api(e.to_string()))?;
+    let check = forge::api::current_user(&Client::new(), &instance, &token, TokenKind::Pat)
+        .map_err(|e| match e {
+            ApiError::Unauthorized => ImportFailure::Rejected,
+            other => ImportFailure::Api(other.to_string()),
+        })?;
+    if !check.missing.is_empty() {
+        return Err(ImportFailure::Scopes(check.missing));
+    }
+    let verified = Verified {
+        kind: candidate.kind,
+        base_url: instance.base_url,
+        ssh_host: instance.ssh_host,
+        login: check.user.login,
+        token,
+    };
+    let store = store
+        .as_ref()
+        .map_err(|e| ImportFailure::Keychain(e.to_string()))?;
+    let id = new_account_id();
+    store
+        .set(&id, &verified.token)
+        .map_err(|e| ImportFailure::Keychain(e.to_string()))?;
+    let mut record = verified.record(id, "");
+    record.imported_from = Some(candidate.tool.name().to_owned());
+    Ok(record)
+}
+
 /* ---------------------------- Add / Reconnect ---------------------------- */
 
 /// The steps of the Add account dialog. Reconnect starts at [`Step::SignIn`].
@@ -453,6 +505,7 @@ impl Verified {
             },
             method: crate::settings::AccountMethod::Token,
             ssh_host: self.ssh_host.clone(),
+            imported_from: None,
         }
     }
 }
@@ -537,6 +590,7 @@ mod tests {
             label: "mira-k".to_owned(),
             method: crate::settings::AccountMethod::Token,
             ssh_host: None,
+            imported_from: None,
         }
     }
 

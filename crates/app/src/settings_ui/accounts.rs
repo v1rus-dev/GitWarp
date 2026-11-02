@@ -23,12 +23,13 @@ use ui::metrics::{FS_BASE, FS_SM, FS_XS, R_MD, R_XS};
 use ui::theme::ActiveTheme;
 use ui::{
     dialog, overlay, Banner, BannerKind, Button, ButtonSize, Dialog, DialogFocus, DialogHost,
-    EmptyState, Icon, IconName, TextInput, TextInputEvent, Tooltip,
+    EmptyState, Icon, IconName, TextInput, TextInputEvent, ToastKind, Tooltip,
 };
 
 use super::account_dialog;
 use super::{heading, SettingsView};
 use crate::accounts::{self as logic, cached_store, AccountStatus, StoreResult};
+use crate::cli_import::{self, Candidate, CliError};
 use crate::settings::{AccountMethod, AccountRecord};
 
 /// The service's icon: the GitHub mark, or a monogram badge for the others.
@@ -92,9 +93,141 @@ pub(crate) fn avatar(login: &str, size: Pixels, font: Pixels, cx: &App) -> AnyEl
 }
 
 impl SettingsView {
-    /// Checks every account (page opened) in the background.
+    /// Checks every account (page opened) in the background, and looks for
+    /// accounts the `gh` / `glab` CLIs are signed in to.
     pub(super) fn open_accounts(&mut self, cx: &mut Context<Self>) {
         self.start_checks(None, cx);
+        self.start_cli_detect(cx);
+    }
+
+    /// Runs the CLI detection off the UI thread, once per page open. An answer
+    /// that arrives after the page was left or opened again is ignored.
+    fn start_cli_detect(&mut self, cx: &mut Context<Self>) {
+        self.cli_detect_generation += 1;
+        let generation = self.cli_detect_generation;
+        self.cli_imports.clear();
+        self.cli_import_rows.clear();
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async { crate::cli_import::detect() })
+                .await;
+            this.update(cx, |view, cx| {
+                if view.cli_detect_generation != generation || view.page != super::Page::Accounts {
+                    return;
+                }
+                view.cli_imports = found;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Dismiss: never offer this login again.
+    fn dismiss_cli_import(&mut self, candidate: &Candidate, cx: &mut Context<Self>) {
+        let key = candidate.key();
+        self.cli_import_rows.remove(&key);
+        crate::update_settings(cx, |settings| {
+            if !settings.dismissed_imports.contains(&key) {
+                settings.dismissed_imports.push(key);
+            }
+        });
+        cx.notify();
+    }
+
+    /// Import: reads the token from the tool, verifies it, saves it like the
+    /// Add dialog's token path. A failure shows its reason on the row.
+    fn import_cli_account(
+        &mut self,
+        candidate: Candidate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = candidate.key();
+        if matches!(self.cli_import_rows.get(&key), Some(ImportRow::Importing)) {
+            return;
+        }
+        self.cli_import_rows
+            .insert(key.clone(), ImportRow::Importing);
+        let cached = cached_store(cx);
+        let window_handle = window.window_handle();
+        let background = candidate.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = cached.unwrap_or_else(logic::resolve_store);
+                    logic::import_cli_account(&store, &background)
+                })
+                .await;
+            // The account is saved here, not in the view: the keychain already
+            // holds the token, and closing Settings mid-import must not leave
+            // it without a record.
+            let outcome = match result {
+                Ok(record) => {
+                    let to_save = record.clone();
+                    let saved = cx.update(|cx| persist_imported(cx, to_save));
+                    if !saved {
+                        // The same login was added meanwhile: drop the copy just stored.
+                        let id = record.id.clone();
+                        let cached = cx.update(|cx| cached_store(cx));
+                        cx.background_executor()
+                            .spawn(async move {
+                                if let Ok(store) = cached.unwrap_or_else(logic::resolve_store) {
+                                    let _ = store.delete(&id);
+                                }
+                            })
+                            .await;
+                    }
+                    Ok((record, saved))
+                }
+                Err(failure) => Err(failure),
+            };
+            window_handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |view, cx| {
+                        view.cli_import_done(candidate, outcome, window, cx)
+                    })
+                    .ok();
+                })
+                .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Row state, status and toast for a finished import; the account itself
+    /// was already saved by [`persist_imported`].
+    fn cli_import_done(
+        &mut self,
+        candidate: Candidate,
+        result: Result<(AccountRecord, bool), logic::ImportFailure>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = candidate.key();
+        let (record, saved) = match result {
+            Ok(done) => done,
+            Err(failure) => {
+                let message = import_failure_text(&candidate, &failure);
+                self.cli_import_rows.insert(key, ImportRow::Failed(message));
+                cx.notify();
+                return;
+            }
+        };
+        self.cli_import_rows.remove(&key);
+        if saved {
+            let message = ui::t!(
+                "settings.accounts.import.toast",
+                login = record.login,
+                tool = candidate.tool.name()
+            );
+            self.account_status
+                .insert(record.id, AccountStatus::Connected);
+            ui::toast::show(ToastKind::Ok, message, window, cx);
+        }
+        cx.notify();
     }
 
     /// Resolves the secret store, then checks the matching accounts, each in
@@ -248,6 +381,209 @@ impl SettingsView {
         .detach();
         cx.notify();
     }
+}
+
+/// Adds an imported account unless the same login (service, instance, login)
+/// exists already. Returns whether it was added.
+fn persist_imported(cx: &mut App, record: AccountRecord) -> bool {
+    let duplicate = super::current_settings(cx).accounts.iter().any(|a| {
+        a.kind == record.kind
+            && a.base_url.eq_ignore_ascii_case(&record.base_url)
+            && a.login.eq_ignore_ascii_case(&record.login)
+    });
+    if duplicate {
+        return false;
+    }
+    crate::update_settings(cx, |settings| settings.accounts.push(record));
+    true
+}
+
+/// The state of one Import row while it is not idle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ImportRow {
+    Importing,
+    Failed(SharedString),
+}
+
+/// The reason shown on a row whose import failed. Never contains the token.
+fn import_failure_text(candidate: &Candidate, failure: &logic::ImportFailure) -> SharedString {
+    let tool = candidate.tool.name();
+    match failure {
+        logic::ImportFailure::Cli(CliError::Timeout) => {
+            ui::t!("settings.accounts.import.error.timeout", tool = tool)
+        }
+        logic::ImportFailure::Cli(CliError::Missing) => {
+            ui::t!("settings.accounts.import.error.missing", tool = tool)
+        }
+        logic::ImportFailure::Cli(CliError::Failed) => {
+            ui::t!("settings.accounts.import.error.failed", tool = tool)
+        }
+        logic::ImportFailure::Cli(CliError::Empty) => {
+            ui::t!("settings.accounts.import.error.empty", tool = tool)
+        }
+        logic::ImportFailure::Rejected => ui::t!("settings.accounts.import.error.rejected"),
+        logic::ImportFailure::Scopes(scopes) => ui::t!(
+            "settings.accounts.import.error.scopes",
+            scopes = scopes.join(", ")
+        ),
+        logic::ImportFailure::Api(error) => {
+            ui::t!("settings.accounts.import.error.api", error = error)
+        }
+        logic::ImportFailure::Keychain(error) => {
+            ui::t!("settings.accounts.import.error.keychain", error = error)
+        }
+    }
+}
+
+/// The banner above the list: one row per login the CLIs are signed in to.
+fn import_banner(
+    view: &SettingsView,
+    candidates: &[Candidate],
+    cx: &mut Context<SettingsView>,
+) -> AnyElement {
+    let colors = cx.theme().colors;
+    let mut banner = div()
+        .max_w(px(760.))
+        .mb(px(16.))
+        .px(px(12.))
+        .py(px(10.))
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .border_1()
+        .border_color(colors.info.opacity(0.5))
+        .rounded(R_MD)
+        .bg(colors.info.opacity(0.09))
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .mt(px(2.))
+                        .child(Icon::new(IconName::Info).size(px(16.)).color(colors.info)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(FS_BASE)
+                                .child(ui::t!("settings.accounts.import.title")),
+                        )
+                        .child(
+                            div()
+                                .text_size(FS_SM)
+                                .text_color(colors.muted)
+                                .child(ui::t!("settings.accounts.import.text")),
+                        ),
+                ),
+        );
+    for (index, candidate) in candidates.iter().enumerate() {
+        let key = candidate.key();
+        let row_state = view.cli_import_rows.get(&key);
+        let importing = matches!(row_state, Some(ImportRow::Importing));
+        let import = {
+            let entity = cx.entity();
+            let candidate = candidate.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                let candidate = candidate.clone();
+                entity.update(cx, |view, cx| {
+                    view.import_cli_account(candidate, window, cx)
+                });
+            }
+        };
+        let dismiss = {
+            let entity = cx.entity();
+            let candidate = candidate.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                let candidate = candidate.clone();
+                entity.update(cx, |view, cx| view.dismiss_cli_import(&candidate, cx));
+            }
+        };
+        banner = banner.child(
+            div()
+                .id(ElementId::Name(format!("settings-import-{key}").into()))
+                .flex()
+                .flex_col()
+                .py(px(6.))
+                .border_t_1()
+                .border_color(colors.border)
+                .when(index == 0, |this| this.mt(px(6.)))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(service_icon(candidate.kind, cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_baseline()
+                                .gap(px(6.))
+                                .text_size(FS_BASE)
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(candidate.login.clone()),
+                                )
+                                .child(div().text_color(colors.muted).truncate().child(ui::t!(
+                                    "settings.accounts.import.source",
+                                    host = candidate.host.clone(),
+                                    tool = candidate.tool.name()
+                                ))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .flex_none()
+                                .child(
+                                    Button::primary(format!("settings-import-{key}-import"))
+                                        .label(if importing {
+                                            ui::t!("settings.accounts.import.importing")
+                                        } else {
+                                            ui::t!("settings.accounts.import.import")
+                                        })
+                                        .size(ButtonSize::Small)
+                                        .disabled(importing)
+                                        .on_click(import),
+                                )
+                                .child(
+                                    Button::new(format!("settings-import-{key}-dismiss"))
+                                        .label(ui::t!("settings.accounts.import.dismiss"))
+                                        .size(ButtonSize::Small)
+                                        .disabled(importing)
+                                        .on_click(dismiss),
+                                ),
+                        ),
+                )
+                .when_some(
+                    match row_state {
+                        Some(ImportRow::Failed(reason)) => Some(reason.clone()),
+                        _ => None,
+                    },
+                    |this, reason| {
+                        this.child(
+                            div()
+                                .mt(px(4.))
+                                .pl(px(30.))
+                                .text_size(FS_SM)
+                                .text_color(colors.error)
+                                .child(reason),
+                        )
+                    },
+                ),
+        );
+    }
+    banner.into_any_element()
 }
 
 fn status_view(status: &AccountStatus, id: &str, cx: &App) -> AnyElement {
@@ -483,6 +819,16 @@ pub(super) fn render(
                 .body(error.clone()),
             ),
         );
+    }
+
+    // Above the list, and above the empty state, as the design shows.
+    let offers = cli_import::visible(
+        &view.cli_imports,
+        &settings.accounts,
+        &settings.dismissed_imports,
+    );
+    if !offers.is_empty() {
+        page = page.child(import_banner(view, &offers, cx));
     }
 
     let add = {
@@ -1183,6 +1529,7 @@ mod picker_tests {
             label: label.into(),
             method,
             ssh_host: None,
+            imported_from: None,
         }
     }
 
