@@ -4,6 +4,10 @@
 //! Every function blocks; callers run them off the UI thread. No message or
 //! `Debug` output of this module ever contains a token.
 
+mod repos;
+
+pub use repos::{list_user_repos, RepoListing, RepoSummary, MAX_REPOS};
+
 use crate::encode::{encode_path, encode_segment};
 use crate::{known_kind_for_host, Instance, RepoCoords, ServiceKind};
 use serde::Deserialize;

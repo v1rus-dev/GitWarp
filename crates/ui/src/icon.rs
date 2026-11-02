@@ -68,11 +68,14 @@ pub enum IconName {
     Hourglass,
     Skip,
     Comment,
+    Repo,
+    RepoForked,
+    Archive,
 }
 
 impl IconName {
-    /// All 59 icons, in the design's order.
-    pub const ALL: [IconName; 59] = [
+    /// All 62 icons, in the design's order.
+    pub const ALL: [IconName; 62] = [
         Self::Branch,
         Self::Tag,
         Self::Cloud,
@@ -132,6 +135,9 @@ impl IconName {
         Self::Hourglass,
         Self::Skip,
         Self::Comment,
+        Self::Repo,
+        Self::RepoForked,
+        Self::Archive,
     ];
 
     /// Asset path, e.g. `icons/chev-r.svg`.
@@ -196,6 +202,9 @@ impl IconName {
             Self::Hourglass => "icons/hourglass.svg",
             Self::Skip => "icons/skip.svg",
             Self::Comment => "icons/comment.svg",
+            Self::Repo => "icons/repo.svg",
+            Self::RepoForked => "icons/repo-forked.svg",
+            Self::Archive => "icons/archive.svg",
         }
     }
 }

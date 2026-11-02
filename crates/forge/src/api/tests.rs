@@ -1,3 +1,4 @@
+use super::repos::list_repos_at;
 use super::*;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -22,6 +23,7 @@ impl Stub {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen: Seen = Arc::default();
         let log = seen.clone();
+        let base_for_thread = base.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut reader = BufReader::new(stream);
@@ -42,22 +44,30 @@ impl Stub {
                     }
                 }
                 let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+                let target = path.to_string();
                 let path = path.split('?').next().unwrap().to_string();
                 log.lock().unwrap().push((path.clone(), headers));
                 let (status, extra, body) = routes
                     .iter()
-                    .find(|(p, _)| *p == path)
+                    // A route may name the query too; it wins over the bare path.
+                    .find(|(p, _)| *p == target)
+                    .or_else(|| routes.iter().find(|(p, _)| *p == path))
                     .map(|(_, c)| c.clone())
                     .unwrap_or((404, vec![], ""));
+                // `{base}` in a header or body stands for this stub's address.
+                let body = body.replace("{base}", &base_for_thread);
                 let mut out = format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
                     body.len()
                 );
                 for (k, v) in extra {
-                    out.push_str(&format!("{k}: {v}\r\n"));
+                    out.push_str(&format!(
+                        "{k}: {}\r\n",
+                        v.replace("{base}", &base_for_thread)
+                    ));
                 }
                 out.push_str("\r\n");
-                out.push_str(body);
+                out.push_str(&body);
                 let _ = reader.get_mut().write_all(out.as_bytes());
             }
         });
@@ -542,4 +552,298 @@ fn a_redirect_is_unknown_not_private() {
     )]);
     let c = coords(&["acme"], "moved");
     assert_eq!(is_public(ServiceKind::GitHub, &stub, &c), Ok(None));
+}
+
+// ---- list_user_repos ----
+
+fn list(kind: ServiceKind, stub: &Stub) -> Result<Vec<RepoSummary>, ApiError> {
+    list_listing(kind, stub).map(|listing| listing.repos)
+}
+
+fn list_listing(kind: ServiceKind, stub: &Stub) -> Result<RepoListing, ApiError> {
+    list_user_repos(&Client::for_tests(), &instance(kind, stub), "sekret")
+}
+
+const GH_FIRST: &str =
+    "/api/v3/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member";
+
+#[test]
+fn github_repos_are_parsed_sorted_and_use_the_token() {
+    let stub = Stub::start(vec![(
+        "/api/v3/user/repos",
+        ok(r#"[
+          {"name":"old","owner":{"login":"mira"},"description":null,"private":true,"fork":false,
+           "archived":true,"updated_at":"2020-01-01T00:00:00Z","clone_url":"https://h/mira/old.git"},
+          {"name":"new","owner":{"login":"acme"},"description":" A tool ","private":false,"fork":true,
+           "archived":false,"updated_at":"2024-05-01T10:00:00Z","clone_url":"https://h/acme/new.git"},
+          {"owner":{"login":"x"},"clone_url":"broken"}
+        ]"#),
+    )]);
+    let repos = list(ServiceKind::GitHub, &stub).unwrap();
+    assert_eq!(repos.len(), 2, "an item without a name is skipped");
+    assert_eq!(
+        repos[0],
+        RepoSummary {
+            owner: "acme".into(),
+            name: "new".into(),
+            description: Some("A tool".into()),
+            private: false,
+            fork: true,
+            archived: false,
+            updated_at: 1_714_557_600,
+            clone_https: "https://h/acme/new.git".into(),
+        }
+    );
+    assert_eq!(repos[1].name, "old");
+    assert!(repos[1].private && repos[1].archived && repos[1].description.is_none());
+    assert_eq!(
+        stub.header("/api/v3/user/repos", "authorization")
+            .as_deref(),
+        Some("Bearer sekret")
+    );
+}
+
+#[test]
+fn github_follows_the_link_header_to_the_last_page() {
+    let item = |n: &str, t: &str| {
+        format!(
+            r#"{{"name":"{n}","owner":{{"login":"a"}},"private":false,"fork":false,"archived":false,"updated_at":"{t}","clone_url":"https://h/a/{n}.git"}}"#
+        )
+    };
+    let page1: &'static str =
+        Box::leak(format!("[{}]", item("one", "2024-01-01T00:00:00Z")).into_boxed_str());
+    let page2: &'static str =
+        Box::leak(format!("[{}]", item("two", "2024-02-01T00:00:00Z")).into_boxed_str());
+    let stub = Stub::start(vec![
+        (
+            GH_FIRST,
+            (
+                200,
+                vec![(
+                    "Link",
+                    r#"<{base}/api/v3/user/repos?page=2>; rel="next", <{base}/api/v3/user/repos?page=2>; rel="last""#,
+                )],
+                page1,
+            ),
+        ),
+        ("/api/v3/user/repos?page=2", ok(page2)),
+    ]);
+    let repos = list(ServiceKind::GitHub, &stub).unwrap();
+    let names: Vec<_> = repos.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["two", "one"]);
+}
+
+#[test]
+fn a_next_link_to_another_origin_is_not_followed() {
+    let stub = Stub::start(vec![(
+        "/api/v3/user/repos",
+        (
+            200,
+            vec![("Link", r#"<http://127.0.0.1:1/steal>; rel="next""#)],
+            "[]",
+        ),
+    )]);
+    assert_eq!(list(ServiceKind::GitHub, &stub), Ok(vec![]));
+    assert_eq!(stub.seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn gitlab_repos_follow_x_next_page() {
+    let stub = Stub::start(vec![
+        (
+            "/api/v4/projects?membership=true&order_by=last_activity_at&per_page=100",
+            (
+                200,
+                vec![("X-Next-Page", "2")],
+                r#"[{"path":"tool","namespace":{"full_path":"grp/sub"},"description":"",
+                    "visibility":"internal","archived":false,"last_activity_at":"2024-03-01T00:00:00.000Z",
+                    "http_url_to_repo":"https://gl/grp/sub/tool.git"}]"#,
+            ),
+        ),
+        (
+            "/api/v4/projects?membership=true&order_by=last_activity_at&per_page=100&page=2",
+            (
+                200,
+                vec![("X-Next-Page", "")],
+                r#"[{"path":"priv","namespace":{"full_path":"me"},"visibility":"private","archived":true,
+                    "forked_from_project":{"id":1},"last_activity_at":"2024-04-01T12:00:00+02:00",
+                    "http_url_to_repo":"https://gl/me/priv.git"}]"#,
+            ),
+        ),
+    ]);
+    let repos = list(ServiceKind::GitLab, &stub).unwrap();
+    assert_eq!(repos.len(), 2);
+    let priv_repo = &repos[0];
+    assert_eq!(
+        (priv_repo.owner.as_str(), priv_repo.name.as_str()),
+        ("me", "priv")
+    );
+    assert!(priv_repo.private && priv_repo.fork && priv_repo.archived);
+    assert_eq!(
+        priv_repo.updated_at, 1_711_965_600,
+        "+02:00 is converted to UTC"
+    );
+    let tool = &repos[1];
+    assert_eq!(tool.owner, "grp/sub");
+    assert!(!tool.private, "internal is visible to every signed-in user");
+    assert!(tool.description.is_none());
+    assert_eq!(
+        stub.header("/api/v4/projects", "private-token").as_deref(),
+        Some("sekret"),
+        "a personal access token goes the way every other GitLab call sends it"
+    );
+}
+
+#[test]
+fn gitea_repos_use_the_token_scheme_and_link_paging() {
+    let stub = Stub::start(vec![
+        (
+            "/api/v1/user/repos?limit=50&page=1",
+            (
+                200,
+                vec![(
+                    "Link",
+                    r#"<{base}/api/v1/user/repos?limit=50&page=2>; rel="next""#,
+                )],
+                r#"[{"name":"a","owner":{"login":"me"},"private":true,"fork":false,"archived":false,
+                    "updated_at":"2024-01-01T00:00:00Z","clone_url":"https://g/me/a.git"}]"#,
+            ),
+        ),
+        (
+            "/api/v1/user/repos?limit=50&page=2",
+            ok(
+                r#"[{"name":"b","owner":{"login":"me"},"private":false,"fork":true,"archived":false,
+                    "updated_at":"2024-06-01T00:00:00Z","clone_url":"https://g/me/b.git"}]"#,
+            ),
+        ),
+    ]);
+    let repos = list(ServiceKind::Gitea, &stub).unwrap();
+    assert_eq!(
+        repos.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        ["b", "a"]
+    );
+    assert_eq!(
+        stub.header("/api/v1/user/repos", "authorization")
+            .as_deref(),
+        Some("token sekret")
+    );
+}
+
+#[test]
+fn bitbucket_cloud_repos_follow_next_and_drop_the_user_from_the_clone_url() {
+    let stub = Stub::start(vec![
+        (
+            "/2.0/repositories?role=member&pagelen=100&sort=-updated_on",
+            ok(
+                r#"{"values":[{"full_name":"ws/one","description":"d","is_private":true,
+                  "updated_on":"2024-05-01T10:00:00.123456+00:00",
+                  "links":{"clone":[{"name":"ssh","href":"git@bitbucket.org:ws/one.git"},
+                                     {"name":"https","href":"https://mira@bitbucket.org/ws/one.git"}]}}],
+                  "next":"{base}/2.0/repositories?page=2"}"#,
+            ),
+        ),
+        (
+            "/2.0/repositories?page=2",
+            ok(
+                r#"{"values":[{"full_name":"ws/two","is_private":false,"parent":{"full_name":"x/two"},
+                  "updated_on":"2023-01-01T00:00:00+00:00",
+                  "links":{"clone":[{"name":"https","href":"https://bitbucket.org/ws/two.git"}]}}]}"#,
+            ),
+        ),
+    ]);
+    let api = format!("{}/2.0", stub.base);
+    let repos = list_repos_at(&Client::for_tests(), ServiceKind::Bitbucket, &api, "sekret")
+        .unwrap()
+        .repos;
+    assert_eq!(repos.len(), 2);
+    assert_eq!(repos[0].clone_https, "https://bitbucket.org/ws/one.git");
+    assert!(repos[0].private && !repos[0].fork && !repos[0].archived);
+    assert_eq!(repos[0].updated_at, 1_714_557_600);
+    assert!(repos[1].fork);
+    assert_eq!(
+        stub.header("/2.0/repositories", "authorization").as_deref(),
+        Some("Bearer sekret")
+    );
+}
+
+#[test]
+fn listing_stops_at_the_cap() {
+    let page = |from: usize| -> &'static str {
+        let items: Vec<String> = (from..from + 300)
+            .map(|n| {
+                format!(
+                    r#"{{"name":"r{n}","owner":{{"login":"a"}},"private":false,"fork":false,"archived":false,"updated_at":"2024-01-01T00:00:00Z","clone_url":"https://h/a/r{n}.git"}}"#
+                )
+            })
+            .collect();
+        Box::leak(format!("[{}]", items.join(",")).into_boxed_str())
+    };
+    let link = |n: u8| -> Vec<(&'static str, &'static str)> {
+        let value: &'static str = Box::leak(
+            format!(r#"<{{base}}/api/v3/user/repos?page={n}>; rel="next""#).into_boxed_str(),
+        );
+        vec![("Link", value)]
+    };
+    let stub = Stub::start(vec![
+        (GH_FIRST, (200, link(2), page(0))),
+        ("/api/v3/user/repos?page=2", (200, link(3), page(300))),
+        ("/api/v3/user/repos?page=3", ok("[]")),
+    ]);
+    let listing = list_listing(ServiceKind::GitHub, &stub).unwrap();
+    assert_eq!(listing.repos.len(), MAX_REPOS);
+    assert!(listing.truncated);
+    assert!(!stub.requested("/api/v3/user/repos?page=3"));
+}
+
+#[test]
+fn an_empty_account_is_an_empty_list() {
+    let stub = Stub::start(vec![("/api/v3/user/repos", ok("[]"))]);
+    assert_eq!(
+        list_listing(ServiceKind::GitHub, &stub),
+        Ok(RepoListing {
+            repos: vec![],
+            truncated: false
+        })
+    );
+}
+
+#[test]
+fn listing_maps_http_errors() {
+    for (status, extra, expected) in [
+        (401, vec![], ApiError::Unauthorized),
+        (403, vec![], ApiError::Forbidden),
+        (
+            403,
+            vec![("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "99")],
+            ApiError::RateLimited { reset_at: Some(99) },
+        ),
+        (500, vec![], ApiError::Status(500)),
+    ] {
+        let stub = Stub::start(vec![("/api/v3/user/repos", (status, extra, "{}"))]);
+        assert_eq!(list(ServiceKind::GitHub, &stub), Err(expected));
+    }
+}
+
+#[test]
+fn listing_rejects_a_body_that_is_not_a_list() {
+    let stub = Stub::start(vec![("/api/v3/user/repos", ok(r#"{"message":"hi"}"#))]);
+    assert!(matches!(
+        list(ServiceKind::GitHub, &stub),
+        Err(ApiError::Decode(_))
+    ));
+}
+
+#[test]
+fn azure_and_bitbucket_server_cannot_list() {
+    let stub = Stub::start(vec![]);
+    assert_eq!(
+        list(ServiceKind::AzureDevOps, &stub),
+        Err(ApiError::Unsupported)
+    );
+    // A self-hosted address is Bitbucket Server, whose API differs.
+    assert_eq!(
+        list(ServiceKind::Bitbucket, &stub),
+        Err(ApiError::Unsupported)
+    );
+    assert!(stub.seen.lock().unwrap().is_empty());
 }

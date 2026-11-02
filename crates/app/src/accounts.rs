@@ -9,11 +9,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use forge::api::{ApiError, Client, Probe, TokenCheck, TokenKind};
+use forge::api::{ApiError, Client, Probe, RepoListing, RepoSummary, TokenCheck, TokenKind};
 use forge::secrets::{KeychainStore, SecretError, SecretStore};
 use forge::{Instance, ServiceKind};
 use gpui::{App, Global, SharedString};
 
+use crate::network_service::{AccountCredential, HostKey};
 use crate::settings::{AccountRecord, LEGACY_ACCOUNT_ID_PREFIX};
 
 /* ------------------------------ secret store ----------------------------- */
@@ -50,6 +51,15 @@ pub(crate) fn init_secret_store(cx: &mut App) {
         cx.update(|cx| cx.global_mut::<SecretStoreGlobal>().state = Some(state));
     })
     .detach();
+}
+
+/// Installs an empty in-memory store as the opened keychain, so a test never
+/// talks to the system one.
+#[cfg(test)]
+pub(crate) fn set_test_store(cx: &mut App) {
+    cx.set_global(SecretStoreGlobal {
+        state: Some(Ok(Arc::new(forge::secrets::MemoryStore::new()))),
+    });
 }
 
 /// The store opened at startup, `None` while that is still in progress. A
@@ -575,6 +585,140 @@ pub(crate) fn sign_in_outcome(
     }
 }
 
+/* -------------------------- clone from an account ------------------------- */
+
+/// The sources of the Clone dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloneTab {
+    Url,
+    Account,
+}
+
+/// "From account" opens first when there is an account to list; without one
+/// the tab is hidden and the dialog is the URL form.
+pub(crate) fn default_clone_tab(account_count: usize) -> CloneTab {
+    if account_count > 0 {
+        CloneTab::Account
+    } else {
+        CloneTab::Url
+    }
+}
+
+/// An account's entry in the account select: `<label> · <host>`.
+pub(crate) fn account_option_label(account: &AccountRecord) -> String {
+    format!(
+        "{} · {}",
+        account.display_label(),
+        host_of(&account.base_url)
+    )
+}
+
+/// Why the repository list of an account could not be shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepoListError {
+    /// The service rejected the token, or none is stored: Reconnect helps.
+    Revoked,
+    /// The instance did not answer: Retry helps.
+    Unreachable,
+    /// The service has no account-wide repository list (Azure DevOps).
+    Unsupported,
+    /// Anything else, with the text to show (Retry helps).
+    Other(String),
+}
+
+pub(crate) fn repo_list_error(error: ApiError) -> RepoListError {
+    match error {
+        ApiError::Unauthorized => RepoListError::Revoked,
+        ApiError::Unreachable(_) | ApiError::TlsUntrusted(_) => RepoListError::Unreachable,
+        ApiError::Unsupported => RepoListError::Unsupported,
+        other => RepoListError::Other(other.to_string()),
+    }
+}
+
+/// The repositories `account` can see. Blocking: reads the keychain, then
+/// asks the service. The token never leaves this function.
+pub(crate) fn list_account_repos(
+    store: &StoreResult,
+    account: &AccountRecord,
+) -> Result<RepoListing, RepoListError> {
+    let store = store
+        .as_ref()
+        .map_err(|error| RepoListError::Other(error.to_string()))?;
+    let instance = instance_of(account).map_err(RepoListError::Other)?;
+    // No token is needed to know there is no list to ask for.
+    if instance.kind == ServiceKind::AzureDevOps {
+        return Err(RepoListError::Unsupported);
+    }
+    let token = store
+        .get(&account.id)
+        .map_err(|error| RepoListError::Other(error.to_string()))?
+        .ok_or(RepoListError::Revoked)?;
+    forge::api::list_user_repos(&Client::new(), &instance, &token).map_err(repo_list_error)
+}
+
+/// Indexes into `repos` of those matching `query`: a case-insensitive
+/// substring of `owner/name description`; an empty query matches all.
+pub(crate) fn filter_repos(repos: &[RepoSummary], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    repos
+        .iter()
+        .enumerate()
+        .filter(|(_, repo)| {
+            query.is_empty()
+                || format!(
+                    "{}/{} {}",
+                    repo.owner,
+                    repo.name,
+                    repo.description.as_deref().unwrap_or("")
+                )
+                .to_lowercase()
+                .contains(&query)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The host entry that lets a clone of `url` use `account`'s token through
+/// the askpass helper. `None` for a non-HTTPS address, an unknown service, or
+/// an address that is not on the account's own instance: a service can report
+/// a clone URL on another host, and the token must never go there.
+pub(crate) fn clone_credential(
+    account: &AccountRecord,
+    url: &str,
+) -> Option<(HostKey, AccountCredential)> {
+    let remote = forge::RemoteRef::parse(url)?;
+    let instance = instance_of(account).ok()?;
+    // `matches` also accepts the SSH host and host aliases; an HTTPS token is
+    // only for the web host itself, on the instance's port and sub-path.
+    instance.matches(&remote)?;
+    if !remote.host.eq_ignore_ascii_case(instance.host()) {
+        return None;
+    }
+    let scheme = match remote.transport {
+        forge::Transport::Https => "https",
+        // Same rule as the push / fetch jobs: plain http only for an account
+        // that was itself set up on an http:// instance.
+        forge::Transport::Http
+            if account
+                .base_url
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("http://") =>
+        {
+            "http"
+        }
+        forge::Transport::Http | forge::Transport::Ssh => return None,
+    };
+    let kind = kind_of(account)?;
+    Some((
+        HostKey::new(scheme, &remote.host, remote.port),
+        AccountCredential {
+            account_id: account.id.clone(),
+            username: kind.git_username(&account.login),
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +736,113 @@ mod tests {
             ssh_host: None,
             imported_from: None,
         }
+    }
+
+    fn repo(owner: &str, name: &str, description: Option<&str>) -> RepoSummary {
+        RepoSummary {
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+            description: description.map(str::to_owned),
+            private: false,
+            fork: false,
+            archived: false,
+            updated_at: 0,
+            clone_https: format!("https://github.com/{owner}/{name}.git"),
+        }
+    }
+
+    #[test]
+    fn the_default_tab_follows_the_accounts() {
+        assert_eq!(default_clone_tab(0), CloneTab::Url);
+        assert_eq!(default_clone_tab(1), CloneTab::Account);
+        assert_eq!(default_clone_tab(4), CloneTab::Account);
+    }
+
+    #[test]
+    fn the_account_option_shows_label_and_host() {
+        let mut account = record("a1", "https://github.com/");
+        assert_eq!(account_option_label(&account), "mira-k · github.com");
+        account.label = "Work".to_owned();
+        assert_eq!(account_option_label(&account), "Work · github.com");
+    }
+
+    #[test]
+    fn the_search_matches_owner_name_and_description_ignoring_case() {
+        let repos = [
+            repo("mira-k", "gitwarp", Some("A fast git client")),
+            repo("nexu-io", "open-design", None),
+            repo("mira-k", "dotfiles", Some("Shell configs")),
+        ];
+        assert_eq!(filter_repos(&repos, ""), [0, 1, 2]);
+        assert_eq!(filter_repos(&repos, "  "), [0, 1, 2]);
+        assert_eq!(filter_repos(&repos, "MIRA"), [0, 2]);
+        assert_eq!(filter_repos(&repos, "client"), [0]);
+        assert_eq!(filter_repos(&repos, "nexu-io/open"), [1]);
+        assert!(filter_repos(&repos, "zzz").is_empty());
+    }
+
+    #[test]
+    fn list_errors_map_to_what_the_user_can_do() {
+        assert_eq!(
+            repo_list_error(ApiError::Unauthorized),
+            RepoListError::Revoked
+        );
+        assert_eq!(
+            repo_list_error(ApiError::Unreachable("dns".into())),
+            RepoListError::Unreachable
+        );
+        assert_eq!(
+            repo_list_error(ApiError::Unsupported),
+            RepoListError::Unsupported
+        );
+        assert!(matches!(
+            repo_list_error(ApiError::Status(500)),
+            RepoListError::Other(_)
+        ));
+    }
+
+    #[test]
+    fn a_missing_token_means_reconnect_without_a_request() {
+        let store: StoreResult = Ok(Arc::new(MemoryStore::new()));
+        let account = record("a1", "https://github.com");
+        assert_eq!(
+            list_account_repos(&store, &account),
+            Err(RepoListError::Revoked)
+        );
+    }
+
+    #[test]
+    fn a_clone_uses_the_account_for_https_only() {
+        let account = record("a1", "https://github.com");
+        let (host, credential) =
+            clone_credential(&account, "https://github.com/acme/tool.git").unwrap();
+        assert_eq!(host, HostKey::new("https", "github.com", None));
+        assert_eq!(credential.account_id, "a1");
+        assert_eq!(credential.username, "mira-k");
+        assert!(clone_credential(&account, "git@github.com:acme/tool.git").is_none());
+        assert!(clone_credential(&account, "http://github.com/acme/tool.git").is_none());
+    }
+
+    /// A self-hosted service may report a clone URL on another host; the
+    /// token is not offered there.
+    #[test]
+    fn a_clone_url_on_another_host_gets_no_token() {
+        let mut account = record("a2", "https://git.corp.example");
+        account.kind = "gitlab".to_owned();
+        assert!(clone_credential(&account, "https://git.corp.example/grp/tool.git").is_some());
+        for other in [
+            "https://evil.example/grp/tool.git",
+            "https://git.corp.example.evil.example/grp/tool.git",
+            "https://git.corp.example:8443/grp/tool.git",
+            "https://user@evil.example/grp/tool.git",
+        ] {
+            assert!(clone_credential(&account, other).is_none(), "{other}");
+        }
+        // The instance's sub-path is part of the match.
+        let mut sub = record("a3", "https://corp.example/git");
+        sub.kind = "gitlab".to_owned();
+        assert!(clone_credential(&sub, "https://corp.example/git/grp/tool.git").is_some());
+        assert!(clone_credential(&sub, "https://corp.example/other/grp/tool.git").is_none());
     }
 
     fn check(login: &str, missing: &[&str]) -> TokenCheck {

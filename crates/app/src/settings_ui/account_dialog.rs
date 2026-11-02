@@ -53,8 +53,9 @@ pub(crate) enum Open {
     Reconnect(AccountRecord),
 }
 
-/// Runs after a new account is saved, with its record. Used when the dialog is
-/// opened from a remote instead of Settings.
+/// Runs after an account is saved, with its record: a new account (when the
+/// dialog is opened from a remote instead of Settings; the opener then replaces
+/// the toast) or a Reconnect (the toast stays).
 pub(crate) type OnSaved = Rc<dyn Fn(&AccountRecord, &mut Window, &mut App)>;
 
 /// A token the service accepted, waiting for the label and Done.
@@ -631,12 +632,17 @@ impl AccountDialog {
         }
         let on_saved = self.on_saved.clone();
         self.close(window, cx);
-        match on_saved {
+        match &on_saved {
             // The opener says what happened in its own words.
             Some(on_saved) if !reconnect => on_saved(&record, window, cx),
             _ => {
                 ui::toast::show(ToastKind::Ok, message, window, cx);
             }
+        }
+        // A Reconnect keeps its toast; the opener only learns the token works
+        // again (e.g. to reload a list that failed with the old one).
+        if let Some(on_saved) = on_saved.filter(|_| reconnect) {
+            on_saved(&record, window, cx);
         }
     }
 
