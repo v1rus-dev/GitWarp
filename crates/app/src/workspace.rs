@@ -199,6 +199,7 @@ impl Workspace {
                     ..Default::default()
                 }),
                 app_id: Some("dev.v1rus.gitwarp".into()),
+                icon: crate::app_icon::window_icon(),
                 ..Default::default()
             },
             move |window, cx| {

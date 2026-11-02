@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=GitWarp
+GenericName=Git Client
+Comment=A fast, keyboard-first Git client
+Exec=gitwarp %F
+Icon=dev.v1rus.gitwarp
+Terminal=false
+Categories=Development;RevisionControl;
+StartupWMClass=dev.v1rus.gitwarp
+MimeType=inode/directory;

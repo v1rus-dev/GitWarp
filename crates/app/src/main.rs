@@ -1,3 +1,4 @@
+mod app_icon;
 mod changes_view;
 mod checkout_dialog;
 mod clone_dialog;
@@ -327,6 +328,7 @@ fn main() {
                         ..Default::default()
                     }),
                     app_id: Some("dev.v1rus.gitwarp".into()),
+                    icon: app_icon::window_icon(),
                     ..Default::default()
                 },
                 |window, cx| {

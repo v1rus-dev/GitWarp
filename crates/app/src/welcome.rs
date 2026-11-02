@@ -298,7 +298,7 @@ impl WelcomeView {
 
     fn render_left(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
-        let git_icon = Icon::new(IconName::Git).size(px(26.)).color(colors.text);
+        let logo = crate::app_icon::logo(px(26.));
 
         let open = row_action(cx, |view, window, cx| {
             view.open_repository_dialog(window, cx)
@@ -327,7 +327,7 @@ impl WelcomeView {
                     .items_center()
                     .gap(px(10.))
                     .mb(px(4.))
-                    .child(git_icon)
+                    .child(logo)
                     .child(
                         div()
                             .text_size(FS_XL)
@@ -627,7 +627,7 @@ impl Render for WelcomeView {
                     .gap(px(8.))
                     .pl(px(4.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(Icon::new(IconName::Git).size(px(16.)))
+                    .child(crate::app_icon::logo(px(16.)))
                     .child("GitWarp"),
             )
             .child(titlebar_fill());

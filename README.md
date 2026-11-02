@@ -24,6 +24,20 @@ cargo test                                   # core crates only (fast, no GPUI)
 cargo run --release -p app -- /path/to/repo  # the app
 ```
 
+### Install on Linux (desktop entry)
+
+After `cargo build --release -p app`, install the binary, desktop entry and
+hicolor icons for the current user:
+
+```sh
+./packaging/linux/install.sh            # into ~/.local
+PREFIX=/some/prefix ./packaging/linux/install.sh
+```
+
+The desktop entry is named `dev.v1rus.gitwarp.desktop` so its basename matches
+the window's `app_id`; Wayland compositors use that to show the icon in the
+launcher and taskbar.
+
 ### Which git
 
 Opening a repository does not spawn `git`. [`GitRunner`](crates/git-core/src/runner.rs)
