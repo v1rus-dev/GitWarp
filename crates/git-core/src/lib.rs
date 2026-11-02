@@ -554,6 +554,13 @@ impl Repo {
         ops::remote_url(self, name)
     }
 
+    /// Every push URL of `name`: one per `remote.<name>.pushurl` entry, or the
+    /// fetch URL when none is set (git's own `get-url --push` semantics).
+    /// Empty when no such remote is configured.
+    pub fn remote_push_urls(&self, name: &str) -> Result<Vec<String>> {
+        ops::remote_push_urls(self, name)
+    }
+
     /// Applies `oid` on top of HEAD; a conflict is aborted and returned.
     pub fn cherry_pick(&self, oid: Oid) -> Result<()> {
         ops::cherry_pick(self, oid)
@@ -590,6 +597,24 @@ impl Repo {
     /// `user.signingkey`, for the tag dialog's signing option.
     pub fn signing_key(&self) -> Result<Option<String>> {
         ops::signing_key(self)
+    }
+
+    /// The subjects of the commits in `base..head`, oldest first (the 500
+    /// newest at most): the prefill of a pull request's description.
+    pub fn commit_subjects(&self, base: &str, head: &str) -> Result<Vec<String>> {
+        ops::commit_subjects(self, base, head)
+    }
+
+    /// `(ahead, behind)`: the commits `head` has that `base` lacks, and the
+    /// commits `base` has that `head` lacks.
+    pub fn ahead_behind(&self, base: &str, head: &str) -> Result<(usize, usize)> {
+        ops::ahead_behind(self, base, head)
+    }
+
+    /// The default branch of `remote` as `refs/remotes/<remote>/HEAD` records
+    /// it, `None` when that pointer is missing.
+    pub fn remote_default_branch(&self, remote: &str) -> Result<Option<String>> {
+        ops::remote_default_branch(self, remote)
     }
 }
 

@@ -5,11 +5,14 @@
 //! hides itself after five seconds.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, App, BorrowAppContext, Div, Global, ParentElement, SharedString, Styled, Window,
-    WindowId,
+    div, px, App, BorrowAppContext, Div, FontWeight, Global, ParentElement, SharedString, Styled,
+    Window, WindowId,
 };
 
 use crate::components::{Button, ButtonSize};
@@ -57,12 +60,71 @@ impl ToastKind {
     }
 }
 
+/// What a toast button runs.
+pub type ToastHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// A small button inside a toast, e.g. "Reconnect". Clicking it dismisses the
+/// toast and runs the handler.
+#[derive(Clone)]
+pub struct ToastAction {
+    pub label: SharedString,
+    pub on_click: ToastHandler,
+}
+
+impl ToastAction {
+    pub fn new(
+        label: impl Into<SharedString>,
+        on_click: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            on_click: Rc::new(on_click),
+        }
+    }
+}
+
+impl fmt::Debug for ToastAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToastAction")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ToastAction {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label && Rc::ptr_eq(&self.on_click, &other.on_click)
+    }
+}
+
+impl Eq for ToastAction {}
+
+/// One line of a toast's list: a result icon, a text, an optional muted
+/// detail and an optional button.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToastLine {
+    /// Check icon when `true`, error icon otherwise.
+    pub ok: bool,
+    pub text: SharedString,
+    pub detail: Option<SharedString>,
+    pub action: Option<ToastAction>,
+}
+
+/// What a toast shows besides its message (the title): a list of lines, a
+/// button next to the message, or both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToastBody {
+    pub lines: Vec<ToastLine>,
+    pub action: Option<ToastAction>,
+}
+
 /// One visible toast.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toast {
     pub id: ToastId,
     pub kind: ToastKind,
     pub message: SharedString,
+    pub body: Option<ToastBody>,
 }
 
 struct QueuedToast {
@@ -89,6 +151,17 @@ impl ToastQueue {
         message: impl Into<SharedString>,
         now: Instant,
     ) -> ToastId {
+        self.push_with(kind, message, None, now)
+    }
+
+    /// [`ToastQueue::push`] with a list and/or a button under the message.
+    pub fn push_with(
+        &mut self,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        body: Option<ToastBody>,
+        now: Instant,
+    ) -> ToastId {
         self.next_id += 1;
         let id = ToastId(self.next_id);
         self.entries.push(QueuedToast {
@@ -96,6 +169,7 @@ impl ToastQueue {
                 id,
                 kind,
                 message: message.into(),
+                body,
             },
             deadline: kind.auto_hide().then(|| now + TOAST_LIFETIME),
         });
@@ -171,8 +245,21 @@ pub fn show(
     window: &mut Window,
     cx: &mut App,
 ) -> ToastId {
+    show_with(kind, message, None, window, cx)
+}
+
+/// [`show`] with a list of lines and/or a button under the message.
+pub fn show_with(
+    kind: ToastKind,
+    message: impl Into<SharedString>,
+    body: Option<ToastBody>,
+    window: &mut Window,
+    cx: &mut App,
+) -> ToastId {
     let now = cx.background_executor().now();
-    let id = with_queue(window, cx, |queue| queue.push(kind, message, now));
+    let id = with_queue(window, cx, |queue| {
+        queue.push_with(kind, message, body, now)
+    });
     window.refresh();
 
     if kind.auto_hide() {
@@ -244,13 +331,78 @@ pub(crate) fn render_stack(window: &Window, cx: &App) -> Option<Div> {
 fn render_toast(toast: &Toast, colors: ThemeColors, shadows: Vec<gpui::BoxShadow>) -> Div {
     let color = toast.kind.color(colors);
     let id = toast.id;
-    div()
+    let body = toast.body.as_ref();
+    let has_lines = body.is_some_and(|body| !body.lines.is_empty());
+    let action_button = |action: &ToastAction, key: String, size: ButtonSize| {
+        let on_click = action.on_click.clone();
+        Button::new(gpui::ElementId::Name(key.into()))
+            .size(size)
+            .label(action.label.clone())
+            .on_click(move |_, window, cx| {
+                dismiss(id, window, cx);
+                on_click(window, cx);
+            })
+    };
+
+    let mut message = div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .flex_1()
+        .min_w_0()
+        .child(
+            div()
+                .text_size(FS_BASE)
+                .text_color(colors.text)
+                .when(has_lines, |title| title.font_weight(FontWeight::SEMIBOLD))
+                .child(toast.message.clone()),
+        );
+    if let Some(body) = body {
+        for (index, line) in body.lines.iter().enumerate() {
+            let line_color = if line.ok {
+                colors.success
+            } else {
+                colors.error
+            };
+            let icon = if line.ok {
+                IconName::Check
+            } else {
+                IconName::Err
+            };
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(FS_BASE)
+                .child(Icon::new(icon).size(px(12.)).color(line_color))
+                .child(div().text_color(colors.text).child(line.text.clone()));
+            if let Some(detail) = &line.detail {
+                row = row.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(colors.muted)
+                        .child(detail.clone()),
+                );
+            }
+            if let Some(action) = &line.action {
+                row = row.child(action_button(
+                    action,
+                    format!("toast-{}-line-{index}", id.0),
+                    ButtonSize::Xs,
+                ));
+            }
+            message = message.child(row);
+        }
+    }
+
+    let mut toast_el = div()
         .relative()
         .flex()
         .items_center()
         .gap(px(8.))
         .min_w(px(260.))
-        .max_w(px(380.))
+        .max_w(if body.is_some() { px(420.) } else { px(380.) })
         .py(px(8.))
         .pr(px(8.))
         .pl(px(12.))
@@ -268,27 +420,32 @@ fn render_toast(toast: &Toast, colors: ThemeColors, shadows: Vec<gpui::BoxShadow
                 .bottom(px(0.))
                 .w(px(3.))
                 .bg(color),
-        )
+        );
+    if has_lines {
+        // A list: the icon stays beside the title, not centred on the list.
+        toast_el = toast_el.items_start();
+    }
+    toast_el = toast_el
         .child(Icon::new(toast.kind.icon()).size(px(14.)).color(color))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_size(FS_BASE)
-                .text_color(colors.text)
-                .child(toast.message.clone()),
-        )
-        .child(
-            Button::ghost(gpui::ElementId::Name(
-                format!("toast-dismiss-{}", id.0).into(),
-            ))
-            .icon_only(IconName::X)
-            .size(ButtonSize::Xs)
-            .tooltip(crate::i18n::t("kit.toast.dismiss"))
-            .on_click(move |_, window, cx| {
-                dismiss(id, window, cx);
-            }),
-        )
+        .child(message);
+    if let Some(action) = body.and_then(|body| body.action.as_ref()) {
+        toast_el = toast_el.child(action_button(
+            action,
+            format!("toast-action-{}", id.0),
+            ButtonSize::Xs,
+        ));
+    }
+    toast_el.child(
+        Button::ghost(gpui::ElementId::Name(
+            format!("toast-dismiss-{}", id.0).into(),
+        ))
+        .icon_only(IconName::X)
+        .size(ButtonSize::Xs)
+        .tooltip(crate::i18n::t("kit.toast.dismiss"))
+        .on_click(move |_, window, cx| {
+            dismiss(id, window, cx);
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -336,5 +493,36 @@ mod tests {
         queue.push(ToastKind::Ok, "saved", now);
         assert!(queue.expire(now + Duration::from_millis(4999)).is_empty());
         assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn a_toast_can_carry_lines_and_a_button() {
+        let mut queue = ToastQueue::new();
+        let now = Instant::now();
+        let body = ToastBody {
+            lines: vec![ToastLine {
+                ok: false,
+                text: "codeberg.org · mira-k".into(),
+                detail: Some("Token invalid or revoked".into()),
+                action: Some(ToastAction::new("Reconnect", |_, _| {})),
+            }],
+            action: None,
+        };
+        let id = queue.push_with(
+            ToastKind::Error,
+            "Pushed main to 1 of 2 targets",
+            Some(body),
+            now,
+        );
+        let toast = queue.iter().next().unwrap();
+        assert_eq!(toast.id, id);
+        let lines = &toast.body.as_ref().unwrap().lines;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].action.as_ref().unwrap().label, "Reconnect");
+        // Errors with a list stay until dismissed, like every error.
+        assert!(queue.expire(now + TOAST_LIFETIME * 10).is_empty());
+        // A plain push has no body.
+        queue.push(ToastKind::Ok, "saved", now);
+        assert!(queue.iter().nth(1).unwrap().body.is_none());
     }
 }

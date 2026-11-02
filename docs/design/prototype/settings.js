@@ -1,4 +1,4 @@
-/* GitWarp settings shell: a centred modal card over the (dimmed) main window, seven sections,
+/* GitWarp settings shell: a centred modal card over the (dimmed) main window, eight sections,
    shared persistence, row builders and a small dialog controller for dialogs opened from Settings. */
 (function () {
   'use strict';
@@ -12,7 +12,8 @@
     ['key', 'SSH keys', 'settings-ssh.html'],
     ['keyboard', 'Keybindings', 'settings-keybindings.html'],
     ['split', 'Diff &amp; merge', 'settings-diff.html'],
-    ['user', 'Identity', 'settings-identity.html']
+    ['user', 'Identity', 'settings-identity.html'],
+    ['cloud', 'Accounts', 'settings-accounts.html']
   ];
   S.nav = (cur) => `<nav class="snav" aria-label="Settings sections">${S.SECTIONS.map(([i, l, h]) => `<a class="node${h === cur ? ' sel' : ''}" href="${h}" style="--lvl:0"${h === cur ? ' aria-current="page"' : ''}>${ic(i, 14)}<span class="nlabel">${l}</span></a>`).join('')}</nav>`;
 

@@ -29,8 +29,9 @@ use ui::focus::{self, RingOffset};
 use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD, R_SM};
 use ui::theme::ThemeColors;
 use ui::{
-    menu, ActiveTheme, Avatar, Button, ButtonSize, EmptyState, Icon, IconName, ListRow, MenuEntry,
-    MenuItem, Progress, RefBadge, RefKind, Skeleton, Spinner, ToastKind, Tooltip,
+    menu, ActiveTheme, Avatar, Button, ButtonSize, CiGlyph, EmptyState, Icon, IconName, ListRow,
+    MenuEntry, MenuItem, PrBadge, Progress, RefBadge, RefKind, Skeleton, Spinner, ToastKind,
+    Tooltip,
 };
 
 use crate::format::{format_count, relative_time};
@@ -48,14 +49,20 @@ pub(crate) type RefActionHandler = Rc<dyn Fn(RefAction, &mut Window, &mut App)>;
 /// What the shell does with a sidebar action chosen from a ref's menu.
 pub(crate) type SidebarActionHandler = Rc<dyn Fn(SidebarAction, &mut Window, &mut App)>;
 
+/// Opens the pull request popover of a local branch at a window position.
+pub(crate) type PrClickHandler = Rc<dyn Fn(String, Point<Pixels>, &mut Window, &mut App)>;
+
 /// Sets (`Some`) or clears (`None`) the History's branch filter.
 type FilterSetter = Rc<dyn Fn(Option<String>, &mut App)>;
 
 /// A sidebar node key's context-menu model.
 type RefMenuSource = Rc<dyn Fn(&str) -> Vec<SidebarMenuEntry>>;
+use crate::hosting_status::{ci_label, HostingView, PrBadgeView};
+use crate::remote_accounts::RemoteTargets;
 use crate::settings::{GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MAX, GRAPH_WIDTH_MIN};
-use crate::sidebar::{sidebar_menu, SidebarAction, SidebarMenuEntry};
+use crate::sidebar::{sidebar_menu_with_links, SidebarAction, SidebarExtras, SidebarMenuEntry};
 use crate::theme;
+use crate::web_links::{self, HostLink};
 use crate::workspace::{OpenGitSettings, Workspace};
 
 /// Rows are delivered to the UI in pages of this size.
@@ -166,6 +173,24 @@ pub(crate) fn bind_history_keys(cx: &mut App, settings: &crate::settings::Settin
 }
 
 type Page = Result<Vec<(CommitInfo, Row<Oid>)>, Failure>;
+
+/// Width reserved for a row's pull request badge: icon, `#1234` and padding.
+const PR_BADGE_WIDTH: f32 = 46.;
+
+/// The pull request badge of a local branch badge (the current branch's HEAD
+/// badge included), with the branch it belongs to.
+fn pr_badge_of<'a>(
+    hosting: &'a HostingView,
+    spec: &'a BadgeSpec,
+) -> Option<(&'a str, &'a PrBadgeView)> {
+    matches!(spec.kind, RefKind::Local | RefKind::Head)
+        .then(|| {
+            hosting
+                .badge(&spec.label)
+                .map(|badge| (spec.label.as_ref(), badge))
+        })
+        .flatten()
+}
 
 /// One ref badge on a history row, derived from HEAD and the refs once they
 /// load — never per frame.
@@ -633,6 +658,16 @@ pub struct HistoryView {
     /// (a branch submenu of the row menu, or a badge's menu); `None` until the
     /// shell installs it, and then those items do nothing.
     sidebar_action: Option<SidebarActionHandler>,
+    /// The repository's remotes, for the "Open on <host>" menu items; set by
+    /// the shell whenever it reloads them.
+    remote_targets: Vec<RemoteTargets>,
+    /// The pull request badges and CI dots, pushed by the shell.
+    hosting: Arc<HostingView>,
+    /// What a click on a pull request badge does; installed by the shell.
+    pr_click: Option<PrClickHandler>,
+    /// Bumped whenever HEAD and the refs were read again, so the shell knows
+    /// to look at its branch tracking once more.
+    meta_version: u64,
     /// The branch last picked in a row-menu picker, for the whole session. It
     /// is listed first in the next picker and never applied by itself.
     last_picked_branch: Rc<RefCell<Option<String>>>,
@@ -942,6 +977,8 @@ struct RowMenu {
     on_filter: FilterSetter,
     /// A sidebar key's menu model.
     branch_menu: RefMenuSource,
+    /// The hosts the commit can be opened on.
+    open_links: Vec<HostLink>,
 }
 
 impl RowMenu {
@@ -955,6 +992,7 @@ impl RowMenu {
                     cx.write_to_clipboard(ClipboardItem::new_string(hash.clone()));
                 }),
         )];
+        self.push_open_items(&mut entries);
         self.push_switch(&mut entries);
         self.push_filter_items(&mut entries);
         self.push_branch_items(&mut entries);
@@ -1015,6 +1053,43 @@ impl RowMenu {
             true,
         );
         entries
+    }
+
+    /// "Open on <Service>" per host the commit can be opened on; the remote's
+    /// name tells them apart when there are several.
+    fn push_open_items(&self, entries: &mut Vec<MenuEntry>) {
+        let several = self.open_links.len() > 1;
+        for link in &self.open_links {
+            let Some(url) = link.url(&forge::WebTarget::Commit(self.hash.clone())) else {
+                continue;
+            };
+            let label = if several {
+                ui::t!(
+                    "history.menu.open_on_host_remote",
+                    service = link.service_name(),
+                    remote = link.remote()
+                )
+            } else {
+                ui::t!("history.menu.open_on_host", service = link.service_name())
+            };
+            let action = SidebarAction::OpenUrl {
+                url,
+                host: link.host().to_owned(),
+            };
+            let handler = self.on_sidebar.clone();
+            entries.push(MenuEntry::Item(
+                MenuItem::new(label)
+                    .icon(IconName::External)
+                    .action(move |window, cx| match &handler {
+                        Some(handler) => handler(action.clone(), window, cx),
+                        None => {
+                            if let SidebarAction::OpenUrl { url, .. } = &action {
+                                cx.open_url(url);
+                            }
+                        }
+                    }),
+            ));
+        }
     }
 
     /// "Switch to {b}" for one other local branch, "Switch to…" for several,
@@ -1230,6 +1305,10 @@ impl HistoryView {
             workspace,
             on_action,
             sidebar_action: None,
+            remote_targets: Vec::new(),
+            hosting: Arc::default(),
+            pr_click: None,
+            meta_version: 0,
             last_picked_branch: Rc::new(RefCell::new(None)),
             root: None,
             items: Vec::new(),
@@ -2008,6 +2087,68 @@ impl HistoryView {
         self.sidebar_action = Some(handler);
     }
 
+    /// Installs what a click on a pull request badge does.
+    pub(crate) fn set_pr_click_handler(&mut self, handler: PrClickHandler) {
+        self.pr_click = Some(handler);
+    }
+
+    /// Replaces the pull request badges and CI dots the rows draw.
+    pub(crate) fn set_hosting(&mut self, hosting: Arc<HostingView>, cx: &mut Context<Self>) {
+        self.hosting = hosting;
+        cx.notify();
+    }
+
+    /// How many commits are loaded.
+    pub(crate) fn loaded_len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Every loaded commit reachable from `tips` (the tips themselves
+    /// included), following parents through the loaded commits only.
+    pub(crate) fn reachable_from(&self, tips: &[Oid]) -> HashSet<Oid> {
+        let index: HashMap<Oid, &CommitInfo> = self
+            .items
+            .iter()
+            .map(|item| (item.commit.id, item.commit.as_ref()))
+            .collect();
+        crate::hosting_status::reachable(tips, |oid| {
+            index.get(&oid).map(|commit| commit.parents.clone())
+        })
+    }
+
+    /// How many times HEAD and the refs have been (re)read.
+    pub(crate) fn meta_version(&self) -> u64 {
+        self.meta_version
+    }
+
+    /// Tells the History which remotes the repository has, so its menus can
+    /// offer "Open on <host>".
+    pub(crate) fn set_remote_targets(&mut self, targets: Vec<RemoteTargets>) {
+        self.remote_targets = targets;
+    }
+
+    /// The hosts the repository's remotes point at, the current branch's
+    /// upstream first. Pure: reads the configured accounts, nothing else.
+    fn host_links(&self, cx: &App) -> Vec<HostLink> {
+        if self.remote_targets.is_empty() {
+            return Vec::new();
+        }
+        let accounts = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.accounts.clone())
+            .unwrap_or_default();
+        let preferred = web_links::upstream_remote(
+            self.head(),
+            self.refs().unwrap_or(&[]),
+            &self.remote_targets,
+        );
+        web_links::host_links(
+            &crate::remote_accounts::account_refs(&accounts),
+            &self.remote_targets,
+            preferred.as_deref(),
+        )
+    }
+
     /// Right-clicking a row selects it and opens the row menu at the pointer.
     fn open_row_menu(
         &mut self,
@@ -2024,8 +2165,10 @@ impl HistoryView {
         let card = CommitCard::from_commit(&item.commit, refs, self.head());
         let (switchable, branches) = row_branches(commit, self.head(), refs);
         let view = cx.entity();
+        let links = self.host_links(cx);
         let menu = RowMenu {
             hash: commit.to_string(),
+            open_links: links.clone(),
             card,
             reset_branch: match self.head() {
                 Some(Head::Branch { name, .. }) => name.clone(),
@@ -2044,18 +2187,25 @@ impl HistoryView {
             on_filter: Rc::new(move |branch, cx| {
                 view.update(cx, |view, cx| view.set_branch_filter(branch, cx));
             }),
-            branch_menu: self.ref_menu_source(),
+            branch_menu: self.ref_menu_source(links),
         };
         menu::open_context_menu(position, menu.entries(), window, cx);
     }
 
     /// Where a ref's own sidebar menu comes from: the sidebar's model for a
     /// sidebar key, over a snapshot of HEAD and the refs.
-    fn ref_menu_source(&self) -> RefMenuSource {
+    fn ref_menu_source(&self, links: Vec<HostLink>) -> RefMenuSource {
         let head = self.head().cloned();
         let refs: Rc<[Ref]> = self.refs().unwrap_or(&[]).into();
-        // No worktree extras: only the worktree rows' menus read them.
-        Rc::new(move |key| sidebar_menu(key, head.as_ref(), None, Some(&refs)))
+        // Only the remotes: the worktree rows' menus are the ones that read
+        // the other extras, and they are not reached from here.
+        let extras = SidebarExtras {
+            remote_targets: self.remote_targets.clone(),
+            ..SidebarExtras::default()
+        };
+        Rc::new(move |key| {
+            sidebar_menu_with_links(key, head.as_ref(), Some(&extras), Some(&refs), &links)
+        })
     }
 
     /// Right-clicking a branch, tag or remote badge opens that ref's own
@@ -2070,7 +2220,7 @@ impl HistoryView {
         let Some(key) = badge_menu_key(spec) else {
             return;
         };
-        let source = self.ref_menu_source();
+        let source = self.ref_menu_source(self.host_links(cx));
         let entries = sidebar_menu_entries(source(&key), self.sidebar_action.clone());
         if !entries.is_empty() {
             menu::open_context_menu(position, entries, window, cx);
@@ -2213,6 +2363,7 @@ impl HistoryView {
             RefsState::Loading | RefsState::Failed => &[],
         };
         self.badges = build_badges(head, refs);
+        self.meta_version = self.meta_version.wrapping_add(1);
         // HEAD may have arrived after the first rows: the initial selection
         // can now move to its row.
         self.settle_initial_selection(cx);
@@ -2987,6 +3138,7 @@ impl HistoryView {
             .as_ref()
             .filter(|_| self.day_rows.is_none());
         let badges = &self.badges;
+        let hosting = self.hosting.clone();
         let badge_widths = &mut self.badge_widths;
         let search_matches = &self.search_matches;
         range
@@ -3129,7 +3281,17 @@ impl HistoryView {
                     let widths: Vec<f32> = specs
                         .iter()
                         .map(|spec| {
-                            f32::from(measure_badge(window, &spec.label, spec.kind, badge_widths))
+                            let width = f32::from(measure_badge(
+                                window,
+                                &spec.label,
+                                spec.kind,
+                                badge_widths,
+                            ));
+                            // A branch with a pull request also carries its badge.
+                            match pr_badge_of(&hosting, spec) {
+                                Some(_) => width + PR_BADGE_WIDTH + BADGE_GAP,
+                                None => width,
+                            }
                         })
                         .collect();
                     // The most hidden badges the "+N" label can stand for.
@@ -3193,6 +3355,28 @@ impl HistoryView {
                                 .tooltip(spec.tooltip.clone()),
                             ),
                     );
+                    if let Some((branch, badge)) = pr_badge_of(&hosting, spec) {
+                        let branch = branch.to_owned();
+                        summary = summary.child(
+                            PrBadge::new(
+                                format!("history-pr-{ix}-{index}"),
+                                badge.state,
+                                badge.text.clone(),
+                            )
+                            .review(badge.review)
+                            .tooltip(badge.tooltip.clone())
+                            .on_click(cx.listener(
+                                move |view, event: &ClickEvent, window, cx| {
+                                    let focus = view.focus.clone();
+                                    window.focus(&focus, cx);
+                                    view.select_row(ix, cx);
+                                    if let Some(handler) = view.pr_click.clone() {
+                                        handler(branch.clone(), event.position(), window, cx);
+                                    }
+                                },
+                            )),
+                        );
+                    }
                 }
                 if fit.collapsed {
                     let hidden = specs[fit.shown..]
@@ -3223,6 +3407,11 @@ impl HistoryView {
                             cx.stop_propagation();
                             view.set_branch_filter(Some(target.clone()), cx);
                         })),
+                    );
+                }
+                if let Some(state) = hosting.ci.get(&c.id) {
+                    summary = summary.child(
+                        CiGlyph::new(format!("history-ci-{ix}"), *state).tooltip(ci_label(*state)),
                     );
                 }
                 row_div = row_div.child(
@@ -4248,6 +4437,7 @@ fn format_time(unix: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar::sidebar_menu;
     use gpui::px;
 
     #[test]
@@ -4393,7 +4583,44 @@ mod tests {
             branch_menu: Rc::new(move |key| {
                 sidebar_menu(key, head_for_menu.as_ref(), None, Some(&refs))
             }),
+            open_links: Vec::new(),
         }
+    }
+
+    #[test]
+    fn commit_menu_offers_open_on_one_host_or_one_per_host() {
+        let commit = Oid::from_hex(&"b".repeat(40)).unwrap();
+        let extras = [
+            ("origin", "https://github.com/o/r.git"),
+            ("publish", "https://gitlab.com/g/r.git"),
+        ];
+        let links = |n: usize| {
+            let targets: Vec<RemoteTargets> = extras[..n]
+                .iter()
+                .map(|(name, url)| RemoteTargets {
+                    name: (*name).to_owned(),
+                    fetch_url: (*url).to_owned(),
+                    push_urls: vec![(*url).to_owned()],
+                })
+                .collect();
+            web_links::host_links(&[], &targets, None)
+        };
+        let menu = |n: usize| {
+            let mut menu = row_menu(commit, None, Vec::new(), None, None);
+            menu.open_links = links(n);
+            labels(&menu.entries())
+        };
+        assert_eq!(menu(0)[0], "Copy commit hash");
+        assert!(!menu(0).iter().any(|l| l.starts_with("Open on")));
+        assert_eq!(menu(1)[..2], ["Copy commit hash", "Open on GitHub"]);
+        assert_eq!(
+            menu(2)[..3],
+            [
+                "Copy commit hash",
+                "Open on GitHub (origin)",
+                "Open on GitLab (publish)"
+            ]
+        );
     }
 
     /// Labels of the items; a rule is `---`.

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — Remotes &amp; accounts</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="dialogs.css">
+<link rel="stylesheet" href="settings.css">
+<link rel="stylesheet" href="hosting.css">
+<script src="app.js"></script>
+<script src="settings.js"></script>
+<script src="dialogs.js"></script>
+<script src="hosting.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL, D = GLD, S = GLS, H = GLH, ic = G.ic, esc = G.esc;
+  const ACC = () => H.accounts();
+  const find = (login, host) => ACC().find((a) => a.login === login && a.host === host);
+  /* remote → host + account. `acc: null` means no account is linked yet. */
+  let cfg;
+  const fresh = () => ({
+    origin: { svc: 'github', host: 'github.com', acc: 'mira-k', branches: ['main', 'feat/idle-lanes', 'fix/git-detect'], exp: true },
+    upstream: { svc: 'github', host: 'github.com', acc: null, pub: true, branches: ['main'], exp: false },
+    work: { svc: 'gitlab', host: 'gitlab.modsen.app', acc: 'yegor.cheprasov', branches: ['main', 'release/0.3'], exp: false },
+    publish: { push: [{ svc: 'github', host: 'github.com', acc: 'mira-k' }, { svc: 'gitea', host: 'codeberg.org', acc: 'mira-k' }], branches: ['main'], exp: false }
+  });
+  const nd = (lvl, icon, label, o) => { o = o || {}; return `<div class="node${o.cls ? ' ' + o.cls : ''}" role="treeitem" tabindex="-1" style="--lvl:${lvl}" data-kind="${o.kind || ''}" data-name="${esc(o.name || label)}" data-q="${esc((o.q || o.name || label).toLowerCase())}"${o.exp != null ? ` aria-expanded="${o.exp}"` : ''}${o.tip ? ` data-tip="${esc(o.tip)}"` : ''}><span class="twisty">${o.exp == null ? '' : ic(o.exp ? 'chevD' : 'chevR', 12)}</span>${icon}<span class="nlabel">${esc(label)}</span>${o.trail || ''}</div>`; };
+  const chip = (t, tip, warn) => `<span class="acc-chip${warn ? ' warn' : ''}" data-tip="${esc(tip)}">${warn ? ic('warn', 11) + ' ' : ''}${esc(t)}</span>`;
+  function remotesHTML() {
+    const out = [];
+    Object.entries(cfg).forEach(([name, r]) => {
+      if (r.push) {
+        out.push(nd(1, ic('cloud', 14), name, { cls: 'hrem', kind: 'remote', exp: r.exp, tip: `${name} · pushes to ${r.push.length} targets`, trail: `<span class="acc-chip" data-tip="Pushes to ${r.push.map((p) => p.host).join(' and ')}">${r.push.length} push URLs</span>` }));
+        r.push.forEach((p) => out.push(nd(2, H.svcIcon(p.svc, 14), `push → ${p.host}`, { cls: 'pushurl hrem', kind: 'pushurl', name: name + ' ' + p.host, tip: `${name} pushes to ${p.host} as ${p.acc}`, trail: chip(p.acc, `${p.host} · account ${p.acc}`), q: name + ' ' + p.host })));
+        r.branches.forEach((b) => out.push(nd(2, ic('branch', 14), b, { kind: 'rbranch', name: name + '/' + b })));
+        return;
+      }
+      const none = !r.acc && !r.pub;
+      out.push(nd(1, H.svcIcon(r.svc, 14), name, { cls: 'hrem', kind: 'remote', exp: r.exp, tip: `${name} · ${r.host}`, trail: r.pub ? chip('public', `${r.host} · public repository, no account needed`) : none ? chip('no account', `No account for ${r.host}`, true) : chip(r.acc, `${r.host} · account ${r.acc}`) }));
+      if (none) out.push(nd(2, ic('plus', 14), `Add account for ${r.host}`, { cls: 'addacc hrem', kind: 'addacc', name: name + ' add account', tip: `Add an account for ${r.host} and use it for ${name}`, q: name + ' ' + r.host + ' add account' }).replace('data-kind="addacc"', `data-kind="addacc" data-remote="${name}" role="button"`));
+      r.branches.forEach((b) => out.push(nd(2, ic('branch', 14), b, { kind: 'rbranch', name: name + '/' + b })));
+    });
+    return out.join('');
+  }
+  function renderRemotes(win) {
+    const tree = win.querySelector('.tree'), sec = tree.querySelector('[data-kind=sec-remotes]');
+    let n = sec.nextElementSibling; while (n && !n.classList.contains('sec')) { const x = n; n = n.nextElementSibling; x.remove(); }
+    const box = document.createElement('div'); box.innerHTML = remotesHTML();
+    Array.from(box.children).forEach((c) => tree.insertBefore(c, n));
+    const cnt = sec.querySelector('.ncount'); if (cnt) { cnt.textContent = Object.keys(cfg).length; cnt.dataset.n = cnt.textContent; }
+  }
+  const at = (win, sel) => { const el = win.querySelector(sel); const r = el.getBoundingClientRect(); return { clientX: r.left + 24, clientY: r.bottom + 2 }; };
+
+  /* push result toast: one line per target, errors stay until dismissed */
+  function pushToast(win, res) {
+    const L = G.layer(win); let c = L.querySelector('.toasts'); if (!c) { c = G.h('<div class="toasts"></div>'); L.appendChild(c); }
+    const bad = res.some((r) => !r.ok), okN = res.filter((r) => r.ok).length;
+    const t = G.h(`<div class="toast ${bad ? 'error' : 'ok'}" role="${bad ? 'alert' : 'status'}" style="max-width:420px">${ic(bad ? 'err' : 'check', 14)}<div class="toast-msg"><b>${bad ? `Pushed main to ${okN} of ${res.length} targets` : `Pushed main to ${res.length} targets`}</b><ul class="tt">${res.map((r) => `<li class="${r.ok ? 'ok' : 'err'}">${ic(r.ok ? 'check' : 'err', 12)}<span style="color:var(--text)">${esc(r.host)} · ${esc(r.acc)}</span><span class="muted">${r.ok ? '4 commits' : esc(r.msg)}</span>${r.reco ? '<button class="btn btn-sm" data-reco>Reconnect</button>' : ''}</li>`).join('')}</ul></div><button class="btn btn-icon btn-ghost btn-xs" aria-label="Dismiss">${ic('x', 12)}</button></div>`);
+    t.querySelector('[aria-label=Dismiss]').onclick = () => t.remove();
+    const rc = t.querySelector('[data-reco]'); if (rc) rc.onclick = () => { t.remove(); const a = find('mira-k', 'codeberg.org'); H.accountDialog(win, { mode: 'reconnect', existing: [], st: { svc: 'gitea', step: 3, inst: 'public', probe: 'ok', method: 'token', login: 'mira-k' }, onDone: () => G.toast(win, 'Reconnected codeberg.org · mira-k. Push again to retry.', 'ok') }); };
+    c.appendChild(t); if (!bad) setTimeout(() => t.remove(), 5000);
+  }
+
+  /* "Which account for origin?": shown once when several accounts match the host; remembered per repository */
+  function picker(win, remote, o) {
+    o = o || {};
+    const host = cfg[remote].host, list = ACC().filter((a) => a.host === host && a.svc === cfg[remote].svc);
+    return S.dialog(win, { st: { sel: o.sel || null }, width: 500,
+      view: (s) => ({ title: `Which account for ${remote}?`, icon: 'user', body: `<div class="col10"><div>${esc(remote)} points to <b>${esc(host)}</b>, and you have ${list.length} accounts there. Pick the one GitWarp uses to fetch, pull and push in this repository.</div>
+        <div class="picklist" role="radiogroup" aria-label="Accounts on ${esc(host)}">${list.map((a) => `<button type="button" class="pick" role="radio" aria-checked="${s.sel === a.id}" data-do="sel" data-v="${a.id}" style="grid-template-columns:20px 28px minmax(0,1fr) auto">${H.svcIcon(a.svc)}${H.avatar(a.login)}<span style="min-width:0"><span class="nm">${esc(H.label(a))}</span><span class="p">${a.login !== H.label(a) ? '@' + esc(a.login) + ' · ' : ''}${a.method === 'browser' ? 'Browser sign-in' : 'Token'}</span></span><span>${a.status === 'ok' ? (s.sel === a.id ? ic('check', 14) : '') : H.statHTML(a)}</span></button>`).join('')}</div>
+        <div class="field-help">${ic('info', 12)} Remembered for this repository. Change it later from the remote’s menu: Account…</div></div>`,
+        foot: S.dbtn('Cancel') + S.dbtn('Use account', { kind: 'primary', act: 'use', dis: !s.sel, def: 1 }) }),
+      actions: { sel: (s, api, d) => { s.sel = d.dataset.v; }, use: (s, api) => { const a = list.find((x) => x.id === s.sel); api.close(); cfg[remote].acc = a.login; renderRemotes(win); G.toast(win, `${remote} will use ${H.label(a)} in this repository`, 'ok'); return false; } } });
+  }
+  function addAccountFor(win, remote) {
+    const r = cfg[remote];
+    H.accountDialog(win, { existing: ACC(), st: { svc: r.svc, step: 3, inst: H.isPublic(r.svc, r.host) ? 'public' : 'self', url: 'https://' + r.host, probe: 'ok', method: 'token' }, onDone: (a) => { r.acc = a.login; renderRemotes(win); G.toast(win, `Connected ${H.label(a)} on ${r.host}. ${remote} now uses it.`, 'ok'); } });
+  }
+  function remoteMenu(win, remote, ev) {
+    const r = cfg[remote], svcName = r.svc ? H.SVC[r.svc].name : H.SVC[r.push[0].svc].name;
+    G.menu(win, ev, [
+      { label: 'Fetch', icon: 'fetch' }, { label: 'Edit remote…', icon: 'edit' }, { sep: 1 },
+      { label: r.push ? 'Accounts for push URLs…' : 'Account…', icon: 'user', onClick: () => { if (r.push) return G.toast(win, 'Each push URL keeps its own account. Edit them in Settings → Accounts.', 'info'); const m = ACC().filter((a) => a.host === r.host && a.svc === r.svc); if (m.length > 1) picker(win, remote, { sel: (m.find((a) => a.login === r.acc) || {}).id }); else if (!m.length) addAccountFor(win, remote); else G.toast(win, `${r.host} has one account (${H.label(m[0])}); ${remote} already uses it.`, 'info'); } },
+      { label: `Open on ${svcName}`, icon: 'external' }, { sep: 1 }, { label: 'Remove remote', icon: 'trash', danger: 1 }]);
+  }
+
+  const reset = (w) => { cfg = fresh(); renderRemotes(w); };
+  const scenes = [
+    ['Remotes: overview (accounts linked)', (w) => { reset(w); }],
+    ['Remotes: multi-push remote expanded (two push URLs)', (w) => { reset(w); cfg.publish.exp = true; renderRemotes(w); }],
+    ['Push result: one target failed', (w) => { reset(w); cfg.publish.exp = true; renderRemotes(w); pushToast(w, [{ host: 'github.com', acc: 'mira-k', ok: true }, { host: 'codeberg.org', acc: 'mira-k', ok: false, msg: 'Token invalid or revoked', reco: true }]); }],
+    ['Push result: both targets ok', (w) => { reset(w); cfg.publish.exp = true; renderRemotes(w); pushToast(w, [{ host: 'github.com', acc: 'mira-k', ok: true }, { host: 'codeberg.org', acc: 'mira-k', ok: true }]); }],
+    ['Several accounts match: “Which account for origin?”', (w) => { reset(w); cfg.origin.acc = null; renderRemotes(w); picker(w, 'origin'); }],
+    ['Picker: account chosen (remembered)', (w) => { reset(w); cfg.origin.acc = 'mira-at-acme'; renderRemotes(w); picker(w, 'origin', { sel: 'a2' }); }],
+    ['Picker: chosen account needs attention', (w) => { reset(w); picker(w, 'origin', { sel: 'a2' }); }],
+    ['Remote menu: Account…', (w) => { reset(w); remoteMenu(w, 'origin', at(w, '[data-kind=remote][data-name=origin]')); }],
+    ['No account for a known host: “Add account for gitlab.modsen.app”', (w) => { reset(w); cfg.work.acc = null; cfg.work.exp = true; renderRemotes(w); }],
+    ['Add account dialog, prefilled from the remote', (w) => { reset(w); cfg.work.acc = null; cfg.work.exp = true; renderRemotes(w); addAccountFor(w, 'work'); }],
+    ['Public remote without an account (upstream)', (w) => { reset(w); cfg.upstream.exp = true; renderRemotes(w); }]
+  ];
+  const page = D.page('Remotes & accounts', scenes, null, { label: 'Scenario', reopen: 'Replay scenario' });
+  const win = page.win, tree = win.querySelector('.tree');
+  /* live behaviour: the inline affordance and the remote menu work in every scenario */
+  tree.addEventListener('click', (e) => { const a = e.target.closest('.node.addacc'); if (a) { e.stopPropagation(); addAccountFor(win, a.dataset.remote); } }, true);
+  tree.addEventListener('contextmenu', (e) => { const n = e.target.closest('.node[data-kind=remote]'); if (!n) return; e.stopPropagation(); e.preventDefault(); win.querySelectorAll('.menu').forEach((m) => m.remove()); remoteMenu(win, n.dataset.name, e); }, true);
+})();
+</script>
+</body>
+</html>

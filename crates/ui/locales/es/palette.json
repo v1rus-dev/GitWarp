@@ -5,6 +5,8 @@
   "palette.command.close_repository": "Cerrar repositorio",
   "palette.command.collapse_idle_lanes": "Contraer carriles inactivos en el grafo",
   "palette.command.create_branch": "Crear rama aquí…",
+  "palette.command.create_merge_request": "Crear merge request…",
+  "palette.command.create_pull_request": "Crear pull request…",
   "palette.command.create_tag": "Crear etiqueta aquí…",
   "palette.command.expand_idle_lanes": "Expandir carriles inactivos en el grafo",
   "palette.command.fetch_all": "Obtener todos los remotos",

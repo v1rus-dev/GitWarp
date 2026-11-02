@@ -5,6 +5,8 @@
   "palette.command.close_repository": "Repository schließen",
   "palette.command.collapse_idle_lanes": "Inaktive Spuren im Graphen einklappen",
   "palette.command.create_branch": "Branch hier erstellen…",
+  "palette.command.create_merge_request": "Merge Request erstellen …",
+  "palette.command.create_pull_request": "Pull Request erstellen …",
   "palette.command.create_tag": "Tag hier erstellen…",
   "palette.command.expand_idle_lanes": "Inaktive Spuren im Graphen ausklappen",
   "palette.command.fetch_all": "Alle Remotes fetchen",

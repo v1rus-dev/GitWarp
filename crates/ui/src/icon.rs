@@ -56,11 +56,26 @@ pub enum IconName {
     Worktree,
     Lock,
     Palette,
+    Github,
+    External,
+    Pr,
+    PrDraft,
+    PrClosed,
+    Merge,
+    CheckFill,
+    XFill,
+    Sync,
+    Hourglass,
+    Skip,
+    Comment,
+    Repo,
+    RepoForked,
+    Archive,
 }
 
 impl IconName {
-    /// All 47 icons, in the design's order.
-    pub const ALL: [IconName; 47] = [
+    /// All 62 icons, in the design's order.
+    pub const ALL: [IconName; 62] = [
         Self::Branch,
         Self::Tag,
         Self::Cloud,
@@ -108,6 +123,21 @@ impl IconName {
         Self::Worktree,
         Self::Lock,
         Self::Palette,
+        Self::Github,
+        Self::External,
+        Self::Pr,
+        Self::PrDraft,
+        Self::PrClosed,
+        Self::Merge,
+        Self::CheckFill,
+        Self::XFill,
+        Self::Sync,
+        Self::Hourglass,
+        Self::Skip,
+        Self::Comment,
+        Self::Repo,
+        Self::RepoForked,
+        Self::Archive,
     ];
 
     /// Asset path, e.g. `icons/chev-r.svg`.
@@ -160,6 +190,21 @@ impl IconName {
             Self::Worktree => "icons/worktree.svg",
             Self::Lock => "icons/lock.svg",
             Self::Palette => "icons/palette.svg",
+            Self::Github => "icons/github.svg",
+            Self::External => "icons/external.svg",
+            Self::Pr => "icons/pr.svg",
+            Self::PrDraft => "icons/pr-draft.svg",
+            Self::PrClosed => "icons/pr-closed.svg",
+            Self::Merge => "icons/merge.svg",
+            Self::CheckFill => "icons/check-circle-fill.svg",
+            Self::XFill => "icons/x-circle-fill.svg",
+            Self::Sync => "icons/sync.svg",
+            Self::Hourglass => "icons/hourglass.svg",
+            Self::Skip => "icons/skip.svg",
+            Self::Comment => "icons/comment.svg",
+            Self::Repo => "icons/repo.svg",
+            Self::RepoForked => "icons/repo-forked.svg",
+            Self::Archive => "icons/archive.svg",
         }
     }
 }

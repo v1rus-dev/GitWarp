@@ -5,6 +5,8 @@
   "palette.command.close_repository": "Close repository",
   "palette.command.collapse_idle_lanes": "Collapse idle lanes in graph",
   "palette.command.create_branch": "Create branch here…",
+  "palette.command.create_merge_request": "Create merge request…",
+  "palette.command.create_pull_request": "Create pull request…",
   "palette.command.create_tag": "Create tag here…",
   "palette.command.expand_idle_lanes": "Expand idle lanes in graph",
   "palette.command.fetch_all": "Fetch all remotes",

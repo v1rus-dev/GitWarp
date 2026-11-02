@@ -27,6 +27,7 @@ mod heatmap;
 mod list_row;
 pub mod menu;
 mod progress;
+mod pull_request;
 mod ref_badge;
 mod scrollbar;
 mod search_field;
@@ -56,6 +57,7 @@ pub use heatmap::{long_date, HeatLegend, Heatmap};
 pub use list_row::ListRow;
 pub use menu::{MenuEntry, MenuItem, MenuNav};
 pub use progress::Progress;
+pub use pull_request::{CiGlyph, CiGlyphState, PrBadge, PrBadgeState, ReviewMark};
 pub use ref_badge::{RefBadge, RefKind};
 pub use scrollbar::{thumb_metrics, ScrollArea, ScrollHandleSource, Scrollbar, ThumbMetrics};
 pub use search_field::SearchField;
@@ -69,10 +71,10 @@ pub use tabs::{Tab, Tabs};
 pub use text_input::{
     Submit as TextInputSubmit, TextArea, TextAreaEvent, TextInput, TextInputEvent,
 };
-pub use toast::{Toast, ToastId, ToastKind, ToastQueue};
+pub use toast::{Toast, ToastAction, ToastBody, ToastId, ToastKind, ToastLine, ToastQueue};
 pub use toggles::{Checkbox, Radio, Switch};
 pub use tooltip::Tooltip;
-pub use tree::{Tree, TreeNodeData, TreeNodeTrailing};
+pub use tree::{Tree, TreeNodeData, TreeNodeTrailing, TreePr};
 pub use window_controls::WindowControls;
 
 pub(crate) use text_input::bind_keys as bind_text_input_keys;

@@ -5,6 +5,8 @@
   "palette.command.close_repository": "Fermer le dépôt",
   "palette.command.collapse_idle_lanes": "Réduire les voies inactives dans le graphe",
   "palette.command.create_branch": "Créer une branche ici…",
+  "palette.command.create_merge_request": "Créer une merge request…",
+  "palette.command.create_pull_request": "Créer une pull request…",
   "palette.command.create_tag": "Créer une étiquette ici…",
   "palette.command.expand_idle_lanes": "Développer les voies inactives dans le graphe",
   "palette.command.fetch_all": "Récupérer tous les dépôts distants",
