@@ -501,10 +501,16 @@ impl WelcomeView {
             .track_scroll(&self.list_scroll)
             .flex_1()
             .min_h_0();
-            panel.child(list).child(Scrollbar::uniform(
-                "recent-scrollbar",
-                self.list_scroll.clone(),
-            ))
+            // The scrollbar overlays the rows: as an in-flow sibling its 10px
+            // track stays even without overflow and cuts the row highlight short.
+            let scrollbar = div().absolute().top_0().bottom_0().right_0();
+            panel
+                .relative()
+                .child(list)
+                .child(scrollbar.child(Scrollbar::uniform(
+                    "recent-scrollbar",
+                    self.list_scroll.clone(),
+                )))
         };
 
         let hint = div()
