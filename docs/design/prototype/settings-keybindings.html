@@ -3,13 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gitwarp — Settings → Keybindings</title>
+<title>GitWarp — Settings → Keybindings</title>
 <link rel="stylesheet" href="tokens.css">
 <link rel="stylesheet" href="gitwarp.css">
 <link rel="stylesheet" href="settings.css">
 <style>
   .ktool { display: flex; align-items: center; gap: 8px; max-width: 760px; margin-bottom: 12px; }
-  .ktool .input-wrap { flex: 1; min-width: 0; }
+  .ktool .kq { flex: 1; min-width: 0; width: auto; height: 26px; }
+  .ktool .input, .ktool .btn { height: 26px; }
   .krow { display: grid; grid-template-columns: minmax(0, 1fr) 190px 72px; gap: 8px; align-items: center; padding: 0 12px; min-height: 36px; border-bottom: 1px solid var(--border); }
   .krow:last-child { border-bottom: 0; }
   .krow .grp { color: var(--muted); font-size: var(--fs-sm); }
@@ -38,7 +39,12 @@
     ['stage', 'Changes', 'Stage / unstage file', 'Space'], ['commit', 'Changes', 'Commit', 'Ctrl+Enter'], ['discard', 'Changes', 'Discard changes', 'Ctrl+Shift+Z']
   ];
   const GROUPS = ['All', 'General', 'View', 'Repository', 'History', 'Changes'];
-  let q = '', grp = 'All', rec = null, conflict = null, st = S.get('kb', {}), flash = '';
+  let q = '', grp = 'All', rec = null, conflict = null, st = S.get('kb', {}), flash = null;
+  const CFG = '/home/mira/.config/gitwarp';
+  /* Export outcomes (presentation switcher): success banner, or one of the three error banners */
+  const EXP = { ok: 'Export succeeds', nodir: 'No configuration directory', mkdir: 'Cannot create the directory', write: 'Cannot write the file' };
+  let expMode = 'ok';
+  const expResult = () => ({ ok: ['info', 'Saved to ' + CFG + '/keybindings.toml'], nodir: ['error', 'No configuration directory to export to'], mkdir: ['error', 'Could not create ' + CFG + ': Permission denied (os error 13)'], write: ['error', 'Could not write ' + CFG + '/keybindings.toml: No space left on device (os error 28)'] }[expMode]);
   const cur = (id) => (id in st ? st[id] : DEF.find((d) => d[0] === id)[3]);
   const norm = (e) => {
     if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return null;
@@ -53,26 +59,27 @@
     const body = rows.map(([id, g, name]) => {
       const isRec = rec === id, isConf = conflict && conflict.id === id, mod = id in st;
       const keys = isRec ? '<span class="muted">Press the new shortcut…</span>' : kbd(cur(id));
-      const acts = isRec ? `<button class="btn btn-sm" data-kcancel>Cancel</button>` : `<button class="btn btn-icon btn-ghost" data-kedit="${id}" aria-label="Change shortcut for ${esc(name)}" data-tip="Change">${ic('edit', 14)}</button>${mod ? `<button class="btn btn-icon btn-ghost" data-kreset="${id}" aria-label="Reset ${esc(name)} to default" data-tip="Reset to ${esc(DEF.find((d) => d[0] === id)[3])}">${ic('undo', 14)}</button>` : ''}`;
-      const msg = isConf ? `<div class="kmsg err" role="alert">${ic('err', 12)}<span><span class="kbd">${esc(conflict.keys)}</span> is already used by “${esc(conflict.other)}”.</span><button class="btn btn-sm" data-kassign>Reassign here</button><button class="btn btn-sm btn-ghost" data-kcancel>Cancel</button></div>` : '';
+      const acts = isRec ? `<button class="btn btn-sm" data-kcancel>Cancel</button>` : `<button class="btn btn-icon btn-ghost" data-kedit="${id}" aria-label="Change shortcut for ${esc(name)}" data-tip="Change shortcut">${ic('edit', 14)}</button>${mod ? `<button class="btn btn-icon btn-ghost" data-kreset="${id}" aria-label="Reset ${esc(name)} to default" data-tip="Reset to default">${ic('undo', 14)}</button>` : ''}`;
+      const msg = isConf ? `<div class="kmsg err" role="alert">${ic('err', 12)}<span>${esc(conflict.keys)} is already used by “${esc(conflict.other)}”.</span><button class="btn btn-sm" data-kassign>Reassign here</button><button class="btn btn-sm" data-kcancel>Cancel</button></div>` : '';
       return `<div class="krow${isRec ? ' rec' : ''}${isConf ? ' conf' : ''}"><div><span>${esc(name)}</span>${mod ? ' <span class="muted" style="font-size:11px">· modified</span>' : ''}</div><div class="keys">${keys}</div><div class="acts">${acts}</div>${msg}</div>`;
     }).join('');
     return `<h2>Keybindings</h2><p class="lead">Click the pencil, then press the shortcut you want. Esc cancels, Backspace unbinds.</p>
-      <div class="ktool"><label class="input-wrap">${ic('search', 14)}<input class="input" placeholder="Search actions or shortcuts" value="${esc(q)}" aria-label="Search keybindings" data-kq></label>
-        <select class="input" style="width:150px" aria-label="Group" data-kg>${GROUPS.map((x) => `<option${x === grp ? ' selected' : ''}>${x}</option>`).join('')}</select>
+      <div class="ktool"><input class="input kq" placeholder="Search actions or shortcuts" value="${esc(q)}" aria-label="Search keybindings" data-kq>
+        <select class="input" style="width:150px;flex:none" aria-label="Group" data-kg>${GROUPS.map((x) => `<option${x === grp ? ' selected' : ''}>${x}</option>`).join('')}</select>
         <button class="btn" data-kall${changed ? '' : ' disabled'}>Reset all</button><button class="btn" data-kexp>${ic('copy', 14)}Export</button></div>
-      ${flash ? S.banner('info', flash, 'Saved to ~/.config/gitwarp/keybindings.toml') : ''}
-      <div class="sgroup"><div class="khead" style="margin-bottom:6px">${rows.length} of ${DEF.length} actions${changed ? ` · ${changed} modified` : ''}</div><div class="slist">${body || `<div class="kempty">No actions match “${esc(q)}”.<br><button class="btn btn-sm" data-kclear style="margin-top:8px">Clear search</button></div>`}</div></div>`;
-  });
+      ${flash ? S.banner(flash[0], flash[1], '') : ''}
+      <div class="sgroup"><div class="khead" style="margin-bottom:6px">${rows.length} of ${DEF.length} actions${changed ? ` · ${changed} modified` : ''}</div><div class="slist">${body || `<div class="kempty">No actions match “${esc(q)}”.</div>`}</div></div>
+      <div class="sfoot">${ic('info', 12)}Caption: record Ctrl+B on another action to see the conflict row.</div>`;
+  }, null, { stagebar: `<label class="scn">Export result <select id="exp" aria-label="Export result">${Object.entries(EXP).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select></label>` });
+  document.getElementById('exp').addEventListener('change', (e) => { expMode = e.target.value; });
   const pane = ctx.pane;
   const act = (e) => {
     const t = (s) => e.target.closest(s);
-    if (t('[data-kedit]')) { rec = t('[data-kedit]').dataset.kedit; conflict = null; flash = ''; ctx.draw(); }
+    if (t('[data-kedit]')) { rec = t('[data-kedit]').dataset.kedit; conflict = null; flash = null; ctx.draw(); }
     else if (t('[data-kcancel]')) { rec = null; conflict = null; ctx.draw(); }
     else if (t('[data-kreset]')) { delete st[t('[data-kreset]').dataset.kreset]; save(); ctx.draw(); }
-    else if (t('[data-kall]')) { st = {}; save(); flash = 'All shortcuts reset to defaults'; ctx.draw(); }
-    else if (t('[data-kexp]')) { ctx.toast('Keybindings copied as keybindings.toml', 'info'); }
-    else if (t('[data-kclear]')) { q = ''; ctx.draw(); }
+    else if (t('[data-kall]')) { st = {}; save(); flash = ['info', 'All shortcuts reset to defaults']; ctx.draw(); }
+    else if (t('[data-kexp]')) { flash = expResult(); ctx.draw(); }
     else if (t('[data-kassign]')) { st[conflict.other_id] = ''; st[conflict.id] = conflict.keys; save(); rec = null; conflict = null; ctx.draw(); }
   };
   pane.addEventListener('click', act);
@@ -80,9 +87,9 @@
   pane.addEventListener('change', (e) => { if (e.target.matches('[data-kg]')) { grp = e.target.value; ctx.draw(); } });
   /* capture phase so the recorded combo never triggers other handlers (Space/Enter on focused buttons) */
   document.addEventListener('keydown', (e) => {
-    if (!rec || conflict) { if (conflict && e.key === 'Escape') { rec = null; conflict = null; ctx.draw(); } return; }
+    if (!rec || conflict) { if (conflict && e.key === 'Escape') { e.stopPropagation(); rec = null; conflict = null; ctx.draw(); } return; }
     e.preventDefault(); e.stopPropagation();
-    if (e.key === 'Escape') { rec = null; ctx.draw(); return; }
+    if (e.key === 'Escape') { rec = null; ctx.draw(); return; } /* Esc cancels recording; Settings stays open (stopPropagation above) */
     if (e.key === 'Backspace') { st[rec] = ''; save(); rec = null; ctx.draw(); return; }
     const k = norm(e); if (!k) return;
     const other = DEF.find((d) => d[0] !== rec && cur(d[0]) === k);

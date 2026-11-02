@@ -1,0 +1,60 @@
+/* Local changes page: panel geometry from the shipped app (changes_view.rs). Tokens only. */
+.chg-wrap { display: grid; grid-template-columns: 310px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; flex: 1; min-height: 0; }
+.lists { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); outline: none; }
+.grp { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.grp + .grp { border-top: 1px solid var(--border); }
+/* group header: 34px, padding left 16 / right 8, gap 8, surface bg, semibold title + CountPill + small Stage all */
+.grp-h { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 8px 0 16px; background: var(--surface); border-bottom: 1px solid var(--border); font-weight: 600; flex: none; }
+.grp .flist { overflow: auto; flex: 1; min-height: 0; outline: none; }
+.grp .none { padding: 10px 16px; font-size: var(--fs-sm); color: var(--muted); }
+/* file rows: kit FileRow, 26px (follows density), inset 6, padding 0 8, radius 5; actions are Xs ghost icon-only 20x20 */
+.frow .acts .btn { height: 20px; width: 20px; }
+.frow .acts { order: 3; }
+.frow .fnum { order: 2; }
+/* the app reveals actions on hover/focus; the selected row keeps them drawn so a static view shows them */
+.frow.sel .acts { display: inline-flex; }
+/* inline discard confirmation bar: top of the file column */
+.discardbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); font-size: var(--fs-sm); flex: none; }
+.discardbar .msg { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dview { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+/* diff toolbar: 34px, padding left 16 / right 8, mono 12px path, muted "{side} · {n} hunk(s)", small Segmented */
+.ddiff .dtool { height: 34px; padding: 0 8px 0 16px; }
+.ddiff .dtool .side { flex: none; }
+.dstate { flex: 1; display: flex; align-items: center; justify-content: center; font-size: var(--fs-sm); color: var(--muted); font-family: var(--font-ui); }
+.dstate.err { align-items: flex-start; justify-content: flex-start; padding: 12px; color: var(--error); }
+.dstate.load { align-items: flex-start; justify-content: flex-start; padding: 12px; flex-direction: column; gap: 10px; }
+.dscroll { overflow: auto; scrollbar-gutter: stable; }
+/* diff rows: 22px; no syntax highlighting (plain text + changed-word emphasis); no row hover; hunk header not sticky; empty split side is a flat hover fill */
+.chg-wrap .dl { position: relative; height: 22px; }
+.chg-wrap .dl:hover > span { filter: none; }
+.chg-wrap .dl > span { line-height: 22px; }
+.chg-wrap .dl .ln { background: transparent; }
+.chg-wrap .dl.add .ln.n, .chg-wrap .dl .ln.add { background: var(--diff-add-bg); }
+.chg-wrap .dl.del .ln.o, .chg-wrap .dl .ln.del { background: var(--diff-del-bg); }
+.chg-wrap .dl .c.empty { background: var(--hover); }
+.chg-wrap .dscroll [class^="t-"], .chg-wrap .dscroll [class*=" t-"] { color: inherit; font-style: normal; }
+.chg-wrap .dh { position: static; height: 22px; padding: 0 6px 0 8px; gap: 6px; }
+.chg-wrap .dh .btn { height: 22px; }
+.dl.pick .ln { cursor: pointer; }
+/* picked line: a 3px solid accent bar at the left edge, full row height; the line number is not recoloured; no checkbox, no tooltip */
+.dl.picked::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--accent); z-index: 1; }
+.dnote { height: 22px; line-height: 22px; padding: 0 6px 0 104px; color: var(--muted); font-size: var(--fs-sm); white-space: pre; }
+/* commit box: surface bg, top border, padding 12, gap 16; right column 260 */
+.commitbox { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 16px; padding: 12px; background: var(--surface); border-top: 1px solid var(--border); }
+.msgwrap { position: relative; }
+.msgwrap textarea { font-family: var(--font-mono); font-size: 12.5px; line-height: 20px; padding: 6px 10px; height: 104px; background: var(--bg); width: 100%; }
+/* character guides: 1px border-strong lines at 10 + 50ch (70% opacity) and 10 + 72ch, inset 1px top/bottom, no labels */
+.guide { position: absolute; top: 1px; bottom: 1px; width: 1px; background: var(--border-strong); pointer-events: none; }
+.guide.g50 { left: calc(10px + 50ch); opacity: .7; } .guide.g72 { left: calc(10px + 72ch); }
+.cb-side { display: flex; flex-direction: column; gap: 8px; justify-content: space-between; }
+.commitbox .field-label { margin-bottom: 4px; }
+/* counters are 11px (fs-xs) and turn warning over the limit */
+.cnt { font-variant-numeric: tabular-nums; font-size: var(--fs-xs); color: var(--muted); }
+.cnt.over { color: var(--warning); }
+/* scenario controls (presentation only, not app UI) */
+.scen { display: flex; flex-wrap: wrap; gap: 6px 20px; align-items: center; margin: 0 auto 12px; max-width: 1200px; }
+.scen .grp-s { display: flex; align-items: center; gap: 8px; }
+.scen .grp-s > .l { font-size: var(--fs-xs); color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.notes { max-width: 1200px; margin: 20px auto 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px 24px; }
+.notes .n { font-size: var(--fs-sm); color: var(--muted); }
+.notes .n b { color: var(--text); display: block; margin-bottom: 2px; font-weight: 600; }

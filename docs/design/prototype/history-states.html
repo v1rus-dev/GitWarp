@@ -6,46 +6,53 @@
 <title>gitwarp — history states</title>
 <link rel="stylesheet" href="tokens.css">
 <link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="shell.css">
 <style>
   .boards { display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: 24px; }
   .board h3 { margin: 0 0 8px; }
-  .frame { height: 380px; border: 1px solid var(--border-strong); border-radius: var(--r-lg); overflow: hidden; background: var(--bg); display: flex; flex-direction: column; }
-  .frame .lhead { grid-template-columns: 112px minmax(0, 1fr) 130px 104px 64px; }
-  .frame .body { flex: 1; min-height: 0; position: relative; }
-  .sk { display: grid; grid-template-columns: 112px minmax(0, 1fr) 130px 104px 64px; column-gap: 12px; align-items: center; height: 26px; padding: 0 12px 0 8px; }
-  .sk .lane { height: 100%; position: relative; }
-  .sk .lane::before { content: ""; position: absolute; left: 7px; top: 0; bottom: 0; width: 2px; background: var(--border-strong); }
-  .sk .lane::after { content: ""; position: absolute; left: 2.5px; top: 8.5px; width: 9px; height: 9px; border-radius: 50%; background: var(--border-strong); }
-  .loadbar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); }
-  .loadbar .progress { flex: 1; width: auto; }
+  .frame { height: 380px; border: 1px solid var(--border-strong); border-radius: var(--r-lg); overflow: hidden; background: var(--bg); display: flex; flex-direction: column; position: relative; }
+  .frame .hist { flex: 1; min-height: 0; }
+  .frame .hs-body { display: flex; }
+  .frame .hs-body > div { flex: 1; min-height: 0; overflow: auto; }
   .note { margin-top: 6px; color: var(--muted); font-size: var(--fs-sm); }
+  h2.sec { margin: 28px 0 12px; font-size: var(--fs-lg); }
 </style>
 <script src="app.js"></script>
 </head>
 <body>
 <script>
 (function () {
-  const G = GL, ic = G.ic;
+  const G = GL, ic = G.ic, esc = G.esc;
+  document.title = 'GitWarp — history states';
   G.stagebar();
-  const head = '<div class="lhead"><div>Graph</div><div>Summary</div><div>Author</div><div>Date</div><div>Hash</div></div>';
-  const skel = (n) => Array.from({ length: n }, (_, i) => `<div class="sk"><div class="lane"></div><div class="skel" style="width:${40 + (i * 37) % 50}%"></div><div class="skel" style="width:${50 + (i * 17) % 35}%"></div><div class="skel" style="width:60%"></div><div class="skel" style="width:80%"></div></div>`).join('');
-  const board = (title, note, inner, hdr) => `<section class="board"><h3>${title}</h3><div class="frame" role="region" aria-label="${title}">${hdr === false ? '' : head}<div class="body">${inner}</div></div><div class="note">${note}</div></section>`;
-  const B = [
-    board('1 · Loading with progress', 'Skeleton rows keep the 26px rhythm; the count updates live while git log streams. First pages are shown as soon as they arrive.',
-      `<div class="loadbar">${ic('fetch', 14, 'spin')}<b>Loading… 12 400 commits</b><span class="progress"><i style="width:34%"></i></span><span class="muted">34%</span><button class="btn btn-sm">Cancel</button></div>${skel(10)}`),
-    board('2 · Empty repository', 'No commits yet: the call to action is the first commit, not an error.',
-      `<div class="empty"><div class="ei">${ic('git', 22)}</div><h4>No commits yet</h4><p>This repository is empty. Stage some files and make your first commit to see history here.</p><div class="od-row" style="margin-top:8px"><button class="btn btn-primary">Go to Local changes</button><button class="btn">Add .gitignore…</button></div></div>`),
-    board('3 · Not a git repository', 'Shown when the opened folder has no .git ancestor. The path is selectable.',
-      `<div class="empty"><div class="ei">${ic('folder', 22)}</div><h4>Not a git repository</h4><p><span class="mono">/home/mira/projects/notes</span> is not inside a git working tree.</p><div class="od-row" style="margin-top:8px"><button class="btn btn-primary">${ic('init', 14)}Initialize repository here</button><button class="btn">Open another…</button></div></div>`),
-    board('4a · Git not found', 'Blocking state. The settings button jumps straight to Settings → Git.',
-      `<div class="empty"><div class="ei" style="color:var(--error)">${ic('err', 22)}</div><h4>git was not found</h4><p>gitwarp could not find a usable git. The bundled copy is missing and there is no <span class="mono">git</span> in PATH.</p><div class="od-row" style="margin-top:8px"><button class="btn btn-primary" onclick="location.href='settings-git.html'">${ic('gear', 14)}Open Git settings</button><button class="btn">Retry</button></div></div>`),
-    board('4b · Unsupported git version', 'Distinct from “not found”: the executable works but is too old.',
-      `<div class="empty"><div class="ei" style="color:var(--warning)">${ic('warn', 22)}</div><h4>git 2.28.1 is too old</h4><p>gitwarp needs git 2.31 or newer. System git at <span class="mono">/usr/bin/git</span> reports 2.28.1.</p><div class="od-row" style="margin-top:8px"><button class="btn btn-primary" onclick="location.href='settings-git.html'">${ic('gear', 14)}Open Git settings</button><button class="btn">Retry</button></div></div>`),
-    board('5 · Generic git error', 'git’s own message is shown verbatim in a selectable monospace block, with the command that failed.',
-      `<div class="empty"><div class="ei" style="color:var(--error)">${ic('err', 22)}</div><h4>git could not read the history</h4><p>The command <span class="mono">git log --all --topo-order</span> failed with exit code 128.</p><div class="errbox" tabindex="0" aria-label="git error output">fatal: bad object refs/heads/feat/palette
-error: refs/heads/feat/palette does not point to a valid object!</div><div class="od-row" style="margin-top:8px"><button class="btn btn-primary">${ic('fetch', 14)}Retry</button><button class="btn">${ic('copy', 14)}Copy details</button></div></div>`)
+  const head = '<div class="lhead" role="row"><div class="gh"><span>Graph</span></div><div>Summary</div><div>Author</div><div>Date</div><div>Hash</div></div>';
+  /* full-pane state: header + the state body; rows state: the real list with a strip above it */
+  const full = (k, strip) => `<div class="hist">${head}${strip ? G.stateStrip(strip) : ''}<div class="hs-body"><div>${G.stateBody(k)}</div></div></div>`;
+  const rows = (k) => `<div class="hist" data-rows="${k}"></div>`;
+  const board = (title, note, inner) => `<section class="board"><h3>${title}</h3><div class="frame" role="region" aria-label="${esc(title)}">${inner}</div><div class="note">${note}</div></section>`;
+  const A = [
+    board('1 · Loading with progress', 'Skeleton rows keep the row rhythm until the first page arrives; the count updates live while git log streams. “· 3 idle lanes folded” is appended when idle-lane collapse is on and lanes are folded. The indeterminate bar shows no percent when the total is unknown. Cancel stops the load.', full('loading', 'loading')),
+    board('2 · Empty repository', 'No commits yet: the call to action is the first commit, not an error. Both actions work now that Local changes ships; the app currently shows them disabled with a stale “arrive in a later version” tooltip (a code bug, not drawn).', full('empty')),
+    board('3 · Not a git repository', 'Shown when the opened folder has no .git ancestor. The path is selectable.', full('notgit')),
+    board('4 · Folder not found', 'A recent entry or CLI path that no longer exists. “Remove from recent” drops the entry and returns to the welcome screen.', full('nofolder')),
+    board('5 · Loading cancelled (no rows)', 'Cancel before the first page arrived: nothing to show, so the whole pane explains it and offers Retry. The status bar reads “Loading cancelled”.', full('cancelled')),
+    board('6a · Git not found', 'Blocking state. Open Git settings opens Settings (Git page) as the modal card; the status-bar git label reads “git not found” and is not clickable.', full('nogit')),
+    board('6b · Unsupported git version', 'Distinct from “not found”: the executable works but is too old. Same actions.', full('oldgit')),
+    board('7 · Generic git error', 'git’s own message is shown verbatim in a selectable monospace block, with the command that failed. Without stderr the box is omitted; if git was killed the body reads “was stopped.” instead of “failed with exit code N.”. Copy details copies the command, exit code and stderr.', full('giterr')),
+    board('8 · Non-git failure', 'An I/O or parse error with no git command: title “GitWarp could not read the history”, the message in the box.', full('nongit'))
   ];
-  document.body.insertAdjacentHTML('beforeend', `<div class="page"><h1>History screen — states</h1><p class="lead">Every state keeps the toolbar, sidebar and back navigation of the main window; only the center pane changes. Use the theme button to check both themes.</p><div class="boards">${B.join('')}</div></div>`);
+  const B = [
+    board('9 · Loading bar above the rows', 'Once the first page has arrived the bar sits under the column header and the loaded rows stay below it.', rows('loading')),
+    board('10 · Cancelled, with rows', 'One-line strip: warning icon, text, Retry. The rows that loaded stay below.', rows('strip-cancelled')),
+    board('11 · Failed, with rows (git)', 'Error strip with the failed command; Retry and Copy details (failures only).', rows('strip-failed')),
+    board('12 · Failed, with rows (message)', 'No git command: the strip carries the message itself. Without a message it reads just “History is incomplete”.', rows('strip-failed-msg'))
+  ];
+  document.body.insertAdjacentHTML('beforeend', `<div class="page"><h1>History screen — states</h1><p class="lead">Every state keeps the toolbar, sidebar and back navigation of the main window; only the centre pane changes (the main windows have a History state switcher that draws the same states inside the real window). Use the theme button to check both themes.</p><h2 class="sec">Full-pane states</h2><div class="boards">${A.join('')}</div><h2 class="sec">In-list strips (rows already loaded)</h2><div class="boards">${B.join('')}</div></div>`);
+  document.querySelectorAll('[data-rows]').forEach((h) => {
+    const k = h.dataset.rows; h.dataset.menuHost = '';
+    G.history(h, G.commits, { gw: 112, sel: 0 }).strip(G.stateStrip(k));
+  });
+  document.addEventListener('click', (e) => { const b = e.target.closest('[data-act="git-settings"]'); if (b) location.href = 'settings-git.html'; });
 })();
 </script>
 </body>

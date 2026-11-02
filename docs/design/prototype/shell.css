@@ -1,0 +1,205 @@
+/* GitWarp shell layer: styles for the window shell, history list and states that match what the app ships.
+   Loaded after gitwarp.css on the pages owned by the shell (main, history-states, graph, index, palette).
+   Tokens only; both themes. Sizes quoted from the app (crates/app/src/repo_view.rs, history_view.rs). */
+
+/* ---------- scenario bar (prototype-only controls; not part of the product UI) ---------- */
+.scenbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; padding: 6px 16px; background: var(--stage); border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+.scenbar label { display: inline-flex; align-items: center; gap: 6px; }
+.scenbar select { height: 24px; background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--r-sm); font-size: 12px; }
+.scenbar .grp { display: inline-flex; align-items: center; gap: 6px; padding-right: 12px; border-right: 1px solid var(--border); }
+.scenbar .grp:last-child { border-right: 0; }
+.scenbar b { color: var(--text); font-weight: 600; }
+.cap-line { margin: 8px 0 0; padding: 0 16px; color: var(--muted); font-size: var(--fs-sm); max-width: 1180px; }
+
+/* ---------- window frame: app draws a 1px border, radius 8 (R_WINDOW) and a pop shadow ---------- */
+.win { box-shadow: var(--shadow-pop); }
+
+/* ---------- toolbar (40px, bg, padding 12, gap 6; tools 28px; separator 1x18 with 4px margin) ---------- */
+.titlebar { background: var(--bg); padding: 0 12px; gap: 6px; }
+.tb-sep { margin: 0 4px; }
+.btn-tool[disabled] { color: var(--disabled); background: transparent; border-color: transparent; pointer-events: none; }
+.btn-tool[disabled] .od-icon { color: var(--disabled); }
+.tb-search .tb-stat { color: var(--muted); font-size: var(--fs-sm); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tb-search .tb-stat[hidden], .tb-search .tb-kbd[hidden] { display: none; }
+.titlebar .seg > button .od-icon { color: inherit; }
+
+/* Toolbar steps are measured against the app's window-width breakpoints, replacing the older prototype steps.
+   Every block restates all of its properties so it fully overrides the earlier steps in gitwarp.css. */
+.titlebar { gap: 6px; padding: 0 12px; }
+.titlebar .tb-search { flex: 0 1 270px; min-width: 150px; }
+.titlebar .tb-name { max-width: 140px; }
+@container tb (max-width: 1359px) {
+  .titlebar { gap: 6px; padding: 0 12px; }
+  .titlebar .tb-kbd { display: none; }
+  .titlebar .lbl { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .titlebar .btn-tool { gap: 4px; padding: 0 8px; }
+  .titlebar .seg > button { padding: 0 8px; gap: 4px; }
+  .titlebar .tb-name { display: block; max-width: 96px; }
+  .titlebar [data-tip="Switch repository"] .tb-name { display: block; }
+  .titlebar .tb-search { flex-basis: 270px; min-width: 150px; }
+}
+@container tb (max-width: 999px) {
+  .titlebar { gap: 6px; padding: 0 12px; }
+  .titlebar .tb-name { max-width: 64px; }
+  .titlebar .tb-search { flex-basis: 180px; min-width: 120px; }
+}
+@container tb (max-width: 869px) {
+  .titlebar { gap: 6px; padding: 0 12px; }
+  .titlebar .tb-name { max-width: 64px; }
+  .titlebar .tb-search { flex-basis: 96px; min-width: 96px; }
+}
+@container tb (max-width: 809px) {
+  .titlebar { gap: 4px; padding: 0 12px; }
+  .titlebar .btn-tool { padding: 0 7px; }
+  .titlebar .seg > button { padding: 0 7px; }
+  .titlebar [data-tip="Switch repository"] .tb-name { display: none; }
+  .titlebar [data-tip="Switch branch"] .tb-name { max-width: 64px; }
+  .titlebar .tb-search { flex-basis: 96px; min-width: 96px; }
+}
+@container tb (max-width: 759px) {
+  .titlebar [data-tip="Switch branch"] .tb-name { display: none; }
+}
+@container tb (max-width: 699px) {
+  .titlebar { gap: 4px; padding: 0 8px; }
+  .titlebar .tb-search { flex-basis: 72px; min-width: 72px; }
+}
+
+/* ---------- status bar (24px, bg, padding 0 8, gap 12, 12px muted) ---------- */
+.statusbar { background: var(--bg); padding: 0 8px; gap: 12px; font-size: var(--fs-sm); }
+.statusbar .op { gap: 8px; min-width: 0; }
+.statusbar .op .op-detail { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.statusbar .op[hidden], .statusbar .sb-state[hidden] { display: none; }
+.statusbar .sb-state { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.statusbar .sb-state.err { color: var(--error); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.statusbar .sb-git { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 6px; color: var(--muted); cursor: default; }
+.statusbar .sb-git.warn { color: var(--warning); }
+.statusbar .sb-git.err { color: var(--error); }
+
+/* ---------- splitters: 2px accent line centred in the 5px hit area (decision 3) ---------- */
+.splitter:hover, .splitter.drag { background: transparent; opacity: 1; }
+.splitter::after { content: ""; position: absolute; background: var(--accent); opacity: 0; }
+.splitter.v::after { left: 50%; top: 0; bottom: 0; width: 2px; margin-left: -1px; }
+.splitter.h::after { top: 50%; left: 0; right: 0; height: 2px; margin-top: -1px; }
+.splitter:hover::after, .splitter.drag::after { opacity: 1; }
+.lhead .gh .grip:hover, .lhead .gh .grip.drag { background: transparent; opacity: 1; }
+.lhead .gh .grip::after { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 2px; margin-left: -1px; background: var(--accent); opacity: 0; }
+.lhead .gh .grip:hover::after, .lhead .gh .grip.drag::after { opacity: 1; }
+
+/* ---------- scrollbars: always visible, 6px thumb in border-strong (decision 5) ---------- */
+.tree, .lbody, .dscroll, .flist, .dinfo, .spane { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+.tree::-webkit-scrollbar, .lbody::-webkit-scrollbar, .dscroll::-webkit-scrollbar, .flist::-webkit-scrollbar, .dinfo::-webkit-scrollbar, .spane::-webkit-scrollbar { width: 6px; height: 6px; background: transparent; }
+.tree::-webkit-scrollbar-thumb, .lbody::-webkit-scrollbar-thumb, .dscroll::-webkit-scrollbar-thumb, .flist::-webkit-scrollbar-thumb, .dinfo::-webkit-scrollbar-thumb, .spane::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
+.tree::-webkit-scrollbar-corner, .dscroll::-webkit-scrollbar-corner { background: transparent; }
+
+/* ---------- sidebar: no border under the filter; tree scrolls sideways, labels never truncate ---------- */
+.sbfilter { padding: 12px 10px 8px; border-bottom: 0; }
+.sidebar .tree { overflow-x: scroll; overflow-y: auto; padding: 0 0 8px; }
+.sidebar .tree .node { width: max-content; min-width: calc(100% - 12px); }
+.sidebar .tree .node .nlabel { flex: 1 0 auto; overflow: visible; text-overflow: clip; white-space: nowrap; }
+.sidebar .tree .node .od-icon, .sidebar .tree .node .twisty { flex: none; }
+.node .st { color: var(--muted); font-size: var(--fs-xs); white-space: nowrap; margin-left: 8px; }
+.node .st.gone { font-style: normal; }
+.node.rowmenu { background: var(--hover); }
+.nomatch { height: var(--row); margin: 0 6px; padding: 0 8px 0 6px; display: flex; align-items: center; color: var(--muted); font-size: var(--fs-sm); }
+/* a section header while refs load shows no count pill */
+.node.sec .ncount[hidden] { display: none; }
+/* keyboard-focused tree node: inset 2px focus ring (decision 9) */
+.node.kf { outline: 2px solid var(--focus); outline-offset: -2px; }
+
+/* ---------- history list ---------- */
+/* header gets the same 6px side margin as the rows so the columns line up (decision 8): padding = row margin + row padding */
+.lhead { padding: 0 24px 0 20px; }
+.lrow { cursor: default; }
+.lrow .summary { gap: 6px; }
+.lrow .ref { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none; display: inline-flex; }
+.lrow .ref .od-icon { flex: none; }
+.lrow .ref .rl { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.lrow .ref.more { --c: var(--muted); font-weight: 600; padding: 0 6px; }
+.lrow .ref.hid { display: none; }
+mark.hl { background: var(--accent-soft); color: inherit; border-radius: 2px; }
+.lbody:focus-within .lrow.sel mark.hl { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+.lrow .dt { white-space: nowrap; }
+/* graph drawing options (Appearance): monochrome lanes and 1-3px line width */
+.hist.mono .g-e:not(.idle) { stroke: var(--muted); }
+.hist.mono .g-d { fill: var(--muted); }
+.hist.mono .g-d.m { fill: var(--row-bg); stroke: var(--muted); }
+.hist .g-e { stroke-width: var(--line-w); }
+
+/* in-list strips above the rows: loading / cancelled / incomplete */
+.strip { display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: var(--surface); border-bottom: 1px solid var(--border); font-size: var(--fs-sm); color: var(--muted); flex: none; }
+.strip .od-icon.w { color: var(--warning); } .strip .od-icon.e { color: var(--error); }
+.strip.load { padding: 8px 12px; gap: 12px; font-size: var(--fs-base); color: var(--text); }
+.strip.load b { white-space: nowrap; }
+.strip.load .progress { flex: 1; width: auto; }
+.strip.load .pct { color: var(--muted); font-size: var(--fs-sm); }
+.strip .od-fill { flex: 1; }
+.hs-body { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.sk { display: grid; grid-template-columns: var(--gw, 112px) minmax(0, 1fr) var(--aw, 130px) var(--dw, 104px) 64px; column-gap: 18px; align-items: center; height: var(--row); margin: 0 6px; padding: 0 18px 0 14px; }
+.sk .lane { height: 100%; position: relative; }
+.sk .lane::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: 2px; background: var(--border-strong); opacity: .6; }
+.sk .lane::after { content: ""; position: absolute; left: 2.5px; top: 8.5px; width: 9px; height: 9px; border-radius: 50%; background: var(--border-strong); }
+.skel { animation: skp 1.4s ease-in-out infinite; background: var(--hover); }
+@keyframes skp { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+.empty .row-btns { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; justify-content: center; }
+.empty .path { font-family: var(--font-mono); color: var(--text); }
+
+/* ---------- details dock ---------- */
+.dhead, .dfiles .sub, .ddiff .dtool { height: 34px; padding: 0 8px 0 16px; }
+.dhead { background: var(--bg); }
+.dock-right .dbody { grid-template-rows: 230px 160px minmax(0, 1fr); }
+.dock-right .dinfo { max-height: none; }
+.dinfo { padding: 16px 18px; }
+.dinfo h3 { font-size: var(--fs-md); font-weight: 700; line-height: 19px; margin: 0 0 8px; }
+.dinfo .body { font-size: var(--fs-base); }
+.meta { grid-template-columns: 74px minmax(0, 1fr); gap: 6px 12px; }
+.link:hover { text-decoration: none; color: var(--accent-hover); }
+.dfiles .sub .ncount { margin-left: 0; }
+.dscroll { line-height: 22px; }
+.dl { min-height: 22px; }
+.dh { height: 22px; position: static; }
+.dstate { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--muted); font-size: var(--fs-sm); text-align: center; padding: 16px; gap: 6px; }
+.dstate.top { justify-content: flex-start; align-items: flex-start; text-align: left; }
+.dstate .sk-bars { display: flex; flex-direction: column; gap: 10px; align-self: flex-start; }
+.dstate .sk-bars.tight { gap: 6px; }
+.dstate .errt { color: var(--error); text-align: left; }
+.dstate b { color: var(--text); font-weight: 600; font-size: var(--fs-base); }
+.dstate.pad18 { padding: 16px 18px; }
+/* Diff setting "line numbers" off: gutters disappear, the split layout drops both */
+.nonum .dl.u { grid-template-columns: 16px minmax(0, 1fr); }
+.nonum .dl.u > .ln { display: none; }
+.nonum .dl.s { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.nonum .dl.s > .ln { display: none; }
+.nonum .dl.s .c + .c { border-left: 1px solid var(--border); }
+
+/* ---------- menus: 28px items, check state via icon ---------- */
+.menu-item.disabled .od-icon, .menu-item.disabled .menu-key { color: var(--disabled); }
+.menu-item.disabled { pointer-events: auto; cursor: default; }
+.menu-item.disabled:hover { background: transparent; color: var(--disabled); }
+
+/* ---------- tooltip: platform style, delay 500ms, at the cursor (decision 4) ---------- */
+.tip { max-width: 360px; }
+
+/* ---------- settings: centred modal card over the main window ---------- */
+.set-scrim { position: absolute; inset: 0; background: var(--overlay); display: flex; align-items: center; justify-content: center; padding: 32px; z-index: 45; }
+.set-card { width: 100%; max-width: 1080px; height: 100%; max-height: 760px; display: grid; grid-template-rows: var(--bar) minmax(0, 1fr) var(--status); background: var(--bg); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow-pop); overflow: hidden; }
+.set-card .set-tb { display: flex; align-items: center; gap: 8px; padding: 0 0 0 12px; border-bottom: 1px solid var(--border); font-weight: 600; user-select: none; }
+.set-card .set-tb .od-icon { color: var(--muted); }
+.set-card .set-body { display: grid; grid-template-columns: 200px minmax(0, 1fr); min-height: 0; }
+.set-card .snav { border-right: 1px solid var(--border); padding: 8px; display: flex; flex-direction: column; gap: 2px; background: var(--bg); }
+.set-card .snav button { all: unset; box-sizing: border-box; display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 10px; border-radius: var(--r-sm); color: var(--muted); cursor: default; }
+.set-card .snav button:hover { background: var(--hover); }
+.set-card .snav button .od-icon { color: var(--muted); }
+.set-card .snav button[aria-current="page"] { background: var(--selection); color: var(--text); }
+.set-card .snav button[aria-current="page"] .od-icon { color: var(--accent); }
+.set-card .snav button:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.set-card .spane { overflow: auto; padding: 20px 28px 28px; }
+.set-card .spane > div { max-width: 760px; margin: 0 auto; }
+.set-card .spane h2 { margin: 0 0 4px; font-size: var(--fs-xl); }
+.set-card .spane p { color: var(--muted); margin: 0 0 16px; }
+.set-card .set-sb { display: flex; align-items: center; gap: 12px; padding: 0 10px; border-top: 1px solid var(--border); font-size: var(--fs-sm); color: var(--muted); }
+.set-card .wc { margin-left: 4px; }
+.set-card .wc .btn { height: var(--bar); }
+
+/* ---------- index (overview): keyboard model ---------- */
+.kb .kbd { white-space: nowrap; }
+.kb-note { color: var(--muted); font-size: var(--fs-sm); margin: 8px 0 0; }

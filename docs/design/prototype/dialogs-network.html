@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — Dialogs: network</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="dialogs.css">
+<script src="app.js"></script>
+<script src="dialogs.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const D = GLD, G = GL;
+  const FAIL = [['error', 'The SSH key was rejected. Check that your key is loaded in ssh-agent and added to the account on the Git host.'], ['error', 'Authentication failed. Check your credentials or configure a git credential helper.'], ['error', 'Could not resolve the host. Check the address and your connection.\nfatal: unable to access \'https://unreachable.example/a/b.git/\''], ['error', 'The Git host did not answer. Check your connection.']];
+  D.page('Dialogs: network', [
+    ['Authentication required · password', (w) => D.credentials(w, {})],
+    ['Authentication required · password, typed', (w) => D.credentials(w, { v: 'ghp_••••••••••' })],
+    ['Authentication required · user name', (w) => D.credentials(w, { prompt: "Username for 'https://github.com': " })],
+    ['Authentication required · SSH key passphrase', (w) => D.credentials(w, { prompt: "Enter passphrase for key '/home/mira/.ssh/id_ed25519_work': " })],
+    ['SSH host key · first connection', (w) => D.hostKey(w, { changed: false })],
+    ['SSH host key · key has changed', (w) => D.hostKey(w, { changed: true })],
+    ['Toasts · success', (w) => D.toastStrip(w, [['ok', 'Already up to date'], ['ok', 'Fetch complete'], ['ok', 'Pull complete'], ['ok', 'Pushed the current branch'], ['ok', 'Pushed tag v0.3.1'], ['ok', 'Pushed all tags'], ['ok', 'Deleted remote branch feat/old-spike']])],
+    ['Toasts · errors (stay until dismissed)', (w) => D.toastStrip(w, FAIL.concat([['error', 'The SSH host key was not trusted, so the connection was stopped.']]))],
+    ['Toasts · pull / push preconditions', (w) => D.toastStrip(w, [['error', 'The branch has diverged from its upstream. Pull is fast-forward only for now; merge or rebase the branch in a terminal first.'], ['error', 'The branch has no upstream. Push it once to create one, or set an upstream.'], ['error', 'No remote is configured for this repository.'], ['error', 'HEAD is detached; check out a branch first.'], ['warn', 'Cannot tell which remote origin/x belongs to']])]
+  ]);
+})();
+</script>
+</body>
+</html>

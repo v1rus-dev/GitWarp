@@ -81,3 +81,15 @@ a.link:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .wtrow .acts { display: flex; gap: 4px; }
 .wtrow.gone .pth { text-decoration: line-through; color: var(--muted); }
 .wtlist { border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); overflow: hidden; }
+
+/* fingerprint box (SSH host key prompt): one mono line per key */
+.fpbox { display: grid; gap: 4px; padding: 10px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+/* indeterminate progress: until git reports a percentage */
+.dprog.ind > i { width: 30%; animation: dprog-ind 1.1s ease-in-out infinite alternate; }
+@keyframes dprog-ind { from { transform: translateX(0); } to { transform: translateX(233%); } }
+@media (prefers-reduced-motion: reduce) { .dprog.ind > i { animation: none; } }
+/* disabled checkbox / pick rows inside busy dialogs */
+.dlg .check[aria-disabled="true"] { opacity: .5; }
+.dlg .pick:disabled { opacity: .5; }
+/* toast message keeps git's line breaks */
+.toast .toast-msg { white-space: pre-line; overflow-wrap: anywhere; }

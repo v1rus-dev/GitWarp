@@ -1,10 +1,13 @@
 # GitWarp design
 
 This folder is a snapshot of the GitWarp UI design prototype, made in an external design
-tool and copied here unchanged so the design can be reviewed without that tool. It is the
-source of truth for UI acceptance: where the implementation and the prototype disagree, the
-prototype wins, except for the decisions listed below. The prototype still says "gitlane" in
-places; the product name is GitWarp. To view it, open `prototype/index.html` in a browser —
+tool (OpenDesign project «gitlane Git Client Design») and copied here so the design can be
+reviewed without that tool. It is the source of truth for UI acceptance: where the
+implementation and the prototype disagree, the prototype wins. On 2026-11-02 the prototype was
+re-synced with the app as shipped through stage 10, so it
+now also shows the dialogs, states and menus the app gained without a design page, and the
+decisions listed below are drawn in it. The product name is GitWarp; the OpenDesign project is
+still named "gitlane". To view it, open `prototype/index.html` in a browser —
 the pages are self-contained and link to each other by relative path — and use the theme
 button at the top right to switch between dark and light. Static screenshots of every page in
 both themes are in `screens/` (`<page>.dark.png` and `<page>.light.png`).
@@ -30,9 +33,16 @@ both themes are in `screens/` (`<page>.dark.png` and `<page>.light.png`).
 | `settings-identity.html` | Settings → Identity: author, signing key, GitHub / GitLab accounts, validation states. | 10 — settings |
 | `settings-ssh.html` | Settings → SSH keys: key list, generate / import / delete, connection test, trusted hosts. | 10 — settings |
 | `palette.html` | Command palette: Ctrl+P quick launcher for commands, branches, commits, files. | 11 — command palette |
+| `dialogs-checkout.html` | Checkout with uncommitted changes: stash / bring changes / discard, for branch, remote branch, tag and commit. | 7 — ref operations |
+| `dialogs-network.html` | Network prompts: HTTPS credentials, SSH host key (first connection, key changed), result toasts. | 8 — network |
+| `activity.html` | Proposal, not scheduled: commit-activity heatmap; placement A (Welcome) vs B (strip above History, recommended), all states. | — |
+| `icons.html` | Icon set: the app's own icons next to their Primer Octicons replacement (adopted in the prototype). | 1 — UI foundation |
 | `index.html` | Overview and keyboard model. | Overview |
 
-## Decisions where the prototype contradicts its own spec
+## Decisions that override the original prototype spec
+
+The prototype now draws all of these; they are kept here because they contradict captions
+and specs written before the re-sync.
 
 Both themes share one geometry and differ only in colour.
 
@@ -52,6 +62,9 @@ Both themes share one geometry and differ only in colour.
 - Disabled checkbox, radio and switch are drawn at 45% opacity.
 - Row density defaults to 26px (Normal); the Appearance settings change it.
 - Light-theme graph lightness is 45% (the token value).
+- Icons are Primer Octicons 19.42.0 (MIT, 16px fill set) instead of the hand-drawn stroke set;
+  the Git mark, keyboard, command and window-control icons stay our own (`icons.html`).
+- Settings opens as a centred modal card over the repository window, not as a separate window.
 
 ## Roadmap
 

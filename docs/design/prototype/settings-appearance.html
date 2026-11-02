@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gitwarp — Settings → Appearance</title>
+<title>GitWarp — Settings → Appearance</title>
 <link rel="stylesheet" href="tokens.css">
 <link rel="stylesheet" href="gitwarp.css">
 <link rel="stylesheet" href="settings.css">
 <style>
   .themes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 12px; }
-  .tcard { display: flex; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); cursor: default; }
+  .tcard { display: flex; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg); cursor: default; }
   .tcard:hover { border-color: var(--border-strong); }
   .tcard.on { border-color: var(--accent); background: var(--accent-soft); }
   .tcard:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
@@ -67,7 +67,7 @@
       ${S.group('Lists and type', [
         S.row('Row density', 'Height of rows in history, changes and the sidebar.', S.seg('density', den, [['compact', 'Compact'], ['normal', 'Normal'], ['roomy', 'Roomy']])),
         S.row('Interface font size', 'Menus, toolbars and lists.', S.seg('ui-size', S.get('ui-size', '13'), [['12', '12'], ['13', '13'], ['14', '14']])),
-        S.row('Code font size', 'Diffs and the commit editor, in px (' + 9 + '–' + 20 + ').', `<div class="stepper"><button class="btn btn-icon" data-step="-1" aria-label="Decrease code font size"${ms <= 9 ? ' disabled' : ''}>${ic('minus', 14)}</button><input class="input num" value="${ms}" inputmode="numeric" aria-label="Code font size" data-mono><button class="btn btn-icon" data-step="1" aria-label="Increase code font size"${ms >= 20 ? ' disabled' : ''}>${ic('plus', 14)}</button></div>`)
+        S.row('Code font size', 'Diffs and the commit editor, in px (' + 9 + '–' + 20 + ').', S.stepper('step', ms, 9, 20, 'code font size'))
       ])}
       ${S.group('Commit graph', [
         S.row('Colour branches', 'Off draws every lane in a single neutral colour.', S.sw('colored', colored, 'Colour branches')),
@@ -90,9 +90,6 @@
     if (st) { S.set('mono-size', Math.max(9, Math.min(20, S.get('mono-size', 12) + (+st.dataset.step)))); apply(); redraw(); }
   });
   pane.addEventListener('keydown', (e) => { if ((e.key === ' ' || e.key === 'Enter') && e.target.matches('[data-theme-pick]')) { e.preventDefault(); e.target.click(); } });
-  pane.addEventListener('change', (e) => {
-    if (e.target.matches('[data-mono]')) { const n = parseInt(e.target.value, 10); S.set('mono-size', isNaN(n) ? 12 : Math.max(9, Math.min(20, n))); apply(); redraw(); }
-  });
   const redraw = () => ctx.draw();
   document.addEventListener('gl-theme', () => { const lab = document.getElementById('gl-theme'); if (lab) S.set('theme-pref', G.theme); });
 })();
