@@ -19,11 +19,13 @@ use gpui::{
     Window,
 };
 
-use git_core::{CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo};
+use git_core::{
+    BranchLog, CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo,
+};
 use git_graph::{ColumnGeometry, GraphBuilder, IdleLanes, Row};
 use ui::actions::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrev};
 use ui::focus::{self, RingOffset};
-use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD};
+use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD, R_SM};
 use ui::theme::ThemeColors;
 use ui::{
     menu, ActiveTheme, Avatar, Button, ButtonSize, EmptyState, Icon, IconName, ListRow, MenuEntry,
@@ -88,6 +90,8 @@ const SKELETON_ROWS: usize = 10;
 /// The gap between a row's ref badges and the summary text (the summary cell's
 /// flex gap).
 const BADGE_GAP: f32 = 6.;
+/// How faint the branch filter's fork-point row is drawn.
+const FORK_ROW_OPACITY: f32 = 0.62;
 /// The widest a badge label may get; a longer ref name is ellipsized.
 const BADGE_LABEL_MAX: f32 = 160.;
 /// A badge's label is wrapped in 6 px padding and a 1 px border on each side;
@@ -549,6 +553,53 @@ struct DayRows {
     _task: Option<Task<()>>,
 }
 
+/// The most commits the branch filter lists for one branch.
+const BRANCH_FILTER_LIMIT: usize = 50_000;
+
+/// What [`HistoryView::set_branch_filter`] found for a branch.
+struct BranchData {
+    log: BranchLog,
+    /// The main line's name, for the "Merged into {main}" button.
+    main: Option<String>,
+    rows: Vec<(CommitInfo, Row<Oid>)>,
+}
+
+/// The rows the History branch filter shows: the branch's own commits
+/// (`git log --first-parent`), cut at the fork point. Like [`DayRows`] they
+/// replace the live `items` for display, selection and search while the filter
+/// is on.
+struct BranchRows {
+    branch: String,
+    state: DayState,
+    items: Vec<Item>,
+    idle_lanes: IdleLanes,
+    geometry: Rc<ColumnGeometry>,
+    /// The fork-point commit: its row is dimmed and carries a "fork point" note.
+    fork: Option<Oid>,
+    /// Merge rows: the branch each one merged in (the "from {x}" chip).
+    merged_from: HashMap<Oid, String>,
+    /// The merge on main that brought the whole branch in, with main's name.
+    merged_into: Option<(Oid, String)>,
+    /// The one-off query; dropping it drops the answer.
+    _task: Option<Task<()>>,
+}
+
+impl BranchRows {
+    fn new(branch: String, state: DayState, collapse: bool, task: Option<Task<()>>) -> Self {
+        Self {
+            branch,
+            state,
+            items: Vec::new(),
+            idle_lanes: IdleLanes::new(),
+            geometry: Rc::new(IdleLanes::new().geometry(collapse)),
+            fork: None,
+            merged_from: HashMap::new(),
+            merged_into: None,
+            _task: task,
+        }
+    }
+}
+
 /// What the sidebar knows about the repository's refs.
 #[derive(Debug, Default)]
 enum RefsState {
@@ -668,6 +719,10 @@ pub struct HistoryView {
     day_rows: Option<DayRows>,
     /// Bumped on every filter change; an older answer is dropped.
     day_generation: u64,
+    /// The active branch filter, if any. Exclusive with the day filter.
+    branch_rows: Option<BranchRows>,
+    /// Bumped on every branch filter change; an older answer is dropped.
+    branch_generation: u64,
 }
 
 /// Adds one row-menu item that asks the shell to open a ref dialog.
@@ -766,6 +821,8 @@ impl HistoryView {
             search_task: None,
             search_jump: false,
             day_rows: None,
+            branch_rows: None,
+            branch_generation: 0,
             day_generation: 0,
         };
         view.start(cx);
@@ -1003,7 +1060,7 @@ impl HistoryView {
         if let Some(index) = self
             .pending_reveal
             .check(&self.items, start)
-            .filter(|_| self.day_rows.is_none())
+            .filter(|_| self.day_rows.is_none() && self.branch_rows.is_none())
         {
             self.reveal_row(index, cx);
         }
@@ -1017,21 +1074,27 @@ impl HistoryView {
         if let Some(day) = &mut self.day_rows {
             day.geometry = Rc::new(day.idle_lanes.geometry(self.collapse));
         }
+        if let Some(branch) = &mut self.branch_rows {
+            branch.geometry = Rc::new(branch.idle_lanes.geometry(self.collapse));
+        }
     }
 
-    /// The rows on screen: the day filter's while it is on, else the history.
+    /// The rows on screen: the day or branch filter's while one is on, else
+    /// the history.
     fn rows(&self) -> &[Item] {
-        match &self.day_rows {
-            Some(day) => &day.items,
-            None => &self.items,
+        match (&self.day_rows, &self.branch_rows) {
+            (Some(day), _) => &day.items,
+            (None, Some(branch)) => &branch.items,
+            (None, None) => &self.items,
         }
     }
 
     /// The graph geometry that belongs to [`Self::rows`].
     fn geometry(&self) -> &Rc<ColumnGeometry> {
-        match &self.day_rows {
-            Some(day) => &day.geometry,
-            None => &self.geometry,
+        match (&self.day_rows, &self.branch_rows) {
+            (Some(day), _) => &day.geometry,
+            (None, Some(branch)) => &branch.geometry,
+            (None, None) => &self.geometry,
         }
     }
 
@@ -1066,6 +1129,10 @@ impl HistoryView {
         if self.day_rows.as_ref().map(|day| &day.filter) == Some(&filter) {
             return;
         }
+        // The day and branch filters are exclusive: the new one replaces the
+        // other.
+        self.branch_generation = self.branch_generation.wrapping_add(1);
+        self.branch_rows = None;
         let git = match &self.git {
             Ok(git) => git.clone(),
             Err(error) => {
@@ -1139,6 +1206,132 @@ impl HistoryView {
             }
         }
         self.reset_rows_view(cx);
+    }
+
+    /// The branch the History is narrowed to, if any.
+    pub fn branch_filter(&self) -> Option<&str> {
+        self.branch_rows.as_ref().map(|rows| rows.branch.as_str())
+    }
+
+    /// Turns the branch filter on ("Show all commits of {branch}"), changes it
+    /// or (with `None`) clears it.
+    ///
+    /// The rows are the branch's own commits (`git log --first-parent`) down
+    /// to its fork point, from a one-off query like the day filter's, laid out
+    /// with the parents that are in the list only. Turning it on replaces the
+    /// day filter, clears the search, and puts the selection on the first row
+    /// at the top of the list.
+    pub fn set_branch_filter(&mut self, branch: Option<String>, cx: &mut Context<Self>) {
+        self.branch_generation = self.branch_generation.wrapping_add(1);
+        let generation = self.branch_generation;
+        let Some(branch) = branch else {
+            if self.branch_rows.take().is_some() {
+                self.reset_rows_view(cx);
+            }
+            return;
+        };
+        // The filters are exclusive, and the search belongs to the rows it ran
+        // over (the shell empties the field when it sees the query is gone).
+        self.day_generation = self.day_generation.wrapping_add(1);
+        self.day_rows = None;
+        self.clear_search(cx);
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                self.branch_rows = Some(BranchRows::new(
+                    branch,
+                    DayState::Failed(error.to_string()),
+                    self.collapse,
+                    None,
+                ));
+                self.reset_rows_view(cx);
+                self.select_first_row(cx);
+                return;
+            }
+        };
+        let path = self.path.clone();
+        let name = branch.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &path).map_err(|e| e.to_string())?;
+                    let main = repo.main_line().map_err(|e| e.to_string())?;
+                    let log = match repo.branch_log(&name, main.as_deref(), BRANCH_FILTER_LIMIT) {
+                        Ok(log) => log,
+                        // A branch that is gone (or not fetched yet) is the
+                        // empty state, not an error.
+                        Err(Error::Parse("branch not found")) => BranchLog {
+                            commits: Vec::new(),
+                            fork_point: None,
+                            merged_into: None,
+                            merged_from: HashMap::new(),
+                        },
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    let rows = layout_branch(&log);
+                    Ok(BranchData { log, main, rows })
+                })
+                .await;
+            this.update(cx, |view, cx| {
+                view.finish_branch_rows(generation, result, cx)
+            })
+            .ok();
+        });
+        self.branch_rows = Some(BranchRows::new(
+            branch,
+            DayState::Loading,
+            self.collapse,
+            Some(task),
+        ));
+        self.reset_rows_view(cx);
+        self.select_first_row(cx);
+    }
+
+    /// The branch query answered.
+    fn finish_branch_rows(
+        &mut self,
+        generation: u64,
+        result: Result<BranchData, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.branch_generation {
+            return;
+        }
+        let collapse = self.collapse;
+        let Some(rows) = &mut self.branch_rows else {
+            return;
+        };
+        match result {
+            Ok(data) => {
+                for (commit, row) in data.rows {
+                    rows.idle_lanes.push(&row);
+                    rows.items.push(Item {
+                        commit: Arc::new(commit),
+                        row: Rc::new(row),
+                    });
+                }
+                rows.geometry = Rc::new(rows.idle_lanes.geometry(collapse));
+                rows.fork = data.log.fork_point;
+                rows.merged_from = data.log.merged_from;
+                rows.merged_into = data.log.merged_into.zip(data.main);
+                rows.state = DayState::Ready;
+            }
+            Err(message) => {
+                log::warn!("could not list the commits of {}: {message}", rows.branch);
+                rows.state = DayState::Failed(message);
+            }
+        }
+        self.reset_rows_view(cx);
+        self.select_first_row(cx);
+    }
+
+    /// Selects the first row (once there is one) as a user pick, so the
+    /// selection does not follow HEAD inside a filtered list.
+    fn select_first_row(&mut self, cx: &mut Context<Self>) {
+        if !self.rows().is_empty() {
+            self.select_row(0, cx);
+        }
     }
 
     /// The rows on screen changed wholesale: back to the top, selection and
@@ -1224,8 +1417,11 @@ impl HistoryView {
         self.pending_reveal.clear();
         // The sidebar target may not be on the filtered day: show the whole
         // history again, then reveal it there.
-        if self.day_rows.is_some() && !self.rows().iter().any(|item| item.commit.id == oid) {
+        if (self.day_rows.is_some() || self.branch_rows.is_some())
+            && !self.rows().iter().any(|item| item.commit.id == oid)
+        {
             self.set_day_filter(None, cx);
+            self.set_branch_filter(None, cx);
         }
         if let Some(index) = self.rows().iter().position(|item| item.commit.id == oid) {
             self.reveal_row(index, cx);
@@ -1417,6 +1613,42 @@ impl HistoryView {
                         .icon(IconName::Check)
                         .action(move |window, cx| {
                             checkout(RefAction::CheckoutBranch(branch.clone()), window, cx);
+                        }),
+                ));
+            }
+            // The branch filter: leave it, or narrow to a local branch on this
+            // commit. (The pickers and the merged-branch items are W7's.)
+            let view = cx.entity();
+            if self.branch_filter().is_some() {
+                let view = view.clone();
+                entries.push(MenuEntry::Item(
+                    MenuItem::new("Show all commits")
+                        .icon(IconName::X)
+                        .action(move |_, cx| {
+                            view.update(cx, |view, cx| view.set_branch_filter(None, cx));
+                        }),
+                ));
+            }
+            let active = self.branch_filter().map(str::to_owned);
+            for reference in card
+                .refs
+                .iter()
+                .filter(|reference| reference.kind == CardRefKind::Local)
+            {
+                let name = reference.name.clone();
+                let is_active = active.as_deref() == Some(name.as_str());
+                let view = view.clone();
+                entries.push(MenuEntry::Item(
+                    MenuItem::new(format!("Show all commits of {name}"))
+                        .icon(if is_active {
+                            IconName::Check
+                        } else {
+                            IconName::Branch
+                        })
+                        .disabled(is_active)
+                        .action(move |_, cx| {
+                            let name = name.clone();
+                            view.update(cx, |view, cx| view.set_branch_filter(Some(name), cx));
                         }),
                 ));
             }
@@ -1650,6 +1882,11 @@ impl HistoryView {
         cx.notify();
     }
 
+    /// The query the search field last reported.
+    pub fn search_query(&self) -> &str {
+        &self.search_text
+    }
+
     /// Esc: no query, no matches, and the next query starts a fresh scan.
     pub fn clear_search(&mut self, cx: &mut Context<Self>) {
         self.search_text.clear();
@@ -1867,6 +2104,10 @@ impl HistoryView {
         // The day's commits may have changed too (a new commit today).
         if let Some(filter) = self.day_rows.take().map(|day| day.filter) {
             self.set_day_filter(Some(filter), cx);
+        }
+        // So may the branch's.
+        if let Some(branch) = self.branch_rows.take().map(|rows| rows.branch) {
+            self.set_branch_filter(Some(branch), cx);
         }
         cx.notify();
     }
@@ -2093,6 +2334,93 @@ impl HistoryView {
         div().w_full().px(px(SIDE_MARGIN)).child(head)
     }
 
+    /// The accent-soft bar under the header while the branch filter is on.
+    fn render_branch_bar(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let colors = cx.theme().colors;
+        let rows = self.branch_rows.as_ref()?;
+        let ready = matches!(rows.state, DayState::Ready);
+        let commits = rows.items.len();
+        let merges = rows.merged_from.len();
+        let mut counts = if ready {
+            format!("{commits} commit{}", if commits == 1 { "" } else { "s" })
+        } else {
+            "…".to_owned()
+        };
+        if ready && merges > 0 {
+            counts.push_str(&format!(
+                " · {merges} merge{}",
+                if merges == 1 { "" } else { "s" }
+            ));
+        }
+        let into = rows.merged_into.as_ref().map(|(oid, main)| {
+            let hash = short_hash(oid);
+            let oid = *oid;
+            Button::new("branch-filter-into")
+                .size(ButtonSize::Small)
+                .label(format!("Merged into {main} · {hash}"))
+                .tooltip(format!("Select the merge commit {hash}"))
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    // Back to the whole history, on that merge.
+                    view.set_branch_filter(None, cx);
+                    view.reveal_commit(oid, cx);
+                }))
+        });
+        Some(
+            div()
+                .id("history-branch-filter")
+                .w_full()
+                .min_h(px(32.))
+                .flex_none()
+                .py(px(4.))
+                .pl(px(8.))
+                .pr(px(12.))
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .bg(colors.accent_soft)
+                .border_b_1()
+                .border_color(colors.border)
+                .text_size(FS_SM)
+                .text_color(colors.text)
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_color(colors.muted)
+                        .child(
+                            Icon::new(IconName::Branch)
+                                .size(px(13.))
+                                .color(colors.muted),
+                        )
+                        .child("Commits of")
+                        .child(
+                            div()
+                                .id("history-branch-filter-name")
+                                .min_w_0()
+                                // The design caps the name at 40ch.
+                                .max_w(px(320.))
+                                .truncate()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(colors.text)
+                                .tooltip(Tooltip::text(rows.branch.clone()))
+                                .child(rows.branch.clone()),
+                        ),
+                )
+                .child(div().flex_none().text_color(colors.muted).child(counts))
+                .children(into)
+                .child(div().flex_1())
+                .child(
+                    Button::new("branch-filter-clear")
+                        .size(ButtonSize::Small)
+                        .icon(IconName::X)
+                        .label("Show all commits")
+                        .on_click(cx.listener(|view, _, _, cx| view.set_branch_filter(None, cx))),
+                ),
+        )
+    }
+
     /// The one-line load bar under the header.
     fn render_load_bar(&self, loaded: u64, total: Option<u64>, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
@@ -2224,10 +2552,15 @@ impl HistoryView {
         let ring_visible = focus::focus_visible(&self.focus, window, cx);
         let now = unix_now();
         let summary_width = self.summary_width;
-        let items: &[Item] = match &self.day_rows {
-            Some(day) => &day.items,
-            None => &self.items,
+        let items: &[Item] = match (&self.day_rows, &self.branch_rows) {
+            (Some(day), _) => &day.items,
+            (None, Some(branch)) => &branch.items,
+            (None, None) => &self.items,
         };
+        let branch_rows = self
+            .branch_rows
+            .as_ref()
+            .filter(|_| self.day_rows.is_none());
         let badges = &self.badges;
         let badge_widths = &mut self.badge_widths;
         let search_matches = &self.search_matches;
@@ -2260,6 +2593,11 @@ impl HistoryView {
                 };
                 let secondary = ListRow::secondary_color(colors, selected, list_focused);
                 let is_head = head == Some(c.id);
+                // Branch filter: the fork-point row, and the branch a merge
+                // row brought in (its stub and "from {x}" chip).
+                let is_fork = branch_rows.is_some_and(|rows| rows.fork == Some(c.id));
+                let merged_from = branch_rows.and_then(|rows| rows.merged_from.get(&c.id));
+                let stub = merged_from.is_some();
                 let row_theme = ui_theme.clone();
                 let row_geometry = geometry.clone();
                 let summary_ranges = fields.map(|f| f.summary.as_slice()).unwrap_or(&[]);
@@ -2281,6 +2619,7 @@ impl HistoryView {
                     .text_size(row_font)
                     .rounded(R_MD)
                     .debug_selector(move || format!("history-row-{ix}"))
+                    .when(is_fork, |row| row.opacity(FORK_ROW_OPACITY))
                     .bg(background)
                     .on_hover(cx.listener(move |view, entered: &bool, _, cx| {
                         // A leave only clears the row it belongs to: the next
@@ -2339,6 +2678,7 @@ impl HistoryView {
                                         background,
                                         &row_geometry,
                                         is_head,
+                                        stub,
                                         &row_theme,
                                         settings.graph_colored,
                                         px(f32::from(settings.graph_line_width)),
@@ -2375,7 +2715,14 @@ impl HistoryView {
                         RefKind::Overflow,
                         badge_widths,
                     ));
-                    badge_overflow(&widths, summary_width, BADGE_GAP, plus_width)
+                    // The "from {x}" chip is not a ref of the row but takes
+                    // room beside the badges.
+                    let chip_width = merged_from.map_or(0., |name| {
+                        let label = SharedString::from(format!("from {name}"));
+                        f32::from(measure_badge(window, &label, RefKind::Local, badge_widths))
+                            + BADGE_GAP
+                    });
+                    badge_overflow(&widths, summary_width - chip_width, BADGE_GAP, plus_width)
                 };
 
                 let mut summary = div()
@@ -2406,41 +2753,60 @@ impl HistoryView {
                             .tooltip(hidden),
                     );
                 }
-                row_div = row_div.child(summary.child({
-                    let mut cell = div()
-                        .id(format!("history-summary-{ix}"))
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(FS_BASE)
-                        .text_color(summary_color)
-                        .when(is_head, |text| text.font_weight(FontWeight::BOLD))
-                        .tooltip(Tooltip::text(c.summary.clone()));
-                    // Only a matching cell pays for styled runs; the plain
-                    // path keeps the cheap shared string.
-                    cell = if summary_ranges.is_empty() {
-                        cell.child(c.summary.clone())
-                    } else {
-                        let style = TextStyle {
-                            color: summary_color,
-                            font_family: FONT_UI.into(),
-                            font_size: FS_BASE.into(),
-                            font_weight: if is_head {
-                                FontWeight::BOLD
+                if let Some(name) = merged_from {
+                    let target = name.clone();
+                    summary = summary.child(
+                        RefBadge::new(format!("history-from-{ix}"), format!("from {name}"))
+                            .dashed()
+                            .max_label_width(px(BADGE_LABEL_MAX))
+                            .tooltip(format!("Merged from {name} · click to show its commits"))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                // The row's own click must not also select a
+                                // row of the list that is about to change.
+                                cx.stop_propagation();
+                                view.set_branch_filter(Some(target.clone()), cx);
+                            })),
+                    );
+                }
+                row_div = row_div.child(
+                    summary
+                        .child({
+                            let mut cell = div()
+                                .id(format!("history-summary-{ix}"))
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(FS_BASE)
+                                .text_color(summary_color)
+                                .when(is_head, |text| text.font_weight(FontWeight::BOLD))
+                                .tooltip(Tooltip::text(c.summary.clone()));
+                            // Only a matching cell pays for styled runs; the plain
+                            // path keeps the cheap shared string.
+                            cell = if summary_ranges.is_empty() {
+                                cell.child(c.summary.clone())
                             } else {
-                                FontWeight::NORMAL
-                            },
-                            ..TextStyle::default()
-                        };
-                        cell.child(highlighted_text(
-                            &c.summary,
-                            summary_ranges,
-                            &style,
-                            colors.accent_soft,
-                        ))
-                    };
-                    cell
-                }));
+                                let style = TextStyle {
+                                    color: summary_color,
+                                    font_family: FONT_UI.into(),
+                                    font_size: FS_BASE.into(),
+                                    font_weight: if is_head {
+                                        FontWeight::BOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    },
+                                    ..TextStyle::default()
+                                };
+                                cell.child(highlighted_text(
+                                    &c.summary,
+                                    summary_ranges,
+                                    &style,
+                                    colors.accent_soft,
+                                ))
+                            };
+                            cell
+                        })
+                        .when(is_fork, |summary| summary.child(fork_note(colors))),
+                );
                 if let Some(author) = columns.author {
                     row_div = row_div.child(
                         div()
@@ -2594,6 +2960,46 @@ impl HistoryView {
                         .icon(IconName::Git)
                         .icon_color(cx.theme().colors.muted),
                 ),
+                DayState::Ready => self.render_list(cx),
+            };
+        }
+        if let Some(branch) = &self.branch_rows {
+            let name = SharedString::from(branch.branch.clone());
+            return match &branch.state {
+                DayState::Loading => self.render_skeletons(columns, cx).into_any_element(),
+                DayState::Failed(message) => {
+                    let message = SharedString::from(message.clone());
+                    let actions = div().flex().gap(px(8.)).child(
+                        Button::primary("empty-branch-retry")
+                            .label("Retry")
+                            .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+                    );
+                    centred(
+                        EmptyState::new("Could not list the commits of this branch")
+                            .icon(IconName::Warn)
+                            .icon_color(cx.theme().colors.warning)
+                            .text(message)
+                            .actions(actions),
+                    )
+                }
+                DayState::Ready if branch.items.is_empty() => {
+                    let actions = div().flex().gap(px(8.)).child(
+                        Button::new("empty-branch-clear")
+                            .label("Show all commits")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_branch_filter(None, cx);
+                            })),
+                    );
+                    centred(
+                        EmptyState::new("No commits to show")
+                            .icon(IconName::Branch)
+                            .icon_color(cx.theme().colors.muted)
+                            .text(format!(
+                                "{name} has no commits in this repository view. It may be gone or not fetched yet."
+                            ))
+                            .actions(actions),
+                    )
+                }
                 DayState::Ready => self.render_list(cx),
             };
         }
@@ -3048,11 +3454,14 @@ impl HistoryView {
             .on_action(cx.listener(|view, _: &Cancel, _, cx| {
                 if view.day_rows.is_some() {
                     view.set_day_filter(None, cx);
+                } else if view.branch_rows.is_some() {
+                    view.set_branch_filter(None, cx);
                 } else {
                     cx.propagate();
                 }
             }))
             .child(self.render_header(columns, cx))
+            .children(self.render_branch_bar(cx))
             .child(body)
             .into_any_element()
     }
@@ -3241,6 +3650,37 @@ fn layout_day(commits: Vec<CommitInfo>) -> Vec<(CommitInfo, Row<Oid>)> {
                 .collect();
             let row = graph.push(c.id, &parents);
             (c, row)
+        })
+        .collect()
+}
+
+/// The dashed "fork point" note after the fork-point row's summary.
+fn fork_note(colors: ThemeColors) -> impl IntoElement {
+    div()
+        .flex_none()
+        .ml(px(8.))
+        .px(px(6.))
+        .h(px(16.))
+        .flex()
+        .items_center()
+        .rounded(R_SM)
+        .border_1()
+        .border_dashed()
+        .border_color(colors.border_strong)
+        .text_color(colors.muted)
+        .text_size(FS_XS)
+        .child("fork point")
+}
+
+/// Lays out a branch's commits as a graph of their own: only parents in the
+/// list are drawn. A merge keeps a hollow dot even when its merged-in parent is
+/// outside the list; its stub is painted from `merged_from`.
+fn layout_branch(log: &BranchLog) -> Vec<(CommitInfo, Row<Oid>)> {
+    layout_day(log.commits.clone())
+        .into_iter()
+        .map(|(commit, mut row)| {
+            row.is_merge |= log.merged_from.contains_key(&commit.id);
+            (commit, row)
         })
         .collect()
 }
@@ -4300,5 +4740,216 @@ mod tests {
                 "a search jump must clear the pending reveal"
             );
         });
+    }
+    fn git_in(repo: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `main`: c1, then `feat` (f1, f2) forks off, main goes on (m1), merges
+    /// `feat` with a merge commit and adds m2. Returns the merge commit's hash.
+    fn branch_filter_repo(name: &str) -> (crate::test_support::TempRepo, String) {
+        let repo = crate::test_support::TempRepo::new(name);
+        let path = repo.path();
+        git_in(path, &["checkout", "-q", "-B", "main"]);
+        commit(path, "c1", "c1");
+        git_in(path, &["checkout", "-q", "-b", "feat"]);
+        commit(path, "f1", "f1");
+        commit(path, "f2", "f2");
+        git_in(path, &["checkout", "-q", "main"]);
+        commit(path, "m1", "m1");
+        git_in(
+            path,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "Merge branch 'feat'",
+                "feat",
+            ],
+        );
+        commit(path, "m2", "m2");
+        // The merge commit is m2's parent.
+        let parent = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD~1"])
+            .output()
+            .expect("git runs");
+        assert!(parent.status.success());
+        (
+            repo,
+            String::from_utf8_lossy(&parent.stdout).trim().to_owned(),
+        )
+    }
+
+    fn summaries(history: &HistoryView) -> Vec<String> {
+        history
+            .rows()
+            .iter()
+            .map(|item| item.commit.summary.to_string())
+            .collect()
+    }
+
+    /// A branch off main lists its own commits down to the fork point, flags
+    /// the fork row, and knows the merge that brought it into main.
+    #[gpui::test]
+    fn a_feature_branch_filter_stops_at_the_fork_point(cx: &mut gpui::TestAppContext) {
+        let (repo, merge) = branch_filter_repo("branch-filter-feature");
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, cx| {
+            view.set_branch_filter(Some("feat".to_owned()), cx)
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert_eq!(view.branch_filter(), Some("feat"));
+            assert_eq!(summaries(view), ["f2", "f1", "c1"]);
+            let rows = view.branch_rows.as_ref().expect("the filter is on");
+            let fork = rows.fork.expect("the branch has a fork point");
+            let fork_row = view.rows().iter().find(|item| item.commit.id == fork);
+            assert_eq!(fork_row.expect("fork row").commit.summary, "c1");
+            let (into, main) = rows.merged_into.clone().expect("feat is merged");
+            assert_eq!(into.to_string(), merge);
+            assert_eq!(main, "main");
+            assert!(rows.merged_from.is_empty());
+            // The first row is selected, at the top.
+            assert_eq!(view.selected, Some(0));
+        });
+    }
+
+    /// The main line keeps its merge commits, each flagged with the branch it
+    /// brought in and drawn as a merge; it has no fork point or merged-into.
+    #[gpui::test]
+    fn the_main_line_filter_flags_merges_with_their_branch(cx: &mut gpui::TestAppContext) {
+        let (repo, merge) = branch_filter_repo("branch-filter-main");
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, cx| {
+            view.set_branch_filter(Some("main".to_owned()), cx)
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert_eq!(summaries(view), ["m2", "Merge branch 'feat'", "m1", "c1"]);
+            let rows = view.branch_rows.as_ref().expect("the filter is on");
+            assert!(rows.fork.is_none() && rows.merged_into.is_none());
+            let merged: Vec<(String, &String)> = rows
+                .merged_from
+                .iter()
+                .map(|(id, from)| (id.to_string(), from))
+                .collect();
+            assert_eq!(merged, [(merge.clone(), &"feat".to_owned())]);
+            // The merge keeps its hollow dot though only one parent is listed.
+            let merge_row = view
+                .rows()
+                .iter()
+                .find(|item| item.commit.id.to_string() == merge)
+                .expect("merge row");
+            assert!(merge_row.row.is_merge);
+        });
+    }
+
+    /// Esc on the focused list clears the filter; a branch that is gone shows
+    /// the empty state's rows (none) instead of failing.
+    #[gpui::test]
+    fn escape_clears_the_branch_filter(cx: &mut gpui::TestAppContext) {
+        let (repo, _) = branch_filter_repo("branch-filter-esc");
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, cx| {
+            view.set_branch_filter(Some("nope".to_owned()), cx)
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert!(matches!(
+                view.branch_rows.as_ref().map(|rows| &rows.state),
+                Some(DayState::Ready)
+            ));
+            assert!(view.rows().is_empty());
+        });
+        history.update(&mut cx, |view, cx| {
+            view.set_branch_filter(Some("feat".to_owned()), cx)
+        });
+        cx.run_until_parked();
+        let focus = history.read_with(&cx, |view, _| view.list_focus());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert!(view.branch_filter().is_none(), "Esc left the filter on");
+            assert_eq!(view.commit_count(), 6);
+        });
+    }
+
+    /// The day and branch filters replace each other, and the branch filter
+    /// clears the search.
+    #[gpui::test]
+    fn the_day_and_branch_filters_are_exclusive(cx: &mut gpui::TestAppContext) {
+        let (repo, _) = branch_filter_repo("branch-filter-exclusive");
+        let (mut cx, history) = open_history(&repo, cx);
+        let today = days_today();
+        history.update(&mut cx, |view, cx| {
+            view.set_search_query("m1".to_owned(), cx);
+            view.set_day_filter(
+                Some(DayFilter {
+                    day: today,
+                    me: None,
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| assert!(view.day_filter().is_some()));
+
+        history.update(&mut cx, |view, cx| {
+            view.set_branch_filter(Some("feat".to_owned()), cx)
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert!(
+                view.day_filter().is_none(),
+                "the branch filter kept the day"
+            );
+            assert_eq!(view.branch_filter(), Some("feat"));
+            assert_eq!(view.search_query(), "", "the branch filter kept the search");
+        });
+
+        history.update(&mut cx, |view, cx| {
+            view.set_day_filter(
+                Some(DayFilter {
+                    day: today,
+                    me: None,
+                }),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        history.read_with(&cx, |view, _| {
+            assert!(
+                view.branch_filter().is_none(),
+                "the day filter kept the branch"
+            );
+            assert!(view.day_filter().is_some());
+        });
+    }
+
+    /// Today's local calendar day, the day the test commits were made on.
+    fn days_today() -> i32 {
+        let now = unix_now() as i64;
+        // Commits land within seconds of now; the local offset is ignored,
+        // which only matters within hours of local midnight, and then the day
+        // filter is merely empty — the test checks exclusivity, not its rows.
+        (now / 86_400) as i32
     }
 }

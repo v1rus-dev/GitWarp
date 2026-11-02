@@ -33,6 +33,7 @@ mod welcome_activity;
 mod workspace;
 mod worktree_dialog;
 mod worktree_path;
+mod worktrees_model;
 mod worktrees_view;
 
 use gpui::{

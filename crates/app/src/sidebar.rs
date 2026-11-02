@@ -226,6 +226,9 @@ pub enum SidebarAction {
     UpdateSubmodule(String),
     /// Opens an initialised submodule's folder in a second window.
     OpenSubmodule(String),
+    /// Narrows the History list to one branch's own commits (local name or
+    /// `<remote>/<name>`).
+    ShowBranchCommits(String),
     /// Shows the Worktrees page.
     ShowWorktrees,
     /// Opens the add-worktree dialog.
@@ -344,6 +347,8 @@ pub fn sidebar_menu(
             item("Checkout", IconName::Check)
                 .shortcut("Enter")
                 .maybe_action((!current).then(|| SidebarAction::CheckoutBranch(name.to_owned()))),
+            item(&format!("Show all commits of {name}"), IconName::Branch)
+                .action(SidebarAction::ShowBranchCommits(name.to_owned())),
             item(&format!("Merge {name} into {head}"), IconName::Branch),
             item(&format!("Rebase {head} onto {name}"), IconName::Branch),
             SidebarMenuEntry::Separator,
@@ -366,6 +371,8 @@ pub fn sidebar_menu(
             item("Checkout as local branch", IconName::Check)
                 .shortcut("Enter")
                 .action(SidebarAction::CheckoutRemoteBranch(name.to_owned())),
+            item(&format!("Show all commits of {name}"), IconName::Branch)
+                .action(SidebarAction::ShowBranchCommits(name.to_owned())),
             item(&format!("Merge {name} into {head}"), IconName::Branch),
             SidebarMenuEntry::Separator,
             item("Delete remote branch…", IconName::Trash)
@@ -2001,6 +2008,7 @@ mod tests {
             )),
             vec![
                 "Checkout",
+                "Show all commits of feat/idle-lanes",
                 "Merge feat/idle-lanes into main",
                 "Rebase main onto feat/idle-lanes",
                 "—",
@@ -2020,6 +2028,7 @@ mod tests {
             )),
             vec![
                 "Checkout as local branch",
+                "Show all commits of origin/feat/idle-lanes",
                 "Merge origin/feat/idle-lanes into main",
                 "—",
                 "Delete remote branch…",
@@ -2157,6 +2166,7 @@ mod tests {
             menu_labels(&sidebar_menu("local:feat/x", Some(&detached), None, None)),
             vec![
                 "Checkout",
+                "Show all commits of feat/x",
                 "Merge feat/x into HEAD",
                 "Rebase HEAD onto feat/x",
                 "—",
@@ -2176,6 +2186,7 @@ mod tests {
             )),
             vec![
                 "Checkout as local branch",
+                "Show all commits of origin/feat/x",
                 "Merge origin/feat/x into HEAD",
                 "—",
                 "Delete remote branch…",
@@ -2184,7 +2195,7 @@ mod tests {
         );
         // HEAD not read yet is named the same way.
         assert_eq!(
-            menu_labels(&sidebar_menu("local:feat/x", None, None, None))[1],
+            menu_labels(&sidebar_menu("local:feat/x", None, None, None))[2],
             "Merge feat/x into HEAD"
         );
     }
@@ -2224,6 +2235,7 @@ mod tests {
             let expected: &[&str] = match key {
                 "local:feat/idle-lanes" => &[
                     "Checkout",
+                    "Show all commits of feat/idle-lanes",
                     "Rename…",
                     "Set upstream",
                     "Delete branch",
@@ -2231,6 +2243,7 @@ mod tests {
                 ],
                 "rbranch:origin/feat/idle-lanes" => &[
                     "Checkout as local branch",
+                    "Show all commits of origin/feat/idle-lanes",
                     "Delete remote branch…",
                     "Copy branch name",
                 ],

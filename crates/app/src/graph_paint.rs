@@ -24,6 +24,9 @@ const DOT_CLIP_MARGIN: f32 = 6.;
 /// Dash pattern of a folded lane: 2 px on, 3 px off.
 const DASH_ON: f32 = 2.;
 const DASH_PERIOD: f32 = 5.;
+/// Where a merge stub ends, relative to its dot.
+const STUB_DX: f32 = 9.;
+const STUB_DY: f32 = 8.;
 
 /// Pixel x of a column's centre inside the graph column: the geometry's x plus
 /// the left inset.
@@ -51,7 +54,8 @@ pub fn overdraw_mask_bounds(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
 
 /// Paints one row. `background` is the row's current fill (`bg`, `hover` or
 /// `selection`): it colours the dot halo and the merge ring's interior, and it
-/// is what the clipped edge fades into.
+/// is what the clipped edge fades into. `stub` adds the History branch
+/// filter's dashed stub: the merged-in branch's line, cut short.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_row(
     row: &Row<Oid>,
@@ -60,6 +64,7 @@ pub fn paint_row(
     background: Hsla,
     geometry: &ColumnGeometry,
     is_head: bool,
+    stub: bool,
     theme: &Theme,
     colored: bool,
     line_width: Pixels,
@@ -189,6 +194,10 @@ pub fn paint_row(
         if dot_visible(local_x(xc), cw) {
             let center = point(xc, mid);
 
+            if stub {
+                paint_stub(window, line_width, center, lane(row.column + 1));
+            }
+
             // The HEAD ring goes under the dot.
             if is_head {
                 ring(
@@ -228,6 +237,27 @@ pub fn paint_row(
             ),
         ));
     }
+}
+
+/// The stub of a merge in the branch filter: a 2-on / 2-off dashed line from
+/// the dot up and to the right, ending in a small dot (the design's
+/// `M xc 13 L xc+9 5` with a 1.8 radius end dot).
+fn paint_stub(window: &mut Window, width: Pixels, centre: Point<Pixels>, color: Hsla) {
+    let end = point(centre.x + px(STUB_DX), centre.y - px(STUB_DY));
+    let length = STUB_DX.hypot(STUB_DY);
+    let mut at = 0.;
+    while at < length {
+        let to = (at + 2.).min(length);
+        let along = |t: f32| {
+            point(
+                centre.x + px(STUB_DX * t / length),
+                centre.y - px(STUB_DY * t / length),
+            )
+        };
+        straight(window, width, along(at), along(to), color);
+        at += 4.;
+    }
+    circle(window, end, px(1.8), color);
 }
 
 /// The row's passing lanes (a full-height line in a column that is not the

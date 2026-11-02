@@ -57,6 +57,7 @@ use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
 use crate::worktree_dialog::SelectedCommit;
+use crate::worktrees_model::{WorktreesModel, WorktreesModelEvent};
 use crate::worktrees_view::{WorktreesEvent, WorktreesView};
 
 actions!(
@@ -318,7 +319,11 @@ pub struct RepositoryView {
     changes: Entity<ChangesView>,
     _changes_observer: Subscription,
     worktrees: Entity<WorktreesView>,
+    /// The worktree list shared by the Worktrees page and, next, the sidebar
+    /// panel and the titlebar switcher.
+    worktrees_model: Entity<WorktreesModel>,
     _worktrees_observer: Subscription,
+    _worktrees_leave: Subscription,
     view: ViewMode,
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
@@ -467,6 +472,12 @@ impl RepositoryView {
                 this.ensure_sidebar(cx);
             }
             this.sync_details(selected, cx);
+            // The branch filter clears the history's search from inside the
+            // list (chip, row menu); the field must not keep the dead query.
+            if history.read(cx).search_query().is_empty() && !this.search.read(cx).text().is_empty()
+            {
+                this.search.update(cx, |input, cx| input.set_text("", cx));
+            }
             cx.notify();
         });
         let activity = cx.new(|cx| {
@@ -489,17 +500,31 @@ impl RepositoryView {
                 ChangesEvent::PushAfterCommit => this.push_branch(window, cx),
             },
         );
-        let worktrees = cx
-            .new(|cx| WorktreesView::new(path.clone(), git.clone(), workspace.clone(), window, cx));
-        let worktrees_observer = cx.subscribe(&worktrees, |this, _, _: &WorktreesEvent, cx| {
-            // A branch was created or deleted, or a worktree changed: the
-            // sidebar, the history's ref labels and the local changes all
-            // read the same repository.
-            this.reload_history(cx);
-            this.changes.update(cx, |changes, cx| changes.refresh(cx));
-            this.refresh(cx);
-            cx.notify();
-        });
+        let worktrees_model =
+            cx.new(|cx| WorktreesModel::new(path.clone(), git.clone(), workspace.clone(), cx));
+        let worktrees = cx.new(|cx| WorktreesView::new(worktrees_model.clone(), window, cx));
+        let worktrees_observer = cx.subscribe(
+            &worktrees_model,
+            |this, _, event: &WorktreesModelEvent, cx| {
+                if *event == WorktreesModelEvent::Changed {
+                    // A branch was created or deleted, or a worktree changed:
+                    // the sidebar, the history's ref labels and the local
+                    // changes all read the same repository.
+                    this.reload_history(cx);
+                    this.changes.update(cx, |changes, cx| changes.refresh(cx));
+                    this.refresh(cx);
+                    cx.notify();
+                }
+            },
+        );
+        let worktrees_leave = cx.subscribe_in(
+            &worktrees,
+            window,
+            |this, _, _: &WorktreesEvent, window, cx| {
+                // Esc on the Worktrees page goes back to History.
+                this.set_view(ViewMode::History, window, cx);
+            },
+        );
         let search = cx.new(|cx| {
             let mut input = TextInput::new(window, cx);
             input.set_placeholder("Search commits, authors, hashes", cx);
@@ -555,7 +580,9 @@ impl RepositoryView {
             changes,
             _changes_observer: changes_observer,
             worktrees,
+            worktrees_model,
             _worktrees_observer: worktrees_observer,
+            _worktrees_leave: worktrees_leave,
             view: ViewMode::History,
             workspace,
             focus: focus.clone(),
@@ -634,6 +661,12 @@ impl RepositoryView {
     pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open = !self.sidebar_open;
         cx.notify();
+    }
+
+    /// The worktree list shared with the sidebar panel and the switcher.
+    #[allow(dead_code)] // read by the sidebar panel and the switcher (W4, W5)
+    pub(crate) fn worktrees_model(&self) -> Entity<WorktreesModel> {
+        self.worktrees_model.clone()
     }
 
     pub(crate) fn toggle_details(&mut self, cx: &mut Context<Self>) {
@@ -1198,6 +1231,9 @@ impl RepositoryView {
                     git_core::network::set_upstream(repo, &branch, &remote, &branch)?;
                     Ok((ui::ToastKind::Ok, format!("{branch} now tracks {upstream}")))
                 });
+            }
+            SidebarAction::ShowBranchCommits(name) => {
+                self.show_branch_commits(name, window, cx);
             }
             SidebarAction::ShowWorktrees => {
                 self.set_view(ViewMode::Worktrees, window, cx);
@@ -2180,6 +2216,20 @@ impl RepositoryView {
                 }
             }
             Command::CreateTagHere => self.run_sidebar_action(SidebarAction::CreateTag, window, cx),
+            Command::ShowBranchCommits => match self.history.read(cx).head() {
+                Some(Head::Branch { name, .. }) => {
+                    let name = name.clone();
+                    self.show_branch_commits(name, window, cx);
+                }
+                _ => {
+                    ui::toast::show(
+                        ui::ToastKind::Info,
+                        "HEAD is detached — there is no current branch",
+                        window,
+                        cx,
+                    );
+                }
+            },
             Command::AddRemote => self.run_sidebar_action(SidebarAction::AddRemote, window, cx),
             Command::AddWorktree => self.run_sidebar_action(SidebarAction::AddWorktree, window, cx),
             Command::Refresh => self.run_sidebar_action(SidebarAction::Refresh, window, cx),
@@ -2226,6 +2276,18 @@ impl RepositoryView {
             SidebarAction::CheckoutBranch(name)
         };
         self.run_sidebar_action(action, window, cx);
+    }
+
+    /// Shows the History narrowed to `branch`'s own commits and empties the
+    /// search field the filter replaces.
+    fn show_branch_commits(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view(ViewMode::History, window, cx);
+        self.search.update(cx, |input, cx| input.set_text("", cx));
+        self.history.update(cx, |history, cx| {
+            history.set_branch_filter(Some(branch), cx)
+        });
+        let focus = self.history.read(cx).list_focus();
+        window.focus(&focus, cx);
     }
 
     /// A palette commit pick: shows the History and selects the commit.
@@ -4727,8 +4789,8 @@ mod tests {
         view.read_with(&cx, |view, _| assert_eq!(view.view, ViewMode::Worktrees));
         assert!(cx.debug_bounds("worktrees-view").is_some());
         assert!(
-            cx.debug_bounds("worktree-row-0").is_some(),
-            "the main worktree row was not drawn"
+            cx.debug_bounds("worktree-detail").is_some(),
+            "the current worktree's details were not drawn"
         );
 
         cx.update(|window, cx| {

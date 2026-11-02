@@ -24,6 +24,9 @@ pub const DIFF_CONTEXT_MAX: u8 = 20;
 /// The background-fetch intervals, in minutes.
 pub const FETCH_INTERVALS: [u16; 4] = [1, 5, 15, 60];
 
+/// The most recent worktree folders kept for ordering by recency.
+pub const WORKTREE_RECENCY_LIMIT: usize = 200;
+
 /// The most recent repositories kept.
 #[allow(dead_code)] // used by the welcome screen (stage 2.3+)
 pub const RECENT_LIMIT: usize = 20;
@@ -139,6 +142,9 @@ pub struct Settings {
     pub keybindings: BTreeMap<String, String>,
     /// Where new worktrees go and what happens around creating and removing them.
     pub worktrees: WorktreeSettings,
+    /// When GitWarp last opened or switched to a worktree, by folder, in unix
+    /// seconds. Orders the worktree lists by recency.
+    pub worktree_recency: BTreeMap<String, u64>,
 }
 
 impl Default for Settings {
@@ -186,6 +192,7 @@ impl Default for Settings {
             git_path: String::new(),
             keybindings: BTreeMap::new(),
             worktrees: WorktreeSettings::default(),
+            worktree_recency: BTreeMap::new(),
         }
     }
 }
@@ -255,6 +262,19 @@ impl Settings {
             },
         );
         self.recent.truncate(RECENT_LIMIT);
+    }
+
+    /// Records that the worktree at `path` was opened at `now`. Only the most
+    /// recent [`WORKTREE_RECENCY_LIMIT`] folders are kept.
+    pub fn touch_worktree(&mut self, path: &Path, now: u64) {
+        self.worktree_recency
+            .insert(path.to_string_lossy().into_owned(), now);
+        if self.worktree_recency.len() > WORKTREE_RECENCY_LIMIT {
+            let mut times: Vec<u64> = self.worktree_recency.values().copied().collect();
+            times.sort_unstable_by(|a, b| b.cmp(a));
+            let cutoff = times[WORKTREE_RECENCY_LIMIT - 1];
+            self.worktree_recency.retain(|_, time| *time >= cutoff);
+        }
     }
 
     /// Removes `path` from the recent list, if present.
@@ -744,6 +764,7 @@ fn settings_from_value(value: Value) -> Settings {
         git_path: take(&mut object, "git_path", defaults.git_path),
         keybindings: take(&mut object, "keybindings", defaults.keybindings),
         worktrees: take(&mut object, "worktrees", defaults.worktrees),
+        worktree_recency: take(&mut object, "worktree_recency", defaults.worktree_recency),
     }
 }
 
@@ -852,6 +873,29 @@ mod tests {
         };
         store.save(&settings).unwrap();
         assert_eq!(store.load(), settings);
+    }
+
+    #[test]
+    fn worktree_recency_is_kept_bounded_and_round_trips() {
+        let dir = TempDir::new("worktree-recency");
+        assert!(load_json(dir.path(), r#"{"theme":"dark"}"#)
+            .worktree_recency
+            .is_empty());
+
+        let mut settings = Settings::default();
+        settings.touch_worktree(Path::new("/w/a"), 10);
+        settings.touch_worktree(Path::new("/w/a"), 20);
+        assert_eq!(settings.worktree_recency["/w/a"], 20);
+        for n in 0..WORKTREE_RECENCY_LIMIT as u64 {
+            settings.touch_worktree(Path::new(&format!("/w/{n}")), 100 + n);
+        }
+        // The oldest entry ("/w/a", 20) was dropped at the limit.
+        assert_eq!(settings.worktree_recency.len(), WORKTREE_RECENCY_LIMIT);
+        assert!(!settings.worktree_recency.contains_key("/w/a"));
+
+        let store = SettingsStore::new(settings_path(dir.path()));
+        store.save(&settings).unwrap();
+        assert_eq!(store.load().worktree_recency, settings.worktree_recency);
     }
 
     #[test]

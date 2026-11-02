@@ -52,6 +52,14 @@ pub(crate) struct WorktreeDialogContext {
     pub current_branch: Option<String>,
     pub selected: Option<SelectedCommit>,
     pub workspace: WeakEntity<Workspace>,
+    /// The main line, for telling whether a branch is merged.
+    pub main_line: Option<String>,
+    /// Settings → Worktrees: ask again before deleting an unmerged branch.
+    pub confirm_delete_branch: bool,
+    /// The "After creating" setting is Switch: without the "new window" box
+    /// the add dialog switches this window to the new worktree, like quick
+    /// create does; otherwise it stays.
+    pub open_after: bool,
 }
 
 /// A worktree as the remove dialog sees it.
@@ -97,9 +105,18 @@ pub(crate) struct WorktreeDialog {
     branch_mode: BranchMode,
     branch: usize,
     base: usize,
+    /// The "Open the worktree in a new window" box (always starts unticked).
     open_after: bool,
+    /// Switch this window to the new worktree when the box is not ticked.
+    switch_after: bool,
     force: bool,
     delete_branch: bool,
+    main_line: Option<String>,
+    confirm_delete_branch: bool,
+    /// Whether the branch to delete is unmerged; `None` until checked.
+    unmerged: Option<bool>,
+    /// The user confirmed deleting the unmerged branch.
+    force_branch: bool,
     running: bool,
     unlocking: bool,
     /// Set once an input changed, so errors do not colour an untouched field.
@@ -113,6 +130,7 @@ pub(crate) struct WorktreeDialog {
     unlock_focus: FocusHandle,
     force_focus: FocusHandle,
     delete_focus: FocusHandle,
+    force_branch_focus: FocusHandle,
     cancel_focus: FocusHandle,
     primary_focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -183,10 +201,14 @@ impl WorktreeDialog {
             branch_mode: BranchMode::Existing,
             branch,
             base,
-            // The design opens the new worktree in its own window by default.
-            open_after: true,
+            open_after: false,
+            switch_after: context.open_after,
             force: false,
             delete_branch: false,
+            main_line: None,
+            confirm_delete_branch: true,
+            unmerged: None,
+            force_branch: false,
             running: false,
             unlocking: false,
             path_touched: false,
@@ -199,6 +221,7 @@ impl WorktreeDialog {
             unlock_focus: cx.focus_handle().tab_stop(true),
             force_focus: cx.focus_handle().tab_stop(true),
             delete_focus: cx.focus_handle().tab_stop(true),
+            force_branch_focus: cx.focus_handle().tab_stop(true),
             cancel_focus: cx.focus_handle().tab_stop(true),
             primary_focus: cx.focus_handle().tab_stop(true),
             _subscriptions: subscriptions,
@@ -230,8 +253,13 @@ impl WorktreeDialog {
             branch: 0,
             base: 0,
             open_after: false,
+            switch_after: false,
             force: false,
             delete_branch: false,
+            main_line: context.main_line,
+            confirm_delete_branch: context.confirm_delete_branch,
+            unmerged: None,
+            force_branch: false,
             running: false,
             unlocking: false,
             path_touched: false,
@@ -244,6 +272,7 @@ impl WorktreeDialog {
             unlock_focus: cx.focus_handle().tab_stop(true),
             force_focus: cx.focus_handle().tab_stop(true),
             delete_focus: cx.focus_handle().tab_stop(true),
+            force_branch_focus: cx.focus_handle().tab_stop(true),
             cancel_focus: cx.focus_handle().tab_stop(true),
             primary_focus: cx.focus_handle().tab_stop(true),
             _subscriptions: Vec::new(),
@@ -382,9 +411,60 @@ impl WorktreeDialog {
             !target.main
                 && target.locked.is_none()
                 && (!dirty(target) || self.force)
+                && !self.branch_confirm_pending()
                 && !self.running
                 && !self.unlocking
         })
+    }
+
+    /// Deleting an unmerged branch asks once more (when the setting says so).
+    fn needs_branch_confirm(&self) -> bool {
+        self.delete_branch && self.confirm_delete_branch && self.unmerged == Some(true)
+    }
+
+    fn branch_confirm_pending(&self) -> bool {
+        self.needs_branch_confirm() && !self.force_branch
+    }
+
+    /// Whether the branch is deleted even though it is unmerged: confirmed,
+    /// or the user turned the confirmation off.
+    fn force_delete_branch(&self) -> bool {
+        self.unmerged == Some(true) && (self.force_branch || !self.confirm_delete_branch)
+    }
+
+    /// Finds out in the background whether `branch` is merged into the main
+    /// line, so ticking "Also delete branch" can ask again for an unmerged one.
+    fn check_branch_merged(&mut self, cx: &mut Context<Self>) {
+        let Some(branch) = self.target.as_ref().and_then(|t| t.branch.clone()) else {
+            return;
+        };
+        let Ok(git) = self.git.clone() else {
+            return;
+        };
+        let root = self.root.clone();
+        let main = self.main_line.clone();
+        cx.spawn(async move |this, cx| {
+            let unmerged = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &root)?;
+                    let log = repo.branch_log(&branch, main.as_deref(), 1)?;
+                    let on_main = log
+                        .fork_point
+                        .is_some_and(|fork| log.commits.first().is_some_and(|c| c.id == fork));
+                    Ok::<_, Error>(log.merged_into.is_none() && !on_main)
+                })
+                .await
+                // When the state cannot be read, ask: deleting is the risk.
+                .unwrap_or(true);
+            this.update(cx, |dialog, cx| {
+                dialog.unmerged = Some(unmerged);
+                dialog.notify_host(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn remove_hint(&self) -> Option<&'static str> {
@@ -395,6 +475,8 @@ impl WorktreeDialog {
             Some("Unlock the worktree first")
         } else if dirty(target) && !self.force {
             Some("Confirm to discard changes")
+        } else if self.branch_confirm_pending() {
+            Some("Confirm deleting the unmerged branch")
         } else {
             None
         }
@@ -457,15 +539,17 @@ impl WorktreeDialog {
                 };
                 let force = dirty(&target) && self.force;
                 let delete_branch = self.delete_branch;
+                let force_branch = self.force_delete_branch();
                 Box::new(move |repo: &Repo| {
                     repo.remove_worktree(&target.path, force)?;
                     let mut notice = format!("Removed worktree {}", target.path.display());
                     if delete_branch {
                         if let Some(branch) = &target.branch {
                             // The worktree is gone already: a branch that is
-                            // not fully merged stays, and the toast says so
-                            // instead of leaving the dialog on a stale path.
-                            if let Err(error) = repo.delete_branch(branch, false) {
+                            // not fully merged stays unless the user confirmed
+                            // (or switched the confirmation off), and the toast
+                            // says so instead of leaving the dialog on a stale path.
+                            if let Err(error) = repo.delete_branch(branch, force_branch) {
                                 notice = format!(
                                     "Removed worktree {}; kept {branch}: {}",
                                     target.path.display(),
@@ -505,8 +589,9 @@ impl WorktreeDialog {
         self.running = false;
         match result {
             Ok(notice) => {
-                let open_path =
-                    (self.mode == Mode::Add && self.open_after).then(|| self.resolved_path(cx));
+                let added = (self.mode == Mode::Add).then(|| self.resolved_path(cx));
+                let open_path = added.clone().filter(|_| self.open_after);
+                let switch_path = added.filter(|_| !self.open_after && self.switch_after);
                 self.close(window, cx);
                 toast::show(ToastKind::Ok, notice, window, cx);
                 let on_done = self.on_done.clone();
@@ -517,6 +602,8 @@ impl WorktreeDialog {
                             workspace.open_repository_window(path, window, cx);
                         })
                         .ok();
+                } else if let Some(path) = switch_path {
+                    crate::worktrees_model::switch_window_to(&self.workspace, path, window, cx);
                 }
             }
             Err(error) => {
@@ -783,6 +870,9 @@ fn build(state: &Entity<WorktreeDialog>, cx: &App) -> Dialog {
                 .is_some_and(|target| target.branch.is_some())
             {
                 focus_order.push(DialogFocus::control(dialog.delete_focus.clone()));
+            }
+            if dialog.needs_branch_confirm() {
+                focus_order.push(DialogFocus::control(dialog.force_branch_focus.clone()));
             }
         }
     }
@@ -1153,6 +1243,11 @@ fn remove_body(
             move |next: bool, _: &mut Window, cx: &mut App| {
                 state.update(cx, |dialog, cx| {
                     dialog.delete_branch = next;
+                    if !next {
+                        dialog.force_branch = false;
+                    } else if dialog.unmerged.is_none() {
+                        dialog.check_branch_merged(cx);
+                    }
                     dialog.notify_host(cx);
                     cx.notify();
                 });
@@ -1160,11 +1255,35 @@ fn remove_body(
         };
         body = body.child(
             Checkbox::new("worktree-delete-branch")
-                .label(format!("Also delete branch {branch} (fully merged)"))
+                .label(format!("Also delete branch {branch}"))
                 .checked(dialog.delete_branch)
                 .focus_handle(dialog.delete_focus.clone())
                 .on_toggle(delete_toggle),
         );
+        if dialog.needs_branch_confirm() {
+            let force_toggle = {
+                let state = state.clone();
+                move |next: bool, _: &mut Window, cx: &mut App| {
+                    state.update(cx, |dialog, cx| {
+                        dialog.force_branch = next;
+                        dialog.notify_host(cx);
+                        cx.notify();
+                    });
+                }
+            };
+            body = body
+                .child(
+                    Banner::new(BannerKind::Warn, format!("{branch} is not merged"))
+                        .body("Unmerged commits stay reachable from the reflog for 30 days."),
+                )
+                .child(
+                    Checkbox::new("worktree-force-branch")
+                        .label(format!("Delete {branch} anyway"))
+                        .checked(dialog.force_branch)
+                        .focus_handle(dialog.force_branch_focus.clone())
+                        .on_toggle(force_toggle),
+                );
+        }
     }
     body.into_any_element()
 }

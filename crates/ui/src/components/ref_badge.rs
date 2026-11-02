@@ -1,9 +1,11 @@
 //! Ref badges: branch, remote, tag, stash and HEAD labels.
 
+use std::rc::Rc;
+
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, App, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement,
-    Pixels, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px, App, ClickEvent, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement,
+    ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::icon::{Icon, IconName};
@@ -24,6 +26,8 @@ pub enum RefKind {
     Overflow,
 }
 
+type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
 /// A small tinted ref label.
 #[derive(IntoElement)]
 pub struct RefBadge {
@@ -32,6 +36,8 @@ pub struct RefBadge {
     kind: RefKind,
     max_label_width: Option<Pixels>,
     tooltip: Option<SharedString>,
+    dashed: bool,
+    on_click: Option<ClickHandler>,
 }
 
 impl RefBadge {
@@ -42,6 +48,8 @@ impl RefBadge {
             kind: RefKind::Local,
             max_label_width: None,
             tooltip: None,
+            dashed: false,
+            on_click: None,
         }
     }
 
@@ -53,6 +61,22 @@ impl RefBadge {
     /// Cap the label at `width`; a longer label is ellipsized inside the badge.
     pub fn max_label_width(mut self, width: Pixels) -> Self {
         self.max_label_width = Some(width);
+        self
+    }
+
+    /// A transparent badge with a dashed border: a reference that is not a ref
+    /// of this commit (the History branch filter's "from {branch}" chip).
+    pub fn dashed(mut self) -> Self {
+        self.dashed = true;
+        self
+    }
+
+    /// Makes the badge a button.
+    pub fn on_click(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_click = Some(Rc::new(handler));
         self
     }
 
@@ -84,11 +108,21 @@ impl RenderOnce for RefBadge {
         let colors = cx.theme().colors;
         let (color, icon, weight) = kind_style(self.kind, colors);
 
-        let (background, border, foreground) = if self.kind == RefKind::Head {
+        let (mut background, border, foreground) = if self.kind == RefKind::Head {
             (colors.accent, colors.accent, colors.accent_fg)
         } else {
             (color.opacity(0.10), color.opacity(0.28), color)
         };
+        let weight = if self.dashed {
+            FontWeight::MEDIUM
+        } else {
+            weight
+        };
+        if self.dashed {
+            background = gpui::transparent_black();
+        }
+        let hover_background = color.opacity(0.14);
+        let dashed = self.dashed;
 
         div()
             .id(self.id)
@@ -101,6 +135,7 @@ impl RenderOnce for RefBadge {
             .rounded(R_SM)
             .bg(background)
             .border_1()
+            .when(dashed, |this| this.border_dashed())
             .border_color(border)
             .text_color(foreground)
             .text_size(FS_XS)
@@ -118,6 +153,11 @@ impl RenderOnce for RefBadge {
             )
             .when_some(self.tooltip, |this, tooltip| {
                 this.tooltip(Tooltip::text(tooltip))
+            })
+            .when_some(self.on_click, |this, handler| {
+                this.cursor_pointer()
+                    .hover(move |style| style.bg(hover_background))
+                    .on_click(move |event, window, cx| handler(event, window, cx))
             })
     }
 }
