@@ -361,8 +361,7 @@ impl WelcomeView {
                     id: "welcome-clone",
                     icon: IconName::Clone,
                     label: "Clone repository…",
-                    // No shortcut, as in the design.
-                    kbd: None,
+                    kbd: Some("Ctrl Shift O"),
                     disabled: false,
                     tooltip: "Clone a repository from a URL",
                 },
@@ -531,7 +530,7 @@ impl WelcomeView {
 
     /// Opens the Clone repository dialog; brings an existing one back if its
     /// layer was closed with Esc.
-    fn open_clone_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_clone_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(dialog) = &self.clone_dialog {
             if !dialog.update(cx, |dialog, cx| dialog.layer_gone(window, cx)) {
                 return;
@@ -1522,6 +1521,16 @@ mod tests {
             cx.update(|window, cx| overlay::layer_count(window, cx)),
             0,
             "Escape did not close the dialog"
+        );
+
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(crate::workspace::OpenCloneDialog), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|window, cx| overlay::layer_count(window, cx)),
+            1,
+            "Ctrl Shift O did not open the Clone dialog"
         );
     }
 }

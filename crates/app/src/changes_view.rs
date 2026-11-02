@@ -586,6 +586,29 @@ impl ChangesView {
         });
     }
 
+    /// Space on a file row: stages the selected unstaged file, or unstages the
+    /// selected staged one.
+    fn stage_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(selection) = self.selection {
+            self.stage_file(selection.side, selection.index, cx);
+        }
+    }
+
+    /// Ctrl+Shift+Z on a file row: asks to discard the selected unstaged file
+    /// through the inline confirm bar, whatever the "confirm discard" setting
+    /// says — a key press never discards on its own.
+    fn ask_discard_selected(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        if let Some(selection) = self.selection.filter(|s| s.side == Side::Unstaged) {
+            if self.file(selection).is_some() {
+                self.confirming_discard = Some(selection);
+                cx.notify();
+            }
+        }
+    }
+
     fn stage_file(&mut self, side: Side, index: usize, cx: &mut Context<Self>) {
         let Some(file) = self
             .status()
@@ -844,6 +867,12 @@ impl ChangesView {
             .on_action(cx.listener(|view, _: &CommitChanges, window, cx| {
                 view.commit(window, cx);
             }))
+            .on_action(cx.listener(|view, _: &StageSelected, _, cx| {
+                view.stage_selected(cx);
+            }))
+            .on_action(cx.listener(|view, _: &DiscardSelected, _, cx| {
+                view.ask_discard_selected(cx);
+            }))
             .on_action(cx.listener(|view, _: &SelectNext, _, cx| {
                 view.step_selection(1, cx);
             }))
@@ -996,10 +1025,14 @@ impl ChangesView {
             } else {
                 IconName::Minus
             };
-            let stage_tip = if side == Side::Unstaged {
-                "Stage file"
-            } else {
-                "Unstage file"
+            let stage_tip = match (
+                side == Side::Unstaged,
+                crate::settings_ui::keybindings::key_cap(cx, "stage"),
+            ) {
+                (true, Some(cap)) => format!("Stage file · {cap}"),
+                (false, Some(cap)) => format!("Unstage file · {cap}"),
+                (true, None) => "Stage file".to_owned(),
+                (false, None) => "Unstage file".to_owned(),
             };
             row = row.action(
                 Button::ghost(format!("stage-{side:?}-{index}"))
@@ -1016,7 +1049,12 @@ impl ChangesView {
                     Button::ghost(format!("discard-{side:?}-{index}"))
                         .size(ButtonSize::Xs)
                         .icon_only(IconName::Undo)
-                        .tooltip("Discard changes")
+                        .tooltip(
+                            match crate::settings_ui::keybindings::key_cap(cx, "discard") {
+                                Some(cap) => format!("Discard changes · {}", cap.replace(' ', "+")),
+                                None => "Discard changes".to_owned(),
+                            },
+                        )
                         .disabled(busy)
                         .on_click(move |_, _, cx| {
                             let confirm = cx
@@ -1045,6 +1083,7 @@ impl ChangesView {
             rows.push(
                 div()
                     .debug_selector(move || debug_id.clone())
+                    .key_context("changes-file")
                     .child(row.on_click(move |_, _, cx| {
                         select_view.update(cx, |view, cx| view.select(side, index, cx));
                     })),
@@ -1642,10 +1681,31 @@ pub fn bind_keys(cx: &mut App, settings: &crate::settings::Settings) {
         .filter(|keys| !keys.is_empty())
         .cloned()
         .unwrap_or_else(|| "secondary-enter".to_owned());
-    cx.bind_keys([key_binding(cx, &key, CommitChanges, None)]);
+    let keys = |id: &str, default: &str| {
+        settings
+            .keybindings
+            .get(id)
+            .filter(|keys| !keys.is_empty())
+            .cloned()
+            .unwrap_or_else(|| default.to_owned())
+    };
+    // The file-row keys live in their own context: it is active on a row and
+    // its buttons only, so Space still types in the message editor and a
+    // focused button keeps its own Space.
+    let file = Some("changes-file && !ui-button");
+    cx.bind_keys([
+        key_binding(cx, &key, CommitChanges, None),
+        key_binding(cx, &keys("stage", "space"), StageSelected, file),
+        key_binding(
+            cx,
+            &keys("discard", "secondary-shift-z"),
+            DiscardSelected,
+            file,
+        ),
+    ]);
 }
 
-actions!(gitwarp, [CommitChanges]);
+actions!(gitwarp, [CommitChanges, StageSelected, DiscardSelected]);
 
 /// Reads one file's diff and flattens it into rows off the UI thread.
 fn read_diff(
@@ -1995,6 +2055,51 @@ mod tests {
             .update(|window, _| window.root::<ChangesView>().flatten())
             .expect("the changes view is the window root");
         (cx, view)
+    }
+
+    /// Space on a focused file row stages the selected file; Ctrl+Shift+Z asks
+    /// to discard it through the inline confirm bar and discards nothing.
+    #[gpui::test]
+    fn space_stages_and_ctrl_shift_z_asks_to_discard(cx: &mut gpui::TestAppContext) {
+        use gpui::Modifiers;
+
+        let repo = crate::test_support::TempRepo::new("changes-keys");
+        write(repo.path(), "a.txt", "one\n");
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "one"]);
+        write(repo.path(), "a.txt", "two\n");
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        let row = cx
+            .debug_bounds("changes-unstaged-0")
+            .expect("the unstaged row was not drawn");
+        cx.simulate_click(row.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("secondary-shift-z");
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.confirming_discard,
+                Some(Selection {
+                    side: Side::Unstaged,
+                    index: 0
+                })
+            );
+            assert_eq!(view.unstaged_count(), 1, "the key discarded without asking");
+        });
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "two\n"
+        );
+
+        cx.simulate_keystrokes("space");
+        cx.run_until_parked();
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.staged_count(), 1, "Space did not stage the file");
+            assert_eq!(view.unstaged_count(), 0);
+        });
     }
 
     #[gpui::test]

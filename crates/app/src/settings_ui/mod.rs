@@ -15,7 +15,7 @@ mod form;
 mod general;
 mod git;
 mod identity;
-mod keybindings;
+pub(crate) mod keybindings;
 mod ssh;
 
 use std::path::PathBuf;

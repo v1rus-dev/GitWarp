@@ -135,6 +135,19 @@ fn action(id: &str) -> Option<&'static Action> {
     ACTIONS.iter().find(|action| action.id == id)
 }
 
+/// The key cap text (`Ctrl Shift L`) of the shortcut effective for `id`:
+/// the user's override from the settings, else the default. `None` for an
+/// unknown id (an empty override counts as the default, as at startup).
+pub fn key_cap(cx: &gpui::App, id: &str) -> Option<String> {
+    let action = action(id)?;
+    let keys = cx
+        .try_global::<crate::AppSettings>()
+        .and_then(|state| state.settings.keybindings.get(id))
+        .filter(|keys| !keys.is_empty())
+        .map_or(action.default, String::as_str);
+    Some(display(keys).replace('+', " "))
+}
+
 /// Formats the stored GPUI syntax as the design's `Ctrl + Shift + B` caps.
 pub fn display(keys: &str) -> String {
     if keys.is_empty() {

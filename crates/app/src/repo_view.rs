@@ -47,8 +47,8 @@ use crate::settings::{
     SIDEBAR_WIDTH_MIN,
 };
 use crate::sidebar::{
-    commit_for, read_sidebar_extras, sidebar_menu, sidebar_nodes, Expansion, SidebarAction,
-    SidebarExtras, SidebarMenuEntry,
+    commit_for, read_sidebar_extras, shortcut_action, sidebar_menu, sidebar_nodes, Expansion,
+    SidebarAction, SidebarExtras, SidebarMenuEntry,
 };
 use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::workspace::{
@@ -70,7 +70,9 @@ actions!(
         OpenRepoSwitcher,
         OpenBranchSwitcher,
         StashChanges,
-        FetchAll
+        FetchAll,
+        PullBranch,
+        PushBranch
     ]
 );
 
@@ -798,6 +800,34 @@ impl RepositoryView {
         };
         if let Some(action) = action {
             self.run_sidebar_action(action, window, cx);
+        }
+    }
+
+    /// Enter / F2 / Delete on a sidebar row: runs the menu item carrying that
+    /// shortcut hint. Returns whether the row has one (and so took the key).
+    fn run_sidebar_shortcut(
+        &mut self,
+        key: &str,
+        hint: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let action = {
+            let history = self.history.read(cx);
+            shortcut_action(
+                key,
+                hint,
+                history.head(),
+                self.sidebar_extras.as_ref(),
+                history.refs(),
+            )
+        };
+        match action {
+            Some(action) => {
+                self.run_sidebar_action(action, window, cx);
+                true
+            }
+            None => false,
         }
     }
 
@@ -1753,11 +1783,11 @@ impl RepositoryView {
         );
     }
 
-    fn pull_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn pull_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.start_network_job(Job::Pull, window, cx);
     }
 
-    fn push_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn push_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.start_network_job(Job::Push, window, cx);
     }
 
@@ -2331,16 +2361,28 @@ impl RepositoryView {
             "toolbar-fetch",
             IconName::Fetch,
             "Fetch",
-            "Fetch all remotes, tags and pruned branches",
+            "Fetch all remotes, tags and pruned branches".to_owned(),
+            crate::settings_ui::keybindings::key_cap(cx, "fetch"),
+            None,
             layout.labels,
             busy,
             fetch,
         );
+        let hints = {
+            let history = self.history.read(cx);
+            let remotes = self
+                .sidebar_extras
+                .as_ref()
+                .map_or(&[][..], |extras| extras.remotes.as_slice());
+            network_hints(history.head(), history.refs(), remotes)
+        };
         let pull_button = network_tool(
             "toolbar-pull",
             IconName::Down,
             "Pull",
-            "Pull the current branch (fast-forward only)",
+            hints.pull_tip,
+            crate::settings_ui::keybindings::key_cap(cx, "pull"),
+            (hints.behind > 0).then(|| Counter::new(format!("↓{}", hints.behind))),
             layout.labels,
             busy,
             pull,
@@ -2349,7 +2391,9 @@ impl RepositoryView {
             "toolbar-push",
             IconName::Up,
             "Push",
-            "Push the current branch",
+            hints.push_tip,
+            crate::settings_ui::keybindings::key_cap(cx, "push"),
+            (hints.ahead > 0).then(|| Counter::new(format!("↑{}", hints.ahead)).accent()),
             layout.labels,
             busy,
             push,
@@ -2480,6 +2524,40 @@ impl RepositoryView {
                 });
             }
         };
+        // Enter checks out a branch or tag row; every other row keeps the
+        // activation Space gives (select, reveal, or toggle a folder).
+        let confirm = {
+            let activate = activate.clone();
+            let rows = rows.clone();
+            let view = view.clone();
+            move |index: usize, window: &mut Window, cx: &mut App| {
+                let Some((key, has_children, _)) = rows.get(index).cloned() else {
+                    return;
+                };
+                let handled = !has_children
+                    && view.update(cx, |view, cx| {
+                        view.run_sidebar_shortcut(&key, "Enter", window, cx)
+                    });
+                if !handled {
+                    activate(index, window, cx);
+                }
+            }
+        };
+        // F2 and Delete run the row menu's Rename / Delete item.
+        let shortcut = |hint: &'static str| {
+            let rows = rows.clone();
+            let view = view.clone();
+            move |index: usize, window: &mut Window, cx: &mut App| {
+                let Some((key, _, _)) = rows.get(index).cloned() else {
+                    return;
+                };
+                view.update(cx, |view, cx| {
+                    view.run_sidebar_shortcut(&key, hint, window, cx);
+                });
+            }
+        };
+        let rename = shortcut("F2");
+        let delete = shortcut("Del");
         // A right-click selects the row and opens its kind's menu at the
         // pointer; the sidebar keeps the keyboard focus.
         let context_menu = {
@@ -2564,6 +2642,9 @@ impl RepositoryView {
                                     .on_expand(node_toggler(rows.clone(), view.clone()))
                                     .on_collapse(node_toggler(rows.clone(), view.clone()))
                                     .on_activate(activate)
+                                    .on_confirm(confirm)
+                                    .on_rename(rename)
+                                    .on_delete(delete)
                                     .on_open(open)
                                     .on_context_menu(context_menu),
                             ),
@@ -3566,6 +3647,12 @@ impl Render for RepositoryView {
             .on_action(cx.listener(|view, _: &FetchAll, window, cx| {
                 view.fetch_remotes(window, cx);
             }))
+            .on_action(cx.listener(|view, _: &PullBranch, window, cx| {
+                view.pull_branch(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &PushBranch, window, cx| {
+                view.push_branch(window, cx);
+            }))
             .child(toolbar)
             .child(body)
             .child(status)
@@ -3634,24 +3721,96 @@ fn no_shrink(child: impl IntoElement) -> Div {
 }
 
 /// A working toolbar tool button: the label is dropped on narrow windows.
+#[allow(clippy::too_many_arguments)]
 fn network_tool(
     id: &'static str,
     icon: IconName,
     label: &'static str,
-    tooltip: &'static str,
+    tooltip: String,
+    kbd: Option<String>,
+    counter: Option<Counter>,
     labels: bool,
     busy: bool,
     action: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Button {
-    let button = Button::tool(id)
-        .icon(icon)
-        .disabled(busy)
-        .tooltip(tooltip)
-        .on_click(action);
+    let mut button = Button::tool(id).icon(icon).disabled(busy).on_click(action);
+    button = match kbd {
+        Some(kbd) => button.tooltip_kbd(tooltip, kbd),
+        None => button.tooltip(tooltip),
+    };
+    if let Some(counter) = counter {
+        button = button.counter(counter);
+    }
     if labels {
         button.label(label)
     } else {
         button
+    }
+}
+
+/// What the Pull and Push toolbar buttons say about the current branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NetworkHints {
+    pull_tip: String,
+    push_tip: String,
+    ahead: usize,
+    behind: usize,
+}
+
+/// `1 commit` / `3 commits`.
+fn commits(count: usize) -> String {
+    format!("{count} commit{}", if count == 1 { "" } else { "s" })
+}
+
+/// The Pull / Push tooltips and counters, from the ahead/behind the refs
+/// already carry (as of the last fetch) — no git command runs per frame.
+fn network_hints(
+    head: Option<&Head>,
+    refs: Option<&[git_core::Ref]>,
+    remotes: &[String],
+) -> NetworkHints {
+    let branch = match head {
+        Some(Head::Branch { name, .. }) => Some(name.as_str()),
+        _ => None,
+    };
+    let local = branch.and_then(|name| {
+        refs.unwrap_or(&[])
+            .iter()
+            .find(|r| r.kind == RefKind::LocalBranch && r.name == name)
+    });
+    let upstream = local
+        .filter(|local| !local.upstream_gone)
+        .and_then(|local| local.upstream.as_deref());
+    let (ahead, behind) = match (local, upstream) {
+        (Some(local), Some(_)) => (local.ahead, local.behind),
+        _ => (0, 0),
+    };
+    let pull_tip = match upstream {
+        _ if ahead > 0 && behind > 0 => "Pull — branches diverged; fast-forward only".to_owned(),
+        Some(upstream) if behind > 0 => format!("Pull {} from {upstream}", commits(behind)),
+        Some(_) => "Pull — nothing to pull".to_owned(),
+        None => "Pull — no upstream branch".to_owned(),
+    };
+    let push_tip = match (upstream, branch) {
+        (Some(upstream), _) if ahead > 0 => format!("Push {} to {upstream}", commits(ahead)),
+        (None, Some(branch)) => {
+            // Same remote the push itself picks: `origin`, else the first.
+            let remote = remotes
+                .iter()
+                .find(|remote| remote.as_str() == "origin")
+                .or_else(|| remotes.first());
+            match remote {
+                Some(remote) => format!("Push and set upstream to {remote}/{branch}"),
+                None => "Push the current branch".to_owned(),
+            }
+        }
+        _ => "Push the current branch".to_owned(),
+    };
+    NetworkHints {
+        pull_tip,
+        push_tip,
+        ahead,
+        behind,
     }
 }
 
@@ -4916,5 +5075,167 @@ mod tests {
             Head::Branch { name, .. } => assert_eq!(name, "feature"),
             Head::Detached(_) => panic!("checkout left a detached HEAD"),
         }
+    }
+
+    /// Clicks the sidebar row with `key` so the tree holds the keyboard.
+    fn click_sidebar_row(
+        cx: &mut gpui::VisualTestContext,
+        view: &Entity<RepositoryView>,
+        key: &str,
+    ) {
+        let index = view
+            .update(cx, |view, cx| {
+                view.tree_nodes(cx)
+                    .iter()
+                    .position(|node| node.key.as_ref() == key)
+            })
+            .unwrap_or_else(|| panic!("no sidebar row {key}"));
+        // `debug_bounds` wants a `'static` name; a leak in a test is harmless.
+        let name: &'static str = Box::leak(format!("sidebar-tree-node-{index}").into_boxed_str());
+        let row = cx
+            .debug_bounds(name)
+            .expect("the sidebar row was not drawn");
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+    }
+
+    fn branch_names(repo: &crate::test_support::TempRepo) -> Vec<String> {
+        git_core::Repo::open(crate::test_support::git(), repo.path())
+            .unwrap()
+            .refs()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == git_core::RefKind::LocalBranch)
+            .map(|r| r.name)
+            .collect()
+    }
+
+    fn repo_with_feature_branch(name: &str) -> crate::test_support::TempRepo {
+        let repo = crate::test_support::TempRepo::new(name);
+        commit(repo.path(), "a.txt", "one\n");
+        let git = crate::test_support::git();
+        let repo_handle = git_core::Repo::open(git, repo.path()).unwrap();
+        let oid = repo_handle.head_commit().unwrap().unwrap().id;
+        repo_handle.create_branch("feature", oid, false).unwrap();
+        repo
+    }
+
+    /// F2 on a focused sidebar branch row opens the Rename dialog.
+    #[gpui::test]
+    fn f2_on_a_sidebar_branch_row_opens_rename(cx: &mut gpui::TestAppContext) {
+        let repo = repo_with_feature_branch("sidebar-f2");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        click_sidebar_row(&mut cx, &view, "local:feature");
+
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        let dialog = view
+            .read_with(&cx, |view, _| view.ref_dialog.clone())
+            .expect("F2 did not open the rename dialog");
+        dialog.update(&mut cx, |dialog, cx| {
+            dialog.set_name_for_test("renamed", cx)
+        });
+        cx.update(|window, cx| {
+            dialog.update(cx, |dialog, cx| dialog.submit_for_test(window, cx));
+        });
+        cx.run_until_parked();
+        cx.run_until_parked();
+        let names = branch_names(&repo);
+        assert!(names.iter().any(|n| n == "renamed"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "feature"), "{names:?}");
+    }
+
+    /// Enter on a focused sidebar branch row checks the branch out.
+    #[gpui::test]
+    fn enter_on_a_sidebar_branch_row_checks_it_out(cx: &mut gpui::TestAppContext) {
+        let repo = repo_with_feature_branch("sidebar-enter");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        click_sidebar_row(&mut cx, &view, "local:feature");
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.run_until_parked();
+        let repo = git_core::Repo::open(crate::test_support::git(), repo.path()).unwrap();
+        match repo.head().unwrap() {
+            Head::Branch { name, .. } => assert_eq!(name, "feature"),
+            Head::Detached(_) => panic!("Enter left a detached HEAD"),
+        }
+    }
+
+    /// B on the focused history list opens "Create branch here…".
+    #[gpui::test]
+    fn b_on_the_history_list_opens_create_branch(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-b");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.update(|_, cx| {
+            crate::history_view::bind_history_keys(cx, &crate::settings::Settings::default());
+        });
+        cx.run_until_parked();
+        let history = view.read_with(&cx, |view, _| view.history());
+        cx.update(|window, cx| {
+            let focus = history.read(cx).list_focus();
+            window.focus(&focus, cx);
+        });
+
+        cx.simulate_keystrokes("b");
+        cx.run_until_parked();
+        let dialog = view
+            .read_with(&cx, |view, _| view.ref_dialog.clone())
+            .expect("B did not open the create-branch dialog");
+        dialog.update(&mut cx, |dialog, cx| dialog.set_name_for_test("from-b", cx));
+        cx.update(|window, cx| {
+            dialog.update(cx, |dialog, cx| dialog.submit_for_test(window, cx));
+        });
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(branch_names(&repo).iter().any(|n| n == "from-b"));
+    }
+
+    fn local_ref(name: &str, upstream: Option<&str>, ahead: usize, behind: usize) -> git_core::Ref {
+        git_core::Ref {
+            full_name: format!("refs/heads/{name}"),
+            name: name.to_owned(),
+            kind: RefKind::LocalBranch,
+            target: Oid::from_hex(&"1".repeat(40)).unwrap(),
+            upstream: upstream.map(str::to_owned),
+            ahead,
+            behind,
+            upstream_gone: false,
+        }
+    }
+
+    #[test]
+    fn pull_and_push_tooltips_follow_ahead_and_behind() {
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        let remotes = vec!["origin".to_owned()];
+        let hints = |refs: &[git_core::Ref]| network_hints(Some(&head), Some(refs), &remotes);
+
+        let idle = hints(&[local_ref("main", Some("origin/main"), 0, 0)]);
+        assert_eq!(idle.pull_tip, "Pull — nothing to pull");
+        assert_eq!(idle.push_tip, "Push the current branch");
+        assert_eq!((idle.ahead, idle.behind), (0, 0));
+
+        let ahead = hints(&[local_ref("main", Some("origin/main"), 3, 0)]);
+        assert_eq!(ahead.push_tip, "Push 3 commits to origin/main");
+        assert_eq!(ahead.ahead, 3);
+
+        let behind = hints(&[local_ref("main", Some("origin/main"), 0, 1)]);
+        assert_eq!(behind.pull_tip, "Pull 1 commit from origin/main");
+
+        let diverged = hints(&[local_ref("main", Some("origin/main"), 2, 2)]);
+        assert_eq!(
+            diverged.pull_tip,
+            "Pull — branches diverged; fast-forward only"
+        );
+
+        let fresh = hints(&[local_ref("main", None, 0, 0)]);
+        assert_eq!(fresh.push_tip, "Push and set upstream to origin/main");
+        assert_eq!(fresh.ahead, 0);
     }
 }

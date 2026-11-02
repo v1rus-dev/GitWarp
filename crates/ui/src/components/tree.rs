@@ -13,7 +13,9 @@ use gpui::{
 };
 use gpui::{MouseDownEvent, Pixels, Point};
 
-use crate::actions::{Confirm, SelectNext, SelectPrev, TreeActivate, TreeCollapse, TreeExpand};
+use crate::actions::{
+    Confirm, SelectNext, SelectPrev, TreeActivate, TreeCollapse, TreeDelete, TreeExpand, TreeRename,
+};
 use crate::components::counter::CountPill;
 use crate::focus::{self, RingOffset};
 use crate::icon::{Icon, IconName};
@@ -196,6 +198,9 @@ pub struct Tree {
     focus_handle: Option<FocusHandle>,
     scroll_handle: Option<ScrollHandle>,
     on_activate: Option<NodeHandler>,
+    on_confirm: Option<NodeHandler>,
+    on_rename: Option<NodeHandler>,
+    on_delete: Option<NodeHandler>,
     on_toggle: Option<NodeHandler>,
     on_expand: Option<NodeHandler>,
     on_collapse: Option<NodeHandler>,
@@ -213,6 +218,9 @@ impl Tree {
             focus_handle: None,
             scroll_handle: None,
             on_activate: None,
+            on_confirm: None,
+            on_rename: None,
+            on_delete: None,
             on_toggle: None,
             on_expand: None,
             on_collapse: None,
@@ -254,6 +262,24 @@ impl Tree {
         listener: impl Fn(usize, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_activate = Some(Rc::new(listener));
+        self
+    }
+
+    /// Enter on the marked row. Without it Enter activates, like Space.
+    pub fn on_confirm(mut self, listener: impl Fn(usize, &mut Window, &mut App) + 'static) -> Self {
+        self.on_confirm = Some(Rc::new(listener));
+        self
+    }
+
+    /// F2 on the marked row.
+    pub fn on_rename(mut self, listener: impl Fn(usize, &mut Window, &mut App) + 'static) -> Self {
+        self.on_rename = Some(Rc::new(listener));
+        self
+    }
+
+    /// Delete on the marked row.
+    pub fn on_delete(mut self, listener: impl Fn(usize, &mut Window, &mut App) + 'static) -> Self {
+        self.on_delete = Some(Rc::new(listener));
         self
     }
 
@@ -398,7 +424,7 @@ impl RenderOnce for Tree {
         {
             let state = state.clone();
             let keys = keys.clone();
-            let on_activate = self.on_activate.clone();
+            let on_activate = self.on_confirm.clone().or_else(|| self.on_activate.clone());
             root = root.on_action(move |_: &Confirm, window: &mut Window, cx: &mut App| {
                 let index = {
                     let state = state.read(cx);
@@ -429,6 +455,44 @@ impl RenderOnce for Tree {
                     )
                 };
                 if let (Some(index), Some(listener)) = (index, &on_activate) {
+                    listener(index, window, cx);
+                }
+            });
+        }
+        {
+            let state = state.clone();
+            let keys = keys.clone();
+            let handler = self.on_rename.clone();
+            root = root.on_action(move |_: &TreeRename, window: &mut Window, cx: &mut App| {
+                let index = {
+                    let state = state.read(cx);
+                    marker_index(
+                        &keys,
+                        selected_index,
+                        state.marker_key.as_ref(),
+                        state.marker_index,
+                    )
+                };
+                if let (Some(index), Some(listener)) = (index, &handler) {
+                    listener(index, window, cx);
+                }
+            });
+        }
+        {
+            let state = state.clone();
+            let keys = keys.clone();
+            let handler = self.on_delete.clone();
+            root = root.on_action(move |_: &TreeDelete, window: &mut Window, cx: &mut App| {
+                let index = {
+                    let state = state.read(cx);
+                    marker_index(
+                        &keys,
+                        selected_index,
+                        state.marker_key.as_ref(),
+                        state.marker_index,
+                    )
+                };
+                if let (Some(index), Some(listener)) = (index, &handler) {
                     listener(index, window, cx);
                 }
             });

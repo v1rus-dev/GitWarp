@@ -23,6 +23,8 @@ actions!(
         TreeExpand,
         TreeCollapse,
         TreeActivate,
+        TreeRename,
+        TreeDelete,
     ]
 );
 
@@ -57,6 +59,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("right", TreeExpand, Some("ui-tree")),
         KeyBinding::new("left", TreeCollapse, Some("ui-tree")),
         KeyBinding::new("space", TreeActivate, Some("ui-tree")),
+        KeyBinding::new("f2", TreeRename, Some("ui-tree")),
+        KeyBinding::new("delete", TreeDelete, Some("ui-tree")),
     ]);
 
     // Root handlers cannot run while nothing is focused: the dispatch path is

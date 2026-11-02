@@ -116,7 +116,8 @@ actions!(
         PrevCommit,
         PageDownCommits,
         PageUpCommits,
-        CopyCommitHash
+        CopyCommitHash,
+        CreateBranchHere
     ]
 );
 
@@ -145,6 +146,7 @@ pub(crate) fn bind_history_keys(cx: &mut App, settings: &crate::settings::Settin
         ui::actions::key_binding(cx, "pagedown", PageDownCommits, Some("history-list")),
         ui::actions::key_binding(cx, "pageup", PageUpCommits, Some("history-list")),
         ui::actions::key_binding(cx, "secondary-c", CopyCommitHash, Some("history-list")),
+        ui::actions::key_binding(cx, "b", CreateBranchHere, Some("history-list")),
     ]);
 }
 
@@ -1113,6 +1115,25 @@ impl HistoryView {
         if let Some(item) = self.items.get(index) {
             cx.write_to_clipboard(ClipboardItem::new_string(item.commit.id.to_string()));
         }
+    }
+
+    /// `B` on the focused list: "Create branch here…" on the selected commit,
+    /// the same request the row menu makes.
+    fn create_branch_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected.or_else(|| self.initial_row()) else {
+            return;
+        };
+        self.select_row(index, cx);
+        let Some(item) = self.items.get(index) else {
+            return;
+        };
+        let card = CommitCard::from_commit(&item.commit, self.refs().unwrap_or(&[]), self.head());
+        // The shell's handler reads this view back for the dialog's context, so
+        // it must run after the current update has finished.
+        let on_action = self.on_action.clone();
+        window.defer(cx, move |window, cx| {
+            on_action(RefAction::CreateBranch(card), window, cx);
+        });
     }
 
     /// Double-click: switch to the row's first local branch that is not HEAD,
@@ -2324,6 +2345,9 @@ impl HistoryView {
         .on_action(cx.listener(|view, _: &PageDownCommits, _, cx| view.page_selection(true, cx)))
         .on_action(cx.listener(|view, _: &PageUpCommits, _, cx| view.page_selection(false, cx)))
         .on_action(cx.listener(|view, _: &CopyCommitHash, _, cx| view.copy_selected_hash(cx)))
+        .on_action(cx.listener(|view, _: &CreateBranchHere, window, cx| {
+            view.create_branch_selected(window, cx);
+        }))
         .into_any_element()
     }
 

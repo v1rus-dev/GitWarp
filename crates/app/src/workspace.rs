@@ -26,19 +26,26 @@ use ui::metrics::{BAR, FONT_UI, FS_BASE, R_WINDOW};
 use ui::theme::ActiveTheme;
 use ui::{overlay, WindowControls};
 
+use crate::clone_dialog::CloneDialog;
 use crate::credential_dialog::CredentialDialog;
 use crate::host_key_dialog::HostKeyDialog;
 use crate::network_service::NetworkService;
 use crate::open_dialog::OpenRepoDialog;
 use crate::repo_view::{
-    FocusSearch, OpenBranchSwitcher, OpenRepoSwitcher, RepositoryView, ToggleDetails, ToggleSidebar,
+    FocusSearch, OpenBranchSwitcher, OpenRepoSwitcher, PullBranch, PushBranch, RepositoryView,
+    ToggleDetails, ToggleSidebar,
 };
 use crate::settings_ui::{Page, SettingsView};
 use crate::welcome::WelcomeView;
 
 actions!(
     workspace,
-    [OpenRepositoryDialog, OpenSettings, OpenGitSettings]
+    [
+        OpenRepositoryDialog,
+        OpenCloneDialog,
+        OpenSettings,
+        OpenGitSettings
+    ]
 );
 
 /// The shadow and resize border drawn around the client-side frame.
@@ -68,6 +75,9 @@ pub struct Workspace {
     settings: Option<Entity<SettingsView>>,
     /// The Open-from-folder dialog, kept so its state survives the frames.
     dialog: Option<Entity<OpenRepoDialog>>,
+    /// The Clone dialog opened from a repository window; on the welcome
+    /// screen the welcome view owns it.
+    clone_dialog: Option<Entity<CloneDialog>>,
     /// A git credential question, while one is open.
     credential: Option<Entity<CredentialDialog>>,
     /// An SSH host-key question, while one is open.
@@ -98,6 +108,7 @@ impl Workspace {
             last_resize_edge: None,
             settings: None,
             dialog: None,
+            clone_dialog: None,
             credential: None,
             host_key: None,
             _network_poll: None,
@@ -314,6 +325,24 @@ impl Workspace {
         let git = self.git.clone();
         let workspace = cx.weak_entity();
         self.dialog = Some(crate::open_dialog::open(window, cx, git, workspace));
+        cx.notify();
+    }
+
+    /// Opens the Clone dialog (Ctrl Shift O). The welcome screen keeps its own
+    /// dialog state so its "Clone repository…" row and the key share one.
+    pub fn open_clone_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Content::Welcome(view) = &self.content {
+            view.update(cx, |view, cx| view.open_clone_dialog(window, cx));
+            return;
+        }
+        if let Some(dialog) = &self.clone_dialog {
+            if !dialog.update(cx, |dialog, cx| dialog.layer_gone(window, cx)) {
+                return;
+            }
+        }
+        let git = self.git.clone();
+        let workspace = cx.weak_entity();
+        self.clone_dialog = Some(crate::clone_dialog::open(git, workspace, window, cx));
         cx.notify();
     }
 
@@ -620,6 +649,15 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenRepositoryDialog, window, cx| {
                 this.open_repository_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PullBranch, window, cx| {
+                this.with_repository(cx, |view, cx| view.pull_branch(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &PushBranch, window, cx| {
+                this.with_repository(cx, |view, cx| view.push_branch(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenCloneDialog, window, cx| {
+                this.open_clone_dialog(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(window, cx);

@@ -364,6 +364,7 @@ pub fn sidebar_menu(
     if let Some(name) = key.strip_prefix("rbranch:") {
         return vec![
             item("Checkout as local branch", IconName::Check)
+                .shortcut("Enter")
                 .action(SidebarAction::CheckoutRemoteBranch(name.to_owned())),
             item(&format!("Merge {name} into {head}"), IconName::Branch),
             SidebarMenuEntry::Separator,
@@ -381,15 +382,20 @@ pub fn sidebar_menu(
                 .map(|r| r.target)
         });
         return vec![
-            item("Checkout", IconName::Check).action(SidebarAction::CheckoutTag(name.to_owned())),
+            item("Checkout", IconName::Check)
+                .shortcut("Enter")
+                .action(SidebarAction::CheckoutTag(name.to_owned())),
             item("Create branch here…", IconName::Branch)
                 .maybe_action(target.map(SidebarAction::CreateBranchAt)),
             item("Push tag to origin", IconName::Up)
                 .action(SidebarAction::PushTag(name.to_owned())),
             SidebarMenuEntry::Separator,
-            item("Rename tag…", IconName::Edit).action(SidebarAction::RenameTag(name.to_owned())),
+            item("Rename tag…", IconName::Edit)
+                .shortcut("F2")
+                .action(SidebarAction::RenameTag(name.to_owned())),
             item("Delete tag", IconName::Trash)
                 .danger()
+                .shortcut("Del")
                 .action(SidebarAction::DeleteTag(name.to_owned())),
         ];
     }
@@ -402,6 +408,7 @@ pub fn sidebar_menu(
             SidebarMenuEntry::Separator,
             item("Drop stash", IconName::Trash)
                 .danger()
+                .shortcut("Del")
                 .maybe_action(index.map(SidebarAction::DropStash)),
         ];
     }
@@ -411,6 +418,7 @@ pub fn sidebar_menu(
             item("Edit remote…", IconName::Edit).action(SidebarAction::EditRemote(name.to_owned())),
             item("Remove remote", IconName::Trash)
                 .danger()
+                .shortcut("Del")
                 .action(SidebarAction::RemoveRemote(name.to_owned())),
         ];
     }
@@ -427,6 +435,7 @@ pub fn sidebar_menu(
             item("Open in new window", IconName::Folder)
                 .action(SidebarAction::OpenWorktree(path.to_owned())),
             item("Rename worktree…", IconName::Edit)
+                .shortcut("F2")
                 .action(SidebarAction::RenameWorktree(path.to_owned())),
             item("Manage worktrees…", IconName::Worktree).action(SidebarAction::ShowWorktrees),
             item("Add worktree…", IconName::Plus).action(SidebarAction::AddWorktree),
@@ -438,6 +447,7 @@ pub fn sidebar_menu(
             }),
             item("Remove worktree…", IconName::Trash)
                 .danger()
+                .shortcut("Del")
                 .action(SidebarAction::RemoveWorktree(path.to_owned())),
         ];
     }
@@ -477,6 +487,29 @@ pub fn sidebar_menu(
         ],
         _ => Vec::new(),
     }
+}
+
+/// The action a keyboard shortcut runs on a sidebar row: the enabled menu item
+/// whose shortcut hint is `hint` (`Enter`, `F2` or `Del`), so the key and the
+/// menu can never disagree. `None` when the row's menu has no such item or it
+/// is disabled (e.g. Checkout / Delete on the current branch).
+pub fn shortcut_action(
+    key: &str,
+    hint: &str,
+    head: Option<&Head>,
+    extras: Option<&SidebarExtras>,
+    refs: Option<&[Ref]>,
+) -> Option<SidebarAction> {
+    sidebar_menu(key, head, extras, refs)
+        .into_iter()
+        .find_map(|entry| match entry {
+            SidebarMenuEntry::Item(item)
+                if item.enabled && item.shortcut.as_deref() == Some(hint) =>
+            {
+                Some(item.action)
+            }
+            _ => None,
+        })
 }
 
 /// A disabled menu item, for the compact builders above.
@@ -2322,5 +2355,59 @@ mod tests {
                 .as_deref(),
             Some("Ctrl+Shift+F")
         );
+    }
+
+    #[test]
+    fn shortcut_actions_follow_the_menu_hints() {
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        let run = |key: &str, hint: &str| shortcut_action(key, hint, Some(&head), None, None);
+        assert_eq!(
+            run("local:feat", "Enter"),
+            Some(SidebarAction::CheckoutBranch("feat".into()))
+        );
+        assert_eq!(run("local:main", "Enter"), None, "the current branch");
+        assert_eq!(
+            run("rbranch:origin/x", "Enter"),
+            Some(SidebarAction::CheckoutRemoteBranch("origin/x".into()))
+        );
+        assert_eq!(
+            run("tag:v1", "Enter"),
+            Some(SidebarAction::CheckoutTag("v1".into()))
+        );
+        assert_eq!(run("stash:0", "Enter"), None);
+        assert_eq!(
+            run("local:feat", "F2"),
+            Some(SidebarAction::RenameBranch("feat".into()))
+        );
+        assert_eq!(
+            run("tag:v1", "F2"),
+            Some(SidebarAction::RenameTag("v1".into()))
+        );
+        assert_eq!(
+            run("wt:/tmp/w", "F2"),
+            Some(SidebarAction::RenameWorktree("/tmp/w".into()))
+        );
+        assert_eq!(
+            run("local:feat", "Del"),
+            Some(SidebarAction::DeleteBranch("feat".into()))
+        );
+        assert_eq!(run("local:main", "Del"), None, "the current branch");
+        assert_eq!(
+            run("tag:v1", "Del"),
+            Some(SidebarAction::DeleteTag("v1".into()))
+        );
+        assert_eq!(run("stash:2", "Del"), Some(SidebarAction::DropStash(2)));
+        assert_eq!(
+            run("remote:origin", "Del"),
+            Some(SidebarAction::RemoveRemote("origin".into()))
+        );
+        assert_eq!(
+            run("wt:/tmp/w", "Del"),
+            Some(SidebarAction::RemoveWorktree("/tmp/w".into()))
+        );
+        assert_eq!(run("section:tags", "Del"), None);
     }
 }

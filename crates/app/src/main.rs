@@ -275,6 +275,21 @@ fn main() {
                     repo_view::FetchAll,
                     None,
                 ),
+                ui::actions::key_binding(
+                    cx,
+                    &keys("pull", "secondary-shift-l"),
+                    repo_view::PullBranch,
+                    None,
+                ),
+                ui::actions::key_binding(
+                    cx,
+                    &keys("push", "secondary-shift-p"),
+                    repo_view::PushBranch,
+                    None,
+                ),
+                // Ctrl Shift O opens the Clone dialog on the welcome screen
+                // and in a repository window.
+                ui::actions::key_binding(cx, "secondary-shift-o", workspace::OpenCloneDialog, None),
                 // Welcome screen: Ctrl N opens the Initialize dialog and Del
                 // drops a recent entry.
                 ui::actions::key_binding(
