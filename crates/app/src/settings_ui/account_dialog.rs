@@ -1,40 +1,44 @@
-//! The Add / Reconnect account dialog (token sign-in only).
+//! The Add / Reconnect account dialog.
 //!
 //! Steps: service, instance (with a probe for self-hosted addresses), sign-in
-//! with a token, then the result with an optional label. Reconnect opens on the
-//! sign-in step with the service and instance locked. The browser sign-in is
-//! drawn disabled: OAuth lands in a later step.
+//! with a token or in the browser, then the result with an optional label.
+//! Reconnect opens on the sign-in step with the service and instance locked;
+//! for a browser account it goes straight to the device-code view. The browser
+//! sign-in (GitHub device flow) is offered for github.com only; the other
+//! services show it disabled.
 //!
 //! The pure rules (step order, button gating, probe and token result mapping,
-//! the label rule) live in `crate::accounts` and are tested there.
+//! the label rule, the device-flow schedule) live in `crate::accounts` and are
+//! tested there.
 
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use forge::api::{Client, TokenKind};
 use forge::ServiceKind;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, AnyElement, App, AppContext, ClickEvent, Context, ElementId, Entity, FocusHandle,
-    FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
+    div, px, AnyElement, App, AppContext, ClickEvent, ClipboardItem, Context, ElementId, Entity,
+    FocusHandle, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window,
 };
 
 use ui::actions::Confirm;
 use ui::focus::{self, RingOffset};
-use ui::metrics::{FONT_MONO, FS_BASE, FS_MD, FS_SM, FS_XS, R_MD, R_SM};
+use ui::metrics::{FONT_MONO, FS_BASE, FS_MD, FS_SM, FS_XL, FS_XS, R_MD, R_SM};
 use ui::theme::ActiveTheme;
 use ui::{
     dialog, overlay, Banner, BannerKind, Button, ButtonSize, Dialog, DialogFocus, DialogHost, Icon,
-    IconName, TextInput, TextInputEvent, ToastKind, Tooltip,
+    IconName, Spinner, TextInput, TextInputEvent, ToastKind, Tooltip,
 };
 
 use super::accounts::{avatar, service_icon};
 use super::SettingsView;
 use crate::accounts::{
     self as logic, cached_store, continue_enabled, continue_label, instance_from_input,
-    probe_state, sign_in_outcome, ProbeState, SignInError, Step,
+    probe_state, sign_in_outcome, DevicePoll, PollOutcome, ProbeState, SignInError, Step, Tick,
 };
-use crate::settings::AccountRecord;
+use crate::settings::{AccountMethod, AccountRecord};
 
 /// What activating a card does.
 type CardAction = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -61,6 +65,23 @@ pub(crate) type OnSaved = Rc<dyn Fn(&AccountRecord, &mut Window, &mut App)>;
 /// A token the service accepted, waiting for the label and Done.
 type Connected = logic::Verified;
 
+/// The device-code view: a code issued by GitHub, being polled.
+struct Device {
+    poll: DevicePoll,
+    started: Instant,
+    /// The short code shown to the user (the device code stays in `poll`).
+    user_code: String,
+    /// The page where the code is entered.
+    verification_uri: String,
+}
+
+/// What the countdown timer found.
+enum DeviceTick {
+    Stop,
+    Wait,
+    Poll(String),
+}
+
 pub(crate) struct AccountDialog {
     /// The account being reconnected, `None` when adding.
     reconnect: Option<AccountRecord>,
@@ -79,6 +100,10 @@ pub(crate) struct AccountDialog {
     token: Entity<TextInput>,
     _token_events: Subscription,
     show_token: bool,
+    /// How the sign-in step signs in.
+    method: AccountMethod,
+    /// The device-code view, while a browser sign-in waits for approval.
+    device: Option<Device>,
     verifying: bool,
     /// Bumped by every token check and whenever the form changes under one, so a
     /// late answer for an earlier attempt is dropped.
@@ -105,6 +130,10 @@ pub(crate) struct AccountDialog {
     self_focus: FocusHandle,
     show_focus: FocusHandle,
     create_focus: FocusHandle,
+    method_token_focus: FocusHandle,
+    method_browser_focus: FocusHandle,
+    open_focus: FocusHandle,
+    copy_focus: FocusHandle,
     action_focus: FocusHandle,
     cancel_focus: FocusHandle,
     primary_focus: FocusHandle,
@@ -194,6 +223,9 @@ pub(crate) fn open(
                 (Some(account), Step::SignIn, kind, self_hosted)
             }
         };
+        let method = kind.map_or(AccountMethod::Token, |kind| {
+            logic::default_method(kind, self_hosted, reconnect.as_ref().map(|a| a.method))
+        });
         AccountDialog {
             reconnect,
             step,
@@ -207,6 +239,8 @@ pub(crate) fn open(
             token,
             _token_events: token_events,
             show_token: false,
+            method,
+            device: None,
             verifying: false,
             connect_generation: 0,
             sign_in_error: None,
@@ -229,6 +263,10 @@ pub(crate) fn open(
             self_focus: cx.focus_handle().tab_stop(true),
             show_focus: cx.focus_handle().tab_stop(true),
             create_focus: cx.focus_handle().tab_stop(true),
+            method_token_focus: cx.focus_handle().tab_stop(true),
+            method_browser_focus: cx.focus_handle().tab_stop(true),
+            open_focus: cx.focus_handle().tab_stop(true),
+            copy_focus: cx.focus_handle().tab_stop(true),
             action_focus: cx.focus_handle().tab_stop(true),
             cancel_focus: cx.focus_handle().tab_stop(true),
             primary_focus: cx.focus_handle().tab_stop(true),
@@ -243,10 +281,13 @@ pub(crate) fn open(
     dialog.update(cx, |dialog, cx| {
         dialog.layer = Some(layer);
         dialog._host = Some(host);
-        // Reconnect and Add-for-a-remote open on the token field.
+        // Reconnect and Add-for-a-remote open on the sign-in method.
         if dialog.step == Step::SignIn {
-            let handle = dialog.token.read(cx).focus_handle().clone();
-            window.focus(&handle, cx);
+            dialog.focus_sign_in(window, cx);
+            // A browser account goes straight to the device code.
+            if dialog.reconnecting() && dialog.method == AccountMethod::Browser {
+                dialog.connect(window, cx);
+            }
         }
     });
     if let Some(base_url) = prefill {
@@ -344,8 +385,32 @@ impl AccountDialog {
 
     fn go_to_sign_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.step = Step::SignIn;
-        let handle = self.token.read(cx).focus_handle().clone();
-        window.focus(&handle, cx);
+        self.method = self.kind.map_or(AccountMethod::Token, |kind| {
+            logic::default_method(kind, self.self_hosted, None)
+        });
+        self.focus_sign_in(window, cx);
+        cx.notify();
+    }
+
+    /// Focus for the sign-in step: the token field, or the primary button
+    /// when the browser is the method (there is no field then).
+    fn focus_sign_in(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.method {
+            AccountMethod::Token => {
+                let handle = self.token.read(cx).focus_handle().clone();
+                window.focus(&handle, cx);
+            }
+            AccountMethod::Browser => window.focus(&self.primary_focus, cx),
+        }
+    }
+
+    fn set_method(&mut self, method: AccountMethod, window: &mut Window, cx: &mut Context<Self>) {
+        if self.verifying || self.saving || self.device.is_some() || self.method == method {
+            return;
+        }
+        self.method = method;
+        self.sign_in_error = None;
+        self.focus_sign_in(window, cx);
         cx.notify();
     }
 
@@ -415,7 +480,11 @@ impl AccountDialog {
     }
 
     fn can_connect(&self, cx: &App) -> bool {
-        !self.token_text(cx).is_empty() && !self.verifying && self.store_error.is_none()
+        let has_credentials = match self.method {
+            AccountMethod::Token => !self.token_text(cx).is_empty(),
+            AccountMethod::Browser => true,
+        };
+        has_credentials && !self.verifying && self.store_error.is_none() && self.device.is_none()
     }
 
     fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -425,6 +494,10 @@ impl AccountDialog {
         let (Some(kind), Some(base_url)) = (self.kind, self.base_url(cx)) else {
             return;
         };
+        if self.method == AccountMethod::Browser {
+            self.start_device(kind, &base_url, window, cx);
+            return;
+        }
         let token = self.token_text(cx);
         let mut instance = match forge::Instance::new(kind, &base_url) {
             Ok(instance) => instance,
@@ -474,6 +547,7 @@ impl AccountDialog {
                                     base_url,
                                     ssh_host,
                                     login,
+                                    method: AccountMethod::Token,
                                     token,
                                 };
                                 dialog.show_result(verified, window, cx)
@@ -488,6 +562,287 @@ impl AccountDialog {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Browser sign-in, step 1: asks GitHub for a device code, then keeps
+    /// polling until the user approves, declines or the code expires. One
+    /// task per attempt; closing the dialog or Cancel bumps the generation and
+    /// the task ends at its next wake-up.
+    fn start_device(
+        &mut self,
+        kind: ServiceKind,
+        base_url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut instance = match forge::Instance::new(kind, base_url) {
+            Ok(instance) => instance,
+            Err(error) => {
+                self.sign_in_error = Some(SignInError::Other(error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        // The OAuth app exists for github.com only: never start (or later
+        // send a token) for any other host, whatever the form or settings say.
+        if !logic::browser_available(kind, self.self_hosted) || !logic::oauth_allowed(&instance) {
+            self.sign_in_error = Some(SignInError::Other(
+                ui::t!("settings.accounts.dialog.signin.browser_unavailable").to_string(),
+            ));
+            cx.notify();
+            return;
+        }
+        if let Some(account) = &self.reconnect {
+            instance.ssh_host = account.ssh_host.clone();
+        }
+        self.verifying = true;
+        self.sign_in_error = None;
+        self.device = None;
+        self.connect_generation = self.connect_generation.wrapping_add(1);
+        let attempt = self.connect_generation;
+        let window_handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let start = cx
+                .background_executor()
+                .spawn(async {
+                    forge::auth::github_device_start(&Client::new(), forge::auth::GITHUB_OAUTH_URL)
+                })
+                .await;
+            let code = match start {
+                Ok(code) => code,
+                Err(error) => {
+                    this.update(cx, |dialog, cx| {
+                        if dialog.is_current(attempt) {
+                            dialog.verifying = false;
+                            dialog.sign_in_error = Some(logic::browser_error(error));
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let shown = this.update(cx, |dialog, cx| {
+                if !dialog.is_current(attempt) {
+                    return false;
+                }
+                dialog.verifying = false;
+                dialog.device = Some(Device {
+                    poll: DevicePoll::new(&code),
+                    started: Instant::now(),
+                    user_code: code.user_code.clone(),
+                    verification_uri: code.verification_uri.clone(),
+                });
+                cx.notify();
+                true
+            });
+            if !matches!(shown, Ok(true)) {
+                return;
+            }
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let Ok(tick) = this.update(cx, |dialog, cx| dialog.device_tick(attempt, cx)) else {
+                    return;
+                };
+                let device_code = match tick {
+                    DeviceTick::Stop => return,
+                    DeviceTick::Wait => continue,
+                    DeviceTick::Poll(device_code) => device_code,
+                };
+                let polled = cx
+                    .background_executor()
+                    .spawn(async move {
+                        forge::auth::github_device_poll(
+                            &Client::new(),
+                            forge::auth::GITHUB_OAUTH_URL,
+                            &device_code,
+                        )
+                    })
+                    .await;
+                let instance = instance.clone();
+                let keep_going = window_handle
+                    .update(cx, |_, window, cx| {
+                        this.update(cx, |dialog, cx| {
+                            dialog.device_polled(attempt, polled, kind, instance, window, cx)
+                        })
+                        .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    return;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Whether `attempt` is the latest and the dialog still open.
+    fn is_current(&self, attempt: u64) -> bool {
+        logic::attempt_is_current(attempt, self.connect_generation, self.layer.is_some())
+    }
+
+    /// One second of the countdown: redraws it, and says whether to poll.
+    fn device_tick(&mut self, attempt: u64, cx: &mut Context<Self>) -> DeviceTick {
+        if !self.is_current(attempt) {
+            return DeviceTick::Stop;
+        }
+        let Some(device) = &self.device else {
+            return DeviceTick::Stop;
+        };
+        match device.poll.tick(device.started.elapsed().as_secs()) {
+            Tick::Expired => {
+                self.device = None;
+                self.sign_in_error = Some(SignInError::Expired);
+                cx.notify();
+                DeviceTick::Stop
+            }
+            Tick::Wait => {
+                cx.notify();
+                DeviceTick::Wait
+            }
+            Tick::Poll => DeviceTick::Poll(device.poll.device_code().to_owned()),
+        }
+    }
+
+    /// Applies one poll answer; `false` ends the polling task.
+    fn device_polled(
+        &mut self,
+        attempt: u64,
+        result: Result<forge::auth::PollStep, forge::auth::AuthError>,
+        kind: ServiceKind,
+        instance: forge::Instance,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.is_current(attempt) {
+            return false;
+        }
+        let Some(device) = self.device.as_mut() else {
+            return false;
+        };
+        let elapsed = device.started.elapsed().as_secs();
+        let keep_going = match device.poll.apply(elapsed, result) {
+            PollOutcome::Continue => return true,
+            PollOutcome::Denied => {
+                self.sign_in_error = Some(SignInError::Denied);
+                false
+            }
+            PollOutcome::Expired => {
+                self.sign_in_error = Some(SignInError::Expired);
+                false
+            }
+            PollOutcome::Failed(error) => {
+                self.sign_in_error = Some(logic::browser_error(error));
+                false
+            }
+            PollOutcome::Done(tokens) => {
+                self.verify_browser(tokens, kind, instance, window, cx);
+                false
+            }
+        };
+        if !keep_going {
+            self.device = None;
+        }
+        cx.notify();
+        keep_going
+    }
+
+    /// Browser sign-in, last step: asks the service who the new token belongs
+    /// to, like the token path does, then goes to the result.
+    fn verify_browser(
+        &mut self,
+        tokens: forge::auth::OAuthTokens,
+        kind: ServiceKind,
+        instance: forge::Instance,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !logic::oauth_allowed(&instance) {
+            self.sign_in_error = Some(SignInError::Other(
+                ui::t!("settings.accounts.dialog.signin.browser_unavailable").to_string(),
+            ));
+            cx.notify();
+            return;
+        }
+        self.verifying = true;
+        let attempt = self.connect_generation;
+        let checked = (kind, instance.base_url.clone(), instance.ssh_host.clone());
+        let window_handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let secret = tokens.to_secret();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    forge::api::current_user(
+                        &Client::new(),
+                        &instance,
+                        &tokens.access,
+                        TokenKind::OAuth,
+                    )
+                })
+                .await;
+            window_handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |dialog, cx| {
+                        if !dialog.is_current(attempt) {
+                            return;
+                        }
+                        dialog.verifying = false;
+                        match sign_in_outcome(kind, result) {
+                            Ok(login) => {
+                                let (kind, base_url, ssh_host) = checked;
+                                dialog.show_result(
+                                    Connected {
+                                        kind,
+                                        base_url,
+                                        ssh_host,
+                                        login,
+                                        method: AccountMethod::Browser,
+                                        token: secret,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                            Err(error) => dialog.sign_in_error = Some(error),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Cancel on the device-code view: back to the method choice.
+    fn cancel_device(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The polling task ends at its next wake-up.
+        self.connect_generation = self.connect_generation.wrapping_add(1);
+        self.device = None;
+        self.verifying = false;
+        self.sign_in_error = None;
+        self.focus_sign_in(window, cx);
+        cx.notify();
+    }
+
+    fn open_verification_page(&self, cx: &mut App) {
+        if let Some(device) = &self.device {
+            cx.open_url(&device.verification_uri);
+        }
+    }
+
+    fn copy_user_code(&self, window: &mut Window, cx: &mut App) {
+        if let Some(device) = &self.device {
+            cx.write_to_clipboard(ClipboardItem::new_string(device.user_code.clone()));
+            ui::toast::show(
+                ToastKind::Ok,
+                ui::t!("settings.accounts.dialog.device.copied"),
+                window,
+                cx,
+            );
+        }
     }
 
     /// Moves to the result step. A second account on the same instance has to
@@ -552,7 +907,7 @@ impl AccountDialog {
                 .background_executor()
                 .spawn(async move {
                     let store = cached.unwrap_or_else(logic::resolve_store)?;
-                    store.set(&id, &token)
+                    logic::store_secret(store.as_ref(), &id, &token)
                 })
                 .await;
             window_handle
@@ -595,7 +950,7 @@ impl AccountDialog {
             cx.background_executor()
                 .spawn(async move {
                     if let Ok(store) = cached.unwrap_or_else(logic::resolve_store) {
-                        let _ = store.delete(&id);
+                        let _ = logic::forget_secret(store.as_ref(), &id);
                     }
                 })
                 .detach();
@@ -618,8 +973,12 @@ impl AccountDialog {
         };
         crate::update_settings(cx, |settings| {
             match settings.accounts.iter_mut().find(|a| a.id == record.id) {
-                // Reconnect keeps the label and the SSH host; the login follows the token.
-                Some(existing) => existing.login = record.login.clone(),
+                // Reconnect keeps the label and the SSH host; the login and the
+                // sign-in method follow the new credentials.
+                Some(existing) => {
+                    existing.login = record.login.clone();
+                    existing.method = record.method;
+                }
                 None => settings.accounts.push(record.clone()),
             }
         });
@@ -667,6 +1026,7 @@ impl AccountDialog {
     fn default_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.step {
             Step::Service | Step::Instance => self.next(window, cx),
+            Step::SignIn if self.device.is_some() => self.open_verification_page(cx),
             Step::SignIn => self.connect(window, cx),
             Step::Done => self.finish(window, cx),
         }
@@ -1085,6 +1445,38 @@ fn sign_in_banner(
             )
             .into_any_element(),
         ),
+        SignInError::Denied => Some(
+            Banner::new(
+                BannerKind::Warn,
+                ui::t!("settings.accounts.dialog.signin.denied.title"),
+            )
+            .body(ui::t!("settings.accounts.dialog.signin.denied.body"))
+            .action(
+                Button::new("account-denied-retry")
+                    .label(ui::t!("settings.accounts.dialog.try_again"))
+                    .icon(IconName::Fetch)
+                    .size(ButtonSize::Small)
+                    .focus_handle(dialog.action_focus.clone())
+                    .on_click(act(state, |d, window, cx| d.connect(window, cx))),
+            )
+            .into_any_element(),
+        ),
+        SignInError::Expired => Some(
+            Banner::new(
+                BannerKind::Warn,
+                ui::t!("settings.accounts.dialog.signin.expired.title"),
+            )
+            .body(ui::t!("settings.accounts.dialog.signin.expired.body"))
+            .action(
+                Button::primary("account-expired-restart")
+                    .label(ui::t!("settings.accounts.dialog.signin.expired.restart"))
+                    .icon(IconName::Fetch)
+                    .size(ButtonSize::Small)
+                    .focus_handle(dialog.action_focus.clone())
+                    .on_click(act(state, |d, window, cx| d.connect(window, cx))),
+            )
+            .into_any_element(),
+        ),
         SignInError::Other(text) => Some(
             Banner::new(
                 BannerKind::Error,
@@ -1270,22 +1662,34 @@ fn sign_in_step(
 ) -> AnyElement {
     let colors = cx.theme().colors;
     let host = dialog.host_text(cx);
+    if let Some(device) = &dialog.device {
+        return device_step(state, dialog, device, &host, cx);
+    }
     let base_url = dialog.base_url(cx).unwrap_or_default();
+    let browser_ok = logic::browser_available(kind, dialog.self_hosted);
+    let method = dialog.method;
+    let pick = |target: AccountMethod| {
+        let state = state.clone();
+        Rc::new(move |window: &mut Window, cx: &mut App| {
+            state.update(cx, |dialog, cx| dialog.set_method(target, window, cx));
+        }) as CardAction
+    };
     let token_card = card(
         "account-method-token",
-        None,
-        true,
+        Some(&dialog.method_token_focus),
+        method == AccountMethod::Token,
         Icon::new(IconName::Key)
             .size(px(16.))
             .color(colors.text)
             .into_any_element(),
         ui::t!("settings.accounts.method.token"),
         ui::t!("settings.accounts.dialog.method.token.description"),
-        Some(Rc::new(|_, _| {})),
+        Some(pick(AccountMethod::Token)),
         window,
         cx,
     );
-    // The browser option is drawn but not selectable: OAuth is a later step.
+    // The browser option is selectable for github.com only; the other services
+    // keep it drawn disabled (their OAuth client IDs come later).
     let browser_description = if logic::has_oauth(kind) {
         if dialog.self_hosted {
             ui::t!("settings.accounts.dialog.method.browser.description_self")
@@ -1300,19 +1704,23 @@ fn sign_in_step(
     };
     let browser_card = card(
         "account-method-browser",
-        None,
-        false,
+        browser_ok.then_some(&dialog.method_browser_focus),
+        browser_ok && method == AccountMethod::Browser,
         Icon::new(IconName::Link)
             .size(px(16.))
-            .color(colors.muted)
+            .color(if browser_ok {
+                colors.text
+            } else {
+                colors.muted
+            })
             .into_any_element(),
         ui::t!("settings.accounts.dialog.method.browser.title"),
         browser_description,
-        None,
+        browser_ok.then(|| pick(AccountMethod::Browser)),
         window,
         cx,
     )
-    .when(logic::has_oauth(kind), |this| {
+    .when(logic::has_oauth(kind) && !browser_ok, |this| {
         this.tooltip(Tooltip::text(ui::t!(
             "settings.accounts.dialog.method.browser.coming_soon"
         )))
@@ -1329,7 +1737,7 @@ fn sign_in_step(
         ui::t!("settings.accounts.dialog.permissions.title")
     };
     let show = dialog.show_token;
-    div()
+    let mut column = div()
         .flex()
         .flex_col()
         .gap(px(10.))
@@ -1362,64 +1770,180 @@ fn sign_in_step(
                 .gap(px(8.))
                 .child(token_card)
                 .child(browser_card),
+        );
+    if method == AccountMethod::Token {
+        column = column
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(field_label(ui::t!("settings.accounts.dialog.token.label")))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h(px(26.))
+                                    .child(dialog.token.clone()),
+                            )
+                            .child(
+                                Button::new("account-token-show")
+                                    .icon_only(IconName::Eye)
+                                    .selected(show)
+                                    .tooltip(if show {
+                                        ui::t!("settings.accounts.dialog.token.hide")
+                                    } else {
+                                        ui::t!("settings.accounts.dialog.token.show")
+                                    })
+                                    .focus_handle(dialog.show_focus.clone())
+                                    .on_click(act(state, |d, _, cx| {
+                                        d.show_token = !d.show_token;
+                                        let masked = !d.show_token;
+                                        d.token
+                                            .update(cx, |input, cx| input.set_masked(masked, cx));
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(field_label(permissions_title))
+                            .child(perms)
+                            .child(help_text(logic::token_where(kind), cx).mt(px(6.))),
+                    )
+                    .child(
+                        Button::new("account-token-create")
+                            .label(ui::t!("settings.accounts.dialog.token.create"))
+                            .icon(IconName::Link)
+                            .focus_handle(dialog.create_focus.clone())
+                            .on_click(move |_: &ClickEvent, _, cx: &mut App| {
+                                cx.open_url(&token_url)
+                            }),
+                    ),
+            );
+    } else {
+        column = column.child(help_text(
+            ui::t!("settings.accounts.dialog.browser.help", host = host),
+            cx,
+        ));
+    }
+    column.into_any_element()
+}
+
+/// The device-code view of a browser sign-in: the code to enter, buttons to
+/// open the page and copy the code, and the countdown.
+fn device_step(
+    state: &Entity<AccountDialog>,
+    dialog: &AccountDialog,
+    device: &Device,
+    host: &str,
+    cx: &App,
+) -> AnyElement {
+    let colors = cx.theme().colors;
+    let remaining = device.poll.remaining(device.started.elapsed().as_secs());
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .child(
+            Banner::new(
+                BannerKind::Info,
+                ui::t!("settings.accounts.dialog.device.title"),
+            )
+            .body(ui::t!("settings.accounts.dialog.device.body", host = host)),
         )
         .child(
             div()
                 .flex()
-                .flex_col()
-                .gap(px(4.))
-                .child(field_label(ui::t!("settings.accounts.dialog.token.label")))
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .px(px(16.))
+                .py(px(14.))
+                .border_1()
+                .border_color(colors.border_strong)
+                .rounded(R_MD)
+                .bg(colors.bg)
+                .child(
+                    div()
+                        .font_family(FONT_MONO)
+                        .text_size(FS_XL)
+                        .font_weight(FontWeight::BOLD)
+                        .child(device.user_code.clone()),
+                )
+                .child(
+                    Button::new("account-device-copy")
+                        .label(ui::t!("settings.accounts.dialog.device.copy"))
+                        .icon(IconName::Copy)
+                        .focus_handle(dialog.copy_focus.clone())
+                        .on_click({
+                            let state = state.clone();
+                            move |_: &ClickEvent, window, cx: &mut App| {
+                                state.update(cx, |d, cx| d.copy_user_code(window, cx))
+                            }
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    Button::primary("account-device-open")
+                        .label(ui::t!("settings.accounts.dialog.device.open"))
+                        .icon(IconName::Link)
+                        .focus_handle(dialog.open_focus.clone())
+                        .on_click({
+                            let state = state.clone();
+                            move |_: &ClickEvent, _, cx: &mut App| {
+                                state.update(cx, |d, cx| d.open_verification_page(cx))
+                            }
+                        }),
+                )
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(px(4.))
+                        .min_w_0()
+                        .text_size(FS_SM)
+                        .text_color(colors.muted)
+                        .child(ui::t!("settings.accounts.dialog.device.or_go_to"))
                         .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .h(px(26.))
-                                .child(dialog.token.clone()),
-                        )
-                        .child(
-                            Button::new("account-token-show")
-                                .icon_only(IconName::Eye)
-                                .selected(show)
-                                .tooltip(if show {
-                                    ui::t!("settings.accounts.dialog.token.hide")
-                                } else {
-                                    ui::t!("settings.accounts.dialog.token.show")
-                                })
-                                .focus_handle(dialog.show_focus.clone())
-                                .on_click(act(state, |d, _, cx| {
-                                    d.show_token = !d.show_token;
-                                    let masked = !d.show_token;
-                                    d.token.update(cx, |input, cx| input.set_masked(masked, cx));
-                                    cx.notify();
-                                })),
+                                .font_family(FONT_MONO)
+                                .child(device.verification_uri.clone()),
                         ),
                 ),
         )
         .child(
             div()
                 .flex()
-                .items_start()
-                .gap(px(12.))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(field_label(permissions_title))
-                        .child(perms)
-                        .child(help_text(logic::token_where(kind), cx).mt(px(6.))),
-                )
-                .child(
-                    Button::new("account-token-create")
-                        .label(ui::t!("settings.accounts.dialog.token.create"))
-                        .icon(IconName::Link)
-                        .focus_handle(dialog.create_focus.clone())
-                        .on_click(move |_: &ClickEvent, _, cx: &mut App| cx.open_url(&token_url)),
-                ),
+                .items_center()
+                .gap(px(8.))
+                .text_color(colors.muted)
+                .child(Spinner::new(
+                    ElementId::Name("account-device-spin".into()),
+                    px(14.),
+                ))
+                .child(ui::t!(
+                    "settings.accounts.dialog.device.waiting",
+                    time = logic::format_countdown(remaining)
+                )),
         )
         .into_any_element()
 }
@@ -1543,6 +2067,7 @@ fn build(state: &Entity<AccountDialog>, window: &Window, cx: &App) -> Dialog {
         .child(body_inner);
 
     // Footer: a secondary button (Back / Cancel) and the primary one.
+    let waiting = dialog.device.is_some();
     let (secondary_label, secondary_back) = match dialog.step {
         Step::Service => (ui::t!("dialogs.common.cancel"), false),
         Step::Instance => (ui::t!("settings.accounts.dialog.back"), true),
@@ -1566,6 +2091,8 @@ fn build(state: &Entity<AccountDialog>, window: &Window, cx: &App) -> Dialog {
         Step::SignIn => (
             if dialog.verifying {
                 ui::t!("settings.accounts.dialog.checking")
+            } else if dialog.method == AccountMethod::Browser {
+                ui::t!("settings.accounts.dialog.get_code")
             } else if reconnecting {
                 ui::t!("settings.accounts.dialog.reconnect")
             } else {
@@ -1584,7 +2111,9 @@ fn build(state: &Entity<AccountDialog>, window: &Window, cx: &App) -> Dialog {
                 .min_width(px(72.))
                 .focus_handle(dialog.cancel_focus.clone())
                 .on_click(act(state, move |d, window, cx| {
-                    if secondary_back {
+                    if d.device.is_some() {
+                        d.cancel_device(window, cx);
+                    } else if secondary_back {
                         d.back(window, cx);
                     } else {
                         d.close(window, cx);
@@ -1592,14 +2121,17 @@ fn build(state: &Entity<AccountDialog>, window: &Window, cx: &App) -> Dialog {
                 })),
         );
     }
-    footer = footer.child(
-        Button::primary("account-primary")
-            .label(primary_label)
-            .min_width(px(96.))
-            .disabled(!primary_enabled)
-            .focus_handle(dialog.primary_focus.clone())
-            .on_click(act(state, |d, window, cx| d.default_action(window, cx))),
-    );
+    // While waiting for approval the only footer button is Cancel.
+    if !waiting {
+        footer = footer.child(
+            Button::primary("account-primary")
+                .label(primary_label)
+                .min_width(px(96.))
+                .disabled(!primary_enabled)
+                .focus_handle(dialog.primary_focus.clone())
+                .on_click(act(state, |d, window, cx| d.default_action(window, cx))),
+        );
+    }
 
     let mut order: Vec<DialogFocus> = Vec::new();
     let has_action = match dialog.step {
@@ -1607,7 +2139,10 @@ fn build(state: &Entity<AccountDialog>, window: &Window, cx: &App) -> Dialog {
             dialog.probe,
             ProbeState::Other(_) | ProbeState::Unreachable(_)
         ),
-        Step::SignIn => matches!(dialog.sign_in_error, Some(SignInError::Network(_))),
+        Step::SignIn => matches!(
+            dialog.sign_in_error,
+            Some(SignInError::Network(_) | SignInError::Denied | SignInError::Expired)
+        ),
         _ => false,
     };
     match dialog.step {
@@ -1629,12 +2164,22 @@ fn build(state: &Entity<AccountDialog>, window: &Window, cx: &App) -> Dialog {
                 ));
             }
         }
+        Step::SignIn if waiting => {
+            order.push(DialogFocus::control(dialog.open_focus.clone()));
+            order.push(DialogFocus::control(dialog.copy_focus.clone()));
+        }
         Step::SignIn => {
-            order.push(DialogFocus::input(
-                dialog.token.read(cx).focus_handle().clone(),
-            ));
-            order.push(DialogFocus::control(dialog.show_focus.clone()));
-            order.push(DialogFocus::control(dialog.create_focus.clone()));
+            order.push(DialogFocus::control(dialog.method_token_focus.clone()));
+            if logic::browser_available(kind.unwrap_or(ServiceKind::GitLab), dialog.self_hosted) {
+                order.push(DialogFocus::control(dialog.method_browser_focus.clone()));
+            }
+            if dialog.method == AccountMethod::Token {
+                order.push(DialogFocus::input(
+                    dialog.token.read(cx).focus_handle().clone(),
+                ));
+                order.push(DialogFocus::control(dialog.show_focus.clone()));
+                order.push(DialogFocus::control(dialog.create_focus.clone()));
+            }
         }
         Step::Done => {
             if !reconnecting {
@@ -1650,7 +2195,9 @@ fn build(state: &Entity<AccountDialog>, window: &Window, cx: &App) -> Dialog {
     if dialog.step != Step::Done {
         order.push(DialogFocus::control(dialog.cancel_focus.clone()));
     }
-    order.push(DialogFocus::control(dialog.primary_focus.clone()));
+    if !waiting {
+        order.push(DialogFocus::control(dialog.primary_focus.clone()));
+    }
 
     let on_default = {
         let state = state.clone();
@@ -1665,6 +2212,10 @@ fn build(state: &Entity<AccountDialog>, window: &Window, cx: &App) -> Dialog {
         .body(body)
         .footer(footer)
         .focus_order(order)
-        .default_button(dialog.primary_focus.clone())
+        .default_button(if waiting {
+            dialog.open_focus.clone()
+        } else {
+            dialog.primary_focus.clone()
+        })
         .on_default(on_default)
 }

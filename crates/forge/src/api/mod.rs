@@ -194,6 +194,28 @@ impl Client {
         request.call().map_err(map_transport)
     }
 
+    /// POST of a form body for the OAuth endpoints, which answer errors as JSON
+    /// too: returns the status and the body (`Null` when it is not JSON).
+    /// Never put a token into an error: only transport failures are mapped.
+    pub(crate) fn post_form(
+        &self,
+        url: &str,
+        form: &[(&str, &str)],
+    ) -> Result<(u16, Value), ApiError> {
+        let mut response = self
+            .agent
+            .post(url)
+            .header("Accept", "application/json")
+            .send_form(form.iter().copied())
+            .map_err(map_transport)?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .read_json::<Value>()
+            .unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
     /// GET that maps non-2xx statuses to `ApiError` and decodes the JSON body.
     fn get_json<T: serde::de::DeserializeOwned>(
         &self,

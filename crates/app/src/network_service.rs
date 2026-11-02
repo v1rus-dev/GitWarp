@@ -331,16 +331,23 @@ fn account_answer(auth: &JobAuth, prompt: &ParsedPrompt) -> Option<String> {
             if user != credential.username && user.replace("%40", "@") != credential.username {
                 return None;
             }
-            let read = |store: &dyn SecretStore| store.get(&credential.account_id);
+            // Renews a browser sign-in's access token when it is about to end.
+            let read = |store: &dyn SecretStore| {
+                crate::accounts::access_token_for_id(
+                    store,
+                    &credential.account_id,
+                    crate::accounts::oauth_allowed_for_host(&prompt.host),
+                )
+            };
             let token = match &auth.store {
                 Some(store) => read(store.as_ref()),
                 None => match crate::accounts::resolve_store() {
                     Ok(store) => read(store.as_ref()),
-                    Err(error) => Err(error),
+                    Err(error) => Err(crate::accounts::TokenError::Keychain(error.to_string())),
                 },
             };
             // Neither the token nor the reason it failed is logged.
-            token.ok().flatten().filter(|token| !token.is_empty())
+            token.ok().filter(|token| !token.is_empty())
         }
     }
 }
@@ -989,6 +996,24 @@ mod tests {
         assert!(guard.is_none());
         assert!(context.git_config.is_empty());
         assert!(!context.env.iter().any(|(k, _)| k == "GIT_ASKPASS"));
+    }
+
+    #[test]
+    fn askpass_answers_a_browser_sign_in_with_its_access_token() {
+        // A fresh access token (8 h left) is used as is; no refresh happens.
+        let expires = forge::auth::now_unix() + 8 * 3600;
+        let secret = forge::auth::OAuthTokens {
+            access: "ghu_access".to_owned(),
+            refresh: "ghr_refresh".to_owned(),
+            access_expires_at: expires,
+            refresh_expires_at: expires + 100 * 24 * 3600,
+        }
+        .to_secret();
+        let auth = github_job(true, Some(&secret));
+        assert_eq!(
+            account_answer(&auth, &parsed("Password for 'https://mira@github.com': ")).as_deref(),
+            Some("ghu_access")
+        );
     }
 
     fn parsed(text: &str) -> ParsedPrompt {

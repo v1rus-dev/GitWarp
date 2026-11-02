@@ -5,17 +5,19 @@
 //! without a window. The Settings → Accounts page and the dialog call these on
 //! the background executor.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use forge::api::{ApiError, Client, Probe, RepoListing, RepoSummary, TokenCheck, TokenKind};
+use forge::auth::{AuthError, DeviceCode, OAuthTokens, PollStep, StoredSecret};
 use forge::secrets::{KeychainStore, SecretError, SecretStore};
 use forge::{Instance, ServiceKind};
 use gpui::{App, Global, SharedString};
 
 use crate::network_service::{AccountCredential, HostKey};
-use crate::settings::{AccountRecord, LEGACY_ACCOUNT_ID_PREFIX};
+use crate::settings::{AccountMethod, AccountRecord, LEGACY_ACCOUNT_ID_PREFIX};
 
 /* ------------------------------ secret store ----------------------------- */
 
@@ -128,13 +130,34 @@ pub(crate) fn service_blurb(kind: ServiceKind) -> SharedString {
     }
 }
 
-/// Whether the service has a browser sign-in flow for desktop apps. Only
-/// shown as an unavailable option today: OAuth lands in a later step.
+/// Whether the service has a browser sign-in flow for desktop apps. Whether
+/// GitWarp can run it today is [`browser_available`].
 pub(crate) fn has_oauth(kind: ServiceKind) -> bool {
     matches!(
         kind,
         ServiceKind::GitHub | ServiceKind::GitLab | ServiceKind::Gitea
     )
+}
+
+/// Whether "Sign in with browser" can be used: only GitHub's public instance
+/// has a GitWarp OAuth app so far (device flow); the client IDs for
+/// self-hosted instances, GitLab and Gitea come later.
+pub(crate) fn browser_available(kind: ServiceKind, self_hosted: bool) -> bool {
+    kind == ServiceKind::GitHub && !self_hosted
+}
+
+/// The method the sign-in step starts on: the browser where it is available
+/// (and the account, when reconnecting, did not use a token), else a token.
+pub(crate) fn default_method(
+    kind: ServiceKind,
+    self_hosted: bool,
+    reconnecting: Option<AccountMethod>,
+) -> AccountMethod {
+    if browser_available(kind, self_hosted) && reconnecting != Some(AccountMethod::Token) {
+        AccountMethod::Browser
+    } else {
+        AccountMethod::Token
+    }
 }
 
 /// The permissions GitWarp asks for in a token.
@@ -234,6 +257,388 @@ pub(crate) fn needs_label(existing: &[AccountRecord], base_url: &str) -> bool {
         .any(|a| a.base_url.eq_ignore_ascii_case(base_url))
 }
 
+/* ------------------------------ access tokens ---------------------------- */
+
+/// A browser sign-in's access token is renewed when it has less than this
+/// left, so a long git operation that starts now does not outlive it.
+const REFRESH_WINDOW_SECS: u64 = 5 * 60;
+
+/// The Accounts page warns when a browser sign-in's refresh token ends within
+/// this many days: after that the user has to sign in again.
+pub(crate) const EXPIRY_WARNING_DAYS: u64 = 14;
+
+const SECS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// Why no usable token could be had for an account. Carries no token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TokenError {
+    /// Nothing is stored for the account.
+    Missing,
+    /// The stored sign-in is dead (refresh token expired or refused, secret
+    /// unreadable): the account has to be reconnected.
+    NeedsReconnect,
+    /// The service could not be asked; the text says why.
+    Unreachable(String),
+    /// The keychain could not be read.
+    Keychain(String),
+}
+
+impl std::fmt::Display for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenError::Missing => f.write_str("No token is stored for this account"),
+            TokenError::NeedsReconnect => f.write_str("The account has to be reconnected"),
+            TokenError::Unreachable(why) => write!(f, "Cannot renew the sign-in: {why}"),
+            TokenError::Keychain(why) => write!(f, "Keychain error: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for TokenError {}
+
+/// One in-process lock per account id.
+fn refresh_lock(id: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(id.to_owned())
+        .or_default()
+        .clone()
+}
+
+/// Where the per-account lock files live. Tests use a scratch directory so
+/// they never touch the user's configuration.
+fn lock_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        Some(std::env::temp_dir().join("gitwarp-test-locks"))
+    }
+    #[cfg(not(test))]
+    {
+        crate::settings::config_dir().map(|dir| dir.join("locks"))
+    }
+}
+
+/// Lock file name of an account: the id with everything but `[A-Za-z0-9_-]`
+/// replaced, so a tampered id cannot escape the directory.
+fn lock_file_name(id: &str) -> String {
+    let safe: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{safe}.lock")
+}
+
+/// Runs `f` while holding the account's locks: the in-process mutex and an
+/// exclusive lock on a per-account file, so that other GitWarp processes
+/// (a second window, a CLI helper) do not refresh or rewrite the same secret
+/// at the same time: a refresh token is single-use. `File::lock` blocks and is
+/// advisory; it is released when the file is dropped. If the lock file cannot
+/// be created the in-process lock alone is used (better than failing git).
+fn with_account_lock<T>(id: &str, f: impl FnOnce() -> T) -> T {
+    let lock = refresh_lock(id);
+    let _in_process = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    let _file = lock_dir().and_then(|dir| {
+        std::fs::create_dir_all(&dir).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(lock_file_name(id)))
+            .ok()?;
+        file.lock().ok()?;
+        Some(file)
+    });
+    f()
+}
+
+/// Rotated tokens whose write to the keychain failed twice, by account id.
+/// The old refresh token is dead, so these are the only live ones: consulted
+/// first, dropped by the next successful write or removal.
+fn rotated_cache() -> std::sync::MutexGuard<'static, HashMap<String, OAuthTokens>> {
+    static ROTATED: OnceLock<Mutex<HashMap<String, OAuthTokens>>> = OnceLock::new();
+    ROTATED
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Writes the secret of an account (Add, Reconnect, import) under the
+/// account's locks, so it cannot interleave with a token refresh.
+pub(crate) fn store_secret(
+    store: &dyn SecretStore,
+    id: &str,
+    secret: &str,
+) -> Result<(), SecretError> {
+    with_account_lock(id, || {
+        let result = store.set(id, secret);
+        if result.is_ok() {
+            rotated_cache().remove(id);
+        }
+        result
+    })
+}
+
+/// Deletes the secret of an account (removal) under the account's locks.
+pub(crate) fn forget_secret(store: &dyn SecretStore, id: &str) -> Result<(), SecretError> {
+    with_account_lock(id, || {
+        rotated_cache().remove(id);
+        store.delete(id)
+    })
+}
+
+/// Whether an OAuth-format secret may be used for this instance. Only the
+/// public github.com over https has a GitWarp OAuth app: a tampered
+/// `base_url` in settings must never receive the token.
+pub(crate) fn oauth_allowed(instance: &Instance) -> bool {
+    instance.kind == ServiceKind::GitHub
+        && instance.is_public()
+        && !is_plain_http(&instance.base_url)
+}
+
+/// [`oauth_allowed`] for the host git is asking a password for.
+pub(crate) fn oauth_allowed_for_host(host: &HostKey) -> bool {
+    host.scheme == "https" && host.host == "github.com" && host.port.is_none()
+}
+
+/// The token to use for `account` right now: a personal access token as
+/// stored, or a browser sign-in's access token, renewed first when it ends
+/// within five minutes. The single place a stored secret becomes a token.
+/// Blocking (keychain, and the service when renewing): background threads only.
+pub(crate) fn access_token(
+    store: &dyn SecretStore,
+    account: &AccountRecord,
+) -> Result<String, TokenError> {
+    let allowed = instance_of(account).is_ok_and(|instance| oauth_allowed(&instance));
+    access_credential_for_id(store, &account.id, allowed).map(|(token, _)| token)
+}
+
+/// [`access_token`] for a caller that only has the account id (git's askpass
+/// answer). `oauth_allowed` says whether the instance may receive a browser
+/// sign-in's token ([`oauth_allowed`]); browser sign-in exists for GitHub
+/// only, so a secret in the OAuth format is renewed against GitHub.
+pub(crate) fn access_token_for_id(
+    store: &dyn SecretStore,
+    id: &str,
+    oauth_allowed: bool,
+) -> Result<String, TokenError> {
+    access_credential_for_id(store, id, oauth_allowed).map(|(token, _)| token)
+}
+
+/// [`access_token_for_id`] that also returns how to send the token, for
+/// callers that build a `forge::api::Auth`.
+pub(crate) fn access_credential_for_id(
+    store: &dyn SecretStore,
+    id: &str,
+    oauth_allowed: bool,
+) -> Result<(String, TokenKind), TokenError> {
+    let refresh = |refresh_token: &str| {
+        forge::auth::github_refresh(&Client::new(), forge::auth::GITHUB_OAUTH_URL, refresh_token)
+    };
+    credential_with(store, id, oauth_allowed, forge::auth::now_unix(), &refresh)
+}
+
+fn needs_refresh(tokens: &OAuthTokens, now: u64) -> bool {
+    tokens.access_expires_at.saturating_sub(now) < REFRESH_WINDOW_SECS
+}
+
+/// What the keychain (or the rotated-token cache) holds for an account.
+enum Current {
+    Pat(String),
+    OAuth(OAuthTokens),
+}
+
+/// The account's current credentials, and the raw secret the keychain held
+/// when read (`None` when it holds nothing or could not be read).
+fn read_current(
+    store: &dyn SecretStore,
+    id: &str,
+    oauth_allowed: bool,
+) -> Result<(Current, Option<String>), TokenError> {
+    let stored = match store.get(id) {
+        Ok(Some(secret)) if !secret.is_empty() => Some(secret),
+        Ok(_) => None,
+        Err(error) => {
+            // A failed read is no reason to drop tokens we know are live.
+            return match rotated_cache().get(id) {
+                Some(tokens) if oauth_allowed => Ok((Current::OAuth(tokens.clone()), None)),
+                _ => Err(TokenError::Keychain(error.to_string())),
+            };
+        }
+    };
+    let rotated = rotated_cache().get(id).cloned();
+    if let Some(tokens) = rotated {
+        // Written after the keychain copy was made and never persisted.
+        return if oauth_allowed {
+            Ok((Current::OAuth(tokens), stored))
+        } else {
+            Err(TokenError::NeedsReconnect)
+        };
+    }
+    let Some(secret) = stored.clone() else {
+        return Err(TokenError::Missing);
+    };
+    match forge::auth::parse_secret(&secret) {
+        StoredSecret::Pat(token) => Ok((Current::Pat(token), stored)),
+        StoredSecret::OAuth(_) if !oauth_allowed => Err(TokenError::NeedsReconnect),
+        StoredSecret::OAuth(tokens) => Ok((Current::OAuth(tokens), stored)),
+        StoredSecret::Unusable => Err(TokenError::NeedsReconnect),
+    }
+}
+
+/// [`credential_with`] without the token kind.
+#[cfg(test)]
+fn access_token_with(
+    store: &dyn SecretStore,
+    id: &str,
+    now: u64,
+    refresh: &dyn Fn(&str) -> Result<OAuthTokens, AuthError>,
+) -> Result<String, TokenError> {
+    credential_with(store, id, true, now, refresh).map(|(token, _)| token)
+}
+
+/// The decision logic of [`access_token`], with the clock and the refresh call
+/// injected. Also says how the token is sent: a browser sign-in's token is
+/// `TokenKind::OAuth` (Bearer), a stored personal access token `TokenKind::Pat`.
+fn credential_with(
+    store: &dyn SecretStore,
+    id: &str,
+    oauth_allowed: bool,
+    now: u64,
+    refresh: &dyn Fn(&str) -> Result<OAuthTokens, AuthError>,
+) -> Result<(String, TokenKind), TokenError> {
+    match read_current(store, id, oauth_allowed)?.0 {
+        Current::Pat(token) => return Ok((token, TokenKind::Pat)),
+        Current::OAuth(tokens) if !needs_refresh(&tokens, now) => {
+            return Ok((tokens.access, TokenKind::OAuth))
+        }
+        Current::OAuth(_) => {}
+    }
+    // Single flight, across threads and processes: whoever gets the locks first
+    // refreshes; the others wait here and then find the rotated secret instead
+    // of using the dead refresh token a second time.
+    with_account_lock(id, || {
+        let (current, stored) = read_current(store, id, oauth_allowed)?;
+        let tokens = match current {
+            Current::Pat(token) => return Ok((token, TokenKind::Pat)),
+            Current::OAuth(tokens) => tokens,
+        };
+        if !needs_refresh(&tokens, now) {
+            return Ok((tokens.access, TokenKind::OAuth));
+        }
+        if tokens.refresh.is_empty() || tokens.refresh_expires_at <= now {
+            return Err(TokenError::NeedsReconnect);
+        }
+        match refresh(&tokens.refresh) {
+            Ok(renewed) => Ok(persist(
+                store,
+                id,
+                stored.as_deref(),
+                renewed,
+                oauth_allowed,
+            )),
+            Err(AuthError::Rejected(_)) => {
+                // The refresh token may have been used by a process that does
+                // not take our lock: if the keychain now holds a different one,
+                // that process already renewed the sign-in.
+                let (current, now_stored) = read_current(store, id, oauth_allowed)
+                    .map_err(|_| TokenError::NeedsReconnect)?;
+                match current {
+                    Current::Pat(token) => Ok((token, TokenKind::Pat)),
+                    Current::OAuth(other) if other.refresh == tokens.refresh => {
+                        Err(TokenError::NeedsReconnect)
+                    }
+                    Current::OAuth(other) if !needs_refresh(&other, now) => {
+                        Ok((other.access, TokenKind::OAuth))
+                    }
+                    Current::OAuth(other) => match refresh(&other.refresh) {
+                        Ok(renewed) => Ok(persist(
+                            store,
+                            id,
+                            now_stored.as_deref(),
+                            renewed,
+                            oauth_allowed,
+                        )),
+                        Err(error) => Err(refresh_failure(error)),
+                    },
+                }
+            }
+            Err(error) => Err(refresh_failure(error)),
+        }
+    })
+}
+
+fn refresh_failure(error: AuthError) -> TokenError {
+    match error {
+        AuthError::Rejected(_) => TokenError::NeedsReconnect,
+        AuthError::Network(why) | AuthError::Unexpected(why) => TokenError::Unreachable(why),
+    }
+}
+
+/// Stores freshly rotated tokens, called with the account's locks held. The
+/// old refresh token is dead, so they must not be lost:
+/// - the account was removed meanwhile (`get` says nothing is stored): nothing
+///   is written;
+/// - the keychain secret no longer is what this refresh started from (Reconnect
+///   wrote new tokens): it is not overwritten, its token is used;
+/// - otherwise the secret is written, twice if needed (a failed `get` does not
+///   skip it); if both writes fail the tokens are kept in memory and used until
+///   a later write succeeds.
+fn persist(
+    store: &dyn SecretStore,
+    id: &str,
+    read_from: Option<&str>,
+    renewed: OAuthTokens,
+    oauth_allowed: bool,
+) -> (String, TokenKind) {
+    match store.get(id) {
+        Ok(None) => {
+            rotated_cache().remove(id);
+            return (renewed.access, TokenKind::OAuth);
+        }
+        Ok(Some(current)) if read_from.is_some_and(|read| read != current) => {
+            // Somebody wrote meanwhile: theirs is newer than ours.
+            match forge::auth::parse_secret(&current) {
+                StoredSecret::Pat(token) => {
+                    rotated_cache().remove(id);
+                    return (token, TokenKind::Pat);
+                }
+                StoredSecret::OAuth(tokens) if oauth_allowed => {
+                    rotated_cache().remove(id);
+                    return (tokens.access, TokenKind::OAuth);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    let secret = renewed.to_secret();
+    if store.set(id, &secret).is_ok() || store.set(id, &secret).is_ok() {
+        rotated_cache().remove(id);
+    } else {
+        rotated_cache().insert(id.to_owned(), renewed.clone());
+    }
+    (renewed.access, TokenKind::OAuth)
+}
+
+/// Whole days (rounded up) a browser sign-in's refresh token has left when
+/// that is under [`EXPIRY_WARNING_DAYS`], `None` for everything else.
+fn expiry_warning_days(secret: &StoredSecret, now: u64) -> Option<u64> {
+    let StoredSecret::OAuth(tokens) = secret else {
+        return None;
+    };
+    let left = tokens.refresh_expires_at.saturating_sub(now);
+    (left < EXPIRY_WARNING_DAYS * SECS_PER_DAY).then(|| left.div_ceil(SECS_PER_DAY).max(1))
+}
+
 /* ------------------------------ account status --------------------------- */
 
 /// What the Accounts page shows for one account.
@@ -241,6 +646,11 @@ pub(crate) fn needs_label(existing: &[AccountRecord], base_url: &str) -> bool {
 pub(crate) enum AccountStatus {
     Checking,
     Connected,
+    /// Connected, but a browser sign-in's refresh token ends within
+    /// [`EXPIRY_WARNING_DAYS`]: after that the account has to be reconnected.
+    Expiring {
+        days: u64,
+    },
     /// The service rejected the token, or none is stored; the text explains
     /// the second case.
     Invalid(Option<String>),
@@ -295,9 +705,9 @@ fn import_legacy_secret(
     if !is_current() {
         return Ok(None);
     }
-    store.set(id, &password)?;
+    store_secret(store, id, &password)?;
     if !is_current() {
-        store.delete(id)?;
+        forget_secret(store, id)?;
         return Ok(None);
     }
     Ok(Some(password))
@@ -313,6 +723,19 @@ pub(crate) fn check_account(
     account: &AccountRecord,
     is_current: &dyn Fn() -> bool,
 ) -> CheckOutcome {
+    let oauth_ok = instance_of(account).is_ok_and(|instance| oauth_allowed(&instance));
+    check_account_with(store, git, account, is_current, &Client::new(), oauth_ok)
+}
+
+/// [`check_account`] with the HTTP client and the OAuth host rule injected.
+fn check_account_with(
+    store: &StoreResult,
+    git: Option<&git_core::Git>,
+    account: &AccountRecord,
+    is_current: &dyn Fn() -> bool,
+    client: &Client,
+    oauth_ok: bool,
+) -> CheckOutcome {
     let store = match store {
         Ok(store) => store,
         Err(error) => return CheckOutcome::status(AccountStatus::Unchecked(error.to_string())),
@@ -321,15 +744,24 @@ pub(crate) fn check_account(
         Ok(instance) => instance,
         Err(error) => return CheckOutcome::status(AccountStatus::Unreachable(Some(error))),
     };
-    let mut secret = match store.get(&account.id) {
-        Ok(secret) => secret,
-        Err(error) => return CheckOutcome::status(AccountStatus::Unchecked(error.to_string())),
+    let mut token = match access_token_for_id(&**store, &account.id, oauth_ok) {
+        Ok(token) => Some(token),
+        Err(TokenError::Missing) => None,
+        Err(TokenError::NeedsReconnect) => {
+            return CheckOutcome::status(AccountStatus::Invalid(None))
+        }
+        Err(TokenError::Unreachable(why)) => {
+            return CheckOutcome::status(AccountStatus::Unreachable(Some(why)))
+        }
+        Err(TokenError::Keychain(why)) => {
+            return CheckOutcome::status(AccountStatus::Unchecked(why))
+        }
     };
-    if secret.is_none() && account.id.starts_with(LEGACY_ACCOUNT_ID_PREFIX) {
+    if token.is_none() && account.id.starts_with(LEGACY_ACCOUNT_ID_PREFIX) {
         if let Some(git) = git {
             if let Ok(Some(credential)) = git_core::credential::fill(git, instance.host()) {
                 match import_legacy_secret(&**store, &account.id, credential.password, is_current) {
-                    Ok(Some(password)) => secret = Some(password),
+                    Ok(Some(password)) => token = Some(password),
                     // Removed while the check ran: nothing was written.
                     Ok(None) => return CheckOutcome::status(AccountStatus::Checking),
                     Err(error) => {
@@ -339,13 +771,29 @@ pub(crate) fn check_account(
             }
         }
     }
-    let Some(token) = secret else {
+    let Some(token) = token else {
         return CheckOutcome::status(AccountStatus::Invalid(Some(
             ui::t!("settings.accounts.status.no_token").to_string(),
         )));
     };
-    let result = forge::api::current_user(&Client::new(), &instance, &token, TokenKind::Pat);
-    outcome_of(&account.login, result)
+    let token_kind = match account.method {
+        AccountMethod::Token => TokenKind::Pat,
+        AccountMethod::Browser => TokenKind::OAuth,
+    };
+    let result = forge::api::current_user(client, &instance, &token, token_kind);
+    let mut outcome = outcome_of(&account.login, result);
+    // The refresh token, not the 8 h access token, decides when the account
+    // stops working.
+    if outcome.status == AccountStatus::Connected && account.method == AccountMethod::Browser {
+        let secret = store.get(&account.id).ok().flatten();
+        let days = secret.and_then(|secret| {
+            expiry_warning_days(&forge::auth::parse_secret(&secret), forge::auth::now_unix())
+        });
+        if let Some(days) = days {
+            outcome.status = AccountStatus::Expiring { days };
+        }
+    }
+    outcome
 }
 
 /* ------------------------------ CLI import ------------------------------- */
@@ -386,18 +834,134 @@ pub(crate) fn import_cli_account(
         base_url: instance.base_url,
         ssh_host: instance.ssh_host,
         login: check.user.login,
+        method: AccountMethod::Token,
         token,
     };
     let store = store
         .as_ref()
         .map_err(|e| ImportFailure::Keychain(e.to_string()))?;
     let id = new_account_id();
-    store
-        .set(&id, &verified.token)
+    store_secret(&**store, &id, &verified.token)
         .map_err(|e| ImportFailure::Keychain(e.to_string()))?;
     let mut record = verified.record(id, "");
     record.imported_from = Some(candidate.tool.name().to_owned());
     Ok(record)
+}
+
+/* ----------------------------- device flow ------------------------------- */
+
+/// Extra seconds between polls after GitHub says `slow_down`.
+const SLOW_DOWN_SECS: u64 = 5;
+
+/// Poll failures in a row (network trouble, a 5xx) the sign-in survives: a
+/// code is valid for 15 minutes and a blip should not throw it away.
+const MAX_POLL_FAILURES: u32 = 3;
+
+/// `m:ss`, the countdown shown while waiting for approval.
+pub(crate) fn format_countdown(secs: u64) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// What the dialog's timer does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tick {
+    Wait,
+    /// Ask GitHub whether the user has approved.
+    Poll,
+    /// The code ran out locally.
+    Expired,
+}
+
+/// What a poll answer means for the dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PollOutcome {
+    Continue,
+    Denied,
+    Expired,
+    Done(OAuthTokens),
+    Failed(AuthError),
+}
+
+/// The schedule of one device flow: when to poll, how the interval grows and
+/// when to give up. Time is seconds since the code was issued, so the logic
+/// has no clock of its own. Holds the device code, so it has no `Debug`.
+pub(crate) struct DevicePoll {
+    device_code: String,
+    expires_in: u64,
+    interval: u64,
+    next_poll: u64,
+    failures: u32,
+}
+
+impl DevicePoll {
+    pub(crate) fn new(code: &DeviceCode) -> Self {
+        Self {
+            device_code: code.device_code().to_owned(),
+            expires_in: code.expires_in,
+            interval: code.interval,
+            next_poll: code.interval,
+            failures: 0,
+        }
+    }
+
+    pub(crate) fn device_code(&self) -> &str {
+        &self.device_code
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interval(&self) -> u64 {
+        self.interval
+    }
+
+    /// Seconds until the code expires.
+    pub(crate) fn remaining(&self, elapsed: u64) -> u64 {
+        self.expires_in.saturating_sub(elapsed)
+    }
+
+    pub(crate) fn tick(&self, elapsed: u64) -> Tick {
+        if elapsed >= self.expires_in {
+            Tick::Expired
+        } else if elapsed >= self.next_poll {
+            Tick::Poll
+        } else {
+            Tick::Wait
+        }
+    }
+
+    /// Applies the answer of a poll made `elapsed` seconds in.
+    pub(crate) fn apply(
+        &mut self,
+        elapsed: u64,
+        result: Result<PollStep, AuthError>,
+    ) -> PollOutcome {
+        match result {
+            Ok(PollStep::Pending) => {
+                self.failures = 0;
+                self.next_poll = elapsed.saturating_add(self.interval);
+                PollOutcome::Continue
+            }
+            Ok(PollStep::SlowDown) => {
+                self.failures = 0;
+                self.interval = self.interval.saturating_add(SLOW_DOWN_SECS);
+                self.next_poll = elapsed.saturating_add(self.interval);
+                PollOutcome::Continue
+            }
+            Ok(PollStep::Denied) => PollOutcome::Denied,
+            Ok(PollStep::Expired) => PollOutcome::Expired,
+            Ok(PollStep::Done(tokens)) => PollOutcome::Done(tokens),
+            Err(error @ (AuthError::Network(_) | AuthError::Unexpected(_))) => {
+                self.failures += 1;
+                if self.failures >= MAX_POLL_FAILURES {
+                    PollOutcome::Failed(error)
+                } else {
+                    self.next_poll = elapsed.saturating_add(self.interval);
+                    PollOutcome::Continue
+                }
+            }
+            // The service refused the device code itself: retrying cannot help.
+            Err(error @ AuthError::Rejected(_)) => PollOutcome::Failed(error),
+        }
+    }
 }
 
 /* ---------------------------- Add / Reconnect ---------------------------- */
@@ -486,6 +1050,9 @@ pub(crate) struct Verified {
     pub base_url: String,
     pub ssh_host: Option<String>,
     pub login: String,
+    pub method: AccountMethod,
+    /// The keychain secret: the raw token, or for a browser sign-in the JSON
+    /// secret of `forge::auth` holding both tokens.
     pub token: String,
 }
 
@@ -513,7 +1080,7 @@ impl Verified {
             } else {
                 label.to_owned()
             },
-            method: crate::settings::AccountMethod::Token,
+            method: self.method,
             ssh_host: self.ssh_host.clone(),
             imported_from: None,
         }
@@ -562,8 +1129,20 @@ pub(crate) enum SignInError {
     Permissions(Vec<String>),
     /// The service could not be reached; carries the error text.
     Network(String),
+    /// Browser sign-in: the user declined in the browser.
+    Denied,
+    /// Browser sign-in: the device code ran out before it was approved.
+    Expired,
     /// Any other failure; carries the error text.
     Other(String),
+}
+
+/// Maps a failed device-flow request (or poll) of the browser sign-in.
+pub(crate) fn browser_error(error: AuthError) -> SignInError {
+    match error {
+        AuthError::Network(why) => SignInError::Network(AuthError::Network(why).to_string()),
+        other => SignInError::Other(other.to_string()),
+    }
 }
 
 /// Maps a token check made by the dialog: the login on success.
@@ -649,10 +1228,12 @@ pub(crate) fn list_account_repos(
     if instance.kind == ServiceKind::AzureDevOps {
         return Err(RepoListError::Unsupported);
     }
-    let token = store
-        .get(&account.id)
-        .map_err(|error| RepoListError::Other(error.to_string()))?
-        .ok_or(RepoListError::Revoked)?;
+    // Blocking: may renew a browser sign-in's access token first.
+    let token = access_token(&**store, account).map_err(|error| match error {
+        TokenError::Missing | TokenError::NeedsReconnect => RepoListError::Revoked,
+        TokenError::Unreachable(_) => RepoListError::Unreachable,
+        TokenError::Keychain(why) => RepoListError::Other(why),
+    })?;
     forge::api::list_user_repos(&Client::new(), &instance, &token).map_err(repo_list_error)
 }
 
@@ -1073,9 +1654,11 @@ mod tests {
             base_url: "https://gitlab.acme.corp".to_owned(),
             ssh_host: Some("ssh.acme.corp".to_owned()),
             login: "mira".to_owned(),
+            method: AccountMethod::Token,
             token: "secret".to_owned(),
         };
         let record = verified.record("id1".to_owned(), "  ");
+        assert_eq!(record.method, AccountMethod::Token);
         assert_eq!(record.kind, "gitlab");
         assert_eq!(record.base_url, "https://gitlab.acme.corp");
         assert_eq!(record.ssh_host.as_deref(), Some("ssh.acme.corp"));
@@ -1117,6 +1700,706 @@ mod tests {
             Ok(None)
         );
         assert_eq!(store.get("legacy-x").unwrap(), None);
+    }
+
+    // ---- browser sign-in: tokens ----
+
+    const NOW: u64 = 1_000_000;
+
+    fn oauth(access: &str, refresh: &str, access_in: u64, refresh_in: u64) -> OAuthTokens {
+        OAuthTokens {
+            access: access.to_owned(),
+            refresh: refresh.to_owned(),
+            access_expires_at: NOW + access_in,
+            refresh_expires_at: NOW + refresh_in,
+        }
+    }
+
+    fn never_refresh(_: &str) -> Result<OAuthTokens, AuthError> {
+        panic!("must not refresh");
+    }
+
+    fn token_of(store: &dyn SecretStore, id: &str) -> Result<String, TokenError> {
+        access_token_with(store, id, NOW, &never_refresh)
+    }
+
+    #[test]
+    fn a_raw_secret_is_a_personal_access_token() {
+        let store = MemoryStore::new();
+        store.set("pat", "ghp_raw").unwrap();
+        assert_eq!(token_of(&store, "pat"), Ok("ghp_raw".to_owned()));
+    }
+
+    #[test]
+    fn a_missing_or_empty_secret_is_missing() {
+        let store = MemoryStore::new();
+        assert_eq!(token_of(&store, "none"), Err(TokenError::Missing));
+        store.set("empty", "").unwrap();
+        assert_eq!(token_of(&store, "empty"), Err(TokenError::Missing));
+    }
+
+    #[test]
+    fn an_unreadable_json_secret_needs_a_reconnect() {
+        let store = MemoryStore::new();
+        store.set("bad", r#"{"v":9}"#).unwrap();
+        assert_eq!(token_of(&store, "bad"), Err(TokenError::NeedsReconnect));
+    }
+
+    #[test]
+    fn a_fresh_access_token_is_returned_without_refreshing() {
+        let store = MemoryStore::new();
+        // Six minutes left: outside the five-minute window.
+        store
+            .set("a", &oauth("acc", "ref", 6 * 60, 1_000_000).to_secret())
+            .unwrap();
+        assert_eq!(token_of(&store, "a"), Ok("acc".to_owned()));
+    }
+
+    #[test]
+    fn refresh_happens_inside_the_five_minute_window_and_the_rotation_is_stored() {
+        let store = MemoryStore::new();
+        store
+            .set(
+                "a",
+                &oauth("old-acc", "old-ref", 4 * 60 + 59, 1_000_000).to_secret(),
+            )
+            .unwrap();
+        let seen = Mutex::new(Vec::new());
+        let refresh = |token: &str| {
+            seen.lock().unwrap().push(token.to_owned());
+            Ok(oauth("new-acc", "new-ref", 28_800, 15_638_400))
+        };
+        assert_eq!(
+            access_token_with(&store, "a", NOW, &refresh),
+            Ok("new-acc".to_owned())
+        );
+        assert_eq!(*seen.lock().unwrap(), vec!["old-ref".to_owned()]);
+        // The new refresh token replaced the old one in the keychain.
+        let stored = forge::auth::parse_secret(&store.get("a").unwrap().unwrap());
+        assert_eq!(
+            stored,
+            StoredSecret::OAuth(oauth("new-acc", "new-ref", 28_800, 15_638_400))
+        );
+        // And the next call needs no refresh.
+        assert_eq!(token_of(&store, "a"), Ok("new-acc".to_owned()));
+    }
+
+    #[test]
+    fn an_expired_refresh_token_needs_a_reconnect_without_asking_the_service() {
+        let store = MemoryStore::new();
+        let mut tokens = oauth("acc", "ref", 0, 0);
+        tokens.refresh_expires_at = NOW - 1;
+        store.set("a", &tokens.to_secret()).unwrap();
+        assert_eq!(token_of(&store, "a"), Err(TokenError::NeedsReconnect));
+    }
+
+    #[test]
+    fn a_refused_refresh_needs_a_reconnect_and_keeps_the_secret() {
+        let store = MemoryStore::new();
+        let secret = oauth("acc", "ref", 10, 1_000_000).to_secret();
+        store.set("a", &secret).unwrap();
+        let refused = |_: &str| Err(AuthError::Rejected("bad_refresh_token".into()));
+        assert_eq!(
+            access_token_with(&store, "a", NOW, &refused),
+            Err(TokenError::NeedsReconnect)
+        );
+        assert_eq!(store.get("a").unwrap().as_deref(), Some(secret.as_str()));
+    }
+
+    #[test]
+    fn a_network_failure_while_refreshing_is_unreachable_not_a_reconnect() {
+        let store = MemoryStore::new();
+        store
+            .set("a", &oauth("acc", "ref", 10, 1_000_000).to_secret())
+            .unwrap();
+        let down = |_: &str| Err(AuthError::Network("timed out".into()));
+        assert_eq!(
+            access_token_with(&store, "a", NOW, &down),
+            Err(TokenError::Unreachable("timed out".into()))
+        );
+    }
+
+    #[test]
+    fn concurrent_callers_refresh_once_and_share_the_rotated_token() {
+        use std::sync::atomic::AtomicUsize;
+        let store = Arc::new(MemoryStore::new());
+        store
+            .set("flight", &oauth("old", "ref-1", 10, 1_000_000).to_secret())
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let (store, calls, barrier) = (store.clone(), calls.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    // A counting fake refresher; the sleep keeps the others waiting
+                    // on the lock while it runs. A second use of `ref-1` would fail,
+                    // like GitHub's single-use refresh token.
+                    let refresh = |token: &str| {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(token, "ref-1", "the old refresh token was used twice");
+                        assert_eq!(n, 0);
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        Ok(oauth("new", "ref-2", 28_800, 15_638_400))
+                    };
+                    barrier.wait();
+                    access_token_with(&*store, "flight", NOW, &refresh)
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), Ok("new".to_owned()));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_refresh_for_a_removed_account_writes_nothing_back() {
+        let store = MemoryStore::new();
+        store
+            .set("gone", &oauth("acc", "ref", 10, 1_000_000).to_secret())
+            .unwrap();
+        // The account is removed while the service call is in flight.
+        let refresh = |_: &str| {
+            store.delete("gone").unwrap();
+            Ok(oauth("new", "ref-2", 28_800, 15_638_400))
+        };
+        assert_eq!(
+            access_token_with(&store, "gone", NOW, &refresh),
+            Ok("new".to_owned())
+        );
+        assert_eq!(store.get("gone").unwrap(), None);
+    }
+
+    #[test]
+    fn expiry_warning_uses_the_refresh_token_not_the_access_token() {
+        let day = SECS_PER_DAY;
+        let secret =
+            |access_in, refresh_in| StoredSecret::OAuth(oauth("a", "r", access_in, refresh_in));
+        // Access token ends in an hour, refresh token in 100 days: no warning.
+        assert_eq!(expiry_warning_days(&secret(3600, 100 * day), NOW), None);
+        // Exactly 14 days left is not yet a warning; just under is.
+        assert_eq!(expiry_warning_days(&secret(0, 14 * day), NOW), None);
+        assert_eq!(expiry_warning_days(&secret(0, 14 * day - 1), NOW), Some(14));
+        assert_eq!(expiry_warning_days(&secret(0, 5 * day), NOW), Some(5));
+        assert_eq!(expiry_warning_days(&secret(0, 5 * day - 1), NOW), Some(5));
+        assert_eq!(expiry_warning_days(&secret(0, 60), NOW), Some(1));
+        // A personal access token has no refresh expiry.
+        assert_eq!(
+            expiry_warning_days(&StoredSecret::Pat("x".into()), NOW),
+            None
+        );
+    }
+
+    #[test]
+    fn browser_sign_in_is_offered_for_public_github_only() {
+        assert!(browser_available(ServiceKind::GitHub, false));
+        assert!(!browser_available(ServiceKind::GitHub, true));
+        for kind in [
+            ServiceKind::GitLab,
+            ServiceKind::Gitea,
+            ServiceKind::Bitbucket,
+            ServiceKind::AzureDevOps,
+        ] {
+            assert!(!browser_available(kind, false), "{kind:?}");
+        }
+        assert_eq!(
+            default_method(ServiceKind::GitHub, false, None),
+            AccountMethod::Browser
+        );
+        assert_eq!(
+            default_method(ServiceKind::GitHub, false, Some(AccountMethod::Browser)),
+            AccountMethod::Browser
+        );
+        assert_eq!(
+            default_method(ServiceKind::GitHub, false, Some(AccountMethod::Token)),
+            AccountMethod::Token
+        );
+        assert_eq!(
+            default_method(ServiceKind::GitHub, true, None),
+            AccountMethod::Token
+        );
+        assert_eq!(
+            default_method(ServiceKind::GitLab, false, None),
+            AccountMethod::Token
+        );
+    }
+
+    #[test]
+    fn countdown_is_minutes_and_two_digit_seconds() {
+        assert_eq!(format_countdown(899), "14:59");
+        assert_eq!(format_countdown(900), "15:00");
+        assert_eq!(format_countdown(65), "1:05");
+        assert_eq!(format_countdown(0), "0:00");
+    }
+
+    // ---- browser sign-in: device flow schedule ----
+
+    fn poll_after(code: &str, interval: u64, expires_in: u64) -> DevicePoll {
+        DevicePoll {
+            device_code: code.to_owned(),
+            expires_in,
+            interval,
+            next_poll: interval,
+            failures: 0,
+        }
+    }
+
+    #[test]
+    fn device_poll_waits_for_the_interval_then_polls() {
+        let mut poll = poll_after("dc", 5, 900);
+        assert_eq!(poll.tick(0), Tick::Wait);
+        assert_eq!(poll.tick(4), Tick::Wait);
+        assert_eq!(poll.tick(5), Tick::Poll);
+        assert_eq!(poll.apply(5, Ok(PollStep::Pending)), PollOutcome::Continue);
+        assert_eq!(poll.tick(9), Tick::Wait);
+        assert_eq!(poll.tick(10), Tick::Poll);
+        assert_eq!(poll.remaining(100), 800);
+        assert_eq!(poll.remaining(1000), 0);
+    }
+
+    #[test]
+    fn slow_down_adds_five_seconds_to_the_interval() {
+        let mut poll = poll_after("dc", 5, 900);
+        assert_eq!(poll.apply(5, Ok(PollStep::SlowDown)), PollOutcome::Continue);
+        assert_eq!(poll.interval(), 10);
+        assert_eq!(poll.tick(14), Tick::Wait);
+        assert_eq!(poll.tick(15), Tick::Poll);
+        assert_eq!(
+            poll.apply(15, Ok(PollStep::SlowDown)),
+            PollOutcome::Continue
+        );
+        assert_eq!(poll.interval(), 15);
+    }
+
+    #[test]
+    fn the_code_expires_locally_at_expires_in() {
+        let poll = poll_after("dc", 5, 900);
+        assert_eq!(poll.tick(899), Tick::Poll);
+        assert_eq!(poll.tick(900), Tick::Expired);
+    }
+
+    #[test]
+    fn terminal_poll_answers_end_the_flow() {
+        let mut poll = poll_after("dc", 5, 900);
+        assert_eq!(poll.apply(5, Ok(PollStep::Denied)), PollOutcome::Denied);
+        assert_eq!(poll.apply(5, Ok(PollStep::Expired)), PollOutcome::Expired);
+        let tokens = oauth("a", "r", 28_800, 15_638_400);
+        assert_eq!(
+            poll.apply(5, Ok(PollStep::Done(tokens.clone()))),
+            PollOutcome::Done(tokens)
+        );
+        assert!(matches!(
+            poll.apply(5, Err(AuthError::Rejected("incorrect_device_code".into()))),
+            PollOutcome::Failed(AuthError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn a_few_poll_failures_in_a_row_are_survived_but_not_many() {
+        let mut poll = poll_after("dc", 5, 900);
+        let blip = || Err(AuthError::Network("timed out".into()));
+        assert_eq!(poll.apply(5, blip()), PollOutcome::Continue);
+        assert_eq!(poll.apply(10, blip()), PollOutcome::Continue);
+        // A good answer resets the count.
+        assert_eq!(poll.apply(15, Ok(PollStep::Pending)), PollOutcome::Continue);
+        assert_eq!(poll.apply(20, blip()), PollOutcome::Continue);
+        assert_eq!(poll.apply(25, blip()), PollOutcome::Continue);
+        assert!(matches!(
+            poll.apply(30, blip()),
+            PollOutcome::Failed(AuthError::Network(_))
+        ));
+    }
+
+    #[test]
+    fn browser_errors_map_to_dialog_errors() {
+        let error = browser_error(AuthError::Rejected("access_denied".into()));
+        assert!(matches!(error, SignInError::Other(_)));
+        assert!(matches!(
+            browser_error(AuthError::Network("down".into())),
+            SignInError::Network(_)
+        ));
+    }
+
+    // ---- browser sign-in: locks, write-back, host guard ----
+
+    /// A keychain double that can fail reads and writes on demand.
+    struct FlakyStore {
+        inner: MemoryStore,
+        fail_gets: std::sync::atomic::AtomicUsize,
+        fail_sets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                fail_gets: 0.into(),
+                fail_sets: 0.into(),
+            }
+        }
+    }
+
+    fn take(counter: &std::sync::atomic::AtomicUsize) -> bool {
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
+    impl SecretStore for FlakyStore {
+        fn get(&self, id: &str) -> Result<Option<String>, SecretError> {
+            if take(&self.fail_gets) {
+                return Err(SecretError::Failed("locked".into()));
+            }
+            self.inner.get(id)
+        }
+        fn set(&self, id: &str, secret: &str) -> Result<(), SecretError> {
+            if take(&self.fail_sets) {
+                return Err(SecretError::Failed("locked".into()));
+            }
+            self.inner.set(id, secret)
+        }
+        fn delete(&self, id: &str) -> Result<(), SecretError> {
+            self.inner.delete(id)
+        }
+    }
+
+    fn secret_of(store: &dyn SecretStore, id: &str) -> StoredSecret {
+        forge::auth::parse_secret(&store.get(id).unwrap().unwrap())
+    }
+
+    #[test]
+    fn a_rejected_refresh_after_another_process_renewed_uses_its_tokens() {
+        let store = MemoryStore::new();
+        store
+            .set("xp1", &oauth("old", "ref-1", 10, 1_000_000).to_secret())
+            .unwrap();
+        // Another process (not taking our lock) uses ref-1 between our read
+        // and our refresh: GitHub then refuses ref-1 for us.
+        let refresh = |token: &str| {
+            assert_eq!(token, "ref-1");
+            store
+                .set(
+                    "xp1",
+                    &oauth("other", "ref-2", 28_800, 15_638_400).to_secret(),
+                )
+                .unwrap();
+            Err(AuthError::Rejected("bad_refresh_token".into()))
+        };
+        assert_eq!(
+            access_token_with(&store, "xp1", NOW, &refresh),
+            Ok("other".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_rejected_refresh_after_another_process_renewed_refreshes_once_more_if_needed() {
+        let store = MemoryStore::new();
+        store
+            .set("xp2", &oauth("old", "ref-1", 10, 1_000_000).to_secret())
+            .unwrap();
+        let calls = Mutex::new(Vec::new());
+        let refresh = |token: &str| {
+            calls.lock().unwrap().push(token.to_owned());
+            if token == "ref-1" {
+                // The other process' result is itself about to end.
+                store
+                    .set("xp2", &oauth("other", "ref-2", 20, 1_000_000).to_secret())
+                    .unwrap();
+                Err(AuthError::Rejected("bad_refresh_token".into()))
+            } else {
+                Ok(oauth("third", "ref-3", 28_800, 15_638_400))
+            }
+        };
+        assert_eq!(
+            access_token_with(&store, "xp2", NOW, &refresh),
+            Ok("third".to_owned())
+        );
+        assert_eq!(*calls.lock().unwrap(), vec!["ref-1", "ref-2"]);
+        assert_eq!(
+            secret_of(&store, "xp2"),
+            StoredSecret::OAuth(oauth("third", "ref-3", 28_800, 15_638_400))
+        );
+    }
+
+    #[test]
+    fn a_rejection_with_an_unchanged_refresh_token_still_needs_a_reconnect() {
+        let store = MemoryStore::new();
+        store
+            .set("xp3", &oauth("old", "ref-1", 10, 1_000_000).to_secret())
+            .unwrap();
+        let refused = |_: &str| Err(AuthError::Rejected("bad_refresh_token".into()));
+        assert_eq!(
+            access_token_with(&store, "xp3", NOW, &refused),
+            Err(TokenError::NeedsReconnect)
+        );
+    }
+
+    #[test]
+    fn a_failed_get_before_the_write_back_does_not_skip_it() {
+        let store = FlakyStore::new();
+        store
+            .set("wb1", &oauth("old", "ref-1", 10, 1_000_000).to_secret())
+            .unwrap();
+        let refresh = |_: &str| {
+            // The write-back's own `get` fails once.
+            store.fail_gets.store(1, Ordering::SeqCst);
+            Ok(oauth("new", "ref-2", 28_800, 15_638_400))
+        };
+        assert_eq!(
+            access_token_with(&store, "wb1", NOW, &refresh),
+            Ok("new".to_owned())
+        );
+        assert_eq!(
+            secret_of(&store, "wb1"),
+            StoredSecret::OAuth(oauth("new", "ref-2", 28_800, 15_638_400))
+        );
+    }
+
+    #[test]
+    fn rotated_tokens_survive_two_failed_writes_until_a_write_succeeds() {
+        let store = FlakyStore::new();
+        let stale = oauth("old", "ref-1", 10, 1_000_000).to_secret();
+        store.set("wb2", &stale).unwrap();
+        let refresh = |_: &str| {
+            store.fail_sets.store(2, Ordering::SeqCst);
+            Ok(oauth("new", "ref-2", 28_800, 15_638_400))
+        };
+        assert_eq!(
+            access_token_with(&store, "wb2", NOW, &refresh),
+            Ok("new".to_owned())
+        );
+        // The keychain still has the dead secret...
+        assert_eq!(store.get("wb2").unwrap().as_deref(), Some(stale.as_str()));
+        // ...but the next call uses the rotated tokens without refreshing.
+        assert_eq!(token_of(&store.inner, "wb2"), Ok("new".to_owned()));
+        // A later successful write (Reconnect) clears the in-memory copy.
+        store_secret(
+            &store,
+            "wb2",
+            &oauth("fresh", "ref-9", 28_800, 15_638_400).to_secret(),
+        )
+        .unwrap();
+        assert_eq!(token_of(&store, "wb2"), Ok("fresh".to_owned()));
+        // Removing the account clears it too.
+        store.fail_sets.store(2, Ordering::SeqCst);
+        let refresh = |_: &str| Ok(oauth("again", "ref-3", 28_800, 15_638_400));
+        store
+            .inner
+            .set("wb2", &oauth("x", "r", 10, 1_000_000).to_secret())
+            .unwrap();
+        assert_eq!(
+            access_token_with(&store, "wb2", NOW, &refresh),
+            Ok("again".to_owned())
+        );
+        forget_secret(&store, "wb2").unwrap();
+        assert_eq!(token_of(&store, "wb2"), Err(TokenError::Missing));
+    }
+
+    #[test]
+    fn a_refresh_does_not_overwrite_a_secret_written_meanwhile() {
+        let store = MemoryStore::new();
+        store
+            .set("cw1", &oauth("old", "ref-1", 10, 1_000_000).to_secret())
+            .unwrap();
+        let reconnected = oauth("reconnected", "ref-r", 28_800, 15_638_400);
+        // Reconnect stores fresh tokens while our refresh call is in flight.
+        let refresh = |_: &str| {
+            store.set("cw1", &reconnected.to_secret()).unwrap();
+            Ok(oauth("renewed", "ref-2", 28_800, 15_638_400))
+        };
+        assert_eq!(
+            access_token_with(&store, "cw1", NOW, &refresh),
+            Ok("reconnected".to_owned())
+        );
+        assert_eq!(secret_of(&store, "cw1"), StoredSecret::OAuth(reconnected));
+    }
+
+    #[test]
+    fn writes_and_removals_wait_for_a_refresh_in_progress_in_another_process() {
+        // A second process holds the account's lock file.
+        let dir = lock_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(lock_file_name("fl1"));
+        let other_process = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .unwrap();
+        other_process.lock().unwrap();
+        let store = Arc::new(MemoryStore::new());
+        store.set("fl1", "old").unwrap();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (store, done) = (store.clone(), done.clone());
+            std::thread::spawn(move || {
+                store_secret(&*store, "fl1", "new").unwrap();
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the write must wait for the lock"
+        );
+        assert_eq!(store.get("fl1").unwrap().as_deref(), Some("old"));
+        other_process.unlock().unwrap();
+        writer.join().unwrap();
+        assert_eq!(store.get("fl1").unwrap().as_deref(), Some("new"));
+
+        other_process.lock().unwrap();
+        let remover = {
+            let store = store.clone();
+            std::thread::spawn(move || forget_secret(&*store, "fl1").unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(store.get("fl1").unwrap().as_deref(), Some("new"));
+        other_process.unlock().unwrap();
+        remover.join().unwrap();
+        assert_eq!(store.get("fl1").unwrap(), None);
+    }
+
+    #[test]
+    fn lock_file_names_cannot_escape_the_directory() {
+        assert_eq!(lock_file_name("1a2b-c_d"), "1a2b-c_d.lock");
+        assert_eq!(lock_file_name("../../etc/x"), "______etc_x.lock");
+    }
+
+    #[test]
+    fn an_oauth_secret_is_never_used_for_another_host() {
+        let store = MemoryStore::new();
+        store
+            .set("hg1", &oauth("acc", "ref", 28_800, 15_638_400).to_secret())
+            .unwrap();
+        let ok = |allowed| credential_with(&store, "hg1", allowed, NOW, &never_refresh);
+        assert_eq!(ok(true), Ok(("acc".to_owned(), TokenKind::OAuth)));
+        assert_eq!(ok(false), Err(TokenError::NeedsReconnect));
+        // A personal access token is not tied to the OAuth app.
+        store.set("hg2", "ghp_raw").unwrap();
+        assert_eq!(
+            credential_with(&store, "hg2", false, NOW, &never_refresh),
+            Ok(("ghp_raw".to_owned(), TokenKind::Pat))
+        );
+    }
+
+    #[test]
+    fn a_tampered_base_url_gets_no_oauth_token() {
+        let store = MemoryStore::new();
+        // `access_token` uses the real clock.
+        let real_now = forge::auth::now_unix();
+        let live = OAuthTokens {
+            access: "acc".into(),
+            refresh: "ref".into(),
+            access_expires_at: real_now + 28_800,
+            refresh_expires_at: real_now + 15_638_400,
+        };
+        store.set("hg3", &live.to_secret()).unwrap();
+        let mut account = record("hg3", "https://github.com");
+        account.kind = "github".to_owned();
+        assert_eq!(access_token(&store, &account), Ok("acc".to_owned()));
+        for evil in [
+            "https://evil.example",
+            "http://github.com",
+            "https://github.com:8443",
+            "https://github.com/sub",
+            "https://github.com.evil.example",
+        ] {
+            account.base_url = evil.to_owned();
+            assert_eq!(
+                access_token(&store, &account),
+                Err(TokenError::NeedsReconnect),
+                "{evil}"
+            );
+        }
+        // Another service kind on github.com's address is not GitHub's app either.
+        account.base_url = "https://github.com".to_owned();
+        account.kind = "gitlab".to_owned();
+        assert_eq!(
+            access_token(&store, &account),
+            Err(TokenError::NeedsReconnect)
+        );
+    }
+
+    #[test]
+    fn askpass_host_rule_is_github_com_over_https() {
+        let key = |scheme, host, port| HostKey::new(scheme, host, port);
+        assert!(oauth_allowed_for_host(&key("https", "github.com", None)));
+        assert!(!oauth_allowed_for_host(&key("http", "github.com", None)));
+        assert!(!oauth_allowed_for_host(&key("https", "evil.example", None)));
+        assert!(!oauth_allowed_for_host(&key(
+            "https",
+            "github.com",
+            Some(8443)
+        )));
+    }
+
+    #[test]
+    fn expiry_arithmetic_saturates() {
+        let tokens = forge::auth::OAuthTokens {
+            access: "a".into(),
+            refresh: "r".into(),
+            access_expires_at: u64::MAX,
+            refresh_expires_at: u64::MAX,
+        };
+        assert!(!needs_refresh(&tokens, NOW));
+        let mut poll = poll_after("dc", u64::MAX, u64::MAX);
+        assert_eq!(
+            poll.apply(u64::MAX, Ok(PollStep::Pending)),
+            PollOutcome::Continue
+        );
+        assert_eq!(poll.apply(1, Ok(PollStep::SlowDown)), PollOutcome::Continue);
+    }
+
+    /// Serves `{"login":"mira-k"}` with the GitHub scopes header to every request.
+    fn stub_github() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"login":"mira-k","name":null,"avatar_url":null}"#;
+                let out = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-OAuth-Scopes: repo, read:user, workflow\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(out.as_bytes());
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn check_account_reports_expiring_from_the_refresh_token() {
+        let base = stub_github();
+        let store: StoreResult = Ok(Arc::new(MemoryStore::new()));
+        let mut account = record("ck1", &base);
+        account.kind = "github".to_owned();
+        account.method = AccountMethod::Browser;
+        let secret = |refresh_days: u64| {
+            OAuthTokens {
+                access: "acc".into(),
+                refresh: "ref".into(),
+                access_expires_at: forge::auth::now_unix() + 28_800,
+                refresh_expires_at: forge::auth::now_unix() + refresh_days * SECS_PER_DAY,
+            }
+            .to_secret()
+        };
+        let check = |store: &StoreResult| {
+            check_account_with(store, None, &account, &|| true, &Client::new(), true)
+        };
+        store.as_ref().unwrap().set("ck1", &secret(5)).unwrap();
+        assert_eq!(check(&store).status, AccountStatus::Expiring { days: 5 });
+        // Plenty of refresh lifetime left: plain Connected.
+        store.as_ref().unwrap().set("ck1", &secret(100)).unwrap();
+        assert_eq!(check(&store).status, AccountStatus::Connected);
+        // The same secret on an instance that may not receive it is Invalid.
+        assert_eq!(
+            check_account_with(&store, None, &account, &|| true, &Client::new(), false).status,
+            AccountStatus::Invalid(None)
+        );
     }
 
     #[test]

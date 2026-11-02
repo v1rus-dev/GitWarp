@@ -13,8 +13,11 @@
 //! - [`api::probe`] detects the service behind a URL, [`api::current_user`]
 //!   validates a token, [`api::repo_is_public`] asks anonymously whether a
 //!   repository is public; [`secrets::SecretStore`] keeps tokens in the OS keychain.
+//! - [`auth`] is the GitHub browser sign-in (OAuth device flow, token refresh) and
+//!   the format of the secret it leaves in the keychain.
 
 pub mod api;
+pub mod auth;
 mod encode;
 mod instance;
 mod kind;

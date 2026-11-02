@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use forge::api::{Auth, PrState, PullRequest, TokenKind};
+use forge::api::{Auth, PrState, PullRequest};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, App, Context, Entity, EventEmitter, FontWeight, InteractiveElement, IntoElement,
@@ -27,6 +27,7 @@ use ui::{
     Tooltip,
 };
 
+use crate::accounts::TokenError;
 use crate::format::relative_time;
 use crate::history_view::unix_now;
 use crate::pr_logic::{self, ListError, Listing, PrTab, PrTarget};
@@ -266,17 +267,23 @@ fn fetch_first_page(
     let store = store
         .unwrap_or_else(crate::accounts::resolve_store)
         .map_err(|error| ListError::Other(error.to_string()))?;
-    let token = store
-        .get(&target.account_id)
-        .map_err(|error| ListError::Other(error.to_string()))?
-        // An account without a secret is as good as a revoked one.
-        .ok_or(ListError::TokenRevoked)?;
+    // An account without a secret is as good as a revoked one.
+    let (token, kind) = crate::accounts::access_credential_for_id(
+        store.as_ref(),
+        &target.account_id,
+        crate::accounts::oauth_allowed(&target.instance),
+    )
+    .map_err(|error| match error {
+        TokenError::Missing | TokenError::NeedsReconnect => ListError::TokenRevoked,
+        TokenError::Unreachable(why) => ListError::Offline(why),
+        TokenError::Keychain(why) => ListError::Other(why),
+    })?;
     let (filter, state) = pr_logic::tab_query(tab, &target.login);
     let page = forge::api::list_pull_requests(
         pr_logic::shared_client(),
         &target.instance,
         &target.coords,
-        &Auth::new(Some(&token), TokenKind::Pat),
+        &Auth::new(Some(&token), kind),
         &filter,
         state,
         1,

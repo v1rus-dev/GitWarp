@@ -1040,15 +1040,25 @@ impl Request {
         }
     }
 
-    /// The account's token: a failure to read it falls back to anonymous
-    /// reads, which still work for public repositories.
-    fn token(&self) -> Option<String> {
+    /// The account's token and how to send it (a browser sign-in's token is
+    /// renewed when it is about to end): a failure to get it falls back to
+    /// anonymous reads, which still work for public repositories.
+    fn token(&self) -> Option<(String, TokenKind)> {
         let id = self.account_id.as_deref()?;
         let store = match &self.store {
             Some(store) => store.clone(),
             None => crate::accounts::resolve_store().ok()?,
         };
-        store.get(id).ok().flatten()
+        let oauth_ok = crate::accounts::oauth_allowed(&self.instance);
+        crate::accounts::access_credential_for_id(store.as_ref(), id, oauth_ok).ok()
+    }
+
+    /// The request credentials built from [`Request::token`].
+    fn auth_of(token: &Option<(String, TokenKind)>) -> Auth<'_> {
+        match token {
+            Some((token, kind)) => Auth::new(Some(token), *kind),
+            None => Auth::anonymous(),
+        }
     }
 
     pub fn pull_requests(
@@ -1056,13 +1066,13 @@ impl Request {
         branches: &[String],
     ) -> Result<HashMap<String, PullRequest>, ApiError> {
         let token = self.token();
-        let auth = Auth::new(token.as_deref(), TokenKind::Pat);
+        let auth = Request::auth_of(&token);
         pull_requests_for_branches(&self.client, &self.instance, &self.coords, &auth, branches)
     }
 
     pub fn review(&self, number: u64) -> Result<ReviewState, ApiError> {
         let token = self.token();
-        let auth = Auth::new(token.as_deref(), TokenKind::Pat);
+        let auth = Request::auth_of(&token);
         pull_request_review(&self.client, &self.instance, &self.coords, &auth, number)
     }
 
@@ -1071,7 +1081,7 @@ impl Request {
     /// unanswered.
     pub fn checks(&self, shas: &[String]) -> Vec<(String, Result<CommitChecks, ApiError>)> {
         let token = self.token();
-        let auth = Auth::new(token.as_deref(), TokenKind::Pat);
+        let auth = Request::auth_of(&token);
         let mut answers = Vec::new();
         for sha in shas {
             let result = commit_checks(&self.client, &self.instance, &self.coords, &auth, sha);

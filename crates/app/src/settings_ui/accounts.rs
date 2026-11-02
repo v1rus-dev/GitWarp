@@ -175,7 +175,7 @@ impl SettingsView {
                         cx.background_executor()
                             .spawn(async move {
                                 if let Ok(store) = cached.unwrap_or_else(logic::resolve_store) {
-                                    let _ = store.delete(&id);
+                                    let _ = logic::forget_secret(store.as_ref(), &id);
                                 }
                             })
                             .await;
@@ -363,7 +363,7 @@ impl SettingsView {
                 .background_executor()
                 .spawn(async move {
                     let store = cached.unwrap_or_else(logic::resolve_store)?;
-                    store.delete(&id)
+                    logic::forget_secret(store.as_ref(), &id)
                 })
                 .await;
             this.update(cx, |view, cx| {
@@ -596,6 +596,13 @@ fn status_view(status: &AccountStatus, id: &str, cx: &App) -> AnyElement {
                 colors.success,
                 None,
             ),
+            // The refresh token of a browser sign-in is about to end.
+            AccountStatus::Expiring { days } => (
+                Some(IconName::Warn),
+                ui::i18n::t_count("settings.accounts.status.expiring", *days, &[]),
+                colors.warning,
+                None,
+            ),
             AccountStatus::Checking => (
                 None,
                 ui::t!("settings.accounts.status.checking"),
@@ -664,6 +671,19 @@ fn account_row(
 
     let mut actions = div().flex().items_center().gap(px(6.)).flex_none();
     match status {
+        AccountStatus::Expiring { .. } => {
+            let entity = cx.entity();
+            let account = account.clone();
+            actions = actions.child(
+                Button::new(format!("settings-account-{id}-reconnect"))
+                    .label(ui::t!("settings.accounts.action.reconnect"))
+                    .size(ButtonSize::Small)
+                    .on_click(move |_: &ClickEvent, window, cx| {
+                        let account = account.clone();
+                        entity.update(cx, |view, cx| view.open_reconnect(account, window, cx));
+                    }),
+            );
+        }
         AccountStatus::Invalid(_) => {
             let entity = cx.entity();
             let account = account.clone();
@@ -749,6 +769,11 @@ fn account_row(
         .flex()
         .items_center()
         .gap(px(12.))
+        // No warning-subtle theme token exists; tints elsewhere (Done card,
+        // banners) are the semantic colour at low opacity.
+        .when(matches!(status, AccountStatus::Expiring { .. }), |this| {
+            this.bg(colors.warning.opacity(0.08))
+        })
         .child(service_icon(kind, cx))
         .child(avatar(&account.login, px(28.), FS_SM, cx))
         .child(

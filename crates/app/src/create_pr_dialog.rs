@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use forge::api::{Auth, CreatedPullRequest, NewPullRequest, TokenKind};
+use forge::api::{Auth, CreatedPullRequest, NewPullRequest};
 use git_core::network::NetworkOutcome;
 use git_core::{Error, Git, Repo};
 use gpui::{
@@ -26,6 +26,7 @@ use ui::{
     IconName, Select, TextArea, TextAreaEvent, TextInput, TextInputEvent,
 };
 
+use crate::accounts::TokenError;
 use crate::pr_logic::{self, CreateFailure, PrTarget, PushFailure, PushNeed};
 
 /// A push prepared by the repository view (credentials, host-key asker): runs
@@ -558,15 +559,21 @@ fn create_request(
     let store = store
         .unwrap_or_else(crate::accounts::resolve_store)
         .map_err(|error| CreateFailure::Other(error.to_string()))?;
-    let token = store
-        .get(&target.account_id)
-        .map_err(|error| CreateFailure::Other(error.to_string()))?
-        .ok_or(CreateFailure::TokenRejected)?;
+    let (token, kind) = crate::accounts::access_credential_for_id(
+        store.as_ref(),
+        &target.account_id,
+        crate::accounts::oauth_allowed(&target.instance),
+    )
+    .map_err(|error| match error {
+        TokenError::Missing | TokenError::NeedsReconnect => CreateFailure::TokenRejected,
+        TokenError::Unreachable(why) => CreateFailure::Offline(why),
+        TokenError::Keychain(why) => CreateFailure::Other(why),
+    })?;
     forge::api::create_pull_request(
         pr_logic::shared_client(),
         &target.instance,
         &target.coords,
-        &Auth::new(Some(&token), TokenKind::Pat),
+        &Auth::new(Some(&token), kind),
         new,
     )
     .map_err(|error| pr_logic::create_failure(&error))
