@@ -30,6 +30,7 @@ ui = { path = "crates/ui" }
 # In-process git. `gix` 0.90 needs Rust 1.88 (the workspace MSRV is 1.89 for
 # `uuid` 1.29 and `aes` 0.9 in the lock). Default features stay off: discovery and the reads
 # migrated so far only need hashing and a `Send` repository handle.
+# `sentry` 0.49 (crates/app) needs Rust 1.89, the current workspace MSRV.
 gix = { version = "0.90", default-features = false, features = ["parallel", "sha1"] }
 
 # UI: Zed's GPUI. Pinned on purpose: this is a snapshot of Zed's GPUI
