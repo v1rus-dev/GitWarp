@@ -1,10 +1,15 @@
 //! Crash reporting (Sentry), gated by `Settings::telemetry`.
+//! The DSN is baked in at build time from `GITWARP_SENTRY_DSN`; without it nothing is sent.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use sentry::protocol::Event;
 
-const DSN: &str = "https://76c2e1e6697b4ce02d03366b6275008b@o4512363074682880.ingest.de.sentry.io/4512363096047696";
+/// Baked in at build time. Release builds get it from CI; local builds and forks
+/// leave it unset, which keeps the Sentry client disabled (nothing is sent).
+// An empty value (CI passing an empty secret) is also treated as unset:
+// sentry-core's `IntoDsn for &str` maps "" to no DSN (intodsn.rs:30-38).
+const DSN: Option<&str> = option_env!("GITWARP_SENTRY_DSN");
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
