@@ -89,12 +89,14 @@ impl Failure {
     /// The one-line description the status bar and the empty state share.
     pub fn title(&self) -> SharedString {
         match self {
-            Failure::NotARepository(_) => "Not a git repository".into(),
-            Failure::PathNotFound(_) => "Folder not found".into(),
-            Failure::GitNotFound => "git was not found".into(),
-            Failure::GitTooOld { found, .. } => format!("git {found} is too old").into(),
-            Failure::Git { .. } => "git could not read the history".into(),
-            Failure::Other { .. } => "GitWarp could not read the history".into(),
+            Failure::NotARepository(_) => ui::t!("history.failure.not_a_repository"),
+            Failure::PathNotFound(_) => ui::t!("history.failure.folder_not_found"),
+            Failure::GitNotFound => ui::t!("history.failure.git_not_found"),
+            Failure::GitTooOld { found, .. } => {
+                ui::t!("history.failure.git_too_old", found = found)
+            }
+            Failure::Git { .. } => ui::t!("history.failure.git_failed"),
+            Failure::Other { .. } => ui::t!("history.failure.other"),
         }
     }
 
@@ -120,31 +122,32 @@ impl Failure {
 /// share this copy.
 pub fn git_unavailable_message(error: &Error) -> Option<String> {
     match error.class() {
-        ErrorClass::GitNotFound => Some(
-            "GitWarp could not find a usable git. The bundled copy is missing and there is no \
-             `git` in PATH."
-                .to_owned(),
-        ),
+        ErrorClass::GitNotFound => Some(ui::t!("history.failure.git_unavailable").to_string()),
         ErrorClass::GitTooOld {
             found,
             required,
             source,
             path,
-        } => Some(format!(
-            "GitWarp needs git {required} or newer. {} git at {} reports {found}.",
-            source_label(source),
-            path.display()
-        )),
+        } => Some(
+            ui::t!(
+                "history.failure.git_too_old_detail",
+                required = required,
+                source = source_label(source),
+                path = path.display(),
+                found = found
+            )
+            .to_string(),
+        ),
         _ => None,
     }
 }
 
 /// The source name as a sentence starts it: `System`, `Bundled`, `Custom`.
-pub fn source_label(source: GitSource) -> &'static str {
+pub fn source_label(source: GitSource) -> SharedString {
     match source {
-        GitSource::Bundled => "Bundled",
-        GitSource::System => "System",
-        GitSource::Custom => "Custom",
+        GitSource::Bundled => ui::t!("history.git_source.bundled"),
+        GitSource::System => ui::t!("history.git_source.system"),
+        GitSource::Custom => ui::t!("history.git_source.custom"),
     }
 }
 
