@@ -78,6 +78,8 @@ pub struct Settings {
     pub diff_layout: DiffLayout,
     /// Fetch the remotes in the background while a repository is open.
     pub background_fetch: bool,
+    /// Show the commit activity heatmap on the Welcome screen and above History.
+    pub show_activity: bool,
     /// Selection, focus-ring and primary-button colour.
     pub accent: Accent,
     /// Height of list and tree rows.
@@ -160,6 +162,7 @@ impl Default for Settings {
             activity_collapsed: false,
             diff_layout: DiffLayout::default(),
             background_fetch: true,
+            show_activity: true,
             accent: Accent::default(),
             density: Density::default(),
             ui_font_size: 13,
@@ -730,6 +733,7 @@ fn settings_from_value(value: Value) -> Settings {
         ),
         diff_layout: take(&mut object, "diff_layout", defaults.diff_layout),
         background_fetch: take(&mut object, "background_fetch", defaults.background_fetch),
+        show_activity: take(&mut object, "show_activity", defaults.show_activity),
         accent: take(&mut object, "accent", defaults.accent),
         density: take(&mut object, "density", defaults.density),
         ui_font_size: take(&mut object, "ui_font_size", defaults.ui_font_size),
@@ -883,6 +887,7 @@ mod tests {
             activity_collapsed: true,
             diff_layout: DiffLayout::Split,
             background_fetch: false,
+            show_activity: false,
             ..Settings::default()
         };
         store.save(&settings).unwrap();
@@ -1041,6 +1046,22 @@ mod tests {
         assert!(load_json(dir.path(), r#"{"activity_collapsed":true}"#).activity_collapsed);
         // The round trip above (`missing_file_loads_defaults_and_round_trips`)
         // saves and reloads it with the other prefs.
+    }
+
+    #[test]
+    fn activity_statistics_are_shown_by_default_and_remember_hiding() {
+        assert!(Settings::default().show_activity);
+        let dir = TempDir::new("show-activity");
+        // An older settings file without the key keeps the feature on.
+        assert!(load_json(dir.path(), r#"{"theme":"dark"}"#).show_activity);
+        assert!(!load_json(dir.path(), r#"{"show_activity":false}"#).show_activity);
+        let store = SettingsStore::new(settings_path(dir.path()));
+        let hidden = Settings {
+            show_activity: false,
+            ..Settings::default()
+        };
+        store.save(&hidden).unwrap();
+        assert!(!store.load().show_activity);
     }
 
     #[test]

@@ -562,7 +562,7 @@ impl WelcomeView {
             .gap(px(12.))
             .px(px(24.))
             .py(px(20.))
-            .child(self.activity.clone())
+            .children(crate::activity_strip::enabled(cx).then(|| self.activity.clone()))
             .child(header)
             .child(panel)
             .child(hint)
@@ -676,6 +676,9 @@ impl Render for WelcomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prune_dialog(window, cx);
         self.sync_recent(cx);
+        let show_activity = crate::activity_strip::enabled(cx);
+        self.activity
+            .update(cx, |activity, cx| activity.set_enabled(show_activity, cx));
         self.sync_activity(cx);
         self.ensure_branches(cx);
 

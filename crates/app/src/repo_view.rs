@@ -2616,6 +2616,7 @@ impl RepositoryView {
             Command::Refresh => self.run_sidebar_action(SidebarAction::Refresh, window, cx),
             Command::ToggleSidebar => self.toggle_sidebar(cx),
             Command::ToggleDetails => self.toggle_details(cx),
+            Command::ToggleActivity if !crate::activity_strip::enabled(cx) => {}
             Command::ToggleActivity => {
                 let collapsed = self.activity.read(cx).is_collapsed();
                 self.activity
@@ -4272,12 +4273,22 @@ impl Render for RepositoryView {
             .then(|| self.render_details(details_width, width - sidebar_width - 5., cx));
         let status = self.render_status_bar(cx);
 
+        // The strip is off with the Settings switch; its day filter would
+        // otherwise leave History narrowed with no visible reason.
+        let show_activity = crate::activity_strip::enabled(cx);
+        self.activity
+            .update(cx, |activity, cx| activity.set_enabled(show_activity, cx));
+        if !show_activity && self.history.read(cx).day_filter().is_some() {
+            self.history
+                .update(cx, |history, cx| history.set_day_filter(None, cx));
+        }
+
         let content = match self.view {
             ViewMode::History => div()
                 .size_full()
                 .flex()
                 .flex_col()
-                .child(self.activity.clone())
+                .children(show_activity.then(|| self.activity.clone()))
                 .child(div().flex_1().min_h_0().child(self.history.clone()))
                 .into_any_element(),
             ViewMode::Changes => self.changes.clone().into_any_element(),

@@ -95,6 +95,8 @@ pub struct WelcomeActivity {
     /// The repository selected in the recent list.
     selected: Option<PathBuf>,
     scope: Scope,
+    /// Off while the Activity statistics setting is off: nothing is counted.
+    enabled: bool,
     me: Me,
     repos: HashMap<PathBuf, RepoState>,
     /// The newest "today" any counted repository reported.
@@ -116,6 +118,7 @@ impl WelcomeActivity {
             paths: Vec::new(),
             selected: None,
             scope: Scope::All,
+            enabled: crate::activity_strip::enabled(cx),
             me: Me::Loading,
             repos: HashMap::new(),
             today: 0,
@@ -130,6 +133,17 @@ impl WelcomeActivity {
     /// Adopts a newly resolved git (after a Retry) and counts again.
     pub fn set_git(&mut self, git: Result<Arc<Git>, Arc<Error>>, cx: &mut Context<Self>) {
         self.git = git;
+        self.start(cx);
+        cx.notify();
+    }
+
+    /// Follows the Settings switch: turning it off drops the counts and stops
+    /// the work in flight, turning it on counts again.
+    pub fn set_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.enabled == enabled {
+            return;
+        }
+        self.enabled = enabled;
         self.start(cx);
         cx.notify();
     }
@@ -162,7 +176,13 @@ impl WelcomeActivity {
         let generation = self.generation;
         self.repos.clear();
         self.tasks.clear();
+        self.me_task = None;
         self.today = 0;
+        if !self.enabled {
+            // Not `Known`, so `sync` does not start counts while off.
+            self.me = Me::Loading;
+            return;
+        }
         let git = match &self.git {
             Ok(git) => git.clone(),
             Err(error) => {

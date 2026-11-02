@@ -83,6 +83,13 @@ struct Shown {
     end_day: i32,
 }
 
+/// Whether the Activity statistics are switched on in Settings (on until a
+/// settings file says otherwise).
+pub(crate) fn enabled(cx: &App) -> bool {
+    cx.try_global::<crate::AppSettings>()
+        .is_none_or(|state| state.settings.show_activity)
+}
+
 pub struct ActivityStrip {
     path: PathBuf,
     git: Result<Arc<Git>, Arc<Error>>,
@@ -92,6 +99,8 @@ pub struct ActivityStrip {
     /// (also from its own Esc).
     _history_observer: Subscription,
     collapsed: bool,
+    /// Off while the Activity statistics setting is off: nothing is counted.
+    enabled: bool,
     who: Who,
     /// `None` is "Last 12 months".
     year: Option<i32>,
@@ -138,6 +147,7 @@ impl ActivityStrip {
             history,
             _history_observer: observer,
             collapsed,
+            enabled: enabled(cx),
             who: Who::Me,
             year: None,
             status: Status::Loading,
@@ -159,6 +169,22 @@ impl ActivityStrip {
     /// screen until the new ones land, so the grid does not flash.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.load(cx);
+    }
+
+    /// Follows the Settings switch: turning it off stops any count in flight,
+    /// turning it on counts again.
+    pub(crate) fn set_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.enabled == enabled {
+            return;
+        }
+        self.enabled = enabled;
+        if enabled {
+            self.load(cx);
+        } else {
+            self.generation += 1;
+            self.task = None;
+        }
+        cx.notify();
     }
 
     /// The heatmap's scroll state (tests check it opens at the newest week).
@@ -188,6 +214,9 @@ impl ActivityStrip {
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
+        if !self.enabled {
+            return;
+        }
         self.generation += 1;
         let generation = self.generation;
         if self.shown.is_none() {

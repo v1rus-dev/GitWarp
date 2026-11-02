@@ -241,6 +241,30 @@ pub(super) fn render(
         ],
     ));
 
+    let activity_switch = {
+        let entity = cx.entity();
+        form::switch(
+            "settings-show-activity".into(),
+            settings.show_activity,
+            false,
+            move |checked, _, cx| {
+                entity.update(cx, |view, cx| {
+                    view.change(cx, |settings| settings.show_activity = checked);
+                });
+            },
+        )
+    };
+    page = page.child(group(
+        ui::t!("settings.general.group.activity"),
+        vec![form::row(
+            "settings-show-activity-row",
+            ui::t!("settings.general.activity.title"),
+            ui::t!("settings.general.activity.desc"),
+            activity_switch,
+            false,
+        )],
+    ));
+
     let mut confirmations = Vec::new();
     for (id, title, description, value) in [
         (
