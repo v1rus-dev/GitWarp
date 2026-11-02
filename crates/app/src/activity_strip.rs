@@ -40,6 +40,8 @@ const PARTIAL_DAYS: i32 = 56;
 const YEARS_SHOWN: usize = 5;
 /// The strip's header height, the same as the details dock's.
 const HEADER: f32 = 34.;
+/// Narrowest the side column may get; the grid scrolls before it shrinks below.
+const SIDE_MIN_W: f32 = 160.;
 
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTHS: [&str; 12] = [
@@ -478,8 +480,13 @@ impl ActivityStrip {
                 .text_color(colors.text)
                 .child(text)
         };
+        // Shrinks first (clipped, not wrapped) when the header is too narrow;
+        // the controls on the right keep their full size.
         let total = div()
             .flex()
+            .flex_shrink_1()
+            .min_w_0()
+            .overflow_hidden()
             .items_center()
             .gap(px(4.))
             .text_size(FS_SM)
@@ -583,9 +590,19 @@ impl ActivityStrip {
             )
             .child(total)
             .child(div().flex_1())
-            .when(show_legend, |this| this.child(HeatLegend::new()))
-            .child(author)
-            .child(range)
+            // The legend gives way (clipped) before the segment and select do.
+            .when(show_legend, |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_shrink_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(HeatLegend::new()),
+                )
+            })
+            .child(div().flex_none().child(author))
+            .child(div().flex_none().child(range))
     }
 
     fn render_body(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -675,9 +692,12 @@ impl ActivityStrip {
 
         // Design `.act-side { flex: 1 1 0; min-width: 0 }`: the grid keeps the
         // width it needs and the side column takes what is left.
+        // Not in the design (it stops at ~1200 px): a minimum so that the grid
+        // shrinks and scrolls first, instead of the text collapsing to one
+        // letter per line in a narrow window.
         let side = div()
             .flex_1()
-            .min_w_0()
+            .min_w(px(SIDE_MIN_W))
             .flex()
             .flex_col()
             .gap(px(8.))
