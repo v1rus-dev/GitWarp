@@ -1,3 +1,8 @@
+// Release builds on Windows are GUI-subsystem: no console window behind the app.
+// Debug builds keep the console for logs. Git's askpass calls of this binary
+// still work: piped stdout/stdin handles are inherited either way.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod activity_strip;
 mod app_icon;
 mod changes_view;
