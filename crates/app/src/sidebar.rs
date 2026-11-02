@@ -344,7 +344,7 @@ pub fn sidebar_menu(
             item("Rename…", IconName::Edit)
                 .shortcut("F2")
                 .action(SidebarAction::RenameBranch(name.to_owned())),
-            item("Set upstream…", IconName::Link)
+            item("Set upstream", IconName::Link)
                 .action(SidebarAction::SetUpstream(name.to_owned())),
             item("Delete branch", IconName::Trash)
                 .danger()
@@ -1931,7 +1931,7 @@ mod tests {
                 "Rebase main onto feat/idle-lanes",
                 "—",
                 "Rename…",
-                "Set upstream…",
+                "Set upstream",
                 "Delete branch",
                 "—",
                 "Copy branch name",
@@ -2087,7 +2087,7 @@ mod tests {
                 "Rebase HEAD onto feat/x",
                 "—",
                 "Rename…",
-                "Set upstream…",
+                "Set upstream",
                 "Delete branch",
                 "—",
                 "Copy branch name",
@@ -2151,7 +2151,7 @@ mod tests {
                 "local:feat/idle-lanes" => &[
                     "Checkout",
                     "Rename…",
-                    "Set upstream…",
+                    "Set upstream",
                     "Delete branch",
                     "Copy branch name",
                 ],

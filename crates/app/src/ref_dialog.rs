@@ -16,6 +16,7 @@ use gpui::{
     ParentElement, Styled, Subscription, Window,
 };
 
+use git_core::network::FetchOptions;
 use git_core::{Error, Git, Oid, Ref, RefKind, Repo, ResetMode};
 use ui::metrics::{FONT_MONO, FS_BASE, FS_SM, R_MD};
 use ui::theme::{ActiveTheme, ThemeColors};
@@ -27,6 +28,7 @@ use ui::{
 
 use crate::format::relative_time;
 use crate::history_view::unix_now;
+use crate::network_ops::Job;
 use crate::ref_ops::{
     ref_name_error, remote_name_error, remote_url_kind, CardRefKind, CommitCard, RemoteUrlKind,
 };
@@ -34,12 +36,20 @@ use crate::ref_ops::{
 /// The width every remote/destructive dialog uses when the design gives none.
 const CONFIRM_WIDTH: f32 = 480.;
 
+/// The network action a dialog asks the shell to start after its local git call
+/// succeeded, so it gets the toolbar's progress, prompts and toasts.
+pub(crate) type NetworkAction = Rc<dyn Fn(Job, &mut Window, &mut App)>;
+
 /// Shared context the shell passes to a dialog when it opens.
 pub(crate) struct RefDialogContext {
     pub root: PathBuf,
     pub git: Result<Arc<Git>, Arc<Error>>,
     pub refs: Vec<Ref>,
     pub remotes: Vec<String>,
+    /// `git_core::network::default_remote`'s answer, for the tag push.
+    pub default_remote: Option<String>,
+    /// Starts a network job in the repository view behind the dialog.
+    pub network: Option<NetworkAction>,
     /// `user.signingkey`, when configured; the tag dialog offers signing then.
     pub signing_key: Option<String>,
     /// HEAD's commit, for the "starts at the current commit" note.
@@ -127,6 +137,13 @@ pub(crate) struct RefDialog {
     checkout: bool,
     annotated: bool,
     sign: bool,
+    /// Tag dialog: push the new tag once it exists.
+    push_tag_after_create: bool,
+    /// The default remote the tag is pushed to, and `None` when there is none.
+    push_remote: Option<String>,
+    /// Add-remote dialog: fetch the new remote once it exists.
+    fetch_after_add: bool,
+    network: Option<NetworkAction>,
     signing_key: Option<String>,
     reset_mode: ResetMode,
     branch: String,
@@ -141,6 +158,8 @@ pub(crate) struct RefDialog {
     message_focus: FocusHandle,
     url_focus: FocusHandle,
     checkout_focus: FocusHandle,
+    push_focus: FocusHandle,
+    fetch_focus: FocusHandle,
     sign_focus: FocusHandle,
     cancel_focus: FocusHandle,
     primary_focus: FocusHandle,
@@ -272,6 +291,12 @@ impl RefDialog {
 
         let annotated = matches!(kind, RefDialogKind::CreateTag { .. });
         let checkout = matches!(kind, RefDialogKind::CreateBranch { .. });
+        let push_remote = if annotated {
+            context.default_remote
+        } else {
+            None
+        };
+        let network = context.network;
         let signing_key = context.signing_key;
         let sign = signing_key.is_some();
         Self {
@@ -289,6 +314,10 @@ impl RefDialog {
             checkout,
             annotated,
             sign,
+            push_tag_after_create: false,
+            push_remote,
+            fetch_after_add: true,
+            network,
             signing_key,
             reset_mode: ResetMode::Mixed,
             branch: context.branch,
@@ -301,6 +330,8 @@ impl RefDialog {
             message_focus,
             url_focus,
             checkout_focus: cx.focus_handle().tab_stop(true),
+            push_focus: cx.focus_handle().tab_stop(true),
+            fetch_focus: cx.focus_handle().tab_stop(true),
             sign_focus: cx.focus_handle().tab_stop(true),
             cancel_focus: cx.focus_handle().tab_stop(true),
             primary_focus: cx.focus_handle().tab_stop(true),
@@ -580,6 +611,26 @@ impl RefDialog {
         })
     }
 
+    /// The network job the dialog starts once its local git call has landed.
+    fn follow_up(&self, cx: &App) -> Option<Job> {
+        match &self.kind {
+            RefDialogKind::CreateTag { .. } if self.push_tag_after_create => {
+                let remote = self.push_remote.clone()?;
+                let tag = self.name_text(cx);
+                (!tag.is_empty()).then_some(Job::PushTag { remote, tag })
+            }
+            RefDialogKind::Remote { editing: None } if self.fetch_after_add => {
+                let remote = self.name_text(cx);
+                (!remote.is_empty()).then_some(Job::Fetch(FetchOptions {
+                    remote: Some(remote),
+                    tags: true,
+                    prune: false,
+                }))
+            }
+            _ => None,
+        }
+    }
+
     fn finish(
         &mut self,
         result: std::result::Result<String, Error>,
@@ -589,10 +640,14 @@ impl RefDialog {
         self.running = false;
         match result {
             Ok(notice) => {
+                let follow_up = self.follow_up(cx);
                 self.close(window, cx);
                 toast::show(ToastKind::Ok, notice, window, cx);
                 let on_done = self.on_done.clone();
                 on_done(window, cx);
+                if let (Some(job), Some(network)) = (follow_up, self.network.clone()) {
+                    network(job, window, cx);
+                }
             }
             Err(error) => {
                 let message = error.to_string();
@@ -764,12 +819,33 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
                     );
                 }
             }
-            body = body.child(
-                Checkbox::new("ref-tag-push")
-                    .label("Push the tag to origin after creating — arrives with push")
-                    .checked(false)
-                    .disabled(true),
-            );
+            if let Some(remote) = &dialog.push_remote {
+                let toggle = {
+                    let state = state.clone();
+                    move |next: bool, _: &mut Window, cx: &mut App| {
+                        state.update(cx, |dialog, cx| {
+                            dialog.push_tag_after_create = next;
+                            dialog.notify_host(cx);
+                            cx.notify();
+                        });
+                    }
+                };
+                body = body.child(
+                    Checkbox::new("ref-tag-push")
+                        .label(format!("Push the tag to {remote} after creating"))
+                        .checked(dialog.push_tag_after_create)
+                        .focus_handle(dialog.push_focus.clone())
+                        .on_toggle(toggle),
+                );
+                if dialog.push_tag_after_create {
+                    body = body.child(
+                        Banner::new(BannerKind::Warn, "Pushed tags are public").body(
+                            "Others can fetch it right away. Deleting it later needs a separate \
+                             remote delete.",
+                        ),
+                    );
+                }
+            }
             body
         }
         RefDialogKind::RenameWorktree { from } => body.child(name_field(
@@ -817,11 +893,22 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
                         .child("Renaming the remote also renames its remote-tracking branches."),
                 );
             } else {
+                let toggle = {
+                    let state = state.clone();
+                    move |next: bool, _: &mut Window, cx: &mut App| {
+                        state.update(cx, |dialog, cx| {
+                            dialog.fetch_after_add = next;
+                            dialog.notify_host(cx);
+                            cx.notify();
+                        });
+                    }
+                };
                 body = body.child(
                     Checkbox::new("ref-remote-fetch")
-                        .label("Fetch branches and tags right after adding — arrives with fetch")
-                        .checked(false)
-                        .disabled(true),
+                        .label("Fetch branches and tags right after adding")
+                        .checked(dialog.fetch_after_add)
+                        .focus_handle(dialog.fetch_focus.clone())
+                        .on_toggle(toggle),
                 );
             }
             body
@@ -901,6 +988,7 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
                 "Create branch"
             }
         }
+        RefDialogKind::CreateTag { .. } if dialog.push_tag_after_create => "Create and push",
         RefDialogKind::CreateTag { .. } => "Create tag",
         RefDialogKind::RenameBranch { .. }
         | RefDialogKind::RenameTag { .. }
@@ -963,6 +1051,12 @@ fn build(state: &Entity<RefDialog>, cx: &App) -> Dialog {
     }
     if matches!(dialog.kind, RefDialogKind::CreateBranch { .. }) {
         focus_order.push(DialogFocus::control(dialog.checkout_focus.clone()));
+    }
+    if matches!(dialog.kind, RefDialogKind::CreateTag { .. }) && dialog.push_remote.is_some() {
+        focus_order.push(DialogFocus::control(dialog.push_focus.clone()));
+    }
+    if matches!(dialog.kind, RefDialogKind::Remote { editing: None }) {
+        focus_order.push(DialogFocus::control(dialog.fetch_focus.clone()));
     }
     if dialog.annotated && dialog.signing_key.is_some() {
         focus_order.push(DialogFocus::control(dialog.sign_focus.clone()));

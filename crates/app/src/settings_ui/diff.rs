@@ -1,8 +1,13 @@
 //! Settings → Diff & merge: layout, whitespace, context and the conflict tool,
 //! with a live preview built from the same row shapes as the real diff pane.
 
+use std::path::Path;
+use std::process::{Command, Stdio};
+
 use gpui::prelude::FluentBuilder;
-use gpui::{div, px, AnyElement, App, Context, IntoElement, ParentElement, Styled, Window};
+use gpui::{
+    div, px, AnyElement, App, Context, IntoElement, ParentElement, SharedString, Styled, Window,
+};
 
 use ui::metrics::{FONT_MONO, FS_SM, R_MD};
 use ui::theme::ActiveTheme;
@@ -325,14 +330,17 @@ pub(super) fn render(
                                     .disabled(bad)
                                     .on_click(move |_, _, cx: &mut App| {
                                         entity.update(cx, |view, cx| {
-                                            view.merge_test = Some(
-                                                "Merge tool started with sample files".into(),
-                                            );
-                                            cx.notify();
+                                            view.start_merge_test(cx);
                                         });
                                     })
                             }),
                     )
+                    .when_some(view.merge_test.clone(), |this, result| {
+                        this.child(match result {
+                            Ok(text) => form::success(text, cx),
+                            Err(text) => form::error(text, cx),
+                        })
+                    })
                     .child(if command_text.trim().is_empty() {
                         form::error("Enter a command.", cx)
                     } else if !missing.is_empty() {
@@ -505,4 +513,183 @@ fn gutter(line: Option<u32>, colors: ui::ThemeColors, size: gpui::Pixels) -> Any
         .text_align(gpui::TextAlign::Right)
         .child(line.map(|line| line.to_string()).unwrap_or_default())
         .into_any_element()
+}
+
+impl SettingsView {
+    /// Starts the configured merge tool on three sample files, detached, and
+    /// reports whether the process could be spawned.
+    pub(super) fn start_merge_test(&mut self, cx: &mut Context<Self>) {
+        let command = self.merge_command.read(cx).text().trim().to_owned();
+        if command.is_empty() {
+            return;
+        }
+        self.merge_test = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let program = first_word(&command);
+            let result = cx
+                .background_executor()
+                .spawn(async move { start_sample_merge(&command) })
+                .await;
+            this.update(cx, |view, cx| {
+                view.merge_test = Some(match result {
+                    Ok(()) => Ok(SharedString::from(format!(
+                        "Started {program} with sample files"
+                    ))),
+                    Err(error) => Err(SharedString::from(format!("Could not start: {error}"))),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+/// The program name the result line shows.
+fn first_word(command: &str) -> String {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or(command)
+        .to_owned()
+}
+
+/// Writes base/local/remote files with one conflicting line into a fresh
+/// temporary directory and spawns the tool on them. It never waits.
+fn start_sample_merge(command: &str) -> std::io::Result<()> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("gitwarp-merge-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+
+    let base = dir.join("base.txt");
+    let local = dir.join("local.txt");
+    let remote = dir.join("remote.txt");
+    let merged = dir.join("merged.txt");
+    std::fs::write(&base, "one\nshared\nthree\n")?;
+    std::fs::write(&local, "one\nlocal\nthree\n")?;
+    std::fs::write(&remote, "one\nremote\nthree\n")?;
+    std::fs::write(&merged, "")?;
+
+    let program = first_word(command);
+    let mut command = command.to_owned();
+    for (placeholder, path) in [
+        ("$BASE", &base),
+        ("$LOCAL", &local),
+        ("$REMOTE", &remote),
+        ("$MERGED", &merged),
+    ] {
+        command = substitute(&command, placeholder, path);
+    }
+
+    let mut shell = if cfg!(windows) {
+        let mut shell = Command::new("cmd");
+        shell.arg("/C");
+        shell
+    } else {
+        let mut shell = Command::new("sh");
+        shell.arg("-c");
+        shell
+    };
+    let mut child = shell
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    // A missing tool only shows up as the shell's exit status, so watch the
+    // child briefly: 127 (sh) / 9009 (cmd) mean "command not found".
+    let not_found = if cfg!(windows) { 9009 } else { 127 };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait()? {
+            Some(status) => {
+                return match status.code() {
+                    Some(0) => Ok(()),
+                    Some(code) if code == not_found => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("command not found: {program}"),
+                    )),
+                    Some(code) => Err(std::io::Error::other(format!("exited with code {code}"))),
+                    None => Ok(()),
+                };
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    // Still running: reap it in the background so it does not linger as a
+    // zombie after it exits.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Replaces one placeholder with the quoted path, also consuming quotes the
+/// command already put around it.
+fn substitute(command: &str, placeholder: &str, path: &Path) -> String {
+    let quoted = quote_path(path);
+    // Quoted forms first so their quotes are consumed; the bare form then
+    // handles whatever is left.
+    command
+        .replace(&format!("\"{placeholder}\""), &quoted)
+        .replace(&format!("'{placeholder}'"), &quoted)
+        .replace(placeholder, &quoted)
+}
+
+/// Quotes a path for the platform shell.
+fn quote_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    const P: &str = "'/tmp/m.txt'";
+    #[cfg(windows)]
+    const P: &str = "\"/tmp/m.txt\"";
+
+    #[test]
+    fn substitute_quoted_and_bare() {
+        let path = Path::new("/tmp/m.txt");
+        assert_eq!(
+            substitute("tool \"$MERGED\"", "$MERGED", path),
+            format!("tool {P}")
+        );
+        assert_eq!(
+            substitute("tool '$MERGED'", "$MERGED", path),
+            format!("tool {P}")
+        );
+        assert_eq!(
+            substitute("tool $MERGED", "$MERGED", path),
+            format!("tool {P}")
+        );
+    }
+
+    #[test]
+    fn substitute_mixed_forms() {
+        let path = Path::new("/tmp/m.txt");
+        assert_eq!(
+            substitute("tool \"$MERGED\" '$MERGED' $MERGED", "$MERGED", path),
+            format!("tool {P} {P} {P}")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_tool_is_an_error() {
+        let result = start_sample_merge("definitely-not-a-real-tool-xyz $MERGED");
+        assert!(result.is_err());
+    }
 }

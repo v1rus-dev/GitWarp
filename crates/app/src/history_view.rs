@@ -27,7 +27,7 @@ use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD};
 use ui::theme::ThemeColors;
 use ui::{
     menu, ActiveTheme, Avatar, Button, ButtonSize, EmptyState, Icon, IconName, ListRow, MenuEntry,
-    MenuItem, Progress, RefBadge, RefKind, Skeleton, Spinner, Tooltip,
+    MenuItem, Progress, RefBadge, RefKind, Skeleton, Spinner, ToastKind, Tooltip,
 };
 
 use crate::format::{format_count, relative_time};
@@ -43,7 +43,7 @@ use crate::ref_ops::{CardRefKind, CommitCard, RefAction};
 pub(crate) type RefActionHandler = Rc<dyn Fn(RefAction, &mut Window, &mut App)>;
 use crate::settings::{GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MAX, GRAPH_WIDTH_MIN};
 use crate::theme;
-use crate::workspace::Workspace;
+use crate::workspace::{OpenGitSettings, Workspace};
 
 /// Rows are delivered to the UI in pages of this size.
 const PAGE: usize = 2_000;
@@ -99,6 +99,15 @@ const BADGE_ICON: f32 = 14.;
 const BADGE_TEXT_MIN: f32 = 80.;
 /// Relative dates are recomputed at this interval while the view is open.
 const CLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The starter file the empty history's "Add .gitignore" writes.
+const STARTER_GITIGNORE: &str = "# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+";
 
 actions!(
     gitwarp,
@@ -2371,6 +2380,34 @@ impl HistoryView {
         }
     }
 
+    /// Switches the repository view to Local changes, as the toolbar segment does.
+    fn show_local_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| workspace.show_changes(window, cx));
+        }
+    }
+
+    /// Writes the starter `.gitignore` when it is missing, then shows it as an
+    /// untracked file in Local changes.
+    fn add_gitignore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.root.clone().unwrap_or_else(|| self.path.clone());
+        let path = root.join(".gitignore");
+        if path.exists() {
+            ui::toast::show(ToastKind::Info, ".gitignore already exists", window, cx);
+        } else if let Err(error) = std::fs::write(&path, STARTER_GITIGNORE) {
+            ui::toast::show(
+                ToastKind::Error,
+                format!("Could not add a .gitignore: {error}"),
+                window,
+                cx,
+            );
+            return;
+        } else {
+            ui::toast::show(ToastKind::Ok, "Added a .gitignore", window, cx);
+        }
+        self.show_local_changes(window, cx);
+    }
+
     /// Empty repository: an invitation to make the first commit.
     fn render_no_commits(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
@@ -2383,14 +2420,16 @@ impl HistoryView {
             .child(
                 Button::primary("empty-no-commits-primary")
                     .label("Go to Local changes")
-                    .disabled(true)
-                    .tooltip("Local changes arrive in a later version"),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.show_local_changes(window, cx);
+                    })),
             )
             .child(
                 Button::new("empty-no-commits-secondary")
-                    .label("Add .gitignore…")
-                    .disabled(true)
-                    .tooltip("Local changes arrive in a later version"),
+                    .label("Add .gitignore")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_gitignore(window, cx);
+                    })),
             );
         centred(
             EmptyState::new("No commits yet")
@@ -2509,8 +2548,9 @@ impl HistoryView {
                         Button::primary("empty-git-not-found-settings")
                             .icon(IconName::Gear)
                             .label("Open Git settings")
-                            .disabled(true)
-                            .tooltip("Settings arrive in a later version"),
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                window.dispatch_action(Box::new(OpenGitSettings), cx);
+                            })),
                     )
                     .child(self.retry_git_button("empty-git-not-found-retry", cx));
                 centred(
@@ -2544,8 +2584,9 @@ impl HistoryView {
                         Button::primary("empty-git-too-old-settings")
                             .icon(IconName::Gear)
                             .label("Open Git settings")
-                            .disabled(true)
-                            .tooltip("Settings arrive in a later version"),
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                window.dispatch_action(Box::new(OpenGitSettings), cx);
+                            })),
                     )
                     .child(self.retry_git_button("empty-git-too-old-retry", cx));
                 centred(

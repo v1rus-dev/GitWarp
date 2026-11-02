@@ -152,8 +152,8 @@ pub struct SettingsView {
     /// Diff & merge: the editable merge command.
     pub(crate) merge_command: Entity<ui::TextInput>,
     pub(crate) _merge_command_events: Subscription,
-    /// Merge tool test feedback.
-    pub(crate) merge_test: Option<SharedString>,
+    /// Merge tool test feedback: the started tool or the I/O error.
+    pub(crate) merge_test: Option<Result<SharedString, SharedString>>,
 }
 
 impl SettingsView {
@@ -161,6 +161,7 @@ impl SettingsView {
         root: Option<PathBuf>,
         git: Result<Arc<Git>, Arc<Error>>,
         workspace: WeakEntity<Workspace>,
+        page: Page,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -227,7 +228,7 @@ impl SettingsView {
             root,
             git,
             workspace,
-            page: Page::General,
+            page,
             focus: cx.focus_handle().tab_stop(false),
             home: crate::format::home_dir(),
             language_changed: false,
@@ -267,6 +268,11 @@ impl SettingsView {
             merge_test: None,
         };
         view.start_git_detection(window, cx);
+        match page {
+            Page::Ssh => view.reload_ssh(cx),
+            Page::Identity => view.reload_identity(cx),
+            _ => {}
+        }
         view
     }
 
@@ -285,7 +291,7 @@ impl SettingsView {
         }
     }
 
-    fn set_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         if self.page == page {
             return;
         }
@@ -378,6 +384,7 @@ impl SettingsView {
 
     fn render_status(&self, cx: &Context<Self>) -> Div {
         let colors = cx.theme().colors;
+        let workspace = self.workspace.clone();
         div()
             .h(STATUS)
             .px(px(10.))
@@ -397,7 +404,14 @@ impl SettingsView {
                     .flex()
                     .items_center()
                     .gap(px(4.))
+                    .cursor_pointer()
+                    .hover(|this| this.bg(colors.hover))
                     .tooltip(ui::Tooltip::text(git_tooltip(&self.git)))
+                    .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        let _ = workspace.update(cx, |workspace, cx| {
+                            workspace.open_settings_at(Page::Git, window, cx)
+                        });
+                    })
                     .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
                     .child(git_label(&self.git)),
             )

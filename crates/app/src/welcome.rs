@@ -618,6 +618,7 @@ impl Render for WelcomeView {
         let client = matches!(window.window_decorations(), Decorations::Client { .. });
         let colors = cx.theme().colors;
         let git = git_label(&self.git);
+        let workspace = self.workspace.clone();
 
         let bar = titlebar(cx)
             .child(
@@ -689,7 +690,20 @@ impl Render for WelcomeView {
                             .flex()
                             .items_center()
                             .gap(px(4.))
+                            .cursor_pointer()
+                            .hover(|this| this.bg(colors.hover))
                             .tooltip(Tooltip::text(git_tooltip(&self.git)))
+                            .on_click(
+                                move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                                    let _ = workspace.update(cx, |workspace, cx| {
+                                        workspace.open_settings_at(
+                                            crate::settings_ui::Page::Git,
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                },
+                            )
                             .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
                             .child(git),
                     ),

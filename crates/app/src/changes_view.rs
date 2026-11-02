@@ -48,6 +48,8 @@ pub const BODY_LIMIT: usize = 72;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChangesEvent {
     Committed,
+    /// A commit the user asked to push succeeded; the shell starts the push.
+    PushAfterCommit,
 }
 
 /// Which side of the index a file row belongs to.
@@ -737,6 +739,15 @@ impl ChangesView {
 
     /// Commits the index, or amends HEAD, from the commit box.
     pub(crate) fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_maybe_push(false, window, cx);
+    }
+
+    /// Commits and asks the shell to push the branch once the commit lands.
+    fn commit_and_push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_maybe_push(true, window, cx);
+    }
+
+    fn commit_maybe_push(&mut self, push: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
@@ -784,7 +795,7 @@ impl ChangesView {
                 })
                 .await;
             this.update_in(cx, |view, window, cx| {
-                view.finish_commit(result, window, cx)
+                view.finish_commit(result, push, window, cx)
             })
             .ok();
         })
@@ -795,6 +806,7 @@ impl ChangesView {
     fn finish_commit(
         &mut self,
         result: Result<(String, WorkingStatus), String>,
+        push: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -808,6 +820,9 @@ impl ChangesView {
                 let previous = self.selection_path();
                 self.apply_status(status, previous, cx);
                 cx.emit(ChangesEvent::Committed);
+                if push {
+                    cx.emit(ChangesEvent::PushAfterCommit);
+                }
             }
             Err(error) => {
                 toast::show(ToastKind::Error, error, window, cx);
@@ -1586,20 +1601,26 @@ impl ChangesView {
                             .flex()
                             .flex_col()
                             .gap(px(8.))
-                            .child(
+                            .child({
+                                let commit_view = commit_view.clone();
                                 Button::primary("commit-button")
                                     .label(commit_label)
                                     .disabled(!can_commit)
                                     .on_click(move |_, window, cx| {
                                         commit_view.update(cx, |view, cx| view.commit(window, cx));
-                                    }),
-                            )
-                            .child(
+                                    })
+                            })
+                            .child({
+                                let commit_view = commit_view.clone();
                                 Button::new("commit-push-button")
                                     .label("Commit & Push")
-                                    .disabled(true)
-                                    .tooltip("Commit & Push — arrives in a later version"),
-                            ),
+                                    .disabled(!can_commit)
+                                    .on_click(move |_, window, cx| {
+                                        commit_view.update(cx, |view, cx| {
+                                            view.commit_and_push(window, cx)
+                                        });
+                                    })
+                            }),
                     ),
             )
     }

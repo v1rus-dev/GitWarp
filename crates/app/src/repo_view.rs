@@ -464,11 +464,16 @@ impl RepositoryView {
             cx.notify();
         });
         let changes = cx.new(|cx| ChangesView::new(path.clone(), git.clone(), window, cx));
-        let changes_observer = cx.subscribe(&changes, |this, _, event: &ChangesEvent, cx| {
-            if *event == ChangesEvent::Committed {
-                this.history.update(cx, |history, cx| history.reload(cx));
-            }
-        });
+        let changes_observer = cx.subscribe_in(
+            &changes,
+            window,
+            |this, _, event: &ChangesEvent, window, cx| match event {
+                ChangesEvent::Committed => {
+                    this.history.update(cx, |history, cx| history.reload(cx));
+                }
+                ChangesEvent::PushAfterCommit => this.push_branch(window, cx),
+            },
+        );
         let worktrees = cx
             .new(|cx| WorktreesView::new(path.clone(), git.clone(), workspace.clone(), window, cx));
         let worktrees_observer = cx.subscribe(&worktrees, |this, _, _: &WorktreesEvent, cx| {
@@ -652,6 +657,11 @@ impl RepositoryView {
             }
         }
         cx.notify();
+    }
+
+    /// Switches to Local changes, as the toolbar's segment does.
+    pub(crate) fn show_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view(ViewMode::Changes, window, cx);
     }
 
     /// The history view, for the search's focus hand-off and the tests.
@@ -1238,7 +1248,7 @@ impl RepositoryView {
     }
 
     /// The refs, remotes and HEAD a ref dialog needs.
-    fn ref_dialog_context(&self, cx: &Context<Self>) -> RefDialogContext {
+    fn ref_dialog_context(&self, kind: &RefDialogKind, cx: &Context<Self>) -> RefDialogContext {
         let (refs, head_oid, branch) = {
             let history = self.history.read(cx);
             let refs = history.refs().unwrap_or(&[]).to_vec();
@@ -1262,6 +1272,21 @@ impl RepositoryView {
             .sidebar_extras
             .as_ref()
             .and_then(|extras| extras.signing_key.clone());
+        // Only the Create tag dialog pushes to a remote; other dialogs skip the
+        // git spawn on the UI thread.
+        let default_remote = if matches!(kind, RefDialogKind::CreateTag { .. }) {
+            self.git
+                .as_ref()
+                .ok()
+                .and_then(|git| Repo::open(git.clone(), &self.root).ok())
+                .and_then(|repo| git_core::network::default_remote(&repo).ok().flatten())
+        } else {
+            None
+        };
+        let view = cx.entity();
+        let network: crate::ref_dialog::NetworkAction = Rc::new(move |job, window, cx| {
+            view.update(cx, |view, cx| view.start_network_job(job, window, cx));
+        });
         let changes = self.changes.read(cx);
         let dirty = changes.staged_count() + changes.unstaged_count();
         RefDialogContext {
@@ -1269,6 +1294,8 @@ impl RepositoryView {
             git: self.git.clone(),
             refs,
             remotes,
+            default_remote,
+            network: Some(network),
             signing_key,
             head_oid,
             branch,
@@ -1287,7 +1314,7 @@ impl RepositoryView {
         if let Some(previous) = self.ref_dialog.clone() {
             previous.update(cx, |dialog, cx| dialog.close(window, cx));
         }
-        let context = self.ref_dialog_context(cx);
+        let context = self.ref_dialog_context(&kind, cx);
         let view = cx.entity();
         let on_done = Rc::new(move |window: &mut Window, cx: &mut App| {
             view.update(cx, |view, cx| {
@@ -3343,6 +3370,7 @@ impl RepositoryView {
             ));
         }
 
+        let workspace = self.workspace.clone();
         bar.child(
             div()
                 .id("status-git")
@@ -3353,7 +3381,16 @@ impl RepositoryView {
                 .gap(px(4.))
                 .rounded(R_SM)
                 .text_color(colors.muted)
+                .cursor_pointer()
+                .hover(|this| this.bg(colors.hover))
                 .tooltip(Tooltip::text(self.git_tooltip.clone()))
+                .on_click(
+                    move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                        let _ = workspace.update(cx, |workspace, cx| {
+                            workspace.open_settings_at(crate::settings_ui::Page::Git, window, cx)
+                        });
+                    },
+                )
                 .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
                 .child(self.git_label.clone()),
         )

@@ -33,10 +33,13 @@ use crate::open_dialog::OpenRepoDialog;
 use crate::repo_view::{
     FocusSearch, OpenBranchSwitcher, OpenRepoSwitcher, RepositoryView, ToggleDetails, ToggleSidebar,
 };
-use crate::settings_ui::SettingsView;
+use crate::settings_ui::{Page, SettingsView};
 use crate::welcome::WelcomeView;
 
-actions!(workspace, [OpenRepositoryDialog, OpenSettings]);
+actions!(
+    workspace,
+    [OpenRepositoryDialog, OpenSettings, OpenGitSettings]
+);
 
 /// The shadow and resize border drawn around the client-side frame.
 const INSET: Pixels = px(10.);
@@ -232,17 +235,39 @@ impl Workspace {
     /// Opens Settings as a window over the current content. The repository or
     /// welcome screen stays underneath and keeps its title.
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if let Some(settings) = self.settings.clone() {
+            // Already open: keep the current page, just focus it.
+            let focus = settings.read(cx).focus_handle();
+            window.focus(&focus, cx);
+            cx.notify();
+            return;
+        }
+        self.open_settings_at(Page::General, window, cx);
+    }
+
+    /// Opens Settings on `page`; when Settings is already open, switches its
+    /// page instead of stacking a second window.
+    pub fn open_settings_at(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(settings) = self.settings.clone() {
+            settings.update(cx, |view, cx| view.set_page(page, window, cx));
+            let focus = settings.read(cx).focus_handle();
+            window.focus(&focus, cx);
+            cx.notify();
             return;
         }
         let root = self.with_repository(cx, |view, _| view.path().to_path_buf());
         let git = self.git.clone();
         let workspace = cx.weak_entity();
-        let view = cx.new(|cx| SettingsView::new(root, git, workspace, window, cx));
+        let view = cx.new(|cx| SettingsView::new(root, git, workspace, page, window, cx));
         let focus = view.read(cx).focus_handle();
         self.settings = Some(view);
         window.focus(&focus, cx);
         cx.notify();
+    }
+
+    /// Switches the open repository to its Local changes view.
+    pub fn show_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.with_repository(cx, |view, cx| view.show_changes(window, cx));
     }
 
     /// Closes the settings window, leaving the content it covered as it was.
@@ -598,6 +623,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenGitSettings, window, cx| {
+                this.open_settings_at(Page::Git, window, cx);
             }));
 
         ui::focus::track_pointer(ui::actions::tab_navigation(root))

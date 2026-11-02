@@ -680,11 +680,11 @@ fn build(state: &Entity<CloneDialog>, cx: &App) -> Dialog {
                 .child(
                     Banner::new(BannerKind::Ok, format!("Cloned {}", repo_name(&done.path))).body(
                         format!(
-                            "{} commit{} · {} branch{} · {} tag{}",
+                            "{} commit{} · {} {} · {} tag{}",
                             done.commits,
                             plural(done.commits as usize),
                             done.branches,
-                            plural(done.branches),
+                            branch_word(done.branches),
                             done.tags,
                             plural(done.tags)
                         ),
@@ -976,6 +976,14 @@ fn plural(count: usize) -> &'static str {
         ""
     } else {
         "s"
+    }
+}
+
+fn branch_word(count: usize) -> &'static str {
+    if count == 1 {
+        "branch"
+    } else {
+        "branches"
     }
 }
 
