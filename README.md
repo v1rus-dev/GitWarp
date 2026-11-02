@@ -47,7 +47,8 @@ the log, status and anything that must keep hooks, credentials, LFS or
 signing still run a `git` executable (minimum version 2.31). `GitEngine::Cli`
 is the old `git rev-parse` discovery, kept so the two can be compared.
 
-The workspace MSRV is 1.88 because `gix` 0.90 requires it.
+The workspace MSRV is 1.89: `uuid` 1.29 (via GPUI) and `aes` 0.9 (via the Linux
+keychain store) require it; `gix` 0.90 alone needs 1.88.
 
 Pick the executable with `--git <auto|system|bundled|PATH>` or the
 `GITWARP_GIT` environment variable (the flag wins); the default `auto` uses

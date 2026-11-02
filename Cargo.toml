@@ -19,7 +19,7 @@ default-members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 git-graph = { path = "crates/git-graph" }
@@ -27,8 +27,8 @@ git-core = { path = "crates/git-core" }
 forge = { path = "crates/forge" }
 ui = { path = "crates/ui" }
 
-# In-process git. `gix` 0.90 needs Rust 1.88, which is why the workspace
-# MSRV moved off 1.85. Default features stay off: discovery and the reads
+# In-process git. `gix` 0.90 needs Rust 1.88 (the workspace MSRV is 1.89 for
+# `uuid` 1.29 and `aes` 0.9 in the lock). Default features stay off: discovery and the reads
 # migrated so far only need hashing and a `Send` repository handle.
 gix = { version = "0.90", default-features = false, features = ["parallel", "sha1"] }
 
