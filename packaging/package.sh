@@ -81,7 +81,8 @@ case "$os" in
         app="$stage/GitWarp.app"
         mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
         # CFBundleVersion must be numeric (dot-separated), so a pre-release suffix is dropped there.
-        sed -e "s/@VERSION@/$version/g" -e "s/@BUILD_VERSION@/${version%%-*}/g" \
+        # LC_ALL=C: BSD sed rejects the UTF-8 "©" in the template under some locales.
+        LC_ALL=C sed -e "s/@VERSION@/$version/g" -e "s/@BUILD_VERSION@/${version%%-*}/g" \
             "$script_dir/macos/Info.plist" >"$app/Contents/Info.plist"
         install -m 755 "$binary" "$app/Contents/MacOS/gitwarp"
         cp -a "$bundle_dir/git" "$app/Contents/Resources/git"

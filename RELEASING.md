@@ -20,6 +20,10 @@ The workflow fails if the tag does not match the version in `Cargo.toml`.
 ## Pre-releases
 
 A version with a suffix, e.g. `scripts/release.sh 0.2.0-rc.1`, is published marked as a pre-release.
+Cut a pre-release first whenever the publish path itself changed (and for the very first release): the publish job
+only runs for tags, so pull-request and manual dry runs never exercise it.
+
+The workflow refuses tags whose commit is not on `main`.
 
 ## Dry run
 

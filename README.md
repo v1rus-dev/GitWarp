@@ -94,7 +94,9 @@ may warn about an unknown publisher: click **More info**, then **Run anyway**.
 **macOS**
 
 Unzip the archive and move `GitWarp.app` to Applications. The app is not signed with
-a developer certificate, so on the first launch right-click it and choose **Open**, or run:
+a developer certificate or notarized, so macOS blocks the first launch. Open
+**System Settings → Privacy & Security** and click **Open Anyway** next to the GitWarp message,
+or remove the quarantine flag in a terminal:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/GitWarp.app
