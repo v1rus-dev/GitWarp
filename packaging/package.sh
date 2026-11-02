@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Build one release archive for GitWarp.
 #
-#   packaging/package.sh <linux|windows|macos> <git-bundle-dir> <out-dir>
+#   packaging/package.sh <linux|windows|macos> <bundle-dir> <out-dir>
 #
-# <git-bundle-dir> is the directory that CONTAINS git/ (the <out-dir> of
-# packaging/git/fetch-or-build.sh). The binary is taken from target/release/
+# <bundle-dir> is the directory that CONTAINS git/ (the <out-dir> of
+# packaging/git/fetch-or-build.sh) and THIRD-PARTY-LICENSES.html (the <out-dir>
+# of packaging/licenses.sh). The binary is taken from target/release/
 # (or $CARGO_TARGET_DIR/release/). Prints the path of the produced archive.
 set -euo pipefail
 
@@ -13,7 +14,7 @@ die() {
     exit 1
 }
 
-[ $# -eq 3 ] || die "usage: package.sh <linux|windows|macos> <git-bundle-dir> <out-dir>"
+[ $# -eq 3 ] || die "usage: package.sh <linux|windows|macos> <bundle-dir> <out-dir>"
 os="$1"
 bundle_dir="$2"
 out_dir="$3"
@@ -34,6 +35,8 @@ case "$os" in
 esac
 [ -f "$binary" ] || die "binary not found: $binary (run: cargo build --release -p app)"
 [ -d "$bundle_dir/git" ] || die "git bundle not found: $bundle_dir/git (run packaging/git/fetch-or-build.sh)"
+[ -f "$bundle_dir/THIRD-PARTY-LICENSES.html" ] \
+    || die "third-party licences not found: $bundle_dir/THIRD-PARTY-LICENSES.html (run packaging/licenses.sh)"
 
 mkdir -p "$out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
@@ -41,7 +44,7 @@ stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 
 copy_licences() {
-    cp "$repo_root/LICENSE-MIT" "$repo_root/LICENSE-APACHE" "$1/"
+    cp "$repo_root/LICENSE-MIT" "$repo_root/LICENSE-APACHE" "$bundle_dir/THIRD-PARTY-LICENSES.html" "$1/"
 }
 
 case "$os" in

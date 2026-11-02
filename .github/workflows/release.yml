@@ -11,6 +11,8 @@ on:
       - .github/workflows/release.yml
       - packaging/**
       - scripts/release.sh
+      - about.toml
+      - about.hbs
 
 permissions:
   contents: read
@@ -99,6 +101,14 @@ jobs:
         env:
           GITWARP_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: cargo build --release -p app --locked
+
+      - name: Third-party licences
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo install --locked cargo-about --version 0.9.3 --features cli
+          packaging/licenses.sh "$TARGET" bundle
 
       - name: Bundle git
         shell: bash

@@ -182,5 +182,8 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual
 licensed as above, without any additional terms or conditions.
 
+The licences of the Rust crates compiled into GitWarp are listed in `THIRD-PARTY-LICENSES.html`
+inside every release archive.
+
 The bundled git is licensed under the GPLv2 and runs as a separate program; see
 [packaging/git/README.md](packaging/git/README.md).
