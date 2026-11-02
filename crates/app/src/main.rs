@@ -31,6 +31,7 @@ mod syntax;
 mod test_support;
 mod text_runs;
 mod theme;
+mod web_links;
 mod welcome;
 mod welcome_activity;
 mod workspace;

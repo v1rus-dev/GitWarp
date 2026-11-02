@@ -20,6 +20,7 @@
   "sidebar.menu.manage_worktrees": "Gestionar árboles de trabajo…",
   "sidebar.menu.merge_into": "Fusionar {name} en {head}",
   "sidebar.menu.open_in_new_window": "Abrir en una nueva ventana",
+  "sidebar.menu.open_on_host": "Abrir en {service}",
   "sidebar.menu.pop_stash": "Aplicar y eliminar stash",
   "sidebar.menu.prune_missing_worktrees": "Podar árboles de trabajo ausentes",
   "sidebar.menu.prune_stale_remote_branches": "Podar ramas remotas obsoletas",

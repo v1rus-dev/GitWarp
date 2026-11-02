@@ -74,6 +74,8 @@
   "history.menu.checkout_commit": "Переключиться на этот коммит",
   "history.menu.cherry_pick": "Cherry-pick",
   "history.menu.copy_hash": "Копировать хеш коммита",
+  "history.menu.open_on_host": "Открыть на {service}",
+  "history.menu.open_on_host_remote": "Открыть на {service} ({remote})",
   "history.menu.create_branch_here": "Создать ветку здесь…",
   "history.menu.create_tag_here": "Создать тег здесь…",
   "history.menu.remote_tag": "remote",

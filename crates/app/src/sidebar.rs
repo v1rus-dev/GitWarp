@@ -25,6 +25,7 @@ use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{Button, Chip, CountPill, Icon, IconName, Skeleton, Tooltip, TreeNodeData};
 
 use crate::remote_accounts::{self, RemoteDisplay, RemoteTargets};
+use crate::web_links::{self, HostLink};
 use crate::worktree_glyphs::{main_worktree_tip, worktree_glyphs};
 use crate::worktrees_model::WorktreeEntry;
 
@@ -215,6 +216,11 @@ pub enum SidebarAction {
     None,
     /// Writes this text to the clipboard.
     CopyText(String),
+    /// Opens `url` in the browser and toasts that `host` was opened.
+    OpenUrl {
+        url: String,
+        host: String,
+    },
     /// Reloads the sidebar's lists ([`RepositoryView::refresh`]).
     ///
     /// [`RepositoryView::refresh`]: crate::repo_view::RepositoryView::refresh
@@ -375,6 +381,41 @@ pub fn sidebar_menu(
     extras: Option<&SidebarExtras>,
     refs: Option<&[Ref]>,
 ) -> Vec<SidebarMenuEntry> {
+    sidebar_menu_with_links(key, head, extras, refs, &[])
+}
+
+/// "Open on <Service>" for `target` on the host of `link`; `None` when the
+/// service has no such page.
+fn open_item(link: &HostLink, target: &forge::WebTarget) -> Option<SidebarMenuEntry> {
+    let url = link.url(target)?;
+    Some(
+        item(
+            &ui::t!("sidebar.menu.open_on_host", service = link.service_name()),
+            IconName::External,
+        )
+        .action(SidebarAction::OpenUrl {
+            url,
+            host: link.host().to_owned(),
+        }),
+    )
+}
+
+/// [`sidebar_menu`] plus the "Open on <Service>" items of the repository's
+/// hosts (`links`, see [`web_links::host_links`]); an empty list hides them.
+pub fn sidebar_menu_with_links(
+    key: &str,
+    head: Option<&Head>,
+    extras: Option<&SidebarExtras>,
+    refs: Option<&[Ref]>,
+    links: &[HostLink],
+) -> Vec<SidebarMenuEntry> {
+    let targets: &[RemoteTargets] = extras.map_or(&[], |e| &e.remote_targets);
+    // The branch's own page on its host; hidden without a host, and for a
+    // local branch without an upstream.
+    let branch_open = |key: &str| {
+        let (link, target) = web_links::branch_target(links, targets, refs.unwrap_or(&[]), key)?;
+        open_item(link, &target)
+    };
     let head = match head {
         Some(Head::Branch { name, .. }) => name.as_str(),
         Some(Head::Detached(_)) | None => "HEAD",
@@ -384,7 +425,7 @@ pub fn sidebar_menu(
     // stay shown-but-disabled.
     if let Some(name) = key.strip_prefix("local:") {
         let current = name == head;
-        return vec![
+        let mut entries = vec![
             item(&ui::t!("sidebar.menu.checkout"), IconName::Check)
                 .shortcut("Enter")
                 .maybe_action((!current).then(|| SidebarAction::CheckoutBranch(name.to_owned()))),
@@ -412,12 +453,19 @@ pub fn sidebar_menu(
                 .shortcut("Del")
                 .maybe_action((!current).then(|| SidebarAction::DeleteBranch(name.to_owned()))),
             SidebarMenuEntry::Separator,
+        ];
+        if let Some(open) = branch_open(key) {
+            entries.push(open);
+            entries.push(SidebarMenuEntry::Separator);
+        }
+        entries.push(
             item(&ui::t!("sidebar.menu.copy_branch_name"), IconName::Copy)
                 .action(SidebarAction::CopyText(name.to_owned())),
-        ];
+        );
+        return entries;
     }
     if let Some(name) = key.strip_prefix("rbranch:") {
-        return vec![
+        let mut entries = vec![
             item(
                 &ui::t!("sidebar.menu.checkout_as_local_branch"),
                 IconName::Check,
@@ -440,9 +488,18 @@ pub fn sidebar_menu(
             )
             .danger()
             .action(SidebarAction::DeleteRemoteBranch(name.to_owned())),
+        ];
+        // Set apart from the group above only when there is something to set apart.
+        if let Some(open) = branch_open(key) {
+            entries.push(SidebarMenuEntry::Separator);
+            entries.push(open);
+            entries.push(SidebarMenuEntry::Separator);
+        }
+        entries.push(
             item(&ui::t!("sidebar.menu.copy_branch_name"), IconName::Copy)
                 .action(SidebarAction::CopyText(name.to_owned())),
-        ];
+        );
+        return entries;
     }
     if let Some(name) = key.strip_prefix("tag:") {
         let target = refs.and_then(|refs| {
@@ -450,7 +507,7 @@ pub fn sidebar_menu(
                 .find(|r| r.kind == RefKind::Tag && r.name == name)
                 .map(|r| r.target)
         });
-        return vec![
+        let mut entries = vec![
             item(&ui::t!("sidebar.menu.checkout"), IconName::Check)
                 .shortcut("Enter")
                 .action(SidebarAction::CheckoutTag(name.to_owned())),
@@ -459,6 +516,16 @@ pub fn sidebar_menu(
             item(&ui::t!("sidebar.menu.push_tag_to_origin"), IconName::Up)
                 .action(SidebarAction::PushTag(name.to_owned())),
             SidebarMenuEntry::Separator,
+        ];
+        // Tags are opened on the first host (the upstream's, else origin's).
+        if let Some(open) = links
+            .first()
+            .and_then(|link| open_item(link, &forge::WebTarget::Tag(name.to_owned())))
+        {
+            entries.push(open);
+            entries.push(SidebarMenuEntry::Separator);
+        }
+        entries.extend([
             item(&ui::t!("sidebar.menu.rename_tag"), IconName::Edit)
                 .shortcut("F2")
                 .action(SidebarAction::RenameTag(name.to_owned())),
@@ -466,7 +533,8 @@ pub fn sidebar_menu(
                 .danger()
                 .shortcut("Del")
                 .action(SidebarAction::DeleteTag(name.to_owned())),
-        ];
+        ]);
+        return entries;
     }
     if let Some(index) = key.strip_prefix("stash:") {
         let index = index.parse::<usize>().ok();
@@ -488,7 +556,7 @@ pub fn sidebar_menu(
         let multi_push = extras
             .and_then(|extras| extras.remote_targets.iter().find(|t| t.name == name))
             .is_some_and(remote_accounts::is_multi_push);
-        return vec![
+        let mut entries = vec![
             item(&ui::t!("sidebar.menu.fetch"), IconName::Fetch)
                 .action(SidebarAction::FetchRemote(name.to_owned())),
             item(&ui::t!("sidebar.menu.edit_remote"), IconName::Edit)
@@ -501,12 +569,18 @@ pub fn sidebar_menu(
                 item(&ui::t!("sidebar.menu.account"), IconName::User)
                     .action(SidebarAction::RemoteAccount(name.to_owned()))
             },
-            SidebarMenuEntry::Separator,
-            item(&ui::t!("sidebar.menu.remove_remote"), IconName::Trash)
+        ];
+        // The repository page of the remote's own host.
+        let remote_link = links.iter().find(|link| link.fetches(name));
+        entries.extend(remote_link.and_then(|link| open_item(link, &forge::WebTarget::Repo)));
+        entries.push(SidebarMenuEntry::Separator);
+        entries.extend(
+            [item(&ui::t!("sidebar.menu.remove_remote"), IconName::Trash)
                 .danger()
                 .shortcut("Del")
-                .action(SidebarAction::RemoveRemote(name.to_owned())),
-        ];
+                .action(SidebarAction::RemoveRemote(name.to_owned()))],
+        );
+        return entries;
     }
     if let Some(path) = key.strip_prefix("wt:") {
         let locked = extras
@@ -2735,6 +2809,163 @@ mod tests {
                 SidebarMenuEntry::Separator => "—",
             })
             .collect()
+    }
+
+    fn hosted_ref(name: &str, kind: RefKind, upstream: Option<&str>) -> Ref {
+        Ref {
+            full_name: format!("refs/{name}"),
+            name: name.to_owned(),
+            kind,
+            target: oid_of(0x01),
+            upstream: upstream.map(str::to_owned),
+            ahead: 0,
+            behind: 0,
+            upstream_gone: false,
+        }
+    }
+
+    fn hosted_extras(urls: &[(&str, &str)]) -> SidebarExtras {
+        SidebarExtras {
+            remote_targets: urls
+                .iter()
+                .map(|(name, url)| RemoteTargets {
+                    name: (*name).to_owned(),
+                    fetch_url: (*url).to_owned(),
+                    push_urls: vec![(*url).to_owned()],
+                })
+                .collect(),
+            ..SidebarExtras::default()
+        }
+    }
+
+    #[test]
+    fn open_on_host_items_follow_the_design_order() {
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: None,
+        };
+        let extras = hosted_extras(&[("origin", "git@github.com:o/r.git")]);
+        let refs = [
+            hosted_ref("main", RefKind::LocalBranch, Some("origin/main")),
+            hosted_ref("loose", RefKind::LocalBranch, None),
+            hosted_ref("v1", RefKind::Tag, None),
+        ];
+        let links = web_links::host_links(&[], &extras.remote_targets, None);
+        let menu = |key: &str| {
+            sidebar_menu_with_links(key, Some(&head), Some(&extras), Some(&refs), &links)
+        };
+        let labels = |key: &str| {
+            menu(key)
+                .iter()
+                .map(|entry| match entry {
+                    SidebarMenuEntry::Item(item) => item.label.clone(),
+                    SidebarMenuEntry::Separator => "—".to_owned(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let local = labels("local:main");
+        assert_eq!(
+            local[local.len() - 4..],
+            ["—", "Open on GitHub", "—", "Copy branch name"]
+        );
+        // No upstream, no page on the host.
+        assert!(!labels("local:loose")
+            .iter()
+            .any(|l| l.starts_with("Open on")));
+        assert_eq!(
+            labels("rbranch:origin/dev")[3..],
+            [
+                "—",
+                "Delete remote branch…",
+                "—",
+                "Open on GitHub",
+                "—",
+                "Copy branch name"
+            ]
+        );
+        let tag = labels("tag:v1");
+        assert_eq!(
+            tag[2..],
+            [
+                "Push tag to origin",
+                "—",
+                "Open on GitHub",
+                "—",
+                "Rename tag…",
+                "Delete tag"
+            ]
+        );
+        assert_eq!(
+            labels("remote:origin"),
+            [
+                "Fetch",
+                "Edit remote…",
+                "—",
+                "Account…",
+                "Open on GitHub",
+                "—",
+                "Remove remote"
+            ]
+        );
+
+        let open = |key: &str| {
+            menu(key).into_iter().find_map(|entry| match entry {
+                SidebarMenuEntry::Item(item) => match item.action {
+                    SidebarAction::OpenUrl { url, host } => Some((url, host)),
+                    _ => None,
+                },
+                SidebarMenuEntry::Separator => None,
+            })
+        };
+        let github = |url: &str| Some((url.to_owned(), "github.com".to_owned()));
+        assert_eq!(
+            open("local:main"),
+            github("https://github.com/o/r/tree/main")
+        );
+        assert_eq!(
+            open("rbranch:origin/dev"),
+            github("https://github.com/o/r/tree/dev")
+        );
+        assert_eq!(
+            open("tag:v1"),
+            github("https://github.com/o/r/releases/tag/v1")
+        );
+        assert_eq!(open("remote:origin"), github("https://github.com/o/r"));
+    }
+
+    #[test]
+    fn without_a_known_host_the_menus_are_unchanged() {
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: None,
+        };
+        let extras = hosted_extras(&[("origin", "https://git.corp.example/o/r.git")]);
+        let refs = [hosted_ref(
+            "main",
+            RefKind::LocalBranch,
+            Some("origin/main"),
+        )];
+        let links = web_links::host_links(&[], &extras.remote_targets, None);
+        assert!(links.is_empty());
+        for key in [
+            "local:main",
+            "rbranch:origin/main",
+            "tag:v1",
+            "remote:origin",
+        ] {
+            assert_eq!(
+                menu_labels(&sidebar_menu_with_links(
+                    key,
+                    Some(&head),
+                    Some(&extras),
+                    Some(&refs),
+                    &links
+                )),
+                menu_labels(&sidebar_menu(key, Some(&head), Some(&extras), Some(&refs))),
+                "{key}"
+            );
+        }
     }
 
     #[test]

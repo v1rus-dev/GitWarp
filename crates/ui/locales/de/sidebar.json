@@ -20,6 +20,7 @@
   "sidebar.menu.manage_worktrees": "Worktrees verwalten…",
   "sidebar.menu.merge_into": "{name} in {head} mergen",
   "sidebar.menu.open_in_new_window": "In neuem Fenster öffnen",
+  "sidebar.menu.open_on_host": "Auf {service} öffnen",
   "sidebar.menu.pop_stash": "Stash anwenden und entfernen",
   "sidebar.menu.prune_missing_worktrees": "Fehlende Worktrees bereinigen",
   "sidebar.menu.prune_stale_remote_branches": "Veraltete Remote-Branches bereinigen",

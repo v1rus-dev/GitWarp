@@ -20,6 +20,7 @@
   "sidebar.menu.manage_worktrees": "Manage worktrees…",
   "sidebar.menu.merge_into": "Merge {name} into {head}",
   "sidebar.menu.open_in_new_window": "Open in new window",
+  "sidebar.menu.open_on_host": "Open on {service}",
   "sidebar.menu.pop_stash": "Pop stash",
   "sidebar.menu.prune_missing_worktrees": "Prune missing worktrees",
   "sidebar.menu.prune_stale_remote_branches": "Prune stale remote branches",

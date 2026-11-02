@@ -20,6 +20,7 @@
   "sidebar.menu.manage_worktrees": "Gérer les arbres de travail…",
   "sidebar.menu.merge_into": "Fusionner {name} dans {head}",
   "sidebar.menu.open_in_new_window": "Ouvrir dans une nouvelle fenêtre",
+  "sidebar.menu.open_on_host": "Ouvrir sur {service}",
   "sidebar.menu.pop_stash": "Appliquer et retirer le remisage",
   "sidebar.menu.prune_missing_worktrees": "Élaguer les arbres de travail manquants",
   "sidebar.menu.prune_stale_remote_branches": "Élaguer les branches distantes obsolètes",

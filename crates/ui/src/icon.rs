@@ -57,11 +57,12 @@ pub enum IconName {
     Lock,
     Palette,
     Github,
+    External,
 }
 
 impl IconName {
-    /// All 48 icons, in the design's order.
-    pub const ALL: [IconName; 48] = [
+    /// All 49 icons, in the design's order.
+    pub const ALL: [IconName; 49] = [
         Self::Branch,
         Self::Tag,
         Self::Cloud,
@@ -110,6 +111,7 @@ impl IconName {
         Self::Lock,
         Self::Palette,
         Self::Github,
+        Self::External,
     ];
 
     /// Asset path, e.g. `icons/chev-r.svg`.
@@ -163,6 +165,7 @@ impl IconName {
             Self::Lock => "icons/lock.svg",
             Self::Palette => "icons/palette.svg",
             Self::Github => "icons/github.svg",
+            Self::External => "icons/external.svg",
         }
     }
 }

@@ -559,3 +559,68 @@ fn web_urls_encoding() {
         "https://dev.azure.com/org/project/_git/repo?version=GBfeat/my%20branch%231"
     );
 }
+
+fn blame(rev: &str, path: &str) -> WebTarget {
+    WebTarget::Blame {
+        rev: rev.into(),
+        path: path.into(),
+    }
+}
+
+#[test]
+fn blame_urls_per_service() {
+    let t = |kind, host: &str, ns: &[&str]| {
+        let i = inst(kind, host);
+        let c = coords(ns, "r");
+        try_web_url(&i, &c, &blame("abc", "src/a.rs"))
+    };
+    assert_eq!(
+        t(ServiceKind::GitHub, "github.com", &["o"]).as_deref(),
+        Some("https://github.com/o/r/blame/abc/src/a.rs")
+    );
+    assert_eq!(
+        t(ServiceKind::GitLab, "gitlab.com", &["g", "s"]).as_deref(),
+        Some("https://gitlab.com/g/s/r/-/blame/abc/src/a.rs")
+    );
+    assert_eq!(
+        t(ServiceKind::Gitea, "codeberg.org", &["o"]).as_deref(),
+        Some("https://codeberg.org/o/r/blame/commit/abc/src/a.rs")
+    );
+    assert_eq!(
+        t(ServiceKind::Bitbucket, "bitbucket.org", &["w"]).as_deref(),
+        Some("https://bitbucket.org/w/r/annotate/abc/src/a.rs")
+    );
+}
+
+#[test]
+fn blame_on_azure_has_no_page() {
+    let i = inst(ServiceKind::AzureDevOps, "dev.azure.com");
+    let c = coords(&["org", "project"], "repo");
+    assert_eq!(try_web_url(&i, &c, &blame("abc", "a.rs")), None);
+    // `web_url` stays total: the file page stands in.
+    assert_eq!(
+        web_url(&i, &c, &blame("abc", "a.rs")),
+        web_url(&i, &c, &file("abc", "a.rs"))
+    );
+    assert!(try_web_url(&i, &c, &file("abc", "a.rs")).is_some());
+}
+
+#[test]
+fn blame_urls_encode_the_path() {
+    let gh = inst(ServiceKind::GitHub, "github.com");
+    let c = coords(&["o"], "r");
+    assert_eq!(
+        web_url(&gh, &c, &blame("abc", "my dir/a#b/файл.rs")),
+        "https://github.com/o/r/blame/abc/my%20dir/a%23b/%D1%84%D0%B0%D0%B9%D0%BB.rs"
+    );
+}
+
+#[test]
+fn web_urls_never_carry_remote_credentials() {
+    let remote = RemoteRef::parse("https://user:pass@github.com/o/r.git").unwrap();
+    let i = inst(ServiceKind::GitHub, "github.com");
+    let c = i.matches(&remote).unwrap();
+    let url = web_url(&i, &c, &WebTarget::Commit("abc".into()));
+    assert_eq!(url, "https://github.com/o/r/commit/abc");
+    assert!(!url.contains("user") && !url.contains("pass") && !url.contains('@'));
+}

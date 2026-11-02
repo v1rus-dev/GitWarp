@@ -31,4 +31,4 @@ pub use instance::{known_kind_for_host, Instance, InstanceError, PUBLIC_INSTANCE
 pub use kind::ServiceKind;
 pub use remote::{RemoteRef, RepoCoords, Transport};
 pub use resolve::{resolve, resolve_with, AccountRef, Resolution};
-pub use web::{web_url, WebTarget};
+pub use web::{try_web_url, web_url, WebTarget};

@@ -64,6 +64,8 @@
   "history.menu.checkout_commit": "このコミットをチェックアウト",
   "history.menu.cherry_pick": "チェリーピック",
   "history.menu.copy_hash": "コミットハッシュをコピー",
+  "history.menu.open_on_host": "{service} で開く",
+  "history.menu.open_on_host_remote": "{service} で開く（{remote}）",
   "history.menu.create_branch_here": "ここにブランチを作成…",
   "history.menu.create_tag_here": "ここにタグを作成…",
   "history.menu.remote_tag": "リモート",

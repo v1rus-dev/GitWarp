@@ -9,13 +9,24 @@ pub enum WebTarget {
     Commit(String),
     Branch(String),
     Tag(String),
-    File { rev: String, path: String },
+    File {
+        rev: String,
+        path: String,
+    },
+    /// The line-by-line history of a file at `rev`. Azure DevOps has no such
+    /// page, see [`try_web_url`].
+    Blame {
+        rev: String,
+        path: String,
+    },
     PullRequest(u64),
 }
 
 /// Browser URL of `target` in the repository `coords` on `instance`.
 /// Branch, tag and file names are percent-encoded per segment.
 /// Bitbucket Server uses the Bitbucket Cloud layout (spec covers cloud only).
+/// A blame target on Azure DevOps (no blame page) falls back to the file page;
+/// use [`try_web_url`] to tell the two apart.
 pub fn web_url(instance: &Instance, coords: &RepoCoords, target: &WebTarget) -> String {
     let project = project_url(instance, coords);
     match instance.kind {
@@ -23,8 +34,26 @@ pub fn web_url(instance: &Instance, coords: &RepoCoords, target: &WebTarget) -> 
         ServiceKind::GitLab => format!("{project}{}", gitlab(target)),
         ServiceKind::Gitea => format!("{project}{}", gitea(target)),
         ServiceKind::Bitbucket => format!("{project}{}", bitbucket(target)),
-        ServiceKind::AzureDevOps => format!("{project}{}", azure(target)),
+        ServiceKind::AzureDevOps => match target {
+            WebTarget::Blame { rev, path } => {
+                let file = WebTarget::File {
+                    rev: rev.clone(),
+                    path: path.clone(),
+                };
+                format!("{project}{}", azure(&file))
+            }
+            _ => format!("{project}{}", azure(target)),
+        },
     }
+}
+
+/// Like [`web_url`], but `None` when the service has no page for `target`
+/// (blame on Azure DevOps).
+pub fn try_web_url(instance: &Instance, coords: &RepoCoords, target: &WebTarget) -> Option<String> {
+    if instance.kind == ServiceKind::AzureDevOps && matches!(target, WebTarget::Blame { .. }) {
+        return None;
+    }
+    Some(web_url(instance, coords, target))
 }
 
 fn project_url(instance: &Instance, coords: &RepoCoords) -> String {
@@ -50,6 +79,9 @@ fn github(t: &WebTarget) -> String {
         WebTarget::File { rev, path } => {
             format!("/blob/{}/{}", encode_path(rev), encode_path(path))
         }
+        WebTarget::Blame { rev, path } => {
+            format!("/blame/{}/{}", encode_path(rev), encode_path(path))
+        }
         WebTarget::PullRequest(n) => format!("/pull/{n}"),
     }
 }
@@ -62,6 +94,9 @@ fn gitlab(t: &WebTarget) -> String {
         WebTarget::Tag(tag) => format!("/-/tags/{}", encode_path(tag)),
         WebTarget::File { rev, path } => {
             format!("/-/blob/{}/{}", encode_path(rev), encode_path(path))
+        }
+        WebTarget::Blame { rev, path } => {
+            format!("/-/blame/{}/{}", encode_path(rev), encode_path(path))
         }
         WebTarget::PullRequest(n) => format!("/-/merge_requests/{n}"),
     }
@@ -76,6 +111,9 @@ fn gitea(t: &WebTarget) -> String {
         WebTarget::File { rev, path } => {
             format!("/src/commit/{}/{}", encode_path(rev), encode_path(path))
         }
+        WebTarget::Blame { rev, path } => {
+            format!("/blame/commit/{}/{}", encode_path(rev), encode_path(path))
+        }
         WebTarget::PullRequest(n) => format!("/pulls/{n}"),
     }
 }
@@ -87,6 +125,9 @@ fn bitbucket(t: &WebTarget) -> String {
         WebTarget::Branch(b) => format!("/branch/{}", encode_path(b)),
         WebTarget::Tag(tag) => format!("/src/{}", encode_path(tag)),
         WebTarget::File { rev, path } => format!("/src/{}/{}", encode_path(rev), encode_path(path)),
+        WebTarget::Blame { rev, path } => {
+            format!("/annotate/{}/{}", encode_path(rev), encode_path(path))
+        }
         WebTarget::PullRequest(n) => format!("/pull-requests/{n}"),
     }
 }
@@ -104,6 +145,8 @@ fn azure(t: &WebTarget) -> String {
                 encode_path(rev)
             )
         }
+        // No blame page; `web_url` rewrites it to a File target first.
+        WebTarget::Blame { .. } => String::new(),
         WebTarget::PullRequest(n) => format!("/pullrequest/{n}"),
     }
 }

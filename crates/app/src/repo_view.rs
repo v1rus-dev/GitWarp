@@ -27,9 +27,9 @@ use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
 use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    menu, toast, Avatar, Button, CountPill, Counter, FileRow, Icon, IconName, MenuEntry, MenuItem,
-    Scrollbar, SearchField, SegmentItem, Segmented, Skeleton, Spinner, Splitter, TextInput,
-    TextInputEvent, Tooltip, Tree, TreeNodeData,
+    menu, toast, Avatar, Button, ButtonSize, CountPill, Counter, FileRow, Icon, IconName,
+    MenuEntry, MenuItem, Scrollbar, SearchField, SegmentItem, Segmented, Skeleton, Spinner,
+    Splitter, TextInput, TextInputEvent, Tooltip, Tree, TreeNodeData,
 };
 
 use crate::activity_strip::ActivityStrip;
@@ -52,11 +52,12 @@ use crate::settings::{
 use crate::settings_ui::account_dialog::{self, Open as AccountOpen};
 use crate::settings_ui::accounts::open_picker;
 use crate::sidebar::{
-    commit_for, read_sidebar_extras, shortcut_action, sidebar_menu, sidebar_nodes_with,
+    commit_for, read_sidebar_extras, shortcut_action, sidebar_menu_with_links, sidebar_nodes_with,
     worktree_menu, worktree_panel_rows, Expansion, PanelEvent, PanelState, RemoteDisplays,
     SidebarAction, SidebarExtras, SidebarMenuEntry, WorktreeAction, WorktreePanel,
 };
 use crate::syntax::{self, HighlightSpan, Highlighted, Token};
+use crate::web_links::{self, HostLink};
 use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
@@ -1207,13 +1208,15 @@ impl RepositoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let links = self.host_links(cx);
         let model = {
             let history = self.history.read(cx);
-            sidebar_menu(
+            sidebar_menu_with_links(
                 key,
                 history.head(),
                 self.sidebar_extras.as_ref(),
                 history.refs(),
+                &links,
             )
         };
         if model.is_empty() {
@@ -1265,6 +1268,7 @@ impl RepositoryView {
             SidebarAction::CopyText(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
+            SidebarAction::OpenUrl { url, host } => self.open_on_host(&url, &host, window, cx),
             SidebarAction::Refresh => {
                 self.refresh(cx);
                 self.worktrees
@@ -1665,6 +1669,49 @@ impl RepositoryView {
                 });
             }
         }
+    }
+
+    /// The hosts the remotes point at (see [`web_links::host_links`]), the
+    /// current branch's upstream first. Pure: no network, no keychain.
+    fn host_links(&self, cx: &App) -> Vec<HostLink> {
+        let Some(extras) = self.sidebar_extras.as_ref() else {
+            return Vec::new();
+        };
+        let (accounts, _) = self.account_settings(cx);
+        let history = self.history.read(cx);
+        let preferred = web_links::upstream_remote(
+            history.head(),
+            history.refs().unwrap_or(&[]),
+            &extras.remote_targets,
+        );
+        web_links::host_links(
+            &remote_accounts::account_refs(&accounts),
+            &extras.remote_targets,
+            preferred.as_deref(),
+        )
+    }
+
+    /// Opens `url` in the browser and says which host it was.
+    fn open_on_host(&mut self, url: &str, host: &str, window: &mut Window, cx: &mut Context<Self>) {
+        cx.open_url(url);
+        toast::show(
+            ui::ToastKind::Info,
+            ui::t!("repo.toast.opened_host", host = host),
+            window,
+            cx,
+        );
+    }
+
+    /// Copies `url` to the clipboard and confirms with `message`.
+    fn copy_link(
+        &mut self,
+        url: String,
+        message: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(ClipboardItem::new_string(url));
+        toast::show(ui::ToastKind::Ok, message, window, cx);
     }
 
     /// The configured accounts and this repository's remembered choices.
@@ -2851,6 +2898,9 @@ impl RepositoryView {
                 });
             }
         }
+        let targets = extras.remote_targets.clone();
+        self.history
+            .update(cx, |history, _| history.set_remote_targets(targets));
         self.sidebar_extras = Some(extras);
         cx.notify();
     }
@@ -4313,6 +4363,7 @@ impl RepositoryView {
             row
         };
 
+        let tools = self.render_host_tools(details.id.to_string(), cx);
         column
             .child(
                 div()
@@ -4330,7 +4381,139 @@ impl RepositoryView {
                     .child(meta_row(ui::t!("repo.details.hash"), hash, colors))
                     .child(meta_row(ui::t!("repo.details.parents"), parents, colors)),
             )
+            .children(tools)
             .into_any_element()
+    }
+
+    /// "Open on <Service>" and "Copy link" for the commit, under its metadata;
+    /// none when no remote points at a known host.
+    fn render_host_tools(&self, sha: String, cx: &mut Context<Self>) -> Option<Div> {
+        let links = self.host_links(cx);
+        let link = links.first()?;
+        let url = link.url(&forge::WebTarget::Commit(sha))?;
+        let host = link.host().to_owned();
+        let view = cx.entity();
+        let copy_view = view.clone();
+        let copy_url = url.clone();
+        Some(
+            div()
+                .mt(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    Button::new("details-open-on-host")
+                        .size(ButtonSize::Small)
+                        .icon(IconName::External)
+                        .label(ui::t!(
+                            "repo.details.open_on_host",
+                            service = link.service_name()
+                        ))
+                        .on_click(move |_, window, cx| {
+                            view.update(cx, |view, cx| view.open_on_host(&url, &host, window, cx));
+                        }),
+                )
+                .child(
+                    Button::new("details-copy-link")
+                        .size(ButtonSize::Small)
+                        .icon(IconName::Copy)
+                        .label(ui::t!("repo.details.copy_link"))
+                        .on_click(move |_, window, cx| {
+                            copy_view.update(cx, |view, cx| {
+                                view.copy_link(
+                                    copy_url.clone(),
+                                    ui::t!("repo.toast.copied_link"),
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }),
+                ),
+        )
+    }
+
+    /// Right-click on a changed file: its page, blame and permalink on the
+    /// host (at the selected commit), and Copy path.
+    fn open_file_menu(
+        &mut self,
+        index: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some((path, deleted)), Some(sha)) = (
+            self.details
+                .files()
+                .and_then(|files| files.get(index))
+                .map(|file| {
+                    (
+                        file.path.clone(),
+                        file.kind == git_core::ChangeKind::Deleted,
+                    )
+                }),
+            self.details.details().map(|details| details.id.to_string()),
+        ) else {
+            return;
+        };
+        let links = self.host_links(cx);
+        let view = cx.entity();
+        let mut entries: Vec<MenuEntry> = Vec::new();
+        // A file deleted by the commit has no page at that commit: only Copy path.
+        if let Some(link) = links.first().filter(|_| !deleted) {
+            let file = forge::WebTarget::File {
+                rev: sha.clone(),
+                path: path.clone(),
+            };
+            let blame = forge::WebTarget::Blame {
+                rev: sha,
+                path: path.clone(),
+            };
+            let service = link.service_name();
+            let open = |label: SharedString, url: String| {
+                let (view, host) = (view.clone(), link.host().to_owned());
+                MenuEntry::Item(MenuItem::new(label).icon(IconName::External).action(
+                    move |window, cx| {
+                        view.update(cx, |view, cx| view.open_on_host(&url, &host, window, cx));
+                    },
+                ))
+            };
+            if let Some(url) = link.url(&file) {
+                entries.push(open(
+                    ui::t!("repo.details.open_file_on_host", service = service),
+                    url.clone(),
+                ));
+                // The URL is pinned to the commit's hash, so it is a permalink.
+                let permalink_view = view.clone();
+                let permalink = MenuItem::new(ui::t!("repo.details.copy_permalink"))
+                    .icon(IconName::Link)
+                    .action(move |window, cx| {
+                        permalink_view.update(cx, |view, cx| {
+                            view.copy_link(
+                                url.clone(),
+                                ui::t!("repo.toast.copied_permalink"),
+                                window,
+                                cx,
+                            )
+                        });
+                    });
+                if let Some(blame_url) = link.url(&blame) {
+                    entries.push(open(
+                        ui::t!("repo.details.open_blame_on_host", service = service),
+                        blame_url,
+                    ));
+                }
+                entries.push(MenuEntry::Item(permalink));
+                entries.push(MenuEntry::Separator);
+            }
+        }
+        entries.push(MenuEntry::Item(
+            MenuItem::new(ui::t!("repo.details.copy_path"))
+                .icon(IconName::Copy)
+                .action(move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                }),
+        ));
+        menu::open_context_menu(position, entries, window, cx);
     }
 
     /// The changed-file header and rows.
@@ -4430,9 +4613,18 @@ impl RepositoryView {
             .on_action(cx.listener(|view, _: &SelectLast, _, cx| view.step_file(isize::MAX, cx)));
         for (index, file) in files.iter().enumerate() {
             let view = view.clone();
+            let menu_view = view.clone();
             list = list.child(
                 div()
                     .debug_selector(move || format!("details-file-{index}"))
+                    .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                        menu_view.update(cx, |view, cx| {
+                            view.select_file(index, cx);
+                            view.open_file_menu(index, event.position, window, cx);
+                        });
+                        // Keep the menu that just took focus.
+                        window.prevent_default();
+                    })
                     .child(
                         FileRow::new(
                             SharedString::from(format!("details-file-{index}")),
