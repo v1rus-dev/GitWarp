@@ -598,6 +598,24 @@ impl Repo {
     pub fn signing_key(&self) -> Result<Option<String>> {
         ops::signing_key(self)
     }
+
+    /// The subjects of the commits in `base..head`, oldest first (the 500
+    /// newest at most): the prefill of a pull request's description.
+    pub fn commit_subjects(&self, base: &str, head: &str) -> Result<Vec<String>> {
+        ops::commit_subjects(self, base, head)
+    }
+
+    /// `(ahead, behind)`: the commits `head` has that `base` lacks, and the
+    /// commits `base` has that `head` lacks.
+    pub fn ahead_behind(&self, base: &str, head: &str) -> Result<(usize, usize)> {
+        ops::ahead_behind(self, base, head)
+    }
+
+    /// The default branch of `remote` as `refs/remotes/<remote>/HEAD` records
+    /// it, `None` when that pointer is missing.
+    pub fn remote_default_branch(&self, remote: &str) -> Result<Option<String>> {
+        ops::remote_default_branch(self, remote)
+    }
 }
 
 /// What the "Open from folder" dialog found at a path.

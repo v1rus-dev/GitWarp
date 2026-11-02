@@ -233,6 +233,8 @@ pub enum SidebarAction {
     CheckoutTag(String),
     /// Opens "Create branch here" at `oid`.
     CreateBranchAt(Oid),
+    /// Opens "Create pull request" for a local branch.
+    CreatePullRequest(String),
     RenameBranch(String),
     DeleteBranch(String),
     RenameTag(String),
@@ -706,6 +708,40 @@ pub fn shortcut_action(
 /// A disabled menu item, for the compact builders above.
 fn item(label: &str, icon: IconName) -> SidebarMenuEntry {
     SidebarMenuEntry::Item(SidebarMenuItem::new(label, icon))
+}
+
+/// Adds "Create pull request…" (GitLab: "Create merge request…") to the menu
+/// of the local branch `branch`: right after "Open on <Service>" when the menu
+/// has one, else in the group above "Copy branch name".
+pub fn with_create_pull_request(
+    entries: &mut Vec<SidebarMenuEntry>,
+    branch: &str,
+    kind: forge::ServiceKind,
+) {
+    let label = match kind {
+        forge::ServiceKind::GitLab => ui::t!("sidebar.menu.create_merge_request"),
+        _ => ui::t!("sidebar.menu.create_pull_request"),
+    };
+    let create =
+        item(&label, IconName::Pr).action(SidebarAction::CreatePullRequest(branch.to_owned()));
+    let open = entries.iter().position(|entry| {
+        matches!(
+            entry,
+            SidebarMenuEntry::Item(SidebarMenuItem {
+                action: SidebarAction::OpenUrl { .. },
+                ..
+            })
+        )
+    });
+    match open {
+        Some(index) => entries.insert(index + 1, create),
+        // `…, Separator, Copy branch name`: the item joins a group of its own.
+        None => {
+            let at = entries.len().saturating_sub(1);
+            entries.insert(at, SidebarMenuEntry::Separator);
+            entries.insert(at, create);
+        }
+    }
 }
 
 /// Builds the visible sidebar rows.
@@ -2836,6 +2872,58 @@ mod tests {
                 .collect(),
             ..SidebarExtras::default()
         }
+    }
+
+    #[test]
+    fn create_pull_request_follows_open_on_host_or_joins_the_copy_group() {
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: None,
+        };
+        let extras = hosted_extras(&[("origin", "git@github.com:o/r.git")]);
+        let refs = [
+            hosted_ref("main", RefKind::LocalBranch, Some("origin/main")),
+            hosted_ref("loose", RefKind::LocalBranch, None),
+        ];
+        let links = web_links::host_links(&[], &extras.remote_targets, None);
+
+        // A branch with an upstream has "Open on GitHub": the new item follows it.
+        let mut with_open = sidebar_menu_with_links(
+            "local:main",
+            Some(&head),
+            Some(&extras),
+            Some(&refs),
+            &links,
+        );
+        with_create_pull_request(&mut with_open, "main", forge::ServiceKind::GitHub);
+        let labels = menu_labels(&with_open);
+        let open = labels.iter().position(|l| *l == "Open on GitHub").unwrap();
+        assert_eq!(labels[open + 1], "Create pull request…");
+        assert_eq!(labels.last(), Some(&"Copy branch name"));
+
+        // Without an upstream there is no "Open on": a group of its own above Copy.
+        let mut without = sidebar_menu_with_links(
+            "local:loose",
+            Some(&head),
+            Some(&extras),
+            Some(&refs),
+            &links,
+        );
+        with_create_pull_request(&mut without, "loose", forge::ServiceKind::GitLab);
+        let labels = menu_labels(&without);
+        let n = labels.len();
+        assert_eq!(
+            &labels[n - 4..],
+            ["—", "Create merge request…", "—", "Copy branch name"]
+        );
+        let SidebarMenuEntry::Item(item) = &without[n - 3] else {
+            panic!("an item")
+        };
+        assert!(item.enabled);
+        assert_eq!(
+            item.action,
+            SidebarAction::CreatePullRequest("loose".to_owned())
+        );
     }
 
     #[test]

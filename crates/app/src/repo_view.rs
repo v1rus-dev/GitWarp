@@ -35,6 +35,7 @@ use ui::{
 
 use crate::activity_strip::ActivityStrip;
 use crate::changes_view::{ChangesEvent, ChangesView};
+use crate::create_pr_dialog::{self, CreatePrDialog, PrDialogContext, PushRun};
 use crate::details::{read_details, read_diff, DetailsState, DiffState};
 use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
 use crate::format::{absolute_time, format_count, relative_time};
@@ -46,6 +47,8 @@ use crate::hosting_status::{
 use crate::network_ops::{self, Job};
 use crate::network_service::NetworkService;
 use crate::palette::{self, Command};
+use crate::pr_logic::{self, PrTarget};
+use crate::pr_panel::{PrEvent, PrModel, PrPanel};
 use crate::ref_dialog::{self, RefDialog, RefDialogContext, RefDialogKind, RemoteEdit};
 use crate::ref_ops::{CommitCard, RefAction};
 use crate::remote_accounts::{self, AccountAction, RemoteResolution};
@@ -97,6 +100,14 @@ pub enum ViewMode {
     History,
     Changes,
     Worktrees,
+}
+
+/// What the sidebar shows besides its filter field: the repository tree or
+/// the pull request panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarTab {
+    Repository,
+    PullRequests,
 }
 
 /// Binds the search field's own keys in its `history-search` context, so
@@ -525,6 +536,14 @@ pub struct RepositoryView {
     _worktree_switcher_release: Option<Subscription>,
     /// The stage 7 dialog currently open, if any.
     ref_dialog: Option<Entity<RefDialog>>,
+    /// The "Create pull request" dialog while it is open.
+    pr_dialog: Option<Entity<CreatePrDialog>>,
+    /// The loaded pull requests of the sidebar's panel.
+    pr_model: Entity<PrModel>,
+    _pr_events: Subscription,
+    _pr_redraw: Subscription,
+    /// Repository tree or pull request panel.
+    sidebar_tab: SidebarTab,
     /// A ref operation without a dialog (checkout, stash apply, …) is running.
     ref_action_running: bool,
     /// The network action that is running, if any.
@@ -577,6 +596,15 @@ struct JobMeta {
     remembered: Option<String>,
     /// The branch or tag a push result names.
     subject: String,
+}
+
+/// What a background git network call needs besides the repository: the git
+/// environment with the accounts' askpass, the guard that keeps them
+/// registered and the SSH host-key asker.
+struct JobEnv {
+    context: git_core::network::NetworkContext,
+    guard: Option<crate::network_service::JobGuard>,
+    asker: crate::network_service::HostKeyAsker,
 }
 
 enum NetworkEvent {
@@ -710,6 +738,13 @@ impl RepositoryView {
                 }
             },
         );
+        let pr_model = cx.new(|_| PrModel::new());
+        let pr_events =
+            cx.subscribe_in(&pr_model, window, |this, _, event: &PrEvent, window, cx| {
+                this.pr_event(event.clone(), window, cx)
+            });
+        // The panel redraws when a list arrives.
+        let pr_redraw = cx.observe(&pr_model, |_, _, cx| cx.notify());
         let worktrees_redraw = cx.observe(&worktrees_model, |_, _, cx| cx.notify());
         let worktrees_leave = cx.subscribe_in(
             &worktrees,
@@ -835,6 +870,11 @@ impl RepositoryView {
             worktree_switcher: None,
             _worktree_switcher_release: None,
             ref_dialog: None,
+            pr_dialog: None,
+            pr_model,
+            _pr_events: pr_events,
+            _pr_redraw: pr_redraw,
+            sidebar_tab: SidebarTab::Repository,
             ref_action_running: false,
             network: None,
             network_generation: 0,
@@ -1262,7 +1302,7 @@ impl RepositoryView {
         cx: &mut Context<Self>,
     ) {
         let links = self.host_links(cx);
-        let model = {
+        let mut model = {
             let history = self.history.read(cx);
             sidebar_menu_with_links(
                 key,
@@ -1272,6 +1312,15 @@ impl RepositoryView {
                 &links,
             )
         };
+        // "Create pull request…" for a local branch when a remote can take one.
+        if let Some(branch) = key.strip_prefix("local:") {
+            // The noun of the target the dialog will preselect for this branch.
+            let targets = self.pr_targets(cx);
+            let upstream = self.branch_upstream_remote(branch, cx);
+            if let Some(target) = pr_logic::default_target(&targets, upstream.as_deref()) {
+                crate::sidebar::with_create_pull_request(&mut model, branch, target.kind());
+            }
+        }
         if model.is_empty() {
             return;
         }
@@ -1329,6 +1378,9 @@ impl RepositoryView {
             }
             SidebarAction::CheckoutBranch(name) => {
                 self.checkout_branch(name, window, cx);
+            }
+            SidebarAction::CreatePullRequest(branch) => {
+                self.open_create_pr(Some(branch), window, cx);
             }
             SidebarAction::CheckoutRemoteBranch(remote) => {
                 let label = remote.clone();
@@ -2498,25 +2550,11 @@ impl RepositoryView {
                 .and_then(|u| remembered.get(&u.remote).cloned()),
             subject: self.job_subject(&job, cx),
         };
-        let (context, guard, asker) = match cx.try_global::<NetworkService>() {
-            Some(service) => {
-                let store = match crate::accounts::cached_store(cx) {
-                    Some(Ok(store)) => Some(store),
-                    _ => None,
-                };
-                let (context, guard) = service.job_context(crate::network_service::JobAuth {
-                    interactive: true,
-                    accounts: credentials.accounts,
-                    store,
-                });
-                (context, guard, service.host_keys())
-            }
-            None => (
-                git_core::network::NetworkContext::default(),
-                None,
-                crate::network_service::HostKeyAsker::unavailable(),
-            ),
-        };
+        let JobEnv {
+            context,
+            guard,
+            asker,
+        } = Self::job_environment(credentials.accounts, cx);
         let root = self.root.clone();
         self.network_generation = self.network_generation.wrapping_add(1);
         let generation = self.network_generation;
@@ -2560,6 +2598,40 @@ impl RepositoryView {
             }
         })
         .detach();
+    }
+
+    /// The environment of an interactive network call that may answer git's
+    /// prompts with `accounts`.
+    fn job_environment(
+        accounts: HashMap<
+            crate::network_service::HostKey,
+            crate::network_service::AccountCredential,
+        >,
+        cx: &App,
+    ) -> JobEnv {
+        match cx.try_global::<NetworkService>() {
+            Some(service) => {
+                let store = match crate::accounts::cached_store(cx) {
+                    Some(Ok(store)) => Some(store),
+                    _ => None,
+                };
+                let (context, guard) = service.job_context(crate::network_service::JobAuth {
+                    interactive: true,
+                    accounts,
+                    store,
+                });
+                JobEnv {
+                    context,
+                    guard,
+                    asker: service.host_keys(),
+                }
+            }
+            None => JobEnv {
+                context: git_core::network::NetworkContext::default(),
+                guard: None,
+                asker: crate::network_service::HostKeyAsker::unavailable(),
+            },
+        }
     }
 
     /// Returns whether the job finished.
@@ -2844,6 +2916,222 @@ impl RepositoryView {
         );
     }
 
+    /* ------------------------ pull / merge requests ------------------------ */
+
+    /// The remotes that can take a pull request, the current branch's
+    /// upstream first. Pure: no network, no keychain.
+    fn pr_targets(&self, cx: &App) -> Vec<PrTarget> {
+        let Some(extras) = self.sidebar_extras.as_ref() else {
+            return Vec::new();
+        };
+        let (accounts, remembered) = self.account_settings(cx);
+        let history = self.history.read(cx);
+        let preferred = web_links::upstream_remote(
+            history.head(),
+            history.refs().unwrap_or(&[]),
+            &extras.remote_targets,
+        );
+        pr_logic::pr_targets(
+            &accounts,
+            &extras.remote_targets,
+            &remembered,
+            preferred.as_deref(),
+        )
+    }
+
+    /// Hands the panel the remotes it can list. Cheap when nothing changed.
+    fn sync_pr_targets(&mut self, cx: &mut Context<Self>) {
+        let targets = self.pr_targets(cx);
+        self.pr_model
+            .update(cx, |model, cx| model.set_targets(targets, cx));
+    }
+
+    fn set_sidebar_tab(&mut self, tab: SidebarTab, cx: &mut Context<Self>) {
+        if self.sidebar_tab != tab {
+            self.sidebar_tab = tab;
+            cx.notify();
+        }
+    }
+
+    fn pr_event(&mut self, event: PrEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            PrEvent::Reconnect(id) => self.reconnect_pr_account(&id, window, cx),
+            PrEvent::Open { url, host } => self.open_on_host(&url, &host, window, cx),
+            PrEvent::Checkout(request) => {
+                let (pr, target) = *request;
+                self.start_pr_checkout(&pr, target.remote.clone(), target.kind(), window, cx);
+            }
+        }
+    }
+
+    /// The account dialog on the token step; the panel reloads once saved.
+    fn reconnect_pr_account(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (accounts, _) = self.account_settings(cx);
+        let Some(account) = accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        let view = cx.entity();
+        let dialog = account_dialog::open(
+            AccountOpen::Reconnect(account),
+            None,
+            Some(Rc::new(move |_, _, cx| {
+                view.update(cx, |view, cx| {
+                    view.pr_model.update(cx, |model, cx| model.invalidate(cx));
+                });
+            })),
+            window,
+            cx,
+        );
+        self.account_modal = Some(dialog.into_any());
+    }
+
+    /// A push of `branch` to `remote` (setting the upstream) with that
+    /// remote's account, ready to run on the background executor.
+    fn prepare_push(&self, remote: &str, branch: &str, cx: &App) -> Option<PushRun> {
+        let git = self.git.as_ref().ok()?.clone();
+        let extras = self.sidebar_extras.as_ref()?;
+        let (accounts, remembered) = self.account_settings(cx);
+        let uses = [remote_accounts::RemoteUse {
+            remote: remote.to_owned(),
+            direction: remote_accounts::Direction::Push,
+        }];
+        let credentials =
+            remote_accounts::job_credentials(&accounts, &extras.remote_targets, &uses, &remembered);
+        let env = Self::job_environment(credentials.accounts, cx);
+        let root = self.root.clone();
+        let options = git_core::network::PushOptions {
+            remote: Some(remote.to_owned()),
+            refspec: Some(branch.to_owned()),
+            set_upstream: true,
+        };
+        Some(Box::new(move || {
+            // The account stays registered until the push ended.
+            let _guard = env.guard;
+            let repo = Repo::open(git, &root)?;
+            network_ops::push(
+                &repo,
+                &options,
+                &env.context,
+                &env.asker,
+                &git_core::network::CancelToken::new(),
+                |_| {},
+            )
+        }))
+    }
+
+    /// The remote the local branch `branch` tracks, if it is a configured one.
+    fn branch_upstream_remote(&self, branch: &str, cx: &App) -> Option<String> {
+        let remote_targets: &[remote_accounts::RemoteTargets] = self
+            .sidebar_extras
+            .as_ref()
+            .map_or(&[], |extras| &extras.remote_targets);
+        self.history
+            .read(cx)
+            .refs()
+            .unwrap_or(&[])
+            .iter()
+            .find(|r| r.kind == RefKind::LocalBranch && r.name == branch)
+            .and_then(|r| r.upstream.as_deref())
+            .and_then(|upstream| web_links::split_remote_ref(upstream, remote_targets))
+            .map(|(remote, _)| remote.to_owned())
+    }
+
+    /// Opens "Create pull request" for `branch`, or for the current branch.
+    /// Does nothing without a remote that has an account.
+    pub(crate) fn open_create_pr(
+        &mut self,
+        branch: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets = self.pr_targets(cx);
+        if targets.is_empty() {
+            return;
+        }
+        let head = match branch {
+            Some(branch) => branch,
+            None => match self.history.read(cx).head() {
+                Some(Head::Branch { name, .. }) => name.clone(),
+                _ => {
+                    toast::show(
+                        ui::ToastKind::Info,
+                        ui::t!("repo.toast.detached_no_branch"),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            },
+        };
+        let upstream_remote = self.branch_upstream_remote(&head, cx);
+        let remote_branches = {
+            let history = self.history.read(cx);
+            let refs = history.refs().unwrap_or(&[]);
+            let branches: HashMap<String, Vec<String>> = targets
+                .iter()
+                .map(|target| {
+                    let prefix = format!("{}/", target.remote);
+                    let names = refs
+                        .iter()
+                        .filter(|r| r.kind == RefKind::RemoteBranch)
+                        .filter_map(|r| r.name.strip_prefix(&prefix))
+                        .filter(|name| *name != "HEAD")
+                        .map(str::to_owned)
+                        .collect();
+                    (target.remote.clone(), names)
+                })
+                .collect();
+            branches
+        };
+        let target = pr_logic::default_target(&targets, upstream_remote.as_deref())
+            .and_then(|default| targets.iter().position(|t| t == default))
+            .unwrap_or(0);
+        let view = cx.entity();
+        let context = PrDialogContext {
+            root: self.root.clone(),
+            git: self.git.clone(),
+            targets,
+            target,
+            head,
+            remote_branches,
+            prepare_push: Rc::new({
+                let view = view.clone();
+                move |remote, branch, cx| view.read(cx).prepare_push(remote, branch, cx)
+            }),
+            reconnect: Rc::new({
+                let view = view.clone();
+                move |id, window, cx| {
+                    view.update(cx, |view, cx| view.reconnect_pr_account(&id, window, cx));
+                }
+            }),
+            open_url: Rc::new({
+                let view = view.clone();
+                move |url, host, window, cx| {
+                    view.update(cx, |view, cx| view.open_on_host(&url, &host, window, cx));
+                }
+            }),
+            changed: Rc::new({
+                let view = view.clone();
+                move |pushed, created, _, cx| {
+                    view.update(cx, |view, cx| {
+                        // Forget the lists first: the reload below then finds
+                        // them stale and loads them once.
+                        if created {
+                            view.pr_model.update(cx, |model, cx| model.invalidate(cx));
+                        }
+                        if pushed {
+                            view.reload_after_network(cx);
+                        }
+                    });
+                }
+            }),
+            closed: Rc::new(move |cx| {
+                view.update(cx, |view, _| view.pr_dialog = None);
+            }),
+        };
+        self.pr_dialog = Some(create_pr_dialog::open(context, window, cx));
+    }
+
     /// Reloads everything a remote change can affect.
     fn reload_after_network(&mut self, cx: &mut Context<Self>) {
         self.reload_history(cx);
@@ -2906,6 +3194,10 @@ impl RepositoryView {
         if let Some(root) = root {
             self.start_sidebar(root, cx);
         }
+        // Only the user's own refresh bypasses the 60 s staleness window.
+        let force = trigger.resets_health();
+        self.pr_model
+            .update(cx, |model, cx| model.refresh(force, cx));
     }
 
     /// Reads the four sidebar lists in the background. Each failure is logged
@@ -3253,10 +3545,15 @@ impl RepositoryView {
 
     /// Opens the command palette (Ctrl P) over this repository.
     pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pr_targets = self.pr_targets(cx);
         let history = self.history.read(cx);
         let state = palette::ViewState {
             idle_lanes_collapsed: history.idle_lanes_collapsed(),
             activity_collapsed: self.activity.read(cx).is_collapsed(),
+            pull_requests: !pr_targets.is_empty(),
+            merge_requests: pr_targets
+                .first()
+                .is_some_and(|target| target.kind() == forge::ServiceKind::GitLab),
         };
         let sources = palette::Sources::new(
             state,
@@ -3328,6 +3625,7 @@ impl RepositoryView {
             },
             Command::AddRemote => self.run_sidebar_action(SidebarAction::AddRemote, window, cx),
             Command::AddWorktree => self.run_sidebar_action(SidebarAction::AddWorktree, window, cx),
+            Command::CreatePullRequest => self.open_create_pr(None, window, cx),
             Command::Refresh => self.run_sidebar_action(SidebarAction::Refresh, window, cx),
             Command::ToggleSidebar => self.toggle_sidebar(cx),
             Command::ToggleDetails => self.toggle_details(cx),
@@ -3885,8 +4183,17 @@ impl RepositoryView {
         let colors = cx.theme().colors;
         let worktrees_mode = self.view == ViewMode::Worktrees;
         let panel = worktrees_mode.then(|| self.worktree_panel(cx));
-        // The tree is not built while the worktree panel stands in for it.
-        let nodes = if worktrees_mode {
+        // The Repository / PRs tabs exist while a remote can take requests;
+        // the PRs tab replaces the filter and the tree.
+        self.sync_pr_targets(cx);
+        let has_prs = self.pr_model.read(cx).has_target();
+        let show_prs = has_prs && !worktrees_mode && self.sidebar_tab == SidebarTab::PullRequests;
+        self.pr_model
+            .update(cx, |model, cx| model.set_active(show_prs, cx));
+        let tabs = (has_prs && !worktrees_mode).then(|| self.sidebar_tabs(cx));
+        // The tree is not built while the worktree panel or the PR panel
+        // stands in for it.
+        let nodes = if worktrees_mode || show_prs {
             Vec::new()
         } else {
             let remotes = self.remote_displays(cx);
@@ -3898,7 +4205,7 @@ impl RepositoryView {
             self.sidebar_scroll.scroll_to_item(index);
         }
         let filtering = !self.filter.trim().is_empty();
-        let no_matches = !worktrees_mode && filtering && nodes.is_empty();
+        let no_matches = !worktrees_mode && !show_prs && filtering && nodes.is_empty();
         // Every row's identity and expansion, so a click, Enter/Space or
         // ←/→ can toggle any expandable node, not only the sections.
         let rows: Vec<(SharedString, bool, bool)> = nodes
@@ -4022,17 +4329,12 @@ impl RepositoryView {
             .bg(colors.sidebar)
             .border_r_1()
             .border_color(colors.border)
-            .child(
-                div()
-                    .w_full()
-                    .px(px(10.))
-                    .pt(px(12.))
-                    .pb(px(8.))
-                    .child(SearchField::new(
-                        "sidebar-filter",
-                        self.sidebar_filter.clone(),
-                    )),
-            )
+            .when_some(tabs, |this, tabs| this.child(tabs))
+            .when(!show_prs, |this| {
+                this.child(div().w_full().px(px(10.)).pt(px(12.)).pb(px(8.)).child(
+                    SearchField::new("sidebar-filter", self.sidebar_filter.clone()),
+                ))
+            })
             .child(
                 div()
                     .w_full()
@@ -4042,6 +4344,9 @@ impl RepositoryView {
                     .flex()
                     .flex_col()
                     .when_some(panel, |this, panel| this.child(panel))
+                    .when(show_prs, |this| {
+                        this.child(PrPanel::new(self.pr_model.clone()))
+                    })
                     .when(no_matches, |this| {
                         this.child(
                             div()
@@ -4056,7 +4361,7 @@ impl RepositoryView {
                                 .child(ui::t!("repo.sidebar.no_matches")),
                         )
                     })
-                    .when(!no_matches && !worktrees_mode, |this| {
+                    .when(!no_matches && !worktrees_mode && !show_prs, |this| {
                         this.child(
                             div().w_full().flex_1().min_w_0().min_h_0().child(
                                 Tree::new("sidebar-tree", nodes)
@@ -4080,6 +4385,39 @@ impl RepositoryView {
                         ))
                     }),
             )
+    }
+
+    /// The Repository / PRs switch above the sidebar's filter field.
+    fn sidebar_tabs(&self, cx: &Context<Self>) -> Div {
+        let model = self.pr_model.read(cx);
+        let short = model.kind().map_or_else(
+            || pr_logic::noun_short(forge::ServiceKind::GitHub),
+            pr_logic::noun_short,
+        );
+        let label = match model.open_count() {
+            Some(count) => format!("{short} {count}"),
+            None => short.to_string(),
+        };
+        let view = cx.entity();
+        div().w_full().flex_none().px(px(10.)).pt(px(12.)).child(
+            Segmented::new("sidebar-tabs")
+                .items([
+                    SegmentItem::new(ui::t!("sidebar.prs.tab_repository")),
+                    SegmentItem::new(label),
+                ])
+                .selected(match self.sidebar_tab {
+                    SidebarTab::Repository => 0,
+                    SidebarTab::PullRequests => 1,
+                })
+                .on_select(move |index, _, cx| {
+                    let tab = if index == 0 {
+                        SidebarTab::Repository
+                    } else {
+                        SidebarTab::PullRequests
+                    };
+                    view.update(cx, |view, cx| view.set_sidebar_tab(tab, cx));
+                }),
+        )
     }
 
     fn tree_nodes(&self, remotes: &RemoteDisplays, cx: &Context<Self>) -> Vec<TreeNodeData> {
@@ -5557,6 +5895,24 @@ impl RepositoryView {
         ) else {
             return;
         };
+        self.start_pr_checkout(&pr, target.remote, target.link.instance.kind, window, cx);
+    }
+
+    /// Fetches `pr`'s head ref from `remote` into a local branch (not forced)
+    /// and checks it out; shared by the popover and the pull request panel.
+    fn start_pr_checkout(
+        &mut self,
+        pr: &forge::api::PullRequest,
+        remote: String,
+        kind: forge::ServiceKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // `start_network_job` ignores a second job: say so instead.
+        if self.network.is_some() {
+            toast::show(ui::ToastKind::Warn, ui::t!("sidebar.prs.busy"), window, cx);
+            return;
+        }
         let locals: Vec<String> = self
             .history
             .read(cx)
@@ -5566,18 +5922,16 @@ impl RepositoryView {
             .filter(|r| r.kind == RefKind::LocalBranch)
             .map(|r| r.name.clone())
             .collect();
-        let branch = hosting_status::checkout_branch_name(&pr, &locals);
-        let Ok(refspec) =
-            hosting_status::checkout_refspec(target.link.instance.kind, number, &branch)
-        else {
+        let branch = hosting_status::checkout_branch_name(pr, &locals);
+        let Ok(refspec) = hosting_status::checkout_refspec(kind, pr.number, &branch) else {
             return;
         };
         self.start_network_job(
             Job::FetchPullRequest {
-                remote: target.remote,
+                remote,
                 refspec,
                 branch,
-                number,
+                number: pr.number,
             },
             window,
             cx,
@@ -7115,6 +7469,132 @@ mod tests {
                 "the parent was not selected in the history"
             );
         });
+    }
+
+    /// A repository whose `origin` is on a service with an account gets the
+    /// Repository / PRs tabs; the PRs tab draws the (cached) requests, and
+    /// "Create pull request…" opens the dialog on the current branch.
+    #[gpui::test]
+    fn a_remote_with_an_account_gets_the_pull_request_panel(cx: &mut gpui::TestAppContext) {
+        use forge::api::{PrState, PullRequest, ReviewState};
+
+        let repo = crate::test_support::TempRepo::new("pr-panel");
+        commit(repo.path(), "a.txt", "one\n");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success());
+        };
+        git(&["remote", "add", "origin", "https://github.com/o/r.git"]);
+        let mut settings = crate::settings::Settings::default();
+        settings.accounts.push(crate::settings::AccountRecord {
+            id: "a1".to_owned(),
+            kind: "github".to_owned(),
+            base_url: "https://github.com".to_owned(),
+            login: "mira-k".to_owned(),
+            label: "mira-k".to_owned(),
+            method: crate::settings::AccountMethod::Token,
+            ssh_host: None,
+            imported_from: None,
+        });
+        cx.update(|cx| {
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings,
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+        // A fresh list in the shared cache: the panel needs no network.
+        let key = "https://github.com|o/r|a1";
+        let listing = |numbers: &[u64]| crate::pr_logic::Listing {
+            items: numbers
+                .iter()
+                .map(|&number| PullRequest {
+                    number,
+                    title: format!("PR {number}"),
+                    state: PrState::Open,
+                    review: ReviewState::None,
+                    author: "mira-k".to_owned(),
+                    head_branch: format!("feat/{number}"),
+                    head_repo_full_name: None,
+                    base_branch: "main".to_owned(),
+                    updated_at: 0,
+                    web_url: String::new(),
+                })
+                .collect(),
+            has_next: false,
+            fetched: std::time::Instant::now(),
+        };
+        {
+            let mut cache = crate::pr_logic::cache().lock().unwrap();
+            cache.put(key, crate::pr_logic::PrTab::Mine, listing(&[1, 2]));
+            cache.put(key, crate::pr_logic::PrTab::All, listing(&[1, 2, 3]));
+        }
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+
+        // The tabs exist, the tree is still shown.
+        assert!(cx.debug_bounds("sidebar-tabs-segment-0").is_some());
+        assert!(cx.debug_bounds("sidebar-tree-node-0").is_some());
+        view.update(&mut cx, |view, cx| {
+            view.set_sidebar_tab(SidebarTab::PullRequests, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            let model = view.pr_model.read(cx);
+            assert!(model.has_target());
+            assert_eq!(model.open_count(), Some(3));
+        });
+        assert!(cx.debug_bounds("pr-filter-segment-0").is_some());
+        assert!(cx.debug_bounds("sidebar-tree-node-0").is_none());
+
+        // "Create pull request…" on the current branch.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_create_pr(None, window, cx));
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert!(view.pr_dialog.is_some()));
+
+        // Closing the dialog (here by its own close) clears the view's handle.
+        let dialog = view.read_with(&cx, |view, _| view.pr_dialog.clone().unwrap());
+        cx.update(|window, cx| dialog.update(cx, |dialog, cx| dialog.close(window, cx)));
+        drop(dialog);
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert!(view.pr_dialog.is_none()));
+    }
+
+    /// Without an account there is nothing to list or create: no tabs.
+    #[gpui::test]
+    fn a_remote_without_an_account_has_no_pull_request_tabs(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("pr-no-account");
+        commit(repo.path(), "a.txt", "one\n");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["remote", "add", "origin", "https://github.com/o/r.git"])
+            .output()
+            .expect("git runs");
+        assert!(out.status.success());
+        cx.update(|cx| {
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings: crate::settings::Settings::default(),
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sidebar-tabs-segment-0").is_none());
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.open_create_pr(None, window, cx));
+        });
+        view.read_with(&cx, |view, _| assert!(view.pr_dialog.is_none()));
     }
 
     /// The layout toggle switches the pane to side-by-side rows and stores the

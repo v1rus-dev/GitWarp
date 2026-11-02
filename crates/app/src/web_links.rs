@@ -45,11 +45,7 @@ impl HostLink {
     /// The service as the menus name it: "Codeberg" for codeberg.org, "Gitea"
     /// for the other Gitea / Forgejo hosts, else the service's own name.
     pub fn service_name(&self) -> &'static str {
-        match self.instance.kind {
-            ServiceKind::Gitea if self.instance.host() == "codeberg.org" => "Codeberg",
-            ServiceKind::Gitea => "Gitea",
-            kind => kind.display_name(),
-        }
+        service_name(&self.instance)
     }
 
     /// Host for the "Opened <host> in your browser" toast.
@@ -61,6 +57,16 @@ impl HostLink {
     /// Azure DevOps).
     pub fn url(&self, target: &WebTarget) -> Option<String> {
         try_web_url(&self.instance, &self.coords, target)
+    }
+}
+
+/// The service as the menus name it: "Codeberg" for codeberg.org, "Gitea" for
+/// the other Gitea / Forgejo hosts, else the service's own name.
+pub fn service_name(instance: &Instance) -> &'static str {
+    match instance.kind {
+        ServiceKind::Gitea if instance.host() == "codeberg.org" => "Codeberg",
+        ServiceKind::Gitea => "Gitea",
+        kind => kind.display_name(),
     }
 }
 

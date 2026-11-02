@@ -69,6 +69,8 @@ pub enum Command {
     SwitchBranch,
     CreateBranchHere,
     CreateTagHere,
+    /// Only listed while a remote can take one: see [`Command::available`].
+    CreatePullRequest,
     ShowBranchCommits,
     AddRemote,
     AddWorktree,
@@ -93,6 +95,10 @@ pub enum Command {
 pub struct ViewState {
     pub idle_lanes_collapsed: bool,
     pub activity_collapsed: bool,
+    /// A remote with an account can take a pull request.
+    pub pull_requests: bool,
+    /// ...and the first such remote is on GitLab: "merge request".
+    pub merge_requests: bool,
 }
 
 impl Command {
@@ -127,6 +133,16 @@ impl Command {
         all
     }
 
+    /// [`Command::all`] plus the commands that depend on the repository: the
+    /// pull request one needs a remote with an account.
+    pub fn available(state: ViewState) -> Vec<Command> {
+        let mut all = Command::all();
+        if state.pull_requests {
+            all.push(Command::CreatePullRequest);
+        }
+        all
+    }
+
     pub fn title(self, state: ViewState) -> String {
         match self {
             Command::FetchAll => ui::t!("palette.command.fetch_all").to_string(),
@@ -136,6 +152,10 @@ impl Command {
             Command::SwitchBranch => ui::t!("palette.command.switch_branch").to_string(),
             Command::CreateBranchHere => ui::t!("palette.command.create_branch").to_string(),
             Command::CreateTagHere => ui::t!("palette.command.create_tag").to_string(),
+            Command::CreatePullRequest if state.merge_requests => {
+                ui::t!("palette.command.create_merge_request").to_string()
+            }
+            Command::CreatePullRequest => ui::t!("palette.command.create_pull_request").to_string(),
             Command::ShowBranchCommits => ui::t!("palette.command.show_branch_commits").to_string(),
             Command::AddRemote => ui::t!("palette.command.add_remote").to_string(),
             Command::AddWorktree => ui::t!("palette.command.add_worktree").to_string(),
@@ -343,7 +363,7 @@ pub fn search(query: &str, sources: &Sources, recent: &Recent) -> Vec<Hit> {
     let mut hits = Vec::new();
 
     let commands = if scope.includes(Group::Commands) {
-        Command::all()
+        Command::available(sources.state)
     } else {
         Vec::new()
     };
@@ -506,7 +526,7 @@ fn is_current(sources: &Sources, branch: &BranchSource) -> bool {
 /// the recent ones, then the rest) for an empty query.
 fn default_hits(sources: &Sources, recent: &Recent) -> Vec<Hit> {
     let state = sources.state;
-    let all = Command::all();
+    let all = Command::available(state);
     let mut commands: Vec<Command> = recent
         .commands
         .iter()
@@ -647,6 +667,26 @@ mod tests {
             author_time: 0,
             summary: summary.into(),
         })
+    }
+
+    #[test]
+    fn the_pull_request_command_needs_a_remote_with_an_account() {
+        let off = ViewState::default();
+        assert!(!Command::available(off).contains(&Command::CreatePullRequest));
+        let on = ViewState {
+            pull_requests: true,
+            ..ViewState::default()
+        };
+        assert!(Command::available(on).contains(&Command::CreatePullRequest));
+        assert_eq!(Command::CreatePullRequest.title(on), "Create pull request…");
+        let gitlab = ViewState {
+            merge_requests: true,
+            ..on
+        };
+        assert_eq!(
+            Command::CreatePullRequest.title(gitlab),
+            "Create merge request…"
+        );
     }
 
     fn reference(kind: RefKind, name: &str) -> Ref {

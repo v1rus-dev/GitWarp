@@ -774,7 +774,9 @@ pub struct HostingState {
 impl Default for HostingState {
     fn default() -> Self {
         Self {
-            client: Client::new(),
+            // The one client of pull request calls: the panel and the create
+            // dialog use it too, so they share the conditional-request cache.
+            client: crate::pr_logic::shared_client().clone(),
             target: None,
             tracked: Vec::new(),
             prs: HashMap::new(),
