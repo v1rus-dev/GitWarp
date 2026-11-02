@@ -542,7 +542,11 @@ impl Render for WelcomeActivity {
                     .child(Icon::new(IconName::Fetch).size(px(12.)).color(colors.muted))
                     .child(ui::t!("welcome.activity.counting"))
                     .child(strong(format_count(total)))
-                    .child(ui::t!("welcome.activity.so_far"))
+                    .child(ui::i18n::t_count(
+                        "welcome.activity.so_far",
+                        total as u64,
+                        &[],
+                    ))
                     .into_any_element(),
             )
         } else if total == 0 {

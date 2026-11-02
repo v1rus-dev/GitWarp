@@ -3812,7 +3812,7 @@ impl HistoryView {
             Failure::Git { command, .. } => {
                 ui::t!("history.strip.git_failed", command = command)
             }
-            Failure::Other { message } => ui::t!("history.strip.other", message = message),
+            Failure::Other { message } => ui::t!("history.strip.generic", message = message),
             _ => ui::t!("history.strip.incomplete"),
         };
         let colors = cx.theme().colors;

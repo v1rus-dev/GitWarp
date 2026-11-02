@@ -523,7 +523,11 @@ impl ActivityStrip {
                 .child(Icon::new(IconName::Fetch).size(px(12.)).color(colors.muted))
                 .child(ui::t!("activity.total.counting"))
                 .child(strong(format_count(shown.total)))
-                .child(ui::t!("activity.total.so_far")),
+                .child(ui::i18n::t_count(
+                    "activity.total.so_far",
+                    shown.total as u64,
+                    &[],
+                )),
             (Status::Ready, Some(shown)) => {
                 if self.all.is_empty() {
                     total.child(ui::t!("activity.total.none"))

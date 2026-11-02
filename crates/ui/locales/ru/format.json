@@ -1,1 +1,22 @@
-{}
+{
+  "format.days_ago.one": "{n} д назад",
+  "format.days_ago.few": "{n} д назад",
+  "format.days_ago.many": "{n} д назад",
+  "format.hours_ago.one": "{n} ч назад",
+  "format.hours_ago.few": "{n} ч назад",
+  "format.hours_ago.many": "{n} ч назад",
+  "format.just_now": "только что",
+  "format.minutes_ago.one": "{n} мин назад",
+  "format.minutes_ago.few": "{n} мин назад",
+  "format.minutes_ago.many": "{n} мин назад",
+  "format.months_ago.one": "{n} мес. назад",
+  "format.months_ago.few": "{n} мес. назад",
+  "format.months_ago.many": "{n} мес. назад",
+  "format.weeks_ago.one": "1 неделю назад",
+  "format.weeks_ago.few": "{n} недели назад",
+  "format.weeks_ago.many": "{n} недель назад",
+  "format.years_ago.one": "{n} г. назад",
+  "format.years_ago.few": "{n} г. назад",
+  "format.years_ago.many": "{n} г. назад",
+  "format.yesterday": "вчера"
+}

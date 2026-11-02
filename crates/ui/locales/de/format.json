@@ -1,1 +1,16 @@
-{}
+{
+  "format.days_ago.one": "vor {n} T.",
+  "format.days_ago.other": "vor {n} T.",
+  "format.hours_ago.one": "vor {n} Std.",
+  "format.hours_ago.other": "vor {n} Std.",
+  "format.just_now": "gerade eben",
+  "format.minutes_ago.one": "vor {n} Min.",
+  "format.minutes_ago.other": "vor {n} Min.",
+  "format.months_ago.one": "vor {n} Mon.",
+  "format.months_ago.other": "vor {n} Mon.",
+  "format.weeks_ago.one": "vor 1 Woche",
+  "format.weeks_ago.other": "vor {n} Wochen",
+  "format.years_ago.one": "vor {n} J.",
+  "format.years_ago.other": "vor {n} J.",
+  "format.yesterday": "gestern"
+}

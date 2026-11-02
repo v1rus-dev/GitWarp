@@ -41,7 +41,7 @@
   "history.failure.git_too_old_detail": "GitWarp needs git {required} or newer. {source} git at {path} reports {found}.",
   "history.failure.git_unavailable": "GitWarp could not find a usable git. The bundled copy is missing and there is no `git` in PATH.",
   "history.failure.not_a_repository": "Not a git repository",
-  "history.failure.other": "GitWarp could not read the history",
+  "history.failure.generic": "GitWarp could not read the history",
   "history.git_source.bundled": "Bundled",
   "history.git_source.custom": "Custom",
   "history.git_source.system": "System",
@@ -83,5 +83,5 @@
   "history.strip.cancelled": "History is incomplete — loading was cancelled",
   "history.strip.git_failed": "History is incomplete: git {command} failed",
   "history.strip.incomplete": "History is incomplete",
-  "history.strip.other": "History is incomplete: {message}"
+  "history.strip.generic": "History is incomplete: {message}"
 }

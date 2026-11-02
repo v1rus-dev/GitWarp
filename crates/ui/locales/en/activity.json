@@ -43,6 +43,7 @@
   "activity.total.none": "No commits yet",
   "activity.total.none_mine_last_year": "No commits by you in the last year",
   "activity.total.none_mine_year": "No commits by you in {year}",
-  "activity.total.so_far": "commits so far",
+  "activity.total.so_far.one": "commit so far",
+  "activity.total.so_far.other": "commits so far",
   "activity.total.unavailable": "Activity unavailable"
 }

@@ -96,7 +96,7 @@ impl Failure {
                 ui::t!("history.failure.git_too_old", found = found)
             }
             Failure::Git { .. } => ui::t!("history.failure.git_failed"),
-            Failure::Other { .. } => ui::t!("history.failure.other"),
+            Failure::Other { .. } => ui::t!("history.failure.generic"),
         }
     }
 
