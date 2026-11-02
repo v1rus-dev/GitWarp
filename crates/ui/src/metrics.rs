@@ -8,6 +8,8 @@ use gpui::{px, Pixels};
 pub const FONT_UI: &str = "Inter";
 /// Mono font family; bundled in a later step, GPUI falls back until then.
 pub const FONT_MONO: &str = "JetBrains Mono";
+/// CJK fallback family (bundled Noto Sans JP) for both UI and mono text.
+pub const FONT_CJK: &str = "Noto Sans JP";
 
 /// Section labels, counters, key caps.
 pub const FS_XS: Pixels = px(11.);

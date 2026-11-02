@@ -579,7 +579,7 @@ impl Render for Workspace {
             .cursor(CursorStyle::Arrow)
             .bg(colors.bg)
             .text_color(colors.text)
-            .font_family(FONT_UI)
+            .font(ui::fonts::ui_font())
             .text_size(FS_BASE)
             .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
                 // The frame covers the whole padded area, so this is where the
