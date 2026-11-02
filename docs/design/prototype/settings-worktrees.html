@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — Settings → Worktrees</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="settings.css">
+<script src="app.js"></script>
+<script src="settings.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const S = GLS, G = GL, ic = G.ic;
+  const BASES = [['~/develop', '~/develop (next to the repository)'], ['~/worktrees', '~/worktrees'], ['~/develop/.worktrees', '~/develop/.worktrees']];
+  const TPLS = [['{repo}-{branch}', '{repo}-{branch}'], ['{branch}', '{branch}']];
+  S.mount('settings-worktrees.html', 'Worktrees', () => {
+    const base = S.get('wt-base', '~/develop'), tpl = S.get('wt-tpl', '{repo}-{branch}');
+    const example = base + '/' + tpl.replace('{repo}', 'gitwarp').replace('{branch}', 'fix-git-detect');
+    return `<h2>Worktrees</h2><p class="lead">Where new worktrees go and what happens after you create one. Applies to quick create and the switcher; the Add worktree dialog still lets you pick any folder.</p>
+      ${S.group('Location', [
+        S.row('Base folder', 'New worktrees are created inside this folder, never inside the repository.', S.sel('wt-base', base, BASES, 'Base folder')),
+        S.row('Folder name', `Example: <span class="mono">${example}</span>`, S.sel('wt-tpl', tpl, TPLS, 'Folder name template'))
+      ])}
+      ${S.group('After creating', [
+        S.row('When the worktree is ready', 'Switching keeps your current worktree untouched — its changes stay where they are.', S.seg('wt-after', S.get('wt-after', 'switch'), [['switch', 'Switch to it'], ['stay', 'Stay here']])),
+        S.row('Copy untracked config files', 'Copies .env and .env.local into the new worktree so it runs right away. Ignored build output is never copied.', S.sw('wt-env', S.get('wt-env', true), 'Copy untracked config files'))
+      ])}
+      ${S.group('Ask before…', [
+        S.row('Removing a worktree', 'Always shows unsaved changes first; this only controls the confirmation for clean worktrees.', S.chk('wt-cf-rm', S.get('wt-cf-rm', true), 'Confirm')),
+        S.row('Deleting its branch together with the worktree', 'Unmerged commits stay reachable from the reflog for 30 days.', S.chk('wt-cf-br', S.get('wt-cf-br', true), 'Confirm'))
+      ])}
+      <div class="sfoot">${ic('info', 12)}Settings file: <span class="mono">~/.config/gitwarp/settings.json</span></div>`;
+  });
+})();
+</script>
+</body>
+</html>

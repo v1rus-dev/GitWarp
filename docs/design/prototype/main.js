@@ -17,6 +17,8 @@
     <span class="grp"><b>Appearance</b>${sel('s-date', 'Dates', [['relative', 'Relative'], ['absolute', 'Absolute (UTC)']])}${sel('s-dens', 'Row density', [['26', 'Normal 26'], ['22', 'Compact 22'], ['30', 'Roomy 30']])}${sel('s-col', 'Graph colors', [['on', 'Colored'], ['off', 'Monochrome']])}${sel('s-lw', 'Line width', [['2', '2px'], ['1', '1px'], ['3', '3px']])}${sel('s-ln', 'Diff line numbers', [['on', 'Shown'], ['off', 'Hidden']])}</span>
   </div>`);
   document.body.querySelector('.stagebar').after(bar);
+  bar.insertAdjacentHTML('beforeend', `<span class="grp"><b>Branch filter</b>${sel('s-bf', 'Show commits of', [['', 'Off (all commits)'], ['main', 'main (merges)'], ['feat/palette', 'feat/palette (fork point, merged into main)'], ['feat/idle-lanes', 'feat/idle-lanes'], ['fix/git-detect', 'fix/git-detect'], ['fix/old-experiment', 'fix/old-experiment (no commits)']])}</span>`);
+  const bfSel = bar.querySelector('#s-bf');
   const stage = G.h('<div class="stage"><div class="winwrap"></div></div>');
   document.body.appendChild(stage);
   document.body.appendChild(G.h(`<p class="cap-line">Right-click a sidebar row or a history row for its menu; double-click a branch, tag or commit to check it out; click a branch or tag to reveal its commit. The gear (or Ctrl+,) opens Settings as a modal card. Fetch, Pull, Push and the repository / branch switchers work; with a network job running the three buttons are disabled. Press Ctrl+J to hide the details dock, Ctrl+K to search (Enter / F3 next, Shift+Enter previous, Esc clear). The sidebar splitter drags up to half the window and resets on double-click.</p>`));
@@ -72,7 +74,7 @@
     if (d && d.dataset.dock !== dock) { userPicked = true; setDock(d.dataset.dock); }
     else if (m) { mode = m.dataset.mode; drawDetails(); }
     else if (f) { curFile = +f.dataset.f; drawDetails(); }
-    else if (p) { hist.select(G.commits.findIndex((x) => x.id === p.dataset.parent)); }
+    else if (p) { hist.selectCommit(G.commits.find((x) => x.id === p.dataset.parent)); }
   });
   /* splitter: bottom 220-560 (default 340), right 220-900 (default 640, at most half of the space right of the sidebar); double-click resets */
   split.addEventListener('mousedown', (e) => {
@@ -93,6 +95,7 @@
     histHost.className = 'hist-host';
     hist = G.history(histHost, G.commits, { gw: 112, sel: Math.max(0, G.commits.indexOf(keep)), onSelect: (c) => { cur = c; curFile = 0; drawDetails(); } });
     hist.setRow(row); hist.setMono(mono); hist.setLine(lw);
+    if (bfSel.value) hist.setBranch(bfSel.value);
     if (sh.search.value) searchRun();
   }
   function setHist(k) {
@@ -147,13 +150,14 @@
   sh.onReveal = (kind, name) => {
     if (!hist) return;
     const t = { branch: ['br', 'head'], rbranch: ['rm'], tag: ['tag'] }[kind]; if (!t) return;
-    const i = G.commits.findIndex((c) => c.refs.some((r) => t.includes(r.t) && r.n === name));
-    if (i >= 0) hist.select(i);
+    const c = G.commits.find((c) => c.refs.some((r) => t.includes(r.t) && r.n === name));
+    if (c) hist.selectCommit(c);
   };
   document.addEventListener('gl-head', () => { if (hist) hist.refresh(); });
 
   /* ---------- scenario controls ---------- */
   const $ = (id) => document.getElementById(id);
+  bfSel.onchange = (e) => { if (hist) hist.setBranch(e.target.value || null); };
   $('s-hist').onchange = (e) => setHist(e.target.value);
   $('s-det').onchange = (e) => { dstate = e.target.value; curFile = 0; drawDetails(); };
   $('s-side').onchange = (e) => sh.setSidebar(e.target.value);

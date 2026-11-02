@@ -8,6 +8,7 @@
     ['gear', 'General', 'settings-general.html'],
     ['eye', 'Appearance', 'settings-appearance.html'],
     ['git', 'Git', 'settings-git.html'],
+    ['worktree', 'Worktrees', 'settings-worktrees.html'],
     ['key', 'SSH keys', 'settings-ssh.html'],
     ['keyboard', 'Keybindings', 'settings-keybindings.html'],
     ['split', 'Diff &amp; merge', 'settings-diff.html'],

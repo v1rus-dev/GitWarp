@@ -463,3 +463,22 @@ textarea.input { height: auto; padding: 6px 8px; resize: none; line-height: 1.5;
 /* the .tip caption is a platform tooltip shown at the cursor after 500ms */
 .tip .kbd { margin-left: 2px; }
 .wc .btn.close.is-hover { background: var(--error); color: var(--accent-fg); }
+
+/* ---------- branch filter: "Show all commits of {branch}" (owner: history list, app.js G.history) ---------- */
+.bf-bar { display: flex; align-items: center; gap: 12px; min-height: 32px; padding: 4px 12px 4px 8px; background: var(--accent-soft); border-bottom: 1px solid var(--border); font-size: var(--fs-sm); color: var(--text); }
+.bf-bar .bf-l { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--muted); }
+.bf-bar .bf-n { color: var(--text); font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 40ch; }
+.bf-bar .bf-m { color: var(--muted); white-space: nowrap; }
+.bf-bar .bf-into, .bf-bar .bf-x, .bf-empty .bf-x { height: 22px; padding: 0 8px; border-radius: var(--r-sm); border: 1px solid var(--border-strong); background: var(--bg); color: var(--text); font: inherit; font-size: var(--fs-xs); display: inline-flex; align-items: center; gap: 6px; cursor: default; white-space: nowrap; transition: background-color 140ms cubic-bezier(0.23, 1, 0.32, 1); }
+.bf-bar .bf-into:hover, .bf-bar .bf-x:hover, .bf-empty .bf-x:hover { background: var(--hover); }
+.bf-bar .bf-into:focus-visible, .bf-bar .bf-x:focus-visible, .bf-empty .bf-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.bf-bar .bf-x { margin-left: auto; }
+.ref.mf { background: transparent; border-style: dashed; font-weight: 500; }
+.ref.mf:hover { background: color-mix(in srgb, var(--c) 14%, transparent); }
+.g-e.stub { stroke-dasharray: 2 2; }
+.g-stub { fill: hsl(var(--h) var(--graph-s) var(--graph-l)); }
+.lrow.fork { opacity: .62; }
+.fork-note { flex: none; margin-left: 8px; padding: 0 6px; height: 16px; display: inline-flex; align-items: center; border-radius: var(--r-sm); border: 1px dashed var(--border-strong); color: var(--muted); font-size: var(--fs-xs); }
+.bf-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 48px 24px; text-align: center; color: var(--muted); font-size: var(--fs-sm); }
+.bf-empty b { color: var(--text); font-size: var(--fs-md, 14px); }
+@media (prefers-reduced-motion: reduce) { .bf-bar .bf-into, .bf-bar .bf-x, .bf-empty .bf-x { transition: none; } }

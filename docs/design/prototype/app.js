@@ -79,7 +79,7 @@
   G.logo = (size) => `<img class="app-logo" src="assets/app-icon/${size > 32 ? 'gitwarp' : 'gitwarp-small'}.svg" width="${size}" height="${size}" alt="" style="flex:none;border-radius:${Math.round(size * 0.22)}px">`;
 
   /* ---------- stage bar (presentation only) ---------- */
-  G.PAGES = [['index.html', 'Overview'], ['tokens.html', 'Tokens'], ['components.html', 'Components'], ['graph.html', 'Graph'], ['main-1200.html', 'Main 1200×800'], ['main-1600.html', 'Main 1600×1000'], ['changes.html', 'Local changes'], ['activity.html', 'Activity'], ['settings-general.html', 'Settings'], ['settings-git.html', 'Settings → Git'], ['history-states.html', 'History states'], ['welcome.html', 'Welcome'], ['dialogs-repo.html', 'Dialogs: clone / open'], ['dialogs-ref.html', 'Dialogs: branch / tag'], ['dialogs-checkout.html', 'Dialogs: checkout'], ['dialogs-network.html', 'Dialogs: network'], ['dialogs-worktree.html', 'Worktrees'], ['settings-ssh.html', 'Settings → SSH keys'], ['palette.html', 'Palette']];
+  G.PAGES = [['index.html', 'Overview'], ['tokens.html', 'Tokens'], ['components.html', 'Components'], ['graph.html', 'Graph'], ['main-1200.html', 'Main 1200×800'], ['main-1600.html', 'Main 1600×1000'], ['changes.html', 'Local changes'], ['activity.html', 'Activity'], ['settings-general.html', 'Settings'], ['settings-git.html', 'Settings → Git'], ['history-states.html', 'History states'], ['welcome.html', 'Welcome'], ['dialogs-repo.html', 'Dialogs: clone / open'], ['dialogs-ref.html', 'Dialogs: branch / tag'], ['dialogs-checkout.html', 'Dialogs: checkout'], ['dialogs-network.html', 'Dialogs: network'], ['dialogs-worktree.html', 'Worktrees'], ['worktrees.html', 'Worktrees workspace'], ['settings-ssh.html', 'Settings → SSH keys'], ['palette.html', 'Palette']];
   G.stagebar = function (extra) {
     const cur = location.pathname.split('/').pop() || 'index.html';
     const bar = G.h(`<header class="stagebar"><span class="brand">${G.logo(16)} GitWarp <span class="muted" style="font-weight:400">design</span></span>${G.PAGES.map(([h, l]) => `<a class="nav" href="${h}"${h === cur ? ' aria-current="page"' : ''}>${l}</a>`).join('')}<span class="od-fill"></span>${extra || ''}<button class="btn btn-sm" id="gl-theme" aria-label="Switch theme"></button></header>`);
@@ -130,7 +130,7 @@
     ['a06', 'f3a71c9', ['a07'], 'feat(graph): clip wide graphs with an edge fade and +N badge', 'mo', 300, ['rm:origin/feat/idle-lanes'], ''],
     ['a04', '2e9b8a0', ['a07', 'a09'], "Merge branch 'fix/git-detect'", 'tr', 420, [], ''],
     ['a09', '8d41f6e', ['a10'], 'fix(settings): list both reasons when bundled and system git fail', 'pn', 600, ['br:fix/git-detect', 'rm:origin/fix/git-detect', 'rm:upstream/fix/git-detect', 'tag:v0.3.1-rc1'], ''],
-    ['a07', '5c0e92b', ['a08'], 'refactor(ui): extract Tree component from the sidebar', 'lz', 780, [], ''],
+    ['a07', '5c0e92b', ['a08'], 'refactor(ui): extract Tree component from the sidebar', 'lz', 780, ['br:refactor/tree', 'br:spike/virtual-list', 'br:wip/sidebar', 'rm:origin/refactor/tree', 'rm:upstream/refactor/tree-v2'], ''],
     ['a10', 'b7a3d15', ['a08'], 'feat(settings): validate custom git path, require git ≥ 2.31', 'pn', 1100, ['br:release/0.3-hotfix-for-the-detached-head-checkout-crash-on-windows'], ''],
     ['a08', '04f9c7a', ['a11'], 'chore: update gpui dependency', 'jb', 1500, [], ''],
     ['a11', 'd19e3b6', ['a12'], 'feat(sidebar): tags and stashes sections', 'lz', 2100, [], ''],
@@ -357,6 +357,7 @@
       if (Math.min(xj, xc) > maxX) return;
       p += j === row.col ? `<path class="g-e v" style="--h:${G.hue(j)}" d="M${xc} 13V27"/>` : `<path class="g-e" style="--h:${G.hue(j)}" d="M${xc} 13C${xc} 20 ${xj} 19 ${xj} 26V27"/>`;
     });
+    if (row.stub && xc <= maxX) p += `<path class="g-e stub" style="--h:${G.hue(row.col + 1)}" d="M${xc} 13L${xc + 9} 5"/><circle class="g-stub" style="--h:${G.hue(row.col + 1)}" cx="${xc + 9}" cy="5" r="1.8"/>`;
     if (xc <= maxX + 6) {
       if (o.head) p += `<circle class="g-h" cx="${xc}" cy="13" r="7.5"/>`;
       p += row.merge ? `<circle class="g-d m" style="--h:${G.hue(row.col)}" cx="${xc}" cy="13" r="3.5"/>` : `<circle class="g-d" style="--h:${G.hue(row.col)}" cx="${xc}" cy="13" r="4.5"/>`;
@@ -433,7 +434,7 @@
     const B = (cls, label, icon) => `<button class="btn${cls}" data-act="${label[1]}">${icon ? ic(icon, 14) : ''}${label[0]}</button>`;
     switch (kind) {
       case 'loading': return SK(10);
-      case 'empty': return EMPTY('git', '', 'No commits yet', 'This repository is empty. Stage some files and make your first commit to see history here.', '', B(' btn-primary', ['Go to Local changes', 'changes']) + B('', ['Add .gitignore…', 'gitignore']));
+      case 'empty': return EMPTY('git', '', 'No commits yet', 'This repository is empty. Stage some files and make your first commit to see history here.', '', B(' btn-primary', ['Go to Local changes', 'changes']) + B('', ['Add .gitignore', 'gitignore']));
       case 'notgit': return EMPTY('folder', '', 'Not a git repository', '<span class="path">/home/mira/projects/notes</span> is not inside a git working tree.', '', B(' btn-primary', ['Initialize repository here', 'init'], 'init') + B('', ['Open another…', 'open']));
       case 'nofolder': return EMPTY('folder', '', 'Folder not found', '<span class="path">/home/mira/projects/notes-archive</span> does not exist.', '', B(' btn-primary', ['Remove from recent', 'remove-recent']) + B('', ['Open another…', 'open']));
       case 'cancelled': return EMPTY('fetch', '', 'Loading cancelled', 'The history was not loaded completely.', '', B(' btn-primary', ['Retry', 'retry']));
@@ -452,7 +453,9 @@
   const REFNAME = (r) => (r.t === 'head' ? (r.n === 'HEAD' ? 'HEAD' : 'refs/heads/' + r.n) : r.t === 'br' ? 'refs/heads/' + r.n : r.t === 'rm' ? 'refs/remotes/' + r.n : 'refs/tags/' + r.n);
   G.history = function (host, commits, o) {
     o = o || {};
-    const lay = G.layout(commits);
+    let lay = G.layout(commits);
+    const allCommits = commits, fullLay = lay;
+    let merged = new Map(), forkId = null, bfName = null, bfInfo = null;
     let collapse = !!o.collapse, gw = o.gw || 112, geo = G.geometry(lay, collapse), sel = o.sel == null ? 0 : o.sel, RH = 26, query = '', matches = [], mi = -1;
     host.classList.add('hist');
     host.innerHTML = `<div class="lhead" role="row"><div class="gh"><span>Graph</span><button class="more" hidden></button><span class="grip" data-tip="Drag to resize the graph column · double-click to fit"></span></div><div>Summary</div><div>Author</div><div>Date</div><div>Hash</div></div><div class="lbody" tabindex="0" role="listbox" aria-label="Commit history"></div>`;
@@ -464,14 +467,16 @@
     const mk = (t) => { if (!query) return esc(t); const i = t.toLowerCase().indexOf(query); return i < 0 ? esc(t) : esc(t.slice(0, i)) + '<mark class="hl">' + esc(t.slice(i, i + query.length)) + '</mark>' + esc(t.slice(i + query.length)); };
     function badge(x) {
       const icon = x.t === 'rm' ? 'cloud' : x.t === 'tag' ? 'tag' : 'branch';
-      return `<span class="ref ${x.t === 'rm' ? 'remote' : x.t === 'tag' ? 'tag' : x.t === 'head' ? 'head' : ''}" data-tip="${esc(REFNAME(x))}" data-full="${esc(REFNAME(x))}">${ic(icon, 11)}<span class="rl">${esc(x.n)}</span></span>`;
+      return `<span class="ref ${x.t === 'rm' ? 'remote' : x.t === 'tag' ? 'tag' : x.t === 'head' ? 'head' : ''}" data-tip="${esc(REFNAME(x))}" data-full="${esc(REFNAME(x))}" data-rn="${esc(x.n)}" data-rt="${x.t}">${ic(icon, 11)}<span class="rl">${esc(x.n)}</span></span>`;
     }
     function rowHTML(i) {
       const c = commits[i], r = lay.rows[i], clipped = geo.width > gw;
       const head_ = c.refs.some((x) => x.t === 'head');
       const refs = c.refs.slice().sort((a, b) => (KIND_ORDER[a.t] - KIND_ORDER[b.t]) || a.n.localeCompare(b.n)).map(badge).join('');
       const hx = /^[0-9a-f]{4,40}$/.test(query) && c.hash.startsWith(query);
-      return `<div class="lrow${head_ ? ' head' : ''}${i === sel ? ' sel' : ''}" role="option" aria-selected="${i === sel}" id="cm-${i}" data-i="${i}"><div class="gcol${clipped ? ' clip' : ''}">${G.rowSVG(r, geo, { maxX: clipped ? gw : undefined, head: head_ }).replace('<svg ', `<svg preserveAspectRatio="none" style="height:${RH}px" `)}</div><div class="summary">${refs}<span class="txt" data-tip="${esc(c.summary)}">${mk(c.summary)}</span></div><div class="au">${G.avatar(c, 16)}<span class="od-truncate" data-tip="${esc(c.author)}">${mk(c.author)}</span></div><div class="dt" data-tip="${G.abs(c.min)} UTC">${G.dateCell(c.min)}</div><div class="hash">${hx ? `<mark class="hl">${c.hash.slice(0, query.length)}</mark>${c.hash.slice(query.length)}` : c.hash}</div></div>`;
+      /* branch filter: a merge keeps its second parent as a dashed stub in the graph and a "from {branch}" chip here; the chip drills into that branch */
+      const mf = (merged.get(c.id) || []).map((n) => `<span class="ref mf" role="button" data-bf="${esc(n)}" data-tip="Merged from ${esc(n)} · click to show its commits">${ic('branch', 11)}<span class="rl">from ${esc(n)}</span></span>`).join('');
+      return `<div class="lrow${head_ ? ' head' : ''}${c.id === forkId ? ' fork' : ''}${i === sel ? ' sel' : ''}" role="option" aria-selected="${i === sel}" id="cm-${i}" data-i="${i}"><div class="gcol${clipped ? ' clip' : ''}">${G.rowSVG(r, geo, { maxX: clipped ? gw : undefined, head: head_ }).replace('<svg ', `<svg preserveAspectRatio="none" style="height:${RH}px" `)}</div><div class="summary">${refs}${mf}<span class="txt" data-tip="${esc(c.summary)}">${mk(c.summary)}</span>${c.id === forkId ? '<span class="fork-note">fork point</span>' : ''}</div><div class="au">${G.avatar(c, 16)}<span class="od-truncate" data-tip="${esc(c.author)}">${mk(c.author)}</span></div><div class="dt" data-tip="${G.abs(c.min)} UTC">${G.dateCell(c.min)}</div><div class="hash">${hx ? `<mark class="hl">${c.hash.slice(0, query.length)}</mark>${c.hash.slice(query.length)}` : c.hash}</div></div>`;
     }
     /* badges that do not fit collapse into one muted "+N" badge; the summary keeps at least min(80px, 40% of the cell); HEAD is never hidden */
     function fitRefs() {
@@ -488,6 +493,7 @@
     function paint() {
       const st = body.scrollTop, vh = body.clientHeight || 420;
       const a = Math.max(0, Math.floor(st / RH) - OV), b = Math.min(commits.length, Math.ceil((st + vh) / RH) + OV);
+      if (!commits.length && bfName) { body.innerHTML = `<div class="bf-empty"><b>No commits to show</b><span>${esc(bfName)} has no commits in this repository view. It may be gone or not fetched yet.</span><button type="button" class="bf-x" data-bf-clear>Show all commits</button></div>`; return; }
       let h = `<div class="vs" style="height:${a * RH}px"></div>`;
       for (let i = a; i < b; i++) h += rowHTML(i);
       h += `<div class="vs" style="height:${(commits.length - b) * RH}px"></div>`;
@@ -510,10 +516,42 @@
     /* checkout items of the row menu: one "Switch to {branch}" per local branch other than HEAD, else "Checkout this commit" */
     function others(c) { return c.refs.filter((x) => x.t === 'br'); }
     function checkoutRow(c) { const b = others(c); if (b.length) G.checkout(menuHost(), { branch: b[0].n }); else G.checkout(menuHost(), { commit: c }); }
-    function rowMenu(c) {
+    /* branches a row action can target: the HEAD branch first, then local A-Z, then remote A-Z; a remote ref is dropped when a local branch of the same name sits on the same commit (a duplicate for this purpose) */
+    function filterable(c) {
+      const loc = c.refs.filter((x) => (x.t === 'head' || x.t === 'br') && x.n !== 'HEAD').sort((a, b) => (a.t === 'head' ? -1 : b.t === 'head' ? 1 : a.n.localeCompare(b.n))).map((x) => ({ n: x.n, head: x.t === 'head' }));
+      const names = new Set(loc.map((x) => x.n));
+      const rem = c.refs.filter((x) => x.t === 'rm' && !names.has(x.n.slice(x.n.indexOf('/') + 1))).sort((a, b) => a.n.localeCompare(b.n)).map((x) => ({ n: x.n, remote: true }));
+      return loc.concat(rem);
+    }
+    /* Branch-bound actions pick their branch first (G.menu has no submenus, so the picker REPLACES the menu and starts with "Back").
+       1 branch on the commit: the action names it. 2 or more: "Action…" opens the picker. "Branch…" goes one step further: pick the branch, then get its full sidebar menu.
+       The last-picked branch is listed first, but never acted on automatically. */
+    let lastPick = null;
+    const branchMenuItems = (w, x) => (MENUS(w)[x.remote ? 'rbranch' : 'branch'](x.n));
+    function picker(c, ev, w, fl, run) {
+      const back = { label: 'Back', icon: 'undo', key: '‹', onClick: () => G.menu(w, ev, rowMenu(c, ev)) };
+      const list = fl.slice(); const i = list.findIndex((x) => x.n === lastPick); if (i > 0) list.unshift(list.splice(i, 1)[0]);
+      G.menu(w, ev, [back, { sep: 1 }].concat(list.map((x) => ({ label: x.n, icon: x.remote ? 'cloud' : 'branch', key: x.head ? 'HEAD' : x.remote ? 'remote' : '', onClick: () => { lastPick = x.n; run(x); } }))));
+    }
+    function branchItems(c, ev, w) {
+      const fl = filterable(c), sw = others(c), cur = (n) => n === bfName, out = [];
+      const one = fl[0], many = fl.length > 1;
+      if (sw.length === 1) out.push({ label: `Switch to ${sw[0].n}`, icon: 'check', onClick: () => G.checkout(w, { branch: sw[0].n }) });
+      else if (sw.length > 1) out.push({ label: 'Switch to…', icon: 'check', key: '›', onClick: () => picker(c, ev, w, sw.map((x) => ({ n: x.n })), (x) => G.checkout(w, { branch: x.n })) });
+      else out.push({ label: 'Checkout this commit', icon: 'check', onClick: () => G.checkout(w, { commit: c }) });
+      if (bfName) out.push({ label: 'Show all commits', icon: 'x', onClick: () => api.setBranch(null) });
+      if (fl.length === 1) out.push({ label: `Show all commits of ${one.n}`, icon: cur(one.n) ? 'check' : 'branch', disabled: cur(one.n), onClick: () => api.setBranch(one.n) });
+      else if (many) out.push({ label: 'Show all commits of…', icon: 'branch', key: '›', onClick: () => picker(c, ev, w, fl, (x) => api.setBranch(x.n)) });
+      const back = (x) => ({ label: 'Back', icon: 'undo', key: '‹', onClick: () => G.menu(w, ev, rowMenu(c, ev)) });
+      if (fl.length === 1) out.push({ label: `Branch ${one.n}`, icon: one.remote ? 'cloud' : 'branch', key: '›', onClick: () => G.menu(w, ev, [back(), { sep: 1 }].concat(branchMenuItems(w, one))) });
+      else if (many) out.push({ label: 'Branch…', icon: 'branch', key: '›', onClick: () => picker(c, ev, w, fl, (x) => G.menu(w, ev, [back(), { sep: 1 }].concat(branchMenuItems(w, x)))) });
+      return out;
+    }
+    function rowMenu(c, ev) {
       const w = menuHost(), b = others(c);
-      const co = b.length ? b.map((x) => ({ label: `Switch to ${x.n}`, icon: 'check', onClick: () => G.checkout(w, { branch: x.n }) })) : [{ label: 'Checkout this commit', icon: 'check', onClick: () => G.checkout(w, { commit: c }) }];
-      return [{ label: 'Copy commit hash', icon: 'copy', key: 'Ctrl+C', onClick: () => { try { navigator.clipboard.writeText(c.full); } catch (e) {} } }].concat(co, [
+      const mfi = (merged.get(c.id) || []).map((n) => ({ label: `Show all commits of ${n}`, icon: 'branch', onClick: () => api.setBranch(n) }));
+      const own = branchItems(c, ev, w);
+      return [{ label: 'Copy commit hash', icon: 'copy', key: 'Ctrl+C', onClick: () => { try { navigator.clipboard.writeText(c.full); } catch (e) {} } }].concat(own, mfi.length ? [{ sep: 1 }] : [], mfi, [
         { label: 'Create branch here…', icon: 'branch', key: 'B', onClick: () => window.GLD && window.GLD.openIn('branch', w) },
         { label: 'Create tag here…', icon: 'tag', onClick: () => window.GLD && window.GLD.openIn('tag', w) },
         { sep: 1 },
@@ -528,7 +566,12 @@
       const c = commits[+r.dataset.i], b = others(c), onlyHead = c.refs.some((x) => x.t === 'head' && x.n !== 'HEAD');
       if (b.length) checkoutRow(c); else if (!onlyHead && !c.refs.some((x) => x.t === 'head')) G.checkout(menuHost(), { commit: c });
     });
-    body.addEventListener('contextmenu', (e) => { const r = e.target.closest('.lrow'); if (!r || !menuHost()) return; select(+r.dataset.i, false); G.menu(menuHost(), e, rowMenu(commits[+r.dataset.i])); });
+    body.addEventListener('contextmenu', (e) => {
+      const r = e.target.closest('.lrow'); if (!r || !menuHost()) return; select(+r.dataset.i, false);
+      /* right-click on a branch badge: that branch's own menu (the most direct way to pick the branch) */
+      const rb = e.target.closest('.ref[data-rn]');
+      if (rb && rb.dataset.rn !== 'HEAD' && ['head', 'br', 'rm'].includes(rb.dataset.rt)) { G.menu(menuHost(), e, branchMenuItems(menuHost(), { n: rb.dataset.rn, remote: rb.dataset.rt === 'rm' })); return; }
+      G.menu(menuHost(), e, rowMenu(commits[+r.dataset.i], e)); });
     body.addEventListener('keydown', (e) => {
       const page = Math.floor(body.clientHeight / RH) - 1;
       const k = { ArrowDown: 1, ArrowUp: -1, PageDown: page, PageUp: -page, j: 1, k: -1 }[e.key];
@@ -553,6 +596,52 @@
       G.menu(w, e, [{ label: 'Collapse idle lanes', icon: collapse ? 'check' : 'lanes', onClick: () => { collapse = !collapse; geo = G.geometry(lay, collapse); render(); o.onCollapse && o.onCollapse(collapse); } }, { label: 'Fit graph to content', icon: 'split', onClick: fit }]);
     });
     api.select = select;
+    api.selectCommit = (c) => { const i = commits.indexOf(c); if (i >= 0) select(i); };
+    api.branch = () => bfName;
+    /* ---- branch filter: "Show all commits of {branch}" ----
+       Shows the branch's own commits (git log --first-parent). A branch off the main line stops at its fork point (shown dimmed);
+       the main line keeps its merge commits, each with a dashed stub + "from {branch}" chip instead of pulling the merged branch's commits in. */
+    const byId = new Map(allCommits.map((c) => [c.id, c]));
+    const tipOf = (n) => allCommits.find((c) => c.refs.some((r) => (r.t === 'br' || r.t === 'head' || r.t === 'rm') && r.n === n));
+    const mergedName = (c, pid) => {
+      const m = /Merge (?:remote-tracking )?branch '([^']+)'/.exec(c.summary); if (m && c.parents.indexOf(pid) === 1) return m[1];
+      const pc = byId.get(pid), r = pc && pc.refs.find((x) => x.t === 'br'); return r ? r.n : (pc ? pc.hash : pid);
+    };
+    const bar = () => host.querySelector(':scope > .bf-bar');
+    function drawBar() {
+      let b = bar();
+      if (!bfName) { if (b) b.remove(); return; }
+      if (!b) { b = document.createElement('div'); b.className = 'bf-bar'; b.setAttribute('role', 'status'); head.after(b); }
+      const n = commits.length, mg = merged.size, i = bfInfo && bfInfo.into;
+      b.innerHTML = `<span class="bf-l">${ic('branch', 13)}<span>Commits of</span><b class="bf-n" data-tip="${esc(bfName)}">${esc(bfName)}</b></span><span class="bf-m">${n} commit${n === 1 ? '' : 's'}${mg ? ` · ${mg} merge${mg === 1 ? '' : 's'}` : ''}</span>${i ? `<button type="button" class="bf-into" data-bf-into="${esc(i.c.id)}" data-tip="Select the merge commit ${esc(i.c.hash)}">Merged into ${esc(i.into)} · ${esc(i.c.hash)}</button>` : ''}<button type="button" class="bf-x" data-bf-clear aria-label="Show all commits">${ic('x', 11)}<span>Show all commits</span></button>`;
+    }
+    api.setBranch = (name) => {
+      query = ''; matches = []; mi = -1;
+      if (!name) { commits = allCommits; lay = fullLay; merged = new Map(); forkId = null; bfName = null; bfInfo = null; }
+      else {
+        const tip = tipOf(name), line = new Set(); let list = [], fork = null;
+        for (let c = tipOf('main') || allCommits[0]; c; c = byId.get(c.parents[0])) line.add(c.id);
+        if (tip) { const isMain = line.has(tip.id); for (let c = tip; c; c = byId.get(c.parents[0])) { list.push(c); if (!isMain && c !== tip && line.has(c.id)) { fork = c; break; } } }
+        const inSet = new Set(list.map((c) => c.id));
+        merged = new Map();
+        list.forEach((c) => { const ns = c.parents.slice(1).filter((p) => !inSet.has(p)).map((p) => mergedName(c, p)); if (ns.length) merged.set(c.id, ns); });
+        let into = null;
+        if (tip && !line.has(tip.id)) { const m = allCommits.find((c) => !inSet.has(c.id) && c.parents.slice(1).some((p) => inSet.has(p))); if (m) into = { c: m, into: (tipOf('main') ? 'main' : G.headName()) }; }
+        commits = list; bfName = name; forkId = fork && fork.id; bfInfo = { into };
+        lay = G.layout(list.map((c) => ({ id: c.id, parents: c.parents.filter((p) => inSet.has(p)) })));
+        lay.rows.forEach((r) => { r.merge = merged.has(r.id); r.stub = r.merge; });
+      }
+      geo = G.geometry(lay, collapse); sel = 0; body.scrollTop = 0; drawBar(); render();
+      body.setAttribute('aria-activedescendant', 'cm-0');
+      if (commits.length && o.onSelect) o.onSelect(commits[0], 0);
+      return api;
+    };
+    body.addEventListener('click', (e) => { const c = e.target.closest('.ref.mf'); if (c) api.setBranch(c.dataset.bf); else if (e.target.closest('[data-bf-clear]')) api.setBranch(null); });
+    host.addEventListener('click', (e) => { const x = e.target.closest('.bf-bar [data-bf-clear]'), t = e.target.closest('.bf-bar [data-bf-into]'); if (x) api.setBranch(null); else if (t) { const c = byId.get(t.dataset.bfInto); api.setBranch(null); api.selectCommit(c); } });
+    body.addEventListener('keydown', (e) => { if (e.key === 'Escape' && bfName) { api.setBranch(null); e.preventDefault(); } });
+    if (host._bfh) document.removeEventListener('gl-branch-filter', host._bfh);
+    host._bfh = (e) => { const w = menuHost(); if (w && e.detail && e.detail.win === w) api.setBranch(e.detail.branch); };
+    document.addEventListener('gl-branch-filter', host._bfh);
     api.setCollapse = (b) => { collapse = b; geo = G.geometry(lay, collapse); render(); };
     api.setWidth = (w) => { gw = w; render(); };
     api.geo = () => geo;
@@ -698,6 +787,7 @@
   const MENUS = (win) => ({
     branch: (n) => { const cur = n === G.state.head, h = G.headName(); return [
       { label: 'Checkout', icon: 'check', key: 'Enter', disabled: cur, onClick: () => G.checkout(win, { branch: n }) },
+      { label: `Show all commits of ${n}`, icon: 'branch', onClick: () => document.dispatchEvent(new CustomEvent('gl-branch-filter', { detail: { win, branch: n } })) },
       { label: `Merge ${n} into ${h}`, icon: 'branch', disabled: true },
       { label: `Rebase ${h} onto ${n}`, icon: 'branch', disabled: true },
       { sep: 1 },
@@ -708,6 +798,7 @@
       { label: 'Copy branch name', icon: 'copy', onClick: () => { try { navigator.clipboard.writeText(n); } catch (e) {} } }]; },
     rbranch: (n) => [
       { label: 'Checkout as local branch', icon: 'check', onClick: () => G.checkout(win, { remote: n }) },
+      { label: `Show all commits of ${n}`, icon: 'branch', onClick: () => document.dispatchEvent(new CustomEvent('gl-branch-filter', { detail: { win, branch: n } })) },
       { label: `Merge ${n} into ${G.headName()}`, icon: 'branch', disabled: true },
       { sep: 1 },
       { label: 'Delete remote branch…', icon: 'trash', danger: 1, onClick: () => G.act(win, 'deleteRemoteBranch', n) },
@@ -722,13 +813,13 @@
     stash: (n) => [
       { label: 'Apply stash', icon: 'check', onClick: () => G.toast(win, `Applied ${n}`, 'ok') },
       { label: 'Pop stash', icon: 'undo', onClick: () => G.toast(win, `Popped ${n}`, 'ok') },
-      { label: 'View changes', icon: 'eye', disabled: true },
+      { label: 'View changes', icon: 'eye', onClick: () => G.toast(win, 'Showing the stash in the details dock', 'info') },
       { sep: 1 },
       { label: 'Drop stash', icon: 'trash', danger: 1, onClick: () => G.act(win, 'dropStash', n) }],
     wt: (n, el) => { const locked = el && /locked/.test(el.textContent), cur = el && el.classList.contains('cur'); return [
       { label: 'Open in new window', icon: 'folder', onClick: () => G.toast(win, `Opened ${WTPATH(n)} in a new window`, 'ok') },
       { label: 'Rename worktree…', icon: 'edit', onClick: () => G.act(win, 'renameWorktree', n) },
-      { label: 'Manage worktrees…', icon: 'worktree', onClick: () => { location.href = 'dialogs-worktree.html'; } },
+      { label: 'Manage worktrees…', icon: 'worktree', onClick: () => { location.href = 'worktrees.html'; } },
       { label: 'Add worktree…', icon: 'plus', onClick: () => window.GLD && window.GLD.openIn('worktreeAdd', win) },
       { sep: 1 },
       { label: locked ? 'Unlock' : 'Lock', icon: 'lock', onClick: () => G.toast(win, `${locked ? 'Unlocked' : 'Locked'} ${WTPATH(n)}`, 'ok') },
@@ -737,7 +828,7 @@
       { label: 'Fetch', icon: 'fetch', onClick: () => win._shell.net.run('fetch') },
       { label: 'Edit remote…', icon: 'edit', onClick: () => G.act(win, 'editRemote', n) },
       { label: 'Remove remote', icon: 'trash', danger: 1, onClick: () => G.act(win, 'removeRemote', n) }],
-    sub: () => [{ label: 'Update submodule', icon: 'fetch', disabled: true }, { label: 'Open in new window', icon: 'folder', disabled: true }],
+    sub: () => [{ label: 'Update submodule', icon: 'fetch', onClick: () => G.toast(win, 'Updated submodule vendor/a', 'ok') }, { label: 'Open in new window', icon: 'folder', onClick: () => G.toast(win, 'Opened vendor/a in a new window', 'ok') }],
     'sec-remotes': () => [
       { label: 'Add remote…', icon: 'plus', onClick: () => window.GLD && window.GLD.openIn('remoteAdd', win) },
       { sep: 1 },
@@ -749,7 +840,7 @@
       { label: 'Fetch tags from origin', icon: 'fetch', onClick: () => win._shell.net.run('fetch') },
       { label: 'Push all tags to origin', icon: 'up', onClick: () => win._shell.net.run('tags') }],
     'sec-wt': () => [
-      { label: 'Manage worktrees…', icon: 'worktree', onClick: () => { location.href = 'dialogs-worktree.html'; } },
+      { label: 'Manage worktrees…', icon: 'worktree', onClick: () => { location.href = 'worktrees.html'; } },
       { label: 'Add worktree…', icon: 'plus', onClick: () => window.GLD && window.GLD.openIn('worktreeAdd', win) },
       { sep: 1 },
       { label: 'Prune missing worktrees', icon: 'trash', onClick: () => G.toast(win, 'Pruned stale worktree records', 'ok') },
@@ -785,7 +876,7 @@
         <button class="btn btn-tool net" data-act="push" data-tip="Push the current branch · Ctrl+Shift+P">${ic('up', 14)}<span class="lbl">Push</span></button>
         <button class="btn btn-tool" data-act="stash" data-tip="Stash local changes" data-kbd="Ctrl Shift S">${ic('stash', 14)}<span class="lbl">Stash</span><span class="counter">2</span></button>
         <span class="od-fill"></span>
-        <div class="seg" role="tablist" aria-label="View"><button role="tab" class="${view === 'history' ? 'on' : ''}" onclick="location.href='main-1200.html'">${ic('lanes', 14)}<span class="lbl">History</span></button><button role="tab" class="${view === 'changes' ? 'on' : ''}" data-tip="Local changes" onclick="location.href='changes.html'">${ic('edit', 14)}<span class="lbl">Changes</span></button></div>
+        <div class="seg" role="tablist" aria-label="View"><button role="tab" class="${view === 'history' ? 'on' : ''}" data-tip="History" onclick="location.href='main-1200.html'">${ic('lanes', 14)}<span class="lbl">History</span></button><button role="tab" class="${view === 'changes' ? 'on' : ''}" data-tip="Local changes" onclick="location.href='changes.html'">${ic('edit', 14)}<span class="lbl">Changes</span></button><button role="tab" class="${view === 'worktrees' ? 'on' : ''}" data-tip="Worktrees" data-kbd="Ctrl Alt W" onclick="location.href='worktrees.html'">${ic('worktree', 14)}<span class="lbl">Worktrees</span></button></div>
         <label class="input-wrap tb-search" data-tip="Search commits, authors, hashes" data-kbd="Ctrl K">${ic('search', 14)}<input class="input" placeholder="Search commits, authors, hashes" aria-label="Search commits, authors, hashes"><span class="kbd tb-kbd">Ctrl K</span><span class="tb-stat" hidden></span></label>
         <button class="btn btn-icon btn-ghost" data-act="settings" data-tip="Settings" data-kbd="Ctrl ," aria-label="Settings">${ic('gear', 16)}</button>
         <div class="wc"><button class="btn btn-ghost" aria-label="Minimise">${ic('min', 14)}</button><button class="btn btn-ghost" aria-label="Maximise">${ic('max', 14)}</button><button class="btn btn-ghost close" aria-label="Close">${ic('x', 14)}</button></div>
@@ -860,7 +951,7 @@
       if (k === 'branch') { if (nm !== G.state.head) G.checkout(win, { branch: nm }); }
       else if (k === 'rbranch') G.checkout(win, { remote: nm });
       else if (k === 'tag') { const c = G.commits.find((x) => x.refs.some((r) => r.t === 'tag' && r.n === nm)); if (c) G.checkout(win, { commit: c, tag: nm }); else G.toast(win, 'The tag has no commit to check out', 'warn'); }
-      else if (k === 'wt') location.href = 'dialogs-worktree.html';
+      else if (k === 'wt') location.href = 'worktrees.html';
     });
     /* right-click selects the row without jumping to its commit; folders and the Local branches / Stashes / Submodules headers have no menu */
     tree.addEventListener('contextmenu', (e) => { const n = e.target.closest('.node'); const mk = n && MENUS(win)[n.dataset.kind]; if (!mk) return; clearSel(); n.classList.add('sel'); G.menu(win, e, mk(n.dataset.name, n)); });
@@ -906,7 +997,7 @@
       const recents = ['gitwarp', 'kovalenko-site', 'dotfiles'];
       G.menu(win, under(el), recents.map((n) => ({ label: n, icon: n === repo ? 'check' : 'folder' })).concat([{ sep: 1 },
         { label: 'Open repository…', icon: 'folder', key: 'Ctrl O', onClick: () => window.GLD && window.GLD.openIn('open', win) },
-        { label: 'Worktrees…', icon: 'worktree', onClick: () => { location.href = 'dialogs-worktree.html'; } },
+        { label: 'Worktrees…', icon: 'worktree', onClick: () => { location.href = 'worktrees.html'; } },
         { label: 'Close repository', icon: 'x', onClick: () => { location.href = 'welcome.html'; } },
         { sep: 1 },
         G.state.bgfetch ? { label: 'Fetch in the background', icon: 'check', onClick: () => { G.state.bgfetch = false; } } : { label: 'Background fetch is off', icon: 'fetch', onClick: () => { G.state.bgfetch = true; } }]));

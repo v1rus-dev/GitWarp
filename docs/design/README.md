@@ -25,6 +25,8 @@ both themes are in `screens/` (`<page>.dark.png` and `<page>.light.png`).
 | `changes.html` | Local changes: stage by file, hunk, line; commit editor with amend and character guides. | 6 — local changes |
 | `dialogs-ref.html` | Dialogs: branch / tag here — create branch here and create tag here, with validation states. | 7 — ref operations |
 | `dialogs-worktree.html` | Worktrees: worktree list, add and remove dialogs, locked / dirty / missing states. | 9 — worktrees |
+| `worktrees.html` | Worktrees workspace: titlebar switcher (Ctrl+Alt+W) with create-on-type, sidebar worktree panel, detail pane, quick create from a branch name. | post-10 — W3–W5 |
+| `settings-worktrees.html` | Settings → Worktrees: base folder, folder template, behaviour after creating, confirmations. | post-10 — W2 |
 | `settings-general.html` | Settings → General: language, startup, updates, background fetch, confirmations, privacy. | 10 — settings |
 | `settings-appearance.html` | Settings → Appearance: theme, accent, density, fonts, graph style, live preview. | 10 — settings |
 | `settings-git.html` | Settings → Git: Auto / Bundled / System / Custom, with all warning and error states (scenario switcher). | 10 — settings |
