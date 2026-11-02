@@ -25,10 +25,7 @@
 </p>
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/screenshot-dark.png">
-    <img alt="GitWarp history view" src="docs/images/screenshot-light.png">
-  </picture>
+  <img alt="GitWarp history view in the light and dark themes" src="docs/images/screenshot.png">
 </p>
 
 ## Features
