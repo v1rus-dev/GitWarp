@@ -2633,6 +2633,18 @@ impl HistoryView {
             .cursor_col_resize()
             .hover(move |style| style.bg(accent.opacity(0.7)))
             .when(dragging, |this| this.bg(accent.opacity(0.7)))
+            // A resting 1px divider, so the grip is visible before hover.
+            .when(!dragging, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(3.))
+                        .w(px(1.))
+                        .bg(colors.border_strong),
+                )
+            })
             .tooltip(Tooltip::text(ui::t!("history.header.grip_tooltip")))
             .on_mouse_down(
                 MouseButton::Left,
