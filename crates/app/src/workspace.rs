@@ -33,8 +33,8 @@ use crate::network_service::NetworkService;
 use crate::open_dialog::OpenRepoDialog;
 use crate::palette::OpenPalette;
 use crate::repo_view::{
-    FocusSearch, OpenBranchSwitcher, OpenRepoSwitcher, PullBranch, PushBranch, RepositoryView,
-    ToggleDetails, ToggleSidebar,
+    FocusSearch, OpenBranchSwitcher, OpenRepoSwitcher, OpenWorktreeSwitcher, PullBranch,
+    PushBranch, RepositoryView, ToggleDetails, ToggleSidebar,
 };
 use crate::settings_ui::{Page, SettingsView};
 use crate::welcome::WelcomeView;
@@ -674,6 +674,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenBranchSwitcher, window, cx| {
                 this.with_repository(cx, |view, cx| view.open_branch_menu(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenWorktreeSwitcher, window, cx| {
+                this.with_repository(cx, |view, cx| view.open_worktree_switcher(window, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenRepositoryDialog, window, cx| {
                 this.open_repository_dialog(window, cx);

@@ -34,6 +34,7 @@ mod workspace;
 mod worktree_dialog;
 mod worktree_glyphs;
 mod worktree_path;
+mod worktree_switcher;
 mod worktrees_model;
 mod worktrees_view;
 
@@ -279,6 +280,12 @@ fn main() {
                     repo_view::OpenBranchSwitcher,
                     None,
                 ),
+                ui::actions::key_binding(
+                    cx,
+                    &keys("worktree_switcher", "ctrl-alt-w"),
+                    repo_view::OpenWorktreeSwitcher,
+                    None,
+                ),
                 ui::actions::key_binding(cx, "secondary-shift-s", repo_view::StashChanges, None),
                 // Fetch every remote, as the sidebar's menu advertises.
                 ui::actions::key_binding(
@@ -318,6 +325,8 @@ fn main() {
             repo_view::bind_search_keys(cx);
             // The palette's own keys (PgUp/PgDn, Tab) live in its key context.
             palette::bind_keys(cx);
+            // The worktree switcher's own keys (Alt 1…9) live in its context.
+            worktree_switcher::bind_keys(cx);
             // The history list's extra keys (j/k, PgUp/PgDn, Ctrl+C) live in
             // the list's own context.
             history_view::bind_history_keys(cx, &loaded);

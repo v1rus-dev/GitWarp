@@ -22,6 +22,8 @@ pub struct SegmentItem {
     icon: Option<IconName>,
     disabled: bool,
     tooltip: Option<SharedString>,
+    /// A key cap shown after the tooltip text.
+    tooltip_kbd: Option<SharedString>,
 }
 
 impl SegmentItem {
@@ -32,6 +34,7 @@ impl SegmentItem {
             icon: None,
             disabled: false,
             tooltip: None,
+            tooltip_kbd: None,
         }
     }
 
@@ -42,6 +45,7 @@ impl SegmentItem {
             icon: Some(icon),
             disabled: false,
             tooltip: None,
+            tooltip_kbd: None,
         }
     }
 
@@ -54,6 +58,17 @@ impl SegmentItem {
     /// A tooltip on this option, e.g. for icon-only segments.
     pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
         self.tooltip = Some(text.into());
+        self
+    }
+
+    /// A tooltip with a trailing key cap, e.g. `Ctrl Alt W`.
+    pub fn tooltip_kbd(
+        mut self,
+        text: impl Into<SharedString>,
+        kbd: impl Into<SharedString>,
+    ) -> Self {
+        self.tooltip = Some(text.into());
+        self.tooltip_kbd = Some(kbd.into());
         self
     }
 
@@ -216,7 +231,10 @@ impl RenderOnce for Segmented {
             }
 
             if let Some(tooltip) = item.tooltip {
-                segment = segment.tooltip(Tooltip::text(tooltip));
+                segment = match item.tooltip_kbd {
+                    Some(kbd) => segment.tooltip(Tooltip::with_kbd(tooltip, kbd)),
+                    None => segment.tooltip(Tooltip::text(tooltip)),
+                };
             }
 
             if ring {

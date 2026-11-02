@@ -29,6 +29,7 @@ use ui::{
     ActiveTheme, Icon, IconName, Kbd, RefBadge, RefKind, Scrollbar, TextInput, TextInputEvent,
 };
 
+pub(crate) use matcher::fuzzy;
 pub(crate) use sources::{Command, Group, Hit, Recent, Sources, Target, ViewState};
 
 use crate::repo_view::RepositoryView;
@@ -294,28 +295,7 @@ impl PaletteView {
 
     /// A hit's title with the matched characters in the accent colour, bold.
     fn title(hit: &Hit, colors: ui::ThemeColors) -> StyledText {
-        let style = TextStyle {
-            color: colors.text,
-            font_family: FONT_UI.into(),
-            font_size: FS_BASE.into(),
-            ..TextStyle::default()
-        };
-        let mut matched = style.clone();
-        matched.color = colors.accent;
-        matched.font_weight = FontWeight::BOLD;
-        let mut runs: Vec<TextRun> = Vec::new();
-        let mut cursor = 0;
-        for range in matcher::byte_ranges(&hit.title, &hit.positions) {
-            if cursor < range.start {
-                runs.push(style.to_run(range.start - cursor));
-            }
-            runs.push(matched.to_run(range.len()));
-            cursor = range.end;
-        }
-        if cursor < hit.title.len() {
-            runs.push(style.to_run(hit.title.len() - cursor));
-        }
-        StyledText::new(hit.title.clone()).with_runs(runs)
+        highlighted(&hit.title, &hit.positions, colors)
     }
 
     fn render_row(&self, index: usize, hit: &Hit, cx: &mut Context<Self>) -> impl IntoElement {
@@ -389,6 +369,45 @@ impl PaletteView {
             .child(hint(vec!["Enter"], "run"))
             .child(hint(vec!["Esc"], "close"))
     }
+}
+
+/// `text` with the characters at `positions` (character indices, as the
+/// matcher reports them) in the accent colour, bold. The titlebar worktree
+/// switcher highlights its matches the same way.
+pub(crate) fn highlighted(text: &str, positions: &[usize], colors: ui::ThemeColors) -> StyledText {
+    let style = TextStyle {
+        color: colors.text,
+        font_family: FONT_UI.into(),
+        font_size: FS_BASE.into(),
+        ..TextStyle::default()
+    };
+    highlighted_in(text, positions, style, colors.accent)
+}
+
+/// [`highlighted`] over a caller's base `style`: the matched characters turn
+/// `accent` and bold, the rest keep the style.
+pub(crate) fn highlighted_in(
+    text: &str,
+    positions: &[usize],
+    style: TextStyle,
+    accent: gpui::Hsla,
+) -> StyledText {
+    let mut matched = style.clone();
+    matched.color = accent;
+    matched.font_weight = FontWeight::BOLD;
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut cursor = 0;
+    for range in matcher::byte_ranges(text, positions) {
+        if cursor < range.start {
+            runs.push(style.to_run(range.start - cursor));
+        }
+        runs.push(matched.to_run(range.len()));
+        cursor = range.end;
+    }
+    if cursor < text.len() {
+        runs.push(style.to_run(text.len() - cursor));
+    }
+    StyledText::new(text.to_owned()).with_runs(runs)
 }
 
 /// The area the overlay layer covers: the window less the client-side frame's

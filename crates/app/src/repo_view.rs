@@ -58,6 +58,7 @@ use crate::workspace::{
     git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
 };
 use crate::worktree_dialog::SelectedCommit;
+use crate::worktree_switcher;
 use crate::worktrees_model::{WorktreeEntry, WorktreesModel, WorktreesModelEvent};
 use crate::worktrees_view::{WorktreesEvent, WorktreesView};
 
@@ -73,6 +74,7 @@ actions!(
         SearchFocusList,
         OpenRepoSwitcher,
         OpenBranchSwitcher,
+        OpenWorktreeSwitcher,
         StashChanges,
         FetchAll,
         PullBranch,
@@ -104,7 +106,7 @@ pub(crate) fn bind_search_keys(cx: &mut App) {
 }
 
 /// Height of a toolbar tool button.
-const TOOL_H: f32 = 28.;
+pub(crate) const TOOL_H: f32 = 28.;
 
 /// What the toolbar shows at a given window width.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -117,6 +119,10 @@ pub struct ToolbarLayout {
     pub repo_name: Option<f32>,
     /// Widest the branch name may get; `None` hides it.
     pub branch_name: Option<f32>,
+    /// The worktree switcher button is shown.
+    pub worktree_button: bool,
+    /// Widest the worktree switcher's name may get; `None` hides it.
+    pub worktree_name: Option<f32>,
     /// The search field's flex basis.
     pub search_basis: f32,
     /// The search field's minimum width.
@@ -136,6 +142,8 @@ impl ToolbarLayout {
             search_kbd: true,
             repo_name: Some(96.),
             branch_name: Some(96.),
+            worktree_button: true,
+            worktree_name: Some(96.),
             search_basis: 270.,
             search_min: 150.,
             gap: 6.,
@@ -165,68 +173,89 @@ impl ToolbarLayout {
 /// each side, so a window of `width` has `width - 22` of content. Every item
 /// except the search field is `flex-none`, so the search is the only item that
 /// can shrink; the steps below keep the worst case (names at their maximum,
-/// `Fetch`/`Pull`/`Push`/`Stash`/`History`/`Changes` labelled) inside the bar.
+/// `Fetch`/`Pull`/`Push`/`Stash`/`History`/`Changes` labelled, the worktree
+/// button with its warning dot) inside the bar.
 ///
-/// The labels are dropped from 1340 down: at 1200 a long repository name plus
+/// The labels are dropped from 1460 down: at 1200 a long repository name plus
 /// the segmented labels do not fit even with the search at its minimum, which
-/// clipped "Changes". The third view tab ("Worktrees") widens the labelled bar
-/// by 112px, so the labels and the 140px name caps start 80px higher than with
-/// two tabs.
+/// clipped "Changes". The third view tab ("Worktrees") and the worktree
+/// switcher button widen the bar, so the steps start higher than with the two
+/// switchers alone. Below 740 the worktree button is dropped: Ctrl Alt W still
+/// opens the switcher, under the branch switcher then.
 pub fn toolbar_layout(width: f32) -> ToolbarLayout {
     let full = ToolbarLayout::full();
-    if width >= 1420. {
-        // The design's own 140px cap on both names.
+    if width >= 1580. {
+        // The design's own 140px cap on the repository and branch names.
         ToolbarLayout {
             repo_name: Some(140.),
             branch_name: Some(140.),
             ..full
         }
-    } else if width >= 1340. {
-        full
-    } else if width >= 1000. {
+    } else if width >= 1460. {
+        ToolbarLayout {
+            worktree_name: Some(64.),
+            ..full
+        }
+    } else if width >= 1080. {
         // Icon-only tools and view switch, so the bar fits at 1200.
         ToolbarLayout {
             labels: false,
             search_kbd: false,
+            worktree_name: Some(64.),
             ..full
         }
-    } else if width >= 870. {
+    } else if width >= 990. {
         ToolbarLayout {
             labels: false,
             search_kbd: false,
             repo_name: Some(64.),
             branch_name: Some(64.),
+            worktree_name: Some(64.),
             search_basis: 180.,
             search_min: 120.,
             ..full
         }
-    } else if width >= 840. {
+    } else if width >= 970. {
         ToolbarLayout {
             labels: false,
             search_kbd: false,
             repo_name: Some(64.),
             branch_name: Some(64.),
+            worktree_name: Some(64.),
             search_basis: 96.,
             search_min: 96.,
             ..full
         }
-    } else if width >= 760. {
+    } else if width >= 900. {
+        ToolbarLayout {
+            labels: false,
+            search_kbd: false,
+            repo_name: Some(64.),
+            branch_name: Some(64.),
+            worktree_name: None,
+            search_basis: 96.,
+            search_min: 96.,
+            ..full
+        }
+    } else if width >= 810. {
         ToolbarLayout {
             labels: false,
             search_kbd: false,
             repo_name: None,
             branch_name: Some(64.),
+            worktree_name: None,
             search_basis: 96.,
             search_min: 96.,
             ..full
         }
         .compact()
-    } else if width >= 700. {
+    } else if width >= 740. {
         ToolbarLayout {
             labels: false,
             search_kbd: false,
             repo_name: None,
             branch_name: None,
+            worktree_name: None,
             search_basis: 96.,
             search_min: 96.,
             ..full
@@ -238,6 +267,8 @@ pub fn toolbar_layout(width: f32) -> ToolbarLayout {
             search_kbd: false,
             repo_name: None,
             branch_name: None,
+            worktree_button: false,
+            worktree_name: None,
             search_basis: 60.,
             search_min: 60.,
             padding: 6.,
@@ -397,6 +428,12 @@ pub struct RepositoryView {
     /// Window bounds of the two dropdown anchors, captured while painting.
     repo_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     branch_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Window bounds of the worktree switcher button.
+    worktree_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The worktree switcher popover while it is open; the button is pressed
+    /// then.
+    worktree_switcher: Option<worktree_switcher::Handle>,
+    _worktree_switcher_release: Option<Subscription>,
     /// The stage 7 dialog currently open, if any.
     ref_dialog: Option<Entity<RefDialog>>,
     /// A ref operation without a dialog (checkout, stash apply, …) is running.
@@ -653,6 +690,9 @@ impl RepositoryView {
             files_focus: cx.focus_handle().tab_stop(true),
             repo_bounds: Rc::new(Cell::new(None)),
             branch_bounds: Rc::new(Cell::new(None)),
+            worktree_bounds: Rc::new(Cell::new(None)),
+            worktree_switcher: None,
+            _worktree_switcher_release: None,
             ref_dialog: None,
             ref_action_running: false,
             network: None,
@@ -2334,6 +2374,51 @@ impl RepositoryView {
         menu::open_dropdown(anchor, entries, window, cx);
     }
 
+    /// The worktree switcher popover is open (its button is pressed).
+    pub(crate) fn worktree_switcher_open(&self) -> bool {
+        self.worktree_switcher
+            .as_ref()
+            .is_some_and(|weak| weak.upgrade().is_some())
+    }
+
+    /// Opens the worktree switcher (Ctrl Alt W) under its titlebar button; a
+    /// second call closes it.
+    pub(crate) fn open_worktree_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(open) = self
+            .worktree_switcher
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+        {
+            open.update(cx, |switcher, cx| switcher.close(window, cx));
+            return;
+        }
+        // Without the button (narrow bar) the popover opens under the branch
+        // switcher instead.
+        let anchor = self
+            .worktree_bounds
+            .get()
+            .or(self.branch_bounds.get())
+            .unwrap_or_else(|| Bounds::new(point(px(0.), px(0.)), size(px(200.), px(28.))));
+        let repo = cx.entity().downgrade();
+        let add: worktree_switcher::OpenAdd = Rc::new(move |window, cx| {
+            repo.update(cx, |view, cx| {
+                view.worktrees
+                    .update(cx, |worktrees, cx| worktrees.open_add(window, cx));
+            })
+            .ok();
+        });
+        let switcher =
+            worktree_switcher::open(self.worktrees_model.clone(), anchor, add, window, cx);
+        // Any way of closing it (Esc, a click outside, a pick) releases the
+        // popover; the button un-presses then.
+        self._worktree_switcher_release = Some(cx.observe_release(&switcher, |view, _, cx| {
+            view.worktree_switcher = None;
+            cx.notify();
+        }));
+        self.worktree_switcher = Some(switcher.downgrade());
+        cx.notify();
+    }
+
     /// Opens the command palette (Ctrl P) over this repository.
     pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let history = self.history.read(cx);
@@ -2702,7 +2787,7 @@ impl RepositoryView {
     fn branch_label(&self, cx: &Context<Self>) -> SharedString {
         match self.history.read(cx).head() {
             Some(Head::Branch { name, .. }) => name.clone().into(),
-            Some(Head::Detached(oid)) => oid.short().into(),
+            Some(Head::Detached(_)) => "detached HEAD".into(),
             None => "…".into(),
         }
     }
@@ -2754,6 +2839,34 @@ impl RepositoryView {
             ("Switch branch", Some("Ctrl Shift B")),
             self.branch_bounds.clone(),
             branch_click,
+            colors,
+        );
+
+        if !layout.worktree_button {
+            self.worktree_bounds.set(None);
+        }
+        let worktree_click = {
+            let view = cx.entity();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                view.update(cx, |view, cx| view.open_worktree_switcher(window, cx));
+            }
+        };
+        let (worktree_name, worktree_changed) = {
+            let model = self.worktrees_model.read(cx);
+            match model.current() {
+                Some(entry) => (entry.name().into(), entry.changes.len()),
+                None => (self.repo_name.clone(), 0),
+            }
+        };
+        let worktree_switcher = worktree_switcher::titlebar_button(
+            worktree_name,
+            layout.worktree_name,
+            layout.item_pad,
+            worktree_changed,
+            self.worktree_switcher_open(),
+            crate::settings_ui::keybindings::key_cap(cx, "worktree_switcher"),
+            self.worktree_bounds.clone(),
+            worktree_click,
             colors,
         );
 
@@ -2843,6 +2956,7 @@ impl RepositoryView {
             .child(no_shrink(sidebar_toggle))
             .child(repo_switcher)
             .child(branch_switcher)
+            .when(layout.worktree_button, |bar| bar.child(worktree_switcher))
             .child(no_shrink(
                 div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(colors.border),
             ))
@@ -2872,10 +2986,12 @@ impl RepositoryView {
             Segmented::new("view-switch")
                 .item(history_item)
                 .item(changes_item.tooltip("Local changes"))
-                // The design's tooltip also shows `Ctrl Alt W`; that shortcut
-                // arrives with the titlebar switcher, and the segment's
-                // tooltip takes text only.
-                .item(worktrees_item.tooltip("Worktrees"))
+                .item(
+                    match crate::settings_ui::keybindings::key_cap(cx, "worktree_switcher") {
+                        Some(cap) => worktrees_item.tooltip_kbd("Worktrees", cap),
+                        None => worktrees_item.tooltip("Worktrees"),
+                    },
+                )
                 .selected(segment_for_view(self.view))
                 .on_select(move |index, window, cx| {
                     let mode = view_for_segment(index);
@@ -4095,6 +4211,9 @@ impl Render for RepositoryView {
             .on_action(cx.listener(|view, _: &OpenBranchSwitcher, window, cx| {
                 view.open_branch_menu(window, cx);
             }))
+            .on_action(cx.listener(|view, _: &OpenWorktreeSwitcher, window, cx| {
+                view.open_worktree_switcher(window, cx);
+            }))
             .on_action(cx.listener(|view, _: &StashChanges, window, cx| {
                 view.stash_changes(window, cx);
             }))
@@ -4791,9 +4910,17 @@ mod tests {
                 // Three 34px icon segments and the border.
                 104.
             };
+            // The worktree button: icon, name, the warning dot (6px + gap),
+            // chevron.
+            let worktree_item = if layout.worktree_button {
+                6. + name_item(layout.worktree_name) + layout.gap
+            } else {
+                0.
+            };
             let fixed = 26. // sidebar toggle
                 + name_item(layout.repo_name)
                 + name_item(layout.branch_name)
+                + worktree_item
                 + 9. // separator
                 + tools
                 + segmented
@@ -4821,22 +4948,22 @@ mod tests {
     #[test]
     fn toolbar_steps_hide_labels_and_names_in_order() {
         assert!(toolbar_layout(1600.).labels);
-        assert!(toolbar_layout(1340.).labels);
-        assert!(!toolbar_layout(1339.).labels);
-        assert_eq!(toolbar_layout(1419.).repo_name, Some(96.));
+        assert!(toolbar_layout(1460.).labels);
+        assert!(!toolbar_layout(1459.).labels);
+        assert_eq!(toolbar_layout(1579.).repo_name, Some(96.));
         assert!(!toolbar_layout(1200.).labels);
         assert_eq!(toolbar_layout(1600.).repo_name, Some(140.));
         assert_eq!(toolbar_layout(1200.).repo_name, Some(96.));
-        assert_eq!(toolbar_layout(1000.).repo_name, Some(96.));
+        assert_eq!(toolbar_layout(1080.).repo_name, Some(96.));
+        assert_eq!(toolbar_layout(1000.).repo_name, Some(64.));
         assert_eq!(toolbar_layout(900.).repo_name, Some(64.));
-        assert_eq!(toolbar_layout(840.).repo_name, Some(64.));
-        assert_eq!(toolbar_layout(839.).repo_name, None);
-        assert_eq!(toolbar_layout(800.).repo_name, None);
-        assert_eq!(toolbar_layout(800.).branch_name, Some(64.));
-        assert_eq!(toolbar_layout(720.).branch_name, None);
+        assert_eq!(toolbar_layout(899.).repo_name, None);
+        assert_eq!(toolbar_layout(810.).repo_name, None);
+        assert_eq!(toolbar_layout(810.).branch_name, Some(64.));
+        assert_eq!(toolbar_layout(809.).branch_name, None);
         assert_eq!(toolbar_layout(650.).search_min, 60.);
         assert_eq!(toolbar_layout(650.).padding, 6.);
-        assert_eq!(toolbar_layout(720.).search_min, 96.);
+        assert_eq!(toolbar_layout(760.).search_min, 96.);
         assert_eq!(toolbar_layout(1200.).search_min, 150.);
         assert!(!toolbar_layout(900.).search_kbd);
         assert!(!toolbar_layout(1200.).search_kbd);
@@ -4845,6 +4972,16 @@ mod tests {
         assert_eq!(toolbar_layout(800.).gap, 4.);
         assert_eq!(toolbar_layout(1200.).item_pad, 8.);
         assert_eq!(toolbar_layout(800.).item_pad, 7.);
+    }
+
+    #[test]
+    fn the_worktree_button_loses_its_name_then_the_button_as_the_bar_narrows() {
+        assert_eq!(toolbar_layout(1600.).worktree_name, Some(96.));
+        assert_eq!(toolbar_layout(1200.).worktree_name, Some(64.));
+        assert_eq!(toolbar_layout(899.).worktree_name, None);
+        assert!(toolbar_layout(740.).worktree_button);
+        assert!(!toolbar_layout(739.).worktree_button);
+        assert!(!toolbar_layout(620.).worktree_button);
     }
 
     #[test]
