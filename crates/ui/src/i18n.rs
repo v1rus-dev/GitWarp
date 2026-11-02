@@ -5,8 +5,8 @@
 //! `lang` in `en de fr es ru ja`. Keys are namespaced by area (`kit.*`, `format.*`,
 //! `settings.*`, `app.*`, ...). Every file of a language is merged. All files are embedded
 //! through the single [`CATALOGS`] list below; to add an area, create
-//! `locales/<lang>/<area>.json` for every language (`{}` where untranslated) and append six
-//! lines to [`CATALOGS`].
+//! `locales/<lang>/<area>.json` for every language (`{}` where untranslated) and add its
+//! name to the area list in the `embed_catalogs!` call that defines [`CATALOGS`].
 //!
 //! # Placeholders and plurals
 //! `{name}` in a text is replaced by [`t_args`] / [`t_count`]. Plural keys carry a CLDR
@@ -31,95 +31,30 @@ use std::fmt::Display;
 use std::sync::{OnceLock, RwLock};
 
 use gpui::prelude::*;
-use gpui::{div, px, AnyElement, SharedString};
+use gpui::{div, px, AnyElement, Div, SharedString};
+
+/// Embeds `locales/<lang>/<area>.json` for every `lang` x `area` as `(lang, JSON text)`.
+macro_rules! embed_catalogs {
+    (@acc [$($acc:tt)*] [] $areas:tt) => {
+        &[$($acc)*]
+    };
+    (@acc [$($acc:tt)*] [$lang:literal $($rest:literal)*] [$($area:literal)+]) => {
+        embed_catalogs!(@acc [
+            $($acc)*
+            $( ($lang, include_str!(concat!("../locales/", $lang, "/", $area, ".json"))), )+
+        ] [$($rest)*] [$($area)+])
+    };
+    ([$($lang:literal)+] $areas:tt) => {
+        embed_catalogs!(@acc [] [$($lang)+] $areas)
+    };
+}
 
 /// Every embedded catalog file as `(language code, JSON text)`.
-pub const CATALOGS: &[(&str, &str)] = &[
-    ("en", include_str!("../locales/en/kit.json")),
-    ("en", include_str!("../locales/en/format.json")),
-    ("en", include_str!("../locales/en/settings.json")),
-    ("en", include_str!("../locales/en/app.json")),
-    ("en", include_str!("../locales/en/history.json")),
-    ("en", include_str!("../locales/en/changes.json")),
-    ("en", include_str!("../locales/en/repo.json")),
-    ("en", include_str!("../locales/en/sidebar.json")),
-    ("en", include_str!("../locales/en/palette.json")),
-    ("en", include_str!("../locales/en/activity.json")),
-    ("en", include_str!("../locales/en/welcome.json")),
-    ("en", include_str!("../locales/en/dialogs.json")),
-    ("en", include_str!("../locales/en/network.json")),
-    ("en", include_str!("../locales/en/worktrees.json")),
-    ("de", include_str!("../locales/de/kit.json")),
-    ("de", include_str!("../locales/de/format.json")),
-    ("de", include_str!("../locales/de/settings.json")),
-    ("de", include_str!("../locales/de/app.json")),
-    ("de", include_str!("../locales/de/history.json")),
-    ("de", include_str!("../locales/de/changes.json")),
-    ("de", include_str!("../locales/de/repo.json")),
-    ("de", include_str!("../locales/de/sidebar.json")),
-    ("de", include_str!("../locales/de/palette.json")),
-    ("de", include_str!("../locales/de/activity.json")),
-    ("de", include_str!("../locales/de/welcome.json")),
-    ("de", include_str!("../locales/de/dialogs.json")),
-    ("de", include_str!("../locales/de/network.json")),
-    ("de", include_str!("../locales/de/worktrees.json")),
-    ("fr", include_str!("../locales/fr/kit.json")),
-    ("fr", include_str!("../locales/fr/format.json")),
-    ("fr", include_str!("../locales/fr/settings.json")),
-    ("fr", include_str!("../locales/fr/app.json")),
-    ("fr", include_str!("../locales/fr/history.json")),
-    ("fr", include_str!("../locales/fr/changes.json")),
-    ("fr", include_str!("../locales/fr/repo.json")),
-    ("fr", include_str!("../locales/fr/sidebar.json")),
-    ("fr", include_str!("../locales/fr/palette.json")),
-    ("fr", include_str!("../locales/fr/activity.json")),
-    ("fr", include_str!("../locales/fr/welcome.json")),
-    ("fr", include_str!("../locales/fr/dialogs.json")),
-    ("fr", include_str!("../locales/fr/network.json")),
-    ("fr", include_str!("../locales/fr/worktrees.json")),
-    ("es", include_str!("../locales/es/kit.json")),
-    ("es", include_str!("../locales/es/format.json")),
-    ("es", include_str!("../locales/es/settings.json")),
-    ("es", include_str!("../locales/es/app.json")),
-    ("es", include_str!("../locales/es/history.json")),
-    ("es", include_str!("../locales/es/changes.json")),
-    ("es", include_str!("../locales/es/repo.json")),
-    ("es", include_str!("../locales/es/sidebar.json")),
-    ("es", include_str!("../locales/es/palette.json")),
-    ("es", include_str!("../locales/es/activity.json")),
-    ("es", include_str!("../locales/es/welcome.json")),
-    ("es", include_str!("../locales/es/dialogs.json")),
-    ("es", include_str!("../locales/es/network.json")),
-    ("es", include_str!("../locales/es/worktrees.json")),
-    ("ru", include_str!("../locales/ru/kit.json")),
-    ("ru", include_str!("../locales/ru/format.json")),
-    ("ru", include_str!("../locales/ru/settings.json")),
-    ("ru", include_str!("../locales/ru/app.json")),
-    ("ru", include_str!("../locales/ru/history.json")),
-    ("ru", include_str!("../locales/ru/changes.json")),
-    ("ru", include_str!("../locales/ru/repo.json")),
-    ("ru", include_str!("../locales/ru/sidebar.json")),
-    ("ru", include_str!("../locales/ru/palette.json")),
-    ("ru", include_str!("../locales/ru/activity.json")),
-    ("ru", include_str!("../locales/ru/welcome.json")),
-    ("ru", include_str!("../locales/ru/dialogs.json")),
-    ("ru", include_str!("../locales/ru/network.json")),
-    ("ru", include_str!("../locales/ru/worktrees.json")),
-    ("ja", include_str!("../locales/ja/kit.json")),
-    ("ja", include_str!("../locales/ja/format.json")),
-    ("ja", include_str!("../locales/ja/settings.json")),
-    ("ja", include_str!("../locales/ja/app.json")),
-    ("ja", include_str!("../locales/ja/history.json")),
-    ("ja", include_str!("../locales/ja/changes.json")),
-    ("ja", include_str!("../locales/ja/repo.json")),
-    ("ja", include_str!("../locales/ja/sidebar.json")),
-    ("ja", include_str!("../locales/ja/palette.json")),
-    ("ja", include_str!("../locales/ja/activity.json")),
-    ("ja", include_str!("../locales/ja/welcome.json")),
-    ("ja", include_str!("../locales/ja/dialogs.json")),
-    ("ja", include_str!("../locales/ja/network.json")),
-    ("ja", include_str!("../locales/ja/worktrees.json")),
-];
+pub const CATALOGS: &[(&str, &str)] = embed_catalogs!(
+    ["en" "de" "fr" "es" "ru" "ja"]
+    ["kit" "format" "settings" "app" "history" "changes" "repo" "sidebar" "palette"
+     "activity" "welcome" "dialogs" "network" "worktrees"]
+);
 
 /// Supported language codes; `en` is the fallback.
 pub const LANGUAGES: [&str; 6] = ["en", "de", "fr", "es", "ru", "ja"];
@@ -169,20 +104,33 @@ fn lookup(lang: usize, key: &str) -> Option<SharedString> {
     all[lang].get(key).or_else(|| all[0].get(key)).cloned()
 }
 
+/// [`lookup`], falling back to the key itself.
+fn lookup_or_key(lang: usize, key: &str) -> SharedString {
+    lookup(lang, key).unwrap_or_else(|| SharedString::from(key.to_owned()))
+}
+
+/// The plural template of `key` for `n` in `lang` (the `.other` form when the category's is
+/// missing, the key itself when neither exists).
+fn plural_template(lang: usize, key: &str, n: u64) -> SharedString {
+    let category = plural_category(LANGUAGES[lang], n);
+    lookup(lang, &format!("{key}.{category}"))
+        .or_else(|| lookup(lang, &format!("{key}.other")))
+        .unwrap_or_else(|| SharedString::from(key.to_owned()))
+}
+
 /// Translates `key`; falls back to English, then to the key itself.
 ///
 /// ```
 /// let text = ui::i18n::t("kit.dialog.close"); // "Close"
 /// ```
 pub fn t(key: &str) -> SharedString {
-    lookup(active(), key).unwrap_or_else(|| SharedString::from(key.to_owned()))
+    lookup_or_key(active(), key)
 }
 
 /// Translates `key` into `lang` (a code from [`LANGUAGES`]; unknown means English) without
 /// touching the active language. For measuring a text in another language.
 pub fn t_in(lang: &str, key: &str) -> SharedString {
-    let index = LANGUAGES.iter().position(|l| *l == lang).unwrap_or(0);
-    lookup(index, key).unwrap_or_else(|| SharedString::from(key.to_owned()))
+    lookup_or_key(lang_index(lang), key)
 }
 
 /// Translates `key` and replaces each `{name}` with the matching argument.
@@ -201,11 +149,7 @@ pub fn t_args(key: &str, args: &[(&str, &dyn Display)]) -> SharedString {
 /// let text = ui::i18n::t_count("format.days_ago", 3, &[]); // "3 days ago"
 /// ```
 pub fn t_count(key: &str, n: u64, args: &[(&str, &dyn Display)]) -> SharedString {
-    let lang = active();
-    let category = plural_category(LANGUAGES[lang], n);
-    let template = lookup(lang, &format!("{key}.{category}"))
-        .or_else(|| lookup(lang, &format!("{key}.other")))
-        .unwrap_or_else(|| SharedString::from(key.to_owned()));
+    let template = plural_template(active(), key, n);
     let mut all: Vec<(&str, &dyn Display)> = vec![("n", &n)];
     all.extend_from_slice(args);
     substitute(&template, &all).into()
@@ -256,11 +200,7 @@ pub fn t_count_pieces(
     args: &[(&str, &dyn Display)],
     slots: &[&str],
 ) -> Vec<Piece> {
-    let lang = active();
-    let category = plural_category(LANGUAGES[lang], n);
-    let template = lookup(lang, &format!("{key}.{category}"))
-        .or_else(|| lookup(lang, &format!("{key}.other")))
-        .unwrap_or_else(|| SharedString::from(key.to_owned()));
+    let template = plural_template(active(), key, n);
     let mut all: Vec<(&str, &dyn Display)> = Vec::new();
     if !slots.contains(&"n") {
         all.push(("n", &n));
@@ -295,6 +235,16 @@ pub fn pieces_children(pieces: Vec<Piece>, slots: Vec<AnyElement>) -> Vec<AnyEle
             }
         })
         .collect()
+}
+
+/// One translated sentence as a row: [`pieces_children`] in a wrapping, vertically centred
+/// flex row. Callers must not add a `gap` (the sentence supplies its own spaces).
+pub fn sentence(pieces: Vec<Piece>, slots: Vec<AnyElement>) -> Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .children(pieces_children(pieces, slots))
 }
 
 /// `t!("key")` is [`t`]; `t!("key", name = value, ...)` is [`t_args`].

@@ -27,6 +27,7 @@ mod sidebar;
 mod syntax;
 #[cfg(test)]
 mod test_support;
+mod text_runs;
 mod theme;
 mod welcome;
 mod welcome_activity;

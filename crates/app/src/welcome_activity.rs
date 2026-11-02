@@ -22,7 +22,7 @@ use gpui::{div, px, App, Context, FontWeight, Global, SharedString, Task, WeakEn
 
 use git_core::{Error, Git, Repo};
 use ui::i18n;
-use ui::metrics::{FONT_MONO, FS_LG, FS_SM, R_MD, SP_4, SP_5};
+use ui::metrics::{FS_LG, FS_SM, R_MD, SP_4, SP_5};
 use ui::{
     long_date, menu, ActiveTheme, Button, ButtonSize, HeatLegend, Heatmap, Icon, IconName,
     MenuEntry, MenuItem, SegmentItem, Segmented, Skeleton, Tooltip,
@@ -31,6 +31,7 @@ use ui::{
 use crate::activity_strip::{commits, range_days, LAST_YEAR_DAYS, WEEKS};
 use crate::format::{display_path, format_count, home_dir};
 use crate::history_view::DayFilter;
+use crate::text_runs::{mono, strong};
 use crate::welcome::recent_name;
 use crate::workspace::Workspace;
 
@@ -510,12 +511,6 @@ impl Render for WelcomeActivity {
         let thresholds = git_core::levels(&in_range);
         let skeleton = pending && ready == 0;
 
-        let strong = |text: String| {
-            div()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors.text)
-                .child(text)
-        };
         let line = || {
             div()
                 .flex()
@@ -548,7 +543,7 @@ impl Render for WelcomeActivity {
                             &[],
                             &["n"],
                         ),
-                        vec![strong(format_count(total)).into_any_element()],
+                        vec![strong(colors.text, format_count(total)).into_any_element()],
                     )))
                     .into_any_element(),
             )
@@ -568,7 +563,7 @@ impl Render for WelcomeActivity {
                             &[],
                             &["n"],
                         ),
-                        vec![strong(format_count(total)).into_any_element()],
+                        vec![strong(colors.text, format_count(total)).into_any_element()],
                     )))
                     .into_any_element(),
             )
@@ -643,20 +638,6 @@ impl Render for WelcomeActivity {
                 .child(Icon::new(icon).size(px(16.)).color(colors.muted))
                 .child(text)
         };
-        let mono = |text: String| {
-            div()
-                .font_family(FONT_MONO)
-                .text_color(colors.text)
-                .child(text)
-        };
-        // One translated sentence with styled slots; the sentence supplies its own spaces.
-        let sentence = |pieces, slots| {
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .children(i18n::pieces_children(pieces, slots))
-        };
         let body = if me.is_none() && !me_loading {
             let view = cx.entity();
             message(
@@ -664,9 +645,9 @@ impl Render for WelcomeActivity {
                 line()
                     .whitespace_normal()
                     .flex_wrap()
-                    .child(sentence(
+                    .child(i18n::sentence(
                         i18n::t_pieces("welcome.activity.identity", &[], &["key"]),
-                        vec![mono("user.email".to_owned()).into_any_element()],
+                        vec![mono(colors.text, "user.email".to_owned()).into_any_element()],
                     ))
                     .child(
                         Button::new("welcome-activity-identity")
@@ -685,9 +666,10 @@ impl Render for WelcomeActivity {
                 line()
                     .whitespace_normal()
                     .flex_wrap()
-                    .child(sentence(
+                    .child(i18n::sentence(
                         i18n::t_pieces("welcome.activity.unreachable", &[], &["path"]),
-                        vec![mono(display_path(path, home.as_deref())).into_any_element()],
+                        vec![mono(colors.text, display_path(path, home.as_deref()))
+                            .into_any_element()],
                     ))
                     .into_any_element(),
             )
@@ -715,9 +697,9 @@ impl Render for WelcomeActivity {
         // The footer: who, how many repositories, the legend.
         let footer_left =
             if let Some(me) = me.as_ref().filter(|_| !skeleton && unreachable.is_none()) {
-                let mut left = line().child(sentence(
+                let mut left = line().child(i18n::sentence(
                     i18n::t_pieces("welcome.activity.by", &[], &["email"]),
-                    vec![mono(me.clone()).into_any_element()],
+                    vec![mono(colors.text, me.clone()).into_any_element()],
                 ));
                 if scope == Scope::All && !pending {
                     let skipped = skipped(&self.paths, &self.repos);
@@ -764,7 +746,7 @@ impl Render for WelcomeActivity {
                 if !pending && total == 0 && unreachable.is_none() {
                     left = line()
                         .child(ui::t!("welcome.activity.no_commits_by"))
-                        .child(mono(me.clone()));
+                        .child(mono(colors.text, me.clone()));
                 }
                 Some(left.into_any_element())
             } else {

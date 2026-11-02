@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
@@ -312,6 +312,16 @@ pub fn label_extra_width(lang: &str, measure: impl Fn(&str) -> f32) -> f32 {
 /// [`label_extra_width`] for the active language, measured with the window's text
 /// system at the toolbar font.
 fn toolbar_label_extra(window: &Window) -> f32 {
+    // Language and fonts are fixed for the process, so measure once; English needs no
+    // measuring (the extra is 0 by definition).
+    static EXTRA: OnceLock<f32> = OnceLock::new();
+    if ui::i18n::language() == "en" {
+        return 0.;
+    }
+    *EXTRA.get_or_init(|| measure_label_extra(window))
+}
+
+fn measure_label_extra(window: &Window) -> f32 {
     let font = ui::fonts::ui_font();
     label_extra_width(ui::i18n::language(), |text| {
         let run = TextRun {

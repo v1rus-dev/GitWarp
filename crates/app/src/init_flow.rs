@@ -246,52 +246,44 @@ pub(crate) fn details(
             );
             let commits = usize::try_from(*commits).unwrap_or(usize::MAX);
             Some(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .text_size(FS_BASE)
-                    .text_color(colors.muted)
-                    .children(ui::i18n::pieces_children(
-                        ui::i18n::t_count_pieces(
-                            "welcome.init.details.repo",
-                            u64::try_from(commits).unwrap_or(u64::MAX),
-                            &[("n", &format_count(commits))],
-                            &["repo", "branch"],
-                        ),
-                        vec![
-                            div()
-                                .font_family(FONT_MONO)
-                                .child(repo_name(root.as_path()))
-                                .into_any_element(),
-                            div()
-                                .font_family(FONT_MONO)
-                                .child(branch)
-                                .into_any_element(),
-                        ],
-                    ))
-                    .into_any_element(),
+                ui::i18n::sentence(
+                    ui::i18n::t_count_pieces(
+                        "welcome.init.details.repo",
+                        u64::try_from(commits).unwrap_or(u64::MAX),
+                        &[("n", &format_count(commits))],
+                        &["repo", "branch"],
+                    ),
+                    vec![
+                        div()
+                            .font_family(FONT_MONO)
+                            .child(repo_name(root.as_path()))
+                            .into_any_element(),
+                        div()
+                            .font_family(FONT_MONO)
+                            .child(branch)
+                            .into_any_element(),
+                    ],
+                )
+                .text_size(FS_BASE)
+                .text_color(colors.muted)
+                .into_any_element(),
             )
         }
         Ok(FolderProbe::Nested { root }) => {
             let root = display_path(root.as_path(), home);
             Some(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .text_size(FS_BASE)
-                    .text_color(colors.muted)
-                    .children(ui::i18n::pieces_children(
-                        ui::i18n::t_pieces("welcome.init.details.root", &[], &["root"]),
-                        vec![div()
-                            .font_family(FONT_MONO)
-                            .max_w(px(420.))
-                            .truncate()
-                            .child(root)
-                            .into_any_element()],
-                    ))
-                    .into_any_element(),
+                ui::i18n::sentence(
+                    ui::i18n::t_pieces("welcome.init.details.root", &[], &["root"]),
+                    vec![div()
+                        .font_family(FONT_MONO)
+                        .max_w(px(420.))
+                        .truncate()
+                        .child(root)
+                        .into_any_element()],
+                )
+                .text_size(FS_BASE)
+                .text_color(colors.muted)
+                .into_any_element(),
             )
         }
         _ => None,

@@ -22,6 +22,8 @@ use git_core::{Activity, Error, Git, Repo};
 use ui::actions::Cancel;
 use ui::i18n;
 use ui::metrics::{FONT_MONO, FONT_UI, FS_SM};
+
+use crate::text_runs::{mono, strong};
 use ui::{
     long_date, ActiveTheme, Button, ButtonSize, HeatLegend, Heatmap, Icon, IconName, Kbd,
     SegmentItem, Segmented, Select, Skeleton,
@@ -455,12 +457,6 @@ impl ActivityStrip {
             .on_click(cx.listener(move |this, _, _, cx| this.set_collapsed(!this.collapsed, cx)));
 
         let mine = self.who == Who::Me;
-        let strong = |text: String| {
-            div()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors.text)
-                .child(text)
-        };
         // Shrinks first (clipped, not wrapped) when the header is too narrow;
         // the controls on the right keep their full size.
         let total = div()
@@ -487,7 +483,7 @@ impl ActivityStrip {
                         &[],
                         &["n"],
                     ),
-                    vec![strong(format_count(shown.total)).into_any_element()],
+                    vec![strong(colors.text, format_count(shown.total)).into_any_element()],
                 ))),
             (Status::Ready, Some(shown)) => {
                 if self.all.is_empty() {
@@ -521,7 +517,7 @@ impl ActivityStrip {
                     };
                     total.child(div().flex().children(i18n::pieces_children(
                         pieces,
-                        vec![strong(format_count(shown.total)).into_any_element()],
+                        vec![strong(colors.text, format_count(shown.total)).into_any_element()],
                     )))
                 }
             }
@@ -746,12 +742,6 @@ impl ActivityStrip {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let colors = cx.theme().colors;
-        let mono = |text: String| {
-            div()
-                .font_family(FONT_MONO)
-                .text_color(colors.text)
-                .child(text)
-        };
         let link = |id: &'static str, label: SharedString| {
             div()
                 .id(id)
@@ -760,8 +750,6 @@ impl ActivityStrip {
                 .hover(|this| this.underline())
                 .child(label)
         };
-        // No gap: the spaces between runs come from the translated sentence.
-        let line = || div().flex().items_center().flex_wrap();
 
         if loading {
             return side
@@ -771,10 +759,10 @@ impl ActivityStrip {
         if self.me.is_none() {
             let view = cx.entity();
             return side
-                .child(line().children(i18n::pieces_children(
+                .child(i18n::sentence(
                     i18n::t_pieces("activity.side.unset", &[], &["key"]),
-                    vec![mono("user.email".to_owned()).into_any_element()],
-                )))
+                    vec![mono(colors.text, "user.email".to_owned()).into_any_element()],
+                ))
                 .child(
                     link(
                         "activity-set-identity",
@@ -793,10 +781,11 @@ impl ActivityStrip {
             return side
                 .child(
                     // The design ends the line with a full stop right after the address.
-                    line().children(i18n::pieces_children(
+                    i18n::sentence(
                         i18n::t_pieces("activity.side.none_by", &[], &["email"]),
-                        vec![mono(self.me.clone().unwrap_or_default()).into_any_element()],
-                    )),
+                        vec![mono(colors.text, self.me.clone().unwrap_or_default())
+                            .into_any_element()],
+                    ),
                 )
                 .child(
                     link(
@@ -816,19 +805,14 @@ impl ActivityStrip {
                 .or_else(|| shown.counts.get(&filter.day).map(|&c| c as usize))
                 .unwrap_or(0);
             return side
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(colors.text)
-                        .child(long_date(filter.day)),
-                )
+                .child(strong(colors.text, long_date(filter.day)))
                 .child(ui::t!("activity.side.filtered", commits = commits(count)));
         }
         if matches!(self.status, Status::Partial { .. }) {
-            return side.child(line().children(i18n::pieces_children(
+            return side.child(i18n::sentence(
                 i18n::t_pieces("activity.side.partial", &[], &["command"]),
-                vec![mono("git log".to_owned()).into_any_element()],
-            )));
+                vec![mono(colors.text, "git log".to_owned()).into_any_element()],
+            ));
         }
         let keys = |text: &'static str| Kbd::new(text);
         let pair = |a: &'static str, b: &'static str| {
@@ -842,23 +826,19 @@ impl ActivityStrip {
         side.child(ui::t!("activity.side.hint")).child(
             // Wraps only when the side column is too narrow, as in the
             // design; items wrap whole, never mid-word.
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .whitespace_nowrap()
-                .children(i18n::pieces_children(
-                    i18n::t_pieces(
-                        "activity.side.keys",
-                        &[],
-                        &["day_keys", "week_keys", "filter_key"],
-                    ),
-                    vec![
-                        pair("↑", "↓"),
-                        pair("←", "→"),
-                        keys("Enter").into_any_element(),
-                    ],
-                )),
+            i18n::sentence(
+                i18n::t_pieces(
+                    "activity.side.keys",
+                    &[],
+                    &["day_keys", "week_keys", "filter_key"],
+                ),
+                vec![
+                    pair("↑", "↓"),
+                    pair("←", "→"),
+                    keys("Enter").into_any_element(),
+                ],
+            )
+            .whitespace_nowrap(),
         )
     }
 
@@ -868,7 +848,6 @@ impl ActivityStrip {
         let history = self.history.read(cx);
         let filter = history.day_filter()?.clone();
         let count = history.day_filter_count();
-        let strong = |text: String| div().font_weight(FontWeight::SEMIBOLD).child(text);
         let noun_n = count.unwrap_or(0) as u64;
         let pieces = if filter.me.is_some() {
             i18n::t_count_pieces("activity.filter.mine", noun_n, &[], &["n", "date"])
@@ -899,9 +878,10 @@ impl ActivityStrip {
                 .child(div().flex().items_center().children(i18n::pieces_children(
                     pieces,
                     vec![
-                        strong(count.map_or("…".to_owned(), format_count)).into_any_element(),
-                        strong(long_date(filter.day)).into_any_element(),
-                    ],
+                            strong(colors.text, count.map_or("…".to_owned(), format_count))
+                                .into_any_element(),
+                            strong(colors.text, long_date(filter.day)).into_any_element(),
+                        ],
                 )))
                 .child(div().flex_1())
                 .child(

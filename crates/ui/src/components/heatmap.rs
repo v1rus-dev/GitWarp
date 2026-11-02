@@ -270,7 +270,7 @@ fn civil_from_days(day: i32) -> (i32, u32, u32) {
 }
 
 /// `Wed, 14 Oct 2026` in the active language.
-pub fn long_date(day: i32) -> String {
+pub fn long_date(day: i32) -> SharedString {
     let (year, month, date) = civil_from_days(day);
     let weekday = crate::i18n::t(WEEKDAYS[weekday_row(day) as usize]);
     let month = crate::i18n::t(MONTHS[month as usize - 1]);
@@ -283,7 +283,6 @@ pub fn long_date(day: i32) -> String {
             ("year", &year),
         ],
     )
-    .to_string()
 }
 
 /// `5 commits on Wed, 14 Oct 2026`, `1 commit on …`, `No commits on …`.

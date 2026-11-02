@@ -5,6 +5,7 @@
 //! without a system CJK font.
 
 use std::borrow::Cow;
+use std::sync::OnceLock;
 
 use gpui::{App, Font, FontFallbacks};
 
@@ -39,7 +40,11 @@ pub fn fallbacks() -> FontFallbacks {
 /// The base UI font for a window's root element: Inter plus [`fallbacks`].
 /// Descendants that switch to `FONT_MONO` via `font_family` keep the fallbacks.
 pub fn ui_font() -> Font {
-    let mut font = gpui::font(FONT_UI);
-    font.fallbacks = Some(fallbacks());
-    font
+    static FONT: OnceLock<Font> = OnceLock::new();
+    FONT.get_or_init(|| {
+        let mut font = gpui::font(FONT_UI);
+        font.fallbacks = Some(fallbacks());
+        font
+    })
+    .clone()
 }
