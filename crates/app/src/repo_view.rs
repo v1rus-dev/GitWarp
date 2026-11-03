@@ -66,8 +66,8 @@ use crate::sidebar::{
 use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::web_links::{self, HostLink};
 use crate::workspace::{
-    git_label, git_tooltip, inline_window_controls, repo_name, title_strip, titlebar, titlebar_end,
-    titlebar_fill, uses_title_strip, Workspace,
+    git_label, git_tooltip, inline_window_controls, repo_name, title_strip, titlebar_end,
+    titlebar_fill, uses_title_strip, window_titlebar, Workspace,
 };
 use crate::worktree_dialog::SelectedCommit;
 use crate::worktree_switcher;
@@ -3978,6 +3978,7 @@ impl RepositoryView {
         &mut self,
         layout: ToolbarLayout,
         client: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let colors = cx.theme().colors;
@@ -3985,7 +3986,10 @@ impl RepositoryView {
 
         let sidebar_toggle = Button::ghost("sidebar-toggle")
             .icon_only(IconName::Sidebar)
-            .tooltip_kbd(ui::t!("repo.toolbar.toggle_sidebar"), "Ctrl+B")
+            .tooltip_kbd(
+                ui::t!("repo.toolbar.toggle_sidebar"),
+                ui::kbd::platform_label("Ctrl+B"),
+            )
             .on_click(cx.listener(|view, _, _, cx| view.toggle_sidebar(cx)));
 
         let repo_click = {
@@ -4060,7 +4064,10 @@ impl RepositoryView {
         let stash_view = cx.entity();
         let mut stash_button = Button::tool("toolbar-stash")
             .icon(IconName::Stash)
-            .tooltip_kbd(ui::t!("repo.toolbar.stash_tip"), "Ctrl+Shift+S")
+            .tooltip_kbd(
+                ui::t!("repo.toolbar.stash_tip"),
+                ui::kbd::platform_label("Ctrl+Shift+S"),
+            )
             .on_click(move |_, window, cx| {
                 stash_view.update(cx, |view, cx| view.stash_changes(window, cx));
             });
@@ -4132,7 +4139,7 @@ impl RepositoryView {
             push,
         );
 
-        let mut bar = titlebar(cx)
+        let mut bar = window_titlebar(window, cx)
             .gap(px(layout.gap))
             .px(px(layout.padding))
             .child(no_shrink(sidebar_toggle))
@@ -4209,7 +4216,7 @@ impl RepositoryView {
                 }))
                 .tooltip(Tooltip::with_kbd(
                     ui::t!("repo.search.placeholder"),
-                    "Ctrl+K",
+                    ui::kbd::platform_label("Ctrl+K"),
                 ))
                 .child(field),
         );
@@ -4223,7 +4230,10 @@ impl RepositoryView {
         bar = bar.child(no_shrink(
             Button::ghost("settings-button")
                 .icon_only(IconName::Gear)
-                .tooltip_kbd(ui::t!("repo.toolbar.settings"), "Ctrl+,")
+                .tooltip_kbd(
+                    ui::t!("repo.toolbar.settings"),
+                    ui::kbd::platform_label("Ctrl+,"),
+                )
                 .on_click(settings_click),
         ));
 
@@ -5567,7 +5577,7 @@ impl RepositoryView {
                     .hover(|this| this.bg(colors.hover))
                     .tooltip(Tooltip::with_kbd(
                         ui::t!("repo.toolbar.toggle_dock"),
-                        "Ctrl+J",
+                        ui::kbd::platform_label("Ctrl+J"),
                     ))
                     .on_click(
                         move |_: &gpui::ClickEvent, _window: &mut Window, cx: &mut App| {
@@ -6237,7 +6247,7 @@ impl Render for RepositoryView {
             }
         }
 
-        let toolbar = self.render_toolbar(layout, client, cx);
+        let toolbar = self.render_toolbar(layout, client, window, cx);
 
         // The sidebar may take at most half of the visible area. Only the
         // rendered width is capped; the stored width stays as saved.
@@ -6416,7 +6426,10 @@ fn switcher(
         .on_click(on_click)
         .child(Icon::new(icon).size(px(14.)).color(colors.muted));
     row = match tooltip.1 {
-        Some(kbd) => row.tooltip(Tooltip::with_kbd(tooltip.0.clone(), kbd)),
+        Some(kbd) => row.tooltip(Tooltip::with_kbd(
+            tooltip.0.clone(),
+            ui::kbd::platform_label(kbd),
+        )),
         None => row.tooltip(Tooltip::text(tooltip.0.clone())),
     };
     if let (Some(name), Some(max)) = (name, name_max) {

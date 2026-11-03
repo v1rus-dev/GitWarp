@@ -213,9 +213,11 @@ impl Command {
             Command::FocusSearch => "search",
             Command::OpenSettings(Page::General) => "settings",
             // Bound in `main.rs` without an entry on the Keybindings page.
-            Command::StashChanges => return Some("Ctrl+Shift+S".into()),
-            Command::OpenRepository => return Some("Ctrl+O".into()),
-            Command::Clone => return Some("Ctrl+Shift+O".into()),
+            Command::StashChanges => {
+                return Some(ui::kbd::platform_label("Ctrl+Shift+S").to_string())
+            }
+            Command::OpenRepository => return Some(ui::kbd::platform_label("Ctrl+O").to_string()),
+            Command::Clone => return Some(ui::kbd::platform_label("Ctrl+Shift+O").to_string()),
             _ => return None,
         };
         crate::settings_ui::keybindings::key_cap(cx, id)

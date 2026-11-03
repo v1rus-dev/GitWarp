@@ -229,7 +229,7 @@ impl Workspace {
                 titlebar: Some(TitlebarOptions {
                     title: Some(format!("{name} — GitWarp").into()),
                     appears_transparent: true,
-                    ..Default::default()
+                    traffic_light_position: traffic_light_position(),
                 }),
                 app_id: Some("dev.v1rus.gitwarp".into()),
                 icon: crate::app_icon::window_icon(),
@@ -468,16 +468,48 @@ pub fn titlebar(cx: &App) -> Div {
     let colors = cx.theme().colors;
     div()
         .h(BAR)
-        .px(px(12.))
+        .px(px(BAR_PAD))
         .flex()
         .items_center()
-        .gap(px(6.))
+        .gap(px(BAR_GAP))
         .bg(colors.bg)
         .border_b_1()
         .border_color(colors.border)
         .text_size(FS_BASE)
         .font_family(FONT_UI)
 }
+
+/// [`titlebar`] for a bar that sits at the window's top-left edge.
+///
+/// On macOS it starts with a draggable spacer so the content clears the
+/// traffic lights. Full screen hides them, so the content then sits flush left.
+pub fn window_titlebar(window: &Window, cx: &App) -> Div {
+    titlebar(cx).when(cfg!(target_os = "macos") && !window.is_fullscreen(), |d| {
+        d.child(titlebar_fill().flex_none().w(px(MAC_TRAFFIC_LIGHTS_SPACER)))
+    })
+}
+
+/// Where macOS puts the traffic lights so they sit on the titlebar's centre line.
+///
+/// `y` is the gap above *and* below the buttons (gpui sizes the native titlebar
+/// container as button height + 2·y), so with the ~14px buttons it is
+/// (BAR - 14) / 2. `x` keeps the lights inside [`MAC_TRAFFIC_LIGHTS_INSET`].
+/// `None` elsewhere: only macOS reads the option.
+pub fn traffic_light_position() -> Option<Point<Pixels>> {
+    cfg!(target_os = "macos").then(|| point(px(14.), px(13.)))
+}
+
+/// Horizontal padding and child gap of [`titlebar`].
+const BAR_PAD: f32 = 12.;
+const BAR_GAP: f32 = 6.;
+
+/// Width the macOS traffic lights (close/minimise/zoom) occupy from the window's
+/// left edge at their default position: roughly 70-78px; 78 leaves a small margin.
+const MAC_TRAFFIC_LIGHTS_INSET: f32 = 78.;
+
+/// The spacer's own width: the inset minus the bar padding and the gap that
+/// follows the spacer, so the first real item starts at `MAC_TRAFFIC_LIGHTS_INSET`.
+const MAC_TRAFFIC_LIGHTS_SPACER: f32 = MAC_TRAFFIC_LIGHTS_INSET - BAR_PAD - BAR_GAP;
 
 /// The empty stretch of the titlebar: the window drag area.
 ///
@@ -515,7 +547,9 @@ pub fn titlebar_fill() -> Div {
 /// Only Linux client-side decorations put them there. Windows draws no native
 /// title bar either, but its buttons live in the dedicated [`title_strip`] above
 /// the toolbar, so the toolbar gets none; `window_decorations()` reports `Server`
-/// on Windows, so the check below already excludes it.
+/// on Windows, so the check below already excludes it. macOS also reports `Server`
+/// (gpui's `PlatformWindow::window_decorations` default, not overridden by the macOS
+/// backend), and the native traffic lights cover that case.
 pub fn inline_window_controls(window: &Window) -> bool {
     matches!(window.window_decorations(), Decorations::Client { .. })
 }

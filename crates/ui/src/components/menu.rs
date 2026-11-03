@@ -451,7 +451,7 @@ fn menu_item_row(
                 div()
                     .text_size(FS_SM)
                     .text_color(shortcut_color)
-                    .child(shortcut),
+                    .child(crate::kbd::platform_label(&shortcut)),
             )
         });
 

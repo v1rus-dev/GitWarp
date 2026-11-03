@@ -120,7 +120,7 @@ impl RenderOnce for SearchField {
             )
         })
         .when_some(self.hint.filter(|_| !has_trailing), |this, hint| {
-            this.child(Kbd::new(hint))
+            this.child(Kbd::new(crate::kbd::platform_label(&hint)))
         })
     }
 }
