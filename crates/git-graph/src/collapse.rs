@@ -18,7 +18,7 @@
 use crate::Row;
 
 /// Width of one unfolded lane, px.
-pub const LANE_WIDTH: f32 = 14.0;
+pub const LANE_WIDTH: f32 = 16.0;
 
 /// Width of the gap lane that replaces a run of folded lanes, px.
 pub const FOLDED_WIDTH: f32 = 12.0;

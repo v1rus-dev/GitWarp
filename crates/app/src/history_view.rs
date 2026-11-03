@@ -5141,18 +5141,18 @@ mod tests {
     #[test]
     fn clipped_lanes_count_the_centres_past_the_column_edge() {
         let geometry = ColumnGeometry {
-            xs: vec![7., 21., 35., 49.],
+            xs: vec![8., 24., 40., 56.],
             folded: vec![false; 4],
-            width: 56.,
+            width: 64.,
             folded_count: 0,
         };
         // A centre exactly on the edge is not clipped.
-        // (the painted centres are 9, 23, 37, 51 with the 2 px inset).
-        assert_eq!(clipped_lanes(&geometry, 56.), 0);
-        assert_eq!(clipped_lanes(&geometry, 51.), 0);
-        assert_eq!(clipped_lanes(&geometry, 28.), 2);
-        assert_eq!(clipped_lanes(&geometry, 23.), 2);
-        assert_eq!(clipped_lanes(&geometry, 9.), 3);
+        // (the painted centres are 10, 26, 42, 58 with the 2 px inset).
+        assert_eq!(clipped_lanes(&geometry, 64.), 0);
+        assert_eq!(clipped_lanes(&geometry, 58.), 0);
+        assert_eq!(clipped_lanes(&geometry, 32.), 2);
+        assert_eq!(clipped_lanes(&geometry, 26.), 2);
+        assert_eq!(clipped_lanes(&geometry, 10.), 3);
     }
 
     #[test]

@@ -353,9 +353,9 @@ fn geometry_without_collapse_is_lane_width_per_column() {
         ("root", &[]),
     ])
     .geometry(false);
-    assert_eq!(g.xs, vec![7.0, 21.0, 35.0]);
+    assert_eq!(g.xs, vec![8.0, 24.0, 40.0]);
     assert_eq!(g.folded, vec![false, false, false]);
-    assert_eq!(g.width, 42.0);
+    assert_eq!(g.width, 48.0);
     assert_eq!(g.folded_count, 0);
 }
 
@@ -375,8 +375,8 @@ fn three_idle_lanes_fold_into_one_gap() {
     ])
     .geometry(true);
     assert_eq!(g.folded, vec![false, true, true, true]);
-    assert_eq!(g.xs, vec![7.0, 20.0, 20.0, 20.0]);
-    assert_eq!(g.width, 26.0);
+    assert_eq!(g.xs, vec![8.0, 22.0, 22.0, 22.0]);
+    assert_eq!(g.width, 28.0);
     assert_eq!(g.folded_count, 3);
 }
 
@@ -391,8 +391,8 @@ fn two_idle_lanes_do_not_fold() {
     ])
     .geometry(true);
     assert_eq!(g.folded, vec![false, false, false]);
-    assert_eq!(g.xs, vec![7.0, 21.0, 35.0]);
-    assert_eq!(g.width, 42.0);
+    assert_eq!(g.xs, vec![8.0, 24.0, 40.0]);
+    assert_eq!(g.width, 48.0);
     assert_eq!(g.folded_count, 0);
 }
 
@@ -412,8 +412,8 @@ fn a_column_that_once_held_two_commits_never_folds() {
     .geometry(true);
     assert!(!g.folded[1], "a reused non-idle column must not fold");
     assert_eq!(g.folded_count, 0);
-    assert_eq!(g.xs, vec![7.0, 21.0]);
-    assert_eq!(g.width, 28.0);
+    assert_eq!(g.xs, vec![8.0, 24.0]);
+    assert_eq!(g.width, 32.0);
 }
 
 #[test]
@@ -434,8 +434,8 @@ fn a_column_reused_back_to_back_splits_into_separate_instances() {
     ])
     .geometry(true);
     assert_eq!(g.folded, vec![false, true, true, true]);
-    assert_eq!(g.xs, vec![7.0, 20.0, 20.0, 20.0]);
-    assert_eq!(g.width, 26.0);
+    assert_eq!(g.xs, vec![8.0, 22.0, 22.0, 22.0]);
+    assert_eq!(g.width, 28.0);
     assert_eq!(g.folded_count, 3);
 }
 
@@ -457,7 +457,7 @@ fn a_reused_column_with_a_two_commit_lane_does_not_fold() {
     assert!(!g.folded[1], "a two-commit instance is not idle");
     assert_eq!(g.folded_count, 0);
     assert_eq!(g.xs.len(), 4);
-    assert_eq!(g.width, 56.0);
+    assert_eq!(g.width, 64.0);
 }
 
 #[test]
@@ -473,7 +473,7 @@ fn a_merge_tip_makes_its_column_non_foldable() {
     let g = idle.geometry(true);
     assert!(!g.folded[1], "a merge dot is not idle");
     assert_eq!(g.folded_count, 0);
-    assert_eq!(g.width, 28.0);
+    assert_eq!(g.width, 32.0);
 }
 
 #[test]
@@ -485,14 +485,14 @@ fn geometry_follows_new_rows_that_break_a_fold() {
     feed(&mut b, &mut idle, "b", &["root"]);
     let g = idle.geometry(true);
     assert_eq!(g.folded, vec![false, true, true, true]);
-    assert_eq!(g.width, 26.0);
+    assert_eq!(g.width, 28.0);
 
     // `c` is a merge, so its column stops being idle and the run breaks.
     feed(&mut b, &mut idle, "c", &["root", "extra"]);
     let g = idle.geometry(true);
     assert_eq!(g.folded, vec![false, false, false, false]);
     assert_eq!(g.folded_count, 0);
-    assert_eq!(g.width, 56.0);
+    assert_eq!(g.width, 64.0);
 }
 
 #[test]
@@ -514,10 +514,10 @@ fn a_wide_row_tracks_every_column() {
 
     let g = idle.geometry(true);
     assert_eq!(g.xs.len(), PARENTS as usize);
-    assert_eq!(g.xs[0], 7.0);
-    assert!(g.xs[1..].iter().all(|&x| x == 20.0));
+    assert_eq!(g.xs[0], 8.0);
+    assert!(g.xs[1..].iter().all(|&x| x == 22.0));
     assert!(!g.folded[0]);
     assert!(g.folded[1..].iter().all(|&f| f));
     assert_eq!(g.folded_count, PARENTS as usize - 1);
-    assert_eq!(g.width, 26.0);
+    assert_eq!(g.width, 28.0);
 }

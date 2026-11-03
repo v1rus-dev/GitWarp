@@ -7,7 +7,7 @@
 //! their shared gap x.
 
 use git_core::Oid;
-use git_graph::{ColumnGeometry, Row, Segment};
+use git_graph::{ColorId, ColumnGeometry, Row, Segment};
 use gpui::{
     fill, linear_color_stop, linear_gradient, point, px, Bounds, Hsla, PathBuilder, Pixels, Point,
     Window,
@@ -77,15 +77,18 @@ pub fn paint_row(
     // Straight lane segments overdraw their row by 1 px at both ends.
     let overdraw = px(LANE_OVERDRAW);
     let origin_x = bounds.origin.x;
-    let x_of = |col: usize| geometry.xs.get(col).map(|x| origin_x + px(lane_centre(*x)));
-    let local_x = |x: Pixels| f32::from(x - origin_x);
-    let lane = |col: usize| {
-        if colored {
-            theme.lane_color(col as u32)
-        } else {
-            theme.colors.muted
-        }
+    let origin_x_f = f32::from(origin_x);
+    // Snap lane centres to whole pixels: an even line width centred on an
+    // integer x covers exactly two pixel columns. Dots round their centre too,
+    // so curved endpoints land on the same x as the straight lanes and dots.
+    let x_of = |col: usize| {
+        geometry
+            .xs
+            .get(col)
+            .map(|x| px((origin_x_f + lane_centre(*x)).round()))
     };
+    let local_x = |x: Pixels| f32::from(x - origin_x);
+    let lane = |color: ColorId| lane_color(theme, colored, color);
     let folded = |col: usize| geometry.folded.get(col).copied().unwrap_or(false);
     // The dash phase follows the row's absolute content y, so the pattern runs
     // on across row boundaries instead of restarting in every row.
@@ -95,9 +98,10 @@ pub fn paint_row(
     // folded group draws its dashed gap lane once. `xs` never decreases with
     // the column, so the lanes arrive in x order: an equal x is the same folded
     // group, and the first lane past the column edge ends the row.
-    let through: Vec<usize> = passing_lanes(row).map(|s| s.from).collect();
+    let through: Vec<&Segment> = passing_lanes(row).collect();
     let mut last_x: Option<f32> = None;
-    for &col in &through {
+    for segment in &through {
+        let col = segment.from;
         let Some(x) = x_of(col) else {
             continue;
         };
@@ -126,7 +130,7 @@ pub fn paint_row(
                 line_width,
                 point(x, top - overdraw),
                 point(x, bottom + overdraw),
-                lane(col),
+                lane(segment.color),
             );
         }
     }
@@ -138,9 +142,9 @@ pub fn paint_row(
         let Some(x0) = x_of(segment.from) else {
             continue;
         };
-        let color = lane(segment_column(true, segment));
+        let color = lane(segment.color);
         if segment.from == segment.to {
-            if segment.from != row.column && through.contains(&segment.from) {
+            if segment.from != row.column && through.iter().any(|s| s.from == segment.from) {
                 continue; // a straight-through passing lane, drawn above
             }
             if !vertical_visible(local_x(x0), cw) {
@@ -172,7 +176,7 @@ pub fn paint_row(
                 continue;
             };
             if curve_visible(local_x(x0), local_x(x1), cw) {
-                curve(window, line_width, point(x0, top), point(x1, mid), color);
+                curve_into_dot(window, line_width, point(x0, top), point(x1, mid), color);
             }
         }
     }
@@ -184,14 +188,14 @@ pub fn paint_row(
         let Some(x0) = x_of(segment.from) else {
             continue;
         };
+        let color = lane(segment.color);
         if segment.from == segment.to {
-            if segment.from != row.column && through.contains(&segment.from) {
+            if segment.from != row.column && through.iter().any(|s| s.from == segment.from) {
                 continue; // a straight-through passing lane, drawn above
             }
             if !vertical_visible(local_x(x0), cw) {
                 continue;
             }
-            let color = lane(segment_column(false, segment));
             if segment.from != row.column && folded(segment.from) {
                 let color = theme.colors.muted.opacity(0.6);
                 let end = f32::from(bounds.size.height);
@@ -217,15 +221,15 @@ pub fn paint_row(
             let Some(x1) = x_of(segment.to) else {
                 continue;
             };
-            // A compacted passing lane keeps the color it had in the upper
-            // half; an outgoing line takes the color of the lane it leads to.
-            let color = if segment.from != row.column {
-                lane(segment.from)
-            } else {
-                lane(segment_column(false, segment))
-            };
             if curve_visible(local_x(x0), local_x(x1), cw) {
-                curve(window, line_width, point(x0, mid), point(x1, bottom), color);
+                if segment.from == row.column {
+                    curve_out_of_dot(window, line_width, point(x0, mid), point(x1, bottom), color);
+                } else {
+                    // A compacted passing lane shifts sideways while it keeps
+                    // running down: a symmetric S with vertical tangents, so it
+                    // joins the straight lanes above and below without a kink.
+                    curve_shift(window, line_width, point(x0, mid), point(x1, bottom), color);
+                }
             }
         }
     }
@@ -235,7 +239,7 @@ pub fn paint_row(
             let center = point(xc, mid);
 
             if stub {
-                paint_stub(window, line_width, center, lane(row.column + 1));
+                paint_stub(window, line_width, center, lane(row.color));
             }
 
             // The HEAD ring goes under the dot.
@@ -245,18 +249,18 @@ pub fn paint_row(
                     center,
                     HEAD_RING_RADIUS,
                     HEAD_RING_WIDTH,
-                    theme.colors.text,
+                    lane(row.color),
                 );
             }
 
             if row.is_merge {
-                // Hollow ring: outer 4.5, inner 2.5, so the stroke is 2 px. No halo.
-                circle(window, center, DOT_RADIUS, lane(row.column));
+                // Hollow ring: outer 5, inner 2.5, so the stroke is 2.5 px. No halo.
+                circle(window, center, DOT_RADIUS, lane(row.color));
                 circle(window, center, MERGE_INNER_RADIUS, background);
             } else {
                 // Halo first, then the dot: the ring never touches the lines.
                 circle(window, center, DOT_HALO_RADIUS, background);
-                circle(window, center, DOT_RADIUS, lane(row.column));
+                circle(window, center, DOT_RADIUS, lane(row.color));
             }
         }
     }
@@ -316,16 +320,15 @@ fn passing_lanes<'a>(row: &'a Row<Oid>) -> impl Iterator<Item = &'a Segment> + '
     })
 }
 
-/// The column whose colour a segment takes: `above` segments are coloured by
-/// their source column (the lane the line comes from), `below` segments by
-/// their target column (the lane the line leads to). A compacted passing lane
-/// is the exception: it keeps the source column's colour, handled by the
-/// caller.
-fn segment_column(above: bool, segment: &Segment) -> usize {
-    if above {
-        segment.from
+/// The colour of a lane: its own colour id from `git-graph`, or the muted
+/// fallback when the graph is not coloured. Columns are only positions: a lane
+/// that compaction shifts keeps its colour, so the painter must never index
+/// the palette by column.
+fn lane_color(theme: &Theme, colored: bool, color: ColorId) -> Hsla {
+    if colored {
+        theme.lane_color(color)
     } else {
-        segment.to
+        theme.colors.muted
     }
 }
 
@@ -381,16 +384,67 @@ fn straight(
     }
 }
 
-/// A lane change with the design's control points: 7 px along from the start
-/// and 7 px back from the end, so the bend stays inside the row.
-fn curve(window: &mut Window, width: Pixels, from: Point<Pixels>, to: Point<Pixels>, color: Hsla) {
+/// An upper-half lane change: the line leaves the row's top edge vertically
+/// and arrives at the dot horizontally, a long quarter-ellipse rather than a
+/// steep S squeezed into the row. The vertical tangent at the top edge matches
+/// the straight lane above; the horizontal one matches the dot.
+fn curve_into_dot(
+    window: &mut Window,
+    width: Pixels,
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    color: Hsla,
+) {
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
     let mut path = PathBuilder::stroke(width);
     path.move_to(from);
     path.cubic_bezier_to(
         to,
-        point(from.x, from.y + px(7.)),
-        point(to.x, to.y - px(7.)),
+        point(from.x, from.y + dy * 0.45),
+        point(to.x - dx * 0.55, to.y),
     );
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// A lower-half lane change out of the dot: it leaves the dot horizontally and
+/// arrives at the row's bottom edge vertically, mirroring [`curve_into_dot`].
+fn curve_out_of_dot(
+    window: &mut Window,
+    width: Pixels,
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    color: Hsla,
+) {
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let mut path = PathBuilder::stroke(width);
+    path.move_to(from);
+    path.cubic_bezier_to(
+        to,
+        point(from.x + dx * 0.55, from.y),
+        point(to.x, from.y + dy * 0.45),
+    );
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// A passing lane that compaction shifts sideways: a symmetric S with vertical
+/// tangents at both ends, so it meets the straight lane above and below cleanly.
+fn curve_shift(
+    window: &mut Window,
+    width: Pixels,
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    color: Hsla,
+) {
+    let mid_y = from.y + (to.y - from.y) * 0.5;
+    let mut path = PathBuilder::stroke(width);
+    path.move_to(from);
+    path.cubic_bezier_to(to, point(from.x, mid_y), point(to.x, mid_y));
     if let Ok(path) = path.build() {
         window.paint_path(path, color);
     }
@@ -456,28 +510,28 @@ mod tests {
     }
 
     #[test]
-    fn lane_zero_centre_is_nine() {
-        // git-graph puts lane 0 at 7; the 2 px inset makes it 9.
-        assert_eq!(lane_centre(7.), 9.);
-        assert_eq!(lane_centre(21.), 23.);
+    fn lane_zero_centre_is_ten() {
+        // git-graph puts lane 0 at 8; the 2 px inset makes it 10.
+        assert_eq!(lane_centre(8.), 10.);
+        assert_eq!(lane_centre(24.), 26.);
     }
 
     #[test]
-    fn content_width_is_lanes_times_14_plus_inset() {
+    fn content_width_is_lanes_times_16_plus_inset() {
         for n in [1_usize, 3, 10] {
             let g = geometry(
-                (0..n).map(|i| 14. * i as f32 + 7.).collect(),
-                n as f32 * 14.,
+                (0..n).map(|i| 16. * i as f32 + 8.).collect(),
+                n as f32 * 16.,
             );
-            assert_eq!(content_width(&g), n as f32 * 14. + 2.);
+            assert_eq!(content_width(&g), n as f32 * 16. + 2.);
         }
     }
 
     #[test]
     fn fit_width_includes_the_inset() {
-        // Three lanes: 42 + 2 inset + 8 pad.
-        let g = geometry(vec![7., 21., 35.], 42.);
-        assert_eq!(crate::history_view::fit_width(content_width(&g)), 52.);
+        // Three lanes: 48 + 2 inset + 8 pad.
+        let g = geometry(vec![8., 24., 40.], 48.);
+        assert_eq!(crate::history_view::fit_width(content_width(&g)), 58.);
     }
 
     #[test]
@@ -489,16 +543,23 @@ mod tests {
     }
 
     #[test]
-    fn above_segments_take_the_source_column_and_below_the_target() {
-        // A lane change: the incoming half is the child's column, the outgoing
-        // half is the parent's.
-        let change = segment(2, 5);
-        assert_eq!(segment_column(true, &change), 2);
-        assert_eq!(segment_column(false, &change), 5);
-        // A passing lane has the same column on both ends.
-        let passing = segment(3, 3);
-        assert_eq!(segment_column(true, &passing), 3);
-        assert_eq!(segment_column(false, &passing), 3);
+    fn a_shifted_passing_lane_keeps_its_own_colour() {
+        let theme = Theme::dark();
+        // Compaction moved this passing lane from column 1 to column 0: its
+        // colour must come from the lane itself, not from either column's
+        // palette entry.
+        let shifted = Segment {
+            from: 1,
+            to: 0,
+            color: 3,
+        };
+        assert_ne!(shifted.from, shifted.to);
+        let colour = lane_color(&theme, true, shifted.color);
+        assert_eq!(colour, theme.lane_color(shifted.color));
+        assert_ne!(colour, theme.lane_color(shifted.from as u32));
+        assert_ne!(colour, theme.lane_color(shifted.to as u32));
+        // Uncoloured mode keeps the muted fallback.
+        assert_eq!(lane_color(&theme, false, shifted.color), theme.colors.muted);
     }
 
     #[test]
