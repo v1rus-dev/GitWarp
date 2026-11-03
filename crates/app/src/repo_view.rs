@@ -15,7 +15,7 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, canvas, div, point, px, size, uniform_list, AnyElement, App, AppContext, Bounds,
-    ClickEvent, ClipboardItem, Context, Decorations, Div, Entity, FocusHandle, FontWeight, Hsla,
+    ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
     InteractiveElement, IntoElement, ListHorizontalSizingBehavior, MouseButton, ParentElement,
     Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
     StyledText, Subscription, Task, TextRun, UniformListScrollHandle, WeakEntity, Window,
@@ -66,7 +66,8 @@ use crate::sidebar::{
 use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::web_links::{self, HostLink};
 use crate::workspace::{
-    git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
+    git_label, git_tooltip, inline_window_controls, repo_name, title_strip, titlebar, titlebar_end,
+    titlebar_fill, uses_title_strip, Workspace,
 };
 use crate::worktree_dialog::SelectedCommit;
 use crate::worktree_switcher;
@@ -480,6 +481,11 @@ pub struct RepositoryView {
     sidebar_width: f32,
     /// The sidebar tree's scroll state, shared with its horizontal scrollbar.
     sidebar_scroll: ScrollHandle,
+    /// The current-branch node the sidebar has already scrolled into view, so it
+    /// reveals the checked-out branch when that changes but never re-applies the
+    /// scroll on every frame (which would fight a manual scroll or a just-
+    /// expanded folder).
+    sidebar_revealed: Option<SharedString>,
     /// The sidebar's expansion overrides over the defaults.
     sidebar: Expansion,
     /// The sidebar filter field's text.
@@ -617,6 +623,15 @@ enum NetworkEvent {
 const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(30);
 /// How often the UI drains the job's progress channel.
 const NETWORK_POLL: Duration = Duration::from_millis(80);
+
+/// What [`RepositoryView::run_repo_action`] refreshes once the mutation
+/// succeeds. A checkout only moves HEAD, so it re-reads HEAD and the refs
+/// instead of re-walking the whole history (which would reset the scroll).
+#[derive(Clone, Copy)]
+enum PostRefresh {
+    Full,
+    Checkout,
+}
 
 impl RepositoryView {
     pub fn new(
@@ -833,6 +848,7 @@ impl RepositoryView {
                 .sidebar_width
                 .clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX),
             sidebar_scroll: ScrollHandle::new(),
+            sidebar_revealed: None,
             sidebar: Expansion::default(),
             filter: String::new(),
             sidebar_extras: None,
@@ -1201,7 +1217,13 @@ impl RepositoryView {
 
     /// Flips the expansion of any expandable sidebar row, by key. `current`
     /// is the row's effective state as it was built.
-    fn toggle_node(&mut self, key: &str, current: bool, cx: &mut Context<Self>) {
+    fn toggle_node(
+        &mut self,
+        key: &str,
+        current: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // While filtering every expandable row is forced open. Recording a
         // flip here would silently change the state restored when the filter
         // is cleared, so expansion toggles are ignored until then.
@@ -1210,6 +1232,12 @@ impl RepositoryView {
         }
         self.sidebar.toggle(key, current);
         cx.notify();
+        // The sidebar scrollbar reads the tree's scroll height a frame late: it
+        // is built during render, before the tree lays out the new rows. Without
+        // a second frame its vertical thumb keeps the old, shorter range and
+        // cannot reach the rows a just-expanded folder added. Re-render once more
+        // so it picks up the grown height.
+        cx.on_next_frame(window, |_, _, cx| cx.notify());
     }
 
     /// Click / Enter / Space on a leaf: selects it and reveals its commit in
@@ -1450,7 +1478,7 @@ impl RepositoryView {
                 self.open_ref_dialog(RefDialogKind::DeleteTag { name }, window, cx);
             }
             SidebarAction::ApplyStash(index) => {
-                self.run_repo_action(window, cx, move |repo| {
+                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
                     repo.stash_apply(index)?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -1463,7 +1491,7 @@ impl RepositoryView {
                 });
             }
             SidebarAction::PopStash(index) => {
-                self.run_repo_action(window, cx, move |repo| {
+                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
                     repo.stash_pop(index)?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -1679,7 +1707,7 @@ impl RepositoryView {
             }
             SidebarAction::SetUpstream(branch) => {
                 let fallback = self.default_remote_name();
-                self.run_repo_action(window, cx, move |repo| {
+                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
                     let remote = git_core::network::default_remote(repo)?
                         .unwrap_or_else(|| fallback.clone());
                     let upstream = format!("{remote}/{branch}");
@@ -1732,7 +1760,7 @@ impl RepositoryView {
             }
             SidebarAction::LockWorktree(path) => {
                 let path = PathBuf::from(path);
-                self.run_repo_action(window, cx, move |repo| {
+                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
                     repo.lock_worktree(&path, Some("locked manually"))?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -1742,7 +1770,7 @@ impl RepositoryView {
             }
             SidebarAction::UnlockWorktree(path) => {
                 let path = PathBuf::from(path);
-                self.run_repo_action(window, cx, move |repo| {
+                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
                     repo.unlock_worktree(&path)?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -1765,7 +1793,7 @@ impl RepositoryView {
                 });
             }
             SidebarAction::PruneWorktrees => {
-                self.run_repo_action(window, cx, |repo| {
+                self.run_repo_action(window, cx, PostRefresh::Full, |repo| {
                     repo.prune_worktrees()?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -2291,7 +2319,7 @@ impl RepositoryView {
             changes.staged_count() + changes.unstaged_count()
         };
         if dirty == 0 {
-            self.run_repo_action(window, cx, checkout);
+            self.run_repo_action(window, cx, PostRefresh::Checkout, checkout);
             return;
         }
         let body = ui::i18n::t_count("repo.checkout.dirty_body", dirty as u64, &[]);
@@ -2311,7 +2339,7 @@ impl RepositoryView {
                 move |window, cx| {
                     let checkout = take(&checkout);
                     view.update(cx, |view, cx| {
-                        view.run_repo_action(window, cx, move |repo| {
+                        view.run_repo_action(window, cx, PostRefresh::Checkout, move |repo| {
                             // An empty stash (nothing left to save) is fine:
                             // the switch still happens.
                             repo.stash_save(Some("GitWarp: stashed before switching"))?;
@@ -2325,7 +2353,9 @@ impl RepositoryView {
                 let checkout = checkout.clone();
                 move |window, cx| {
                     let checkout = take(&checkout);
-                    view.update(cx, |view, cx| view.run_repo_action(window, cx, checkout));
+                    view.update(cx, |view, cx| {
+                        view.run_repo_action(window, cx, PostRefresh::Checkout, checkout)
+                    });
                 }
             },
             {
@@ -2334,7 +2364,7 @@ impl RepositoryView {
                 move |window, cx| {
                     let checkout = take(&checkout);
                     view.update(cx, |view, cx| {
-                        view.run_repo_action(window, cx, move |repo| {
+                        view.run_repo_action(window, cx, PostRefresh::Checkout, move |repo| {
                             repo.discard_all()?;
                             checkout(repo)
                         });
@@ -2357,9 +2387,27 @@ impl RepositoryView {
         cx.notify();
     }
 
+    /// Like [`Self::after_ref_change`] but for a checkout: HEAD moved while the
+    /// commit set did not, so the history only re-reads its meta (badges and
+    /// the HEAD ring) and keeps the user's scroll position and selection.
+    fn after_checkout(&mut self, cx: &mut Context<Self>) {
+        self.history
+            .update(cx, |history, cx| history.refresh_meta(cx));
+        self.changes.update(cx, |changes, cx| changes.refresh(cx));
+        self.worktrees
+            .update(cx, |worktrees, cx| worktrees.refresh(cx));
+        self.refresh_with(hosting_status::INTERNAL_RELOAD, cx);
+        cx.notify();
+    }
+
     /// Runs a repository mutation without a dialog, then reloads the views.
-    fn run_repo_action<F>(&mut self, window: &mut Window, cx: &mut Context<Self>, action: F)
-    where
+    fn run_repo_action<F>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        post: PostRefresh,
+        action: F,
+    ) where
         F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)> + Send + 'static,
     {
         if self.ref_action_running {
@@ -2387,7 +2435,10 @@ impl RepositoryView {
                 match result {
                     Ok((kind, notice)) => {
                         toast::show(kind, notice, window, cx);
-                        view.after_ref_change(cx);
+                        match post {
+                            PostRefresh::Full => view.after_ref_change(cx),
+                            PostRefresh::Checkout => view.after_checkout(cx),
+                        }
                     }
                     Err(error) => {
                         toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
@@ -2402,7 +2453,7 @@ impl RepositoryView {
 
     /// The toolbar's Stash button: stashes every local change.
     fn stash_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_repo_action(window, cx, |repo| {
+        self.run_repo_action(window, cx, PostRefresh::Full, |repo| {
             if repo.stash_save(None)? {
                 Ok((ui::ToastKind::Ok, ui::t!("repo.toast.stashed").to_string()))
             } else {
@@ -4200,9 +4251,18 @@ impl RepositoryView {
             self.tree_nodes(&remotes, cx)
         };
         if let Some(index) = nodes.iter().position(|node| node.current) {
-            // ScrollHandle applies this during prepaint, so asking during
-            // render lands on the rows that are about to be laid out.
-            self.sidebar_scroll.scroll_to_item(index);
+            // Reveal the checked-out branch only when it actually changes.
+            // ScrollHandle re-applies a `scroll_to_item` on every prepaint, so
+            // doing this each render would snap the list back to the current
+            // branch forever, fighting a manual scroll and the rows a freshly
+            // expanded folder adds. The key guards against that.
+            let key = nodes[index].key.clone();
+            if self.sidebar_revealed.as_ref() != Some(&key) {
+                // ScrollHandle applies this during prepaint, so asking during
+                // render lands on the rows that are about to be laid out.
+                self.sidebar_scroll.scroll_to_item(index);
+                self.sidebar_revealed = Some(key);
+            }
         }
         let filtering = !self.filter.trim().is_empty();
         let no_matches = !worktrees_mode && !show_prs && filtering && nodes.is_empty();
@@ -4229,7 +4289,7 @@ impl RepositoryView {
                         view.run_sidebar_action(SidebarAction::AddAccountFor(remote), window, cx);
                         cx.notify();
                     } else if has_children {
-                        view.toggle_node(&key, expanded, cx);
+                        view.toggle_node(&key, expanded, window, cx);
                     } else {
                         view.activate_node(&key, cx);
                     }
@@ -4362,22 +4422,41 @@ impl RepositoryView {
                         )
                     })
                     .when(!no_matches && !worktrees_mode && !show_prs, |this| {
+                        // The tree scrolls both ways on one handle. The vertical
+                        // bar overlays its right edge (an in-flow track would cut
+                        // the row highlight short); the horizontal one sits below.
+                        let vscroll = div().absolute().top_0().bottom_0().right_0();
                         this.child(
-                            div().w_full().flex_1().min_w_0().min_h_0().child(
-                                Tree::new("sidebar-tree", nodes)
-                                    .horizontal_scroll()
-                                    .scroll_handle(self.sidebar_scroll.clone())
-                                    .on_toggle(node_toggler(rows.clone(), view.clone()))
-                                    .on_expand(node_toggler(rows.clone(), view.clone()))
-                                    .on_collapse(node_toggler(rows.clone(), view.clone()))
-                                    .on_activate(activate)
-                                    .on_confirm(confirm)
-                                    .on_rename(rename)
-                                    .on_delete(delete)
-                                    .on_open(open)
-                                    .on_context_menu(context_menu)
-                                    .on_pr_click(pr_click),
-                            ),
+                            div()
+                                .relative()
+                                .w_full()
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
+                                .child(
+                                    Tree::new("sidebar-tree", nodes)
+                                        .horizontal_scroll()
+                                        .scroll_handle(self.sidebar_scroll.clone())
+                                        .on_toggle(node_toggler(rows.clone(), view.clone()))
+                                        .on_expand(node_toggler(rows.clone(), view.clone()))
+                                        .on_collapse(node_toggler(rows.clone(), view.clone()))
+                                        .on_activate(activate)
+                                        .on_confirm(confirm)
+                                        .on_rename(rename)
+                                        .on_delete(delete)
+                                        .on_open(open)
+                                        .on_context_menu(context_menu)
+                                        .on_pr_click(pr_click),
+                                )
+                                .child(
+                                    vscroll.child(
+                                        Scrollbar::vertical(
+                                            "sidebar-vscrollbar",
+                                            self.sidebar_scroll.clone(),
+                                        )
+                                        .background(colors.sidebar),
+                                    ),
+                                ),
                         )
                         .child(Scrollbar::horizontal(
                             "sidebar-scrollbar",
@@ -5443,7 +5522,7 @@ impl RepositoryView {
         }
 
         let workspace = self.workspace.clone();
-        bar.child(
+        bar = bar.child(
             div()
                 .id("status-git")
                 .h(px(20.))
@@ -5465,7 +5544,40 @@ impl RepositoryView {
                 )
                 .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
                 .child(self.git_label.clone()),
-        )
+        );
+
+        // The details dock toggle (like Fork's) sits to the right of the git
+        // version. The dock belongs to History only, so it shows there; it
+        // highlights while the panel is hidden.
+        if self.view == ViewMode::History {
+            let view = cx.entity();
+            let hidden = !self.details_open;
+            let color = if hidden { colors.accent } else { colors.muted };
+            bar = bar.child(
+                div()
+                    .id("status-dock")
+                    .h(px(20.))
+                    .w(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(R_SM)
+                    .cursor_pointer()
+                    .when(hidden, |this| this.bg(colors.hover))
+                    .hover(|this| this.bg(colors.hover))
+                    .tooltip(Tooltip::with_kbd(
+                        ui::t!("repo.toolbar.toggle_dock"),
+                        "Ctrl+J",
+                    ))
+                    .on_click(
+                        move |_: &gpui::ClickEvent, _window: &mut Window, cx: &mut App| {
+                            view.update(cx, |view, cx| view.toggle_details(cx));
+                        },
+                    )
+                    .child(Icon::new(IconName::PanelB).size(px(14.)).color(color)),
+            );
+        }
+        bar
     }
 }
 
@@ -6104,7 +6216,7 @@ impl From<&HostingState> for HostingView {
 
 impl Render for RepositoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let client = matches!(window.window_decorations(), Decorations::Client { .. });
+        let client = inline_window_controls(window);
         let colors = cx.theme().colors;
         let width = f32::from(window.viewport_size().width);
         let height = f32::from(window.viewport_size().height);
@@ -6262,6 +6374,9 @@ impl Render for RepositoryView {
             .on_action(cx.listener(|view, _: &PushBranch, window, cx| {
                 view.push_branch(window, cx);
             }))
+            .when(uses_title_strip(), |column| {
+                column.child(title_strip(self.repo_name.clone(), cx))
+            })
             .child(toolbar)
             .child(body)
             .child(status)
@@ -6850,14 +6965,14 @@ fn node_toggler(
     rows: Vec<(SharedString, bool, bool)>,
     view: Entity<RepositoryView>,
 ) -> impl Fn(usize, &mut Window, &mut App) + 'static {
-    move |index, _, cx| {
+    move |index, window, cx| {
         let Some((key, has_children, expanded)) = rows.get(index).cloned() else {
             return;
         };
         if !has_children {
             return;
         }
-        view.update(cx, |view, cx| view.toggle_node(&key, expanded, cx));
+        view.update(cx, |view, cx| view.toggle_node(&key, expanded, window, cx));
     }
 }
 

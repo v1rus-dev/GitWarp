@@ -414,10 +414,10 @@ impl RefDialog {
                 },
             ),
             RefDialogKind::CreateTag { .. } | RefDialogKind::RenameTag { .. } => (
-                !name.is_empty()
-                    && name_error.is_none()
-                    && !rename_unchanged
-                    && !(self.annotated && message.is_empty()),
+                !(name.is_empty()
+                    || name_error.is_some()
+                    || rename_unchanged
+                    || self.annotated && message.is_empty()),
                 if name.is_empty() {
                     Some(ui::t!("dialogs.ref.hint.tag_name"))
                 } else if name_error.is_some() {

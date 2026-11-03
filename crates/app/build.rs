@@ -20,6 +20,10 @@ fn embed_icon() {
         .join("gitwarp.ico");
     winresource::WindowsResource::new()
         .set_icon(icon.to_str().expect("the icon path is valid UTF-8"))
+        .set("FileDescription", "GitWarp")
+        .set("ProductName", "GitWarp")
+        .set("OriginalFilename", "gitwarp.exe")
+        .set("InternalName", "gitwarp")
         .compile()
         .expect("failed to embed the Windows icon");
 }

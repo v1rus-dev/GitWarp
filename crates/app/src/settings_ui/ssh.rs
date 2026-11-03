@@ -114,6 +114,7 @@ impl SettingsView {
             return;
         };
         let slot = format!("{}|{}", key.name, host);
+        let key_path = key.path.clone();
         self.ssh_tests
             .insert(slot.clone(), TestState::Running(host.clone()));
         cx.spawn(async move |this, cx| {
@@ -121,7 +122,8 @@ impl SettingsView {
                 .background_executor()
                 .spawn({
                     let host = host.clone();
-                    async move { ssh::test_connection(&host, 8) }
+                    let key_path = key_path.clone();
+                    async move { ssh::test_connection(&host, &key_path, 8) }
                 })
                 .await;
             this.update(cx, |view, cx| {

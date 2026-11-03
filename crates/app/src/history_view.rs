@@ -30,8 +30,8 @@ use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD, R_SM};
 use ui::theme::ThemeColors;
 use ui::{
     menu, ActiveTheme, Avatar, Button, ButtonSize, CiGlyph, EmptyState, Icon, IconName, ListRow,
-    MenuEntry, MenuItem, PrBadge, Progress, RefBadge, RefKind, Skeleton, Spinner, ToastKind,
-    Tooltip,
+    MenuEntry, MenuItem, PrBadge, Progress, RefBadge, RefKind, Scrollbar, Skeleton, Spinner,
+    ToastKind, Tooltip,
 };
 
 use crate::format::{format_count, relative_time};
@@ -2633,6 +2633,38 @@ impl HistoryView {
         cx.notify();
     }
 
+    /// Re-reads HEAD and the refs without re-walking the commit log. A
+    /// checkout only moves HEAD (the `--all` commit set is unchanged), so this
+    /// refreshes the badges and the HEAD ring while the scroll position and
+    /// the selected row stay exactly where the user left them.
+    pub fn refresh_meta(&mut self, cx: &mut Context<Self>) {
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(_) => return,
+        };
+        let path = self.path.clone();
+        cx.spawn(async move |this, cx| {
+            let meta = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &path)?;
+                    let root = repo.root().to_path_buf();
+                    Ok::<_, Error>((root, repo.head(), repo.refs()))
+                })
+                .await;
+            match meta {
+                Ok((root, head, refs)) => {
+                    this.update(cx, |view, cx| view.set_meta(root, head, refs, cx))
+                        .ok();
+                }
+                Err(e) => {
+                    log::warn!("could not refresh HEAD and refs after a checkout: {e}")
+                }
+            }
+        })
+        .detach();
+    }
+
     /// `git init` the folder, then load the new repository.
     fn init_repository(&mut self, cx: &mut Context<Self>) {
         let Ok(git) = self.git.clone() else {
@@ -3552,7 +3584,7 @@ impl HistoryView {
     }
 
     fn render_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        uniform_list(
+        let list = uniform_list(
             "history",
             self.rows().len(),
             cx.processor(|view, range, window, cx| view.render_rows(range, window, cx)),
@@ -3576,8 +3608,28 @@ impl HistoryView {
         .on_action(cx.listener(|view, _: &CopyCommitHash, _, cx| view.copy_selected_hash(cx)))
         .on_action(cx.listener(|view, _: &CreateBranchHere, window, cx| {
             view.create_branch_selected(window, cx);
-        }))
-        .into_any_element()
+        }));
+
+        // The scrollbar overlays the rows rather than sitting beside them: an
+        // in-flow 10px track would steal width from the columns and push the
+        // Hash column out of line with the header above (which spans the full
+        // pane). As an absolute overlay the table stays aligned; the opaque
+        // track keeps row text from showing through beside the thumb.
+        let bg = cx.theme().colors.bg;
+        let scrollbar = div().absolute().top_0().bottom_0().right_0();
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(list)
+            .child(
+                scrollbar
+                    .child(Scrollbar::uniform("history-bar", self.scroll.clone()).background(bg)),
+            )
+            .into_any_element()
     }
 
     fn render_body(&mut self, columns: Columns, cx: &mut Context<Self>) -> AnyElement {

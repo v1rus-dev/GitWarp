@@ -532,23 +532,18 @@ fn target_chip(
             }
         }
         UrlAccount::NoAccount(_) => {
-            // No question to ask (Bitbucket, Azure, a URL that does not map to
-            // owner/repo): the answer is "not public" at once.
+            // No account for a known service. Signing in is optional — a public
+            // repository needs none, and the user may only want to browse or
+            // fetch over SSH — so this is never flagged. A public repository
+            // still gets the neutral chip; everything else shows nothing.
+            // Account… in the remote's menu is still the way to add one.
             let state = target
                 .public_probe
                 .as_ref()
                 .map_or(PublicState::NotPublic, public);
             match state {
-                PublicState::Pending => (None, false),
                 PublicState::Public => (Some(public_chip(host)), false),
-                PublicState::NotPublic => (
-                    Some(Chip {
-                        text: ui::t!("sidebar.remote.chip.no_account").to_string(),
-                        warn: true,
-                        tooltip: ui::t!("sidebar.remote.tip.no_account", host = host).to_string(),
-                    }),
-                    true,
-                ),
+                PublicState::Pending | PublicState::NotPublic => (None, false),
             }
         }
         UrlAccount::Unknown => (None, false),
@@ -1009,33 +1004,23 @@ mod tests {
         assert_eq!(d.add_account, None);
 
         let d = shown(&[], &t, None, PublicState::NotPublic);
-        let chip = d.chip.unwrap();
-        assert_eq!(chip.text, "no account");
-        assert!(chip.warn);
-        assert_eq!(chip.tooltip, "No account for github.com");
-        let add = d.add_account.unwrap();
-        assert_eq!(
-            (add.kind, add.host.as_str()),
-            (ServiceKind::GitHub, "github.com")
-        );
-        assert_eq!(add.label, "Add account for github.com");
-        assert_eq!(
-            add.tooltip,
-            "Add an account for github.com and use it for upstream"
-        );
+        assert!(d.chip.is_none());
+        assert!(d.add_account.is_none());
         assert_eq!(d.service, Some(ServiceKind::GitHub));
         assert_eq!(d.tooltip.as_deref(), Some("upstream · github.com"));
     }
 
     #[test]
-    fn a_service_without_an_anonymous_check_is_not_public_at_once() {
+    fn a_service_without_an_anonymous_check_shows_no_chip() {
+        // Bitbucket (and other services without a public probe) have no
+        // anonymous check, so public_probe is None and the account is
+        // NoAccount. No chip is shown regardless of the public state.
         let t = targets("origin", "https://bitbucket.org/acme/app.git", &[]);
         let r = resolved(&[], &t, None);
         assert_eq!(r.fetch.public_probe, None);
-        // Even while "pending" for everything else.
         let d = shown(&[], &t, None, PublicState::Pending);
-        assert_eq!(d.chip.unwrap().text, "no account");
-        assert!(d.add_account.is_some());
+        assert!(d.chip.is_none());
+        assert!(d.add_account.is_none());
     }
 
     #[test]
@@ -1156,11 +1141,13 @@ mod tests {
         assert_eq!(fetch.label, "fetch → github.com");
         assert_eq!(fetch.chip.unwrap().text, "mira-k");
         assert_eq!(d.pushes.len(), 1);
-        assert_eq!(d.pushes[0].chip.as_ref().unwrap().text, "no account");
+        assert_eq!(d.pushes[0].chip, None);
     }
 
     #[test]
-    fn a_push_url_without_an_account_gets_a_chip_but_no_add_row() {
+    fn a_push_url_without_an_account_shows_no_chip_and_no_add_row() {
+        // A push URL with no linked account no longer shows a warning chip or
+        // an add-account row — the user can add one via the remote's menu.
         let accounts = [github("a1", "mira-k")];
         let t = targets(
             "publish",
@@ -1173,10 +1160,8 @@ mod tests {
         let r = resolved(&accounts, &t, None);
         let d = display(&r, &accounts, &|_| PublicState::NotPublic);
         assert_eq!(d.add_account, None);
-        let chip = d.pushes[1].chip.as_ref().unwrap();
-        assert_eq!(chip.text, "no account");
-        assert!(chip.warn);
-        // And waits for the public answer like any other row.
+        assert_eq!(d.pushes[1].chip, None);
+        // Pending also shows no chip.
         let d = display(&r, &accounts, &|_| PublicState::Pending);
         assert_eq!(d.pushes[1].chip, None);
     }

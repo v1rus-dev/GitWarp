@@ -772,7 +772,7 @@ impl Render for WelcomeActivity {
             } else {
                 None
             };
-        let show_legend = !(me.is_none() && !me_loading) && unreachable.is_none();
+        let show_legend = (me_loading || me.is_some()) && unreachable.is_none();
         let footer = div()
             .flex()
             .items_center()
