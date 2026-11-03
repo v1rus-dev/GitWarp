@@ -468,16 +468,32 @@ pub fn titlebar(cx: &App) -> Div {
     let colors = cx.theme().colors;
     div()
         .h(BAR)
-        .px(px(12.))
+        .px(px(BAR_PAD))
         .flex()
         .items_center()
-        .gap(px(6.))
+        .gap(px(BAR_GAP))
         .bg(colors.bg)
         .border_b_1()
         .border_color(colors.border)
         .text_size(FS_BASE)
         .font_family(FONT_UI)
+        .when(cfg!(target_os = "macos"), |d| {
+            // Draggable spacer so the content starts right of the traffic lights.
+            d.child(titlebar_fill().flex_none().w(px(MAC_TRAFFIC_LIGHTS_SPACER)))
+        })
 }
+
+/// Horizontal padding and child gap of [`titlebar`].
+const BAR_PAD: f32 = 12.;
+const BAR_GAP: f32 = 6.;
+
+/// Width the macOS traffic lights (close/minimise/zoom) occupy from the window's
+/// left edge at their default position: roughly 70-78px; 78 leaves a small margin.
+const MAC_TRAFFIC_LIGHTS_INSET: f32 = 78.;
+
+/// The spacer's own width: the inset minus the bar padding and the gap that
+/// follows the spacer, so the first real item starts at `MAC_TRAFFIC_LIGHTS_INSET`.
+const MAC_TRAFFIC_LIGHTS_SPACER: f32 = MAC_TRAFFIC_LIGHTS_INSET - BAR_PAD - BAR_GAP;
 
 /// The empty stretch of the titlebar: the window drag area.
 ///
@@ -515,7 +531,9 @@ pub fn titlebar_fill() -> Div {
 /// Only Linux client-side decorations put them there. Windows draws no native
 /// title bar either, but its buttons live in the dedicated [`title_strip`] above
 /// the toolbar, so the toolbar gets none; `window_decorations()` reports `Server`
-/// on Windows, so the check below already excludes it.
+/// on Windows, so the check below already excludes it. macOS also reports `Server`
+/// (gpui's `PlatformWindow::window_decorations` default, not overridden by the macOS
+/// backend), and the native traffic lights cover that case.
 pub fn inline_window_controls(window: &Window) -> bool {
     matches!(window.window_decorations(), Decorations::Client { .. })
 }
