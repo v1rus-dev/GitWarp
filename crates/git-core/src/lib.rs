@@ -196,7 +196,9 @@ impl Repo {
         self.bare
     }
 
-    /// Stream commits in topological order. Commits arrive as git produces
+    /// Stream commits in date order, which still puts children before parents
+    /// (all the graph layout needs) while interleaving branches by date, so the
+    /// graph does not grow a lane per merge. Commits arrive as git produces
     /// them, so the first screen of history renders before the log finishes.
     pub fn log(&self, options: &LogOptions) -> Result<LogStream> {
         LogStream::spawn(self, options)
@@ -216,7 +218,7 @@ impl Repo {
 
     /// Whether git keeps a commit-graph file for this repository.
     ///
-    /// Without it `git log --topo-order` must walk the whole history before
+    /// Without it `git log` must walk the whole history before
     /// printing the first commit (on git.git: ~2 s instead of ~0.1 s), so the
     /// app should call [`Repo::write_commit_graph`] in the background when
     /// this returns false.

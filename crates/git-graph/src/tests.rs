@@ -100,10 +100,10 @@ fn second_tip_bends_into_the_waiting_lane() {
 }
 
 #[test]
-fn merge_opens_a_lane_left_of_the_merge_when_a_column_is_free() {
-    // `a` frees column 0 while `m` waits in column 1. D2 opens the merged-in
-    // lane for q there, left of the merge commit, instead of appending a
-    // third column on the right.
+fn a_freed_column_is_reused_by_the_merge_on_the_next_row() {
+    // `a` frees column 0 while `m` waits in column 1: compaction moves m into
+    // column 0 on `a`'s own row, and m's merged-in parent q opens the next
+    // free column to its right.
     let r = rows(&[
         ("x", &["a"]),
         ("y", &["m"]),
@@ -112,17 +112,18 @@ fn merge_opens_a_lane_left_of_the_merge_when_a_column_is_free() {
         ("p", &[]),
         ("q", &[]),
     ]);
-    assert_eq!(r[3].column, 1);
-    // The first parent continues in column 1; the new lane opens in column 0.
-    assert_eq!(shape(&r[3].below), vec![seg(1, 0), seg(1, 1)]);
+    assert_eq!(r[3].column, 0);
+    // The first parent continues in column 0; the new lane opens beside it.
+    assert_eq!(shape(&r[3].below), vec![seg(0, 0), seg(0, 1)]);
     assert_eq!(r[3].width, 2);
-    assert_eq!(r[4].column, 1);
+    assert_eq!(r[4].column, 0);
+    // p closing compacts q into column 0 too.
     assert_eq!(r[5].column, 0);
     assert_continuous(&r);
 
     assert_eq!(
         ascii::render(&r, |row| row.id.to_string()),
-        "●  x\n│\n│ ●  y\n│ │\n● │  a\n  │\n  ◆  m\n╭─┤\n│ ●  p\n│\n●  q\n"
+        "●  x\n│\n│ ●  y\n│ │\n● │  a\n╭─╯\n◆    m\n├─╮\n● │  p\n╭─╯\n●  q\n"
     );
 }
 
@@ -136,10 +137,11 @@ fn octopus_merge_opens_a_lane_per_parent() {
         ("root", &[]),
     ]);
     assert_eq!(shape(&r[0].below), vec![seg(0, 0), seg(0, 1), seg(0, 2)]);
-    assert_eq!([r[1].column, r[2].column, r[3].column], [0, 1, 2]);
+    // c compacts from column 2 into column 1 when b frees it.
+    assert_eq!([r[1].column, r[2].column, r[3].column], [0, 1, 1]);
     // D1: b and c bend into a's waiting lane on their own rows.
-    assert_eq!(shape(&r[2].below), vec![seg(0, 0), seg(1, 0), seg(2, 2)]);
-    assert_eq!(shape(&r[3].below), vec![seg(0, 0), seg(2, 0)]);
+    assert_eq!(shape(&r[2].below), vec![seg(0, 0), seg(1, 0), seg(2, 1)]);
+    assert_eq!(shape(&r[3].below), vec![seg(0, 0), seg(1, 0)]);
     assert_eq!(shape(&r[4].above), vec![seg(0, 0)]);
     assert_eq!(r[4].width, 1);
     assert_eq!(r[0].width, 3);
@@ -178,6 +180,116 @@ fn freed_columns_are_reused() {
     assert_eq!(r[4].column, 1);
     assert!(r.iter().all(|row| row.width <= 2));
     assert_continuous(&r);
+}
+
+#[test]
+fn a_freed_column_compacts_the_lane_on_its_right() {
+    let r = rows(&[
+        ("a", &["root_a"]),
+        ("b", &["root_b"]),
+        ("c", &["root_c"]),
+        ("root_b", &[]),
+        ("root_c", &[]),
+        ("root_a", &[]),
+    ]);
+    // root_b frees column 1 while the c line passes in column 2: that lane
+    // moves into column 1 below this row instead of leaving a hole.
+    assert_eq!(r[3].column, 1);
+    assert_eq!(shape(&r[3].above), vec![seg(0, 0), seg(1, 1), seg(2, 2)]);
+    assert_eq!(shape(&r[3].below), vec![seg(0, 0), seg(2, 1)]);
+    // The next row's lane arrives in the compacted column.
+    assert_eq!(r[4].column, 1);
+    assert_eq!(shape(&r[4].above), vec![seg(0, 0), seg(1, 1)]);
+    assert_continuous(&r);
+}
+
+#[test]
+fn repeated_develop_merges_do_not_build_a_lane_staircase() {
+    // develop and QA over 50 rounds: each round adds three develop commits,
+    // then QA merges develop, then QA commits on top. Dates increase in that
+    // order, so --date-order prints the rounds newest first and interleaves
+    // the develop commits with the merges (the shape that used to staircase
+    // under --topo-order).
+    const ROUNDS: u32 = 50;
+    let mut history: Vec<(u32, Vec<u32>)> = vec![(0, Vec::new())];
+    let mut next = 1u32;
+    let (mut develop, mut qa) = (0u32, 0u32);
+    for _ in 0..ROUNDS {
+        let d1 = next;
+        next += 1;
+        let d2 = next;
+        next += 1;
+        let d3 = next;
+        next += 1;
+        let merge = next;
+        next += 1;
+        let commit = next;
+        next += 1;
+        history.push((d1, vec![develop]));
+        history.push((d2, vec![d1]));
+        history.push((d3, vec![d2]));
+        history.push((merge, vec![qa, d3]));
+        history.push((commit, vec![merge]));
+        develop = d3;
+        qa = commit;
+    }
+    history.reverse();
+
+    let mut b = GraphBuilder::new();
+    let mut max_width = 0;
+    for (id, parents) in history {
+        let row = b.push(id, &parents);
+        max_width = max_width.max(row.width);
+    }
+    assert!(
+        max_width <= 4,
+        "the develop merges opened {max_width} lanes"
+    );
+}
+
+#[test]
+fn lanes_stay_dense_after_every_push() {
+    // A varied DAG (1-3 parents per commit, child ids always below parent
+    // ids) from a small deterministic xorshift, so no dependency is needed.
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    const COUNT: u32 = 400;
+    let mut history = Vec::new();
+    for id in 0..COUNT {
+        let later = COUNT - id - 1;
+        let mut parents = Vec::new();
+        if later > 0 {
+            let count = 1 + (next() % 3) as usize;
+            for _ in 0..count {
+                let parent = id + 1 + (next() % u64::from(later)) as u32;
+                if !parents.contains(&parent) {
+                    parents.push(parent);
+                }
+            }
+        }
+        history.push((id, parents));
+    }
+
+    let mut b = GraphBuilder::new();
+    let mut open_before = None;
+    for (id, parents) in history {
+        let row = b.push(id, &parents);
+        if let Some(open) = open_before {
+            // Every open lane occupies one of the dense columns 0..open, so the
+            // next row's upper half must use them all: a hole would show up as
+            // a smaller maximum column.
+            let used = row.above.iter().map(|s| s.from).max().map_or(0, |m| m + 1);
+            assert_eq!(used, open, "a lane hole is left after commit {id}");
+        }
+        assert!(!b.has_holes(), "a lane hole is left after commit {id}");
+        open_before = Some(b.open_lanes());
+    }
+    assert_eq!(b.open_lanes(), 0, "the finite DAG must close every lane");
 }
 
 #[test]

@@ -5233,7 +5233,7 @@ mod tests {
     fn body_runs_use_the_mono_font_for_code_only() {
         let body = BodyText::new()
             .plain("The command ")
-            .code("git log --all --topo-order")
+            .code("git log --all --date-order")
             .plain(" failed with exit code 128.");
         let style = body_style(ui::Theme::light().colors);
         let runs = body.runs(&style);
@@ -5242,7 +5242,7 @@ mod tests {
             (runs[0].len, runs[1].len, runs[2].len),
             (
                 "The command ".len(),
-                "git log --all --topo-order".len(),
+                "git log --all --date-order".len(),
                 " failed with exit code 128.".len(),
             )
         );

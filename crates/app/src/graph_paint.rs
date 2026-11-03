@@ -91,13 +91,14 @@ pub fn paint_row(
     // on across row boundaries instead of restarting in every row.
     let dash_offset = row_index as f32 * f32::from(bounds.size.height);
 
-    // Passing lanes first: one vertical per distinct x, so a folded group draws
-    // its dashed gap lane once. `xs` never decreases with the column, so the
-    // lanes arrive in x order: an equal x is the same folded group, and the
-    // first lane past the column edge ends the row.
+    // Straight-through passing lanes first: one vertical per distinct x, so a
+    // folded group draws its dashed gap lane once. `xs` never decreases with
+    // the column, so the lanes arrive in x order: an equal x is the same folded
+    // group, and the first lane past the column edge ends the row.
+    let through: Vec<usize> = passing_lanes(row).map(|s| s.from).collect();
     let mut last_x: Option<f32> = None;
-    for segment in passing_lanes(row) {
-        let Some(x) = x_of(segment.from) else {
+    for &col in &through {
+        let Some(x) = x_of(col) else {
             continue;
         };
         let x_local = local_x(x);
@@ -108,7 +109,7 @@ pub fn paint_row(
             continue;
         }
         last_x = Some(x_local);
-        if folded(segment.from) {
+        if folded(col) {
             let color = theme.colors.muted.opacity(0.6);
             for (from, to) in dash_segments(0., f32::from(bounds.size.height), dash_offset) {
                 straight(
@@ -125,23 +126,39 @@ pub fn paint_row(
                 line_width,
                 point(x, top - overdraw),
                 point(x, bottom + overdraw),
-                lane(segment.from),
+                lane(col),
             );
         }
     }
 
     // Incoming lanes: a straight run into the dot, or a curve from the column
-    // the line comes from.
+    // the line comes from. A passing lane that the lower half compacts left
+    // stops at the center line, so only its upper half is drawn here.
     for segment in &row.above {
-        if segment.from == segment.to && segment.from != row.column {
-            continue; // a passing lane, drawn above
-        }
         let Some(x0) = x_of(segment.from) else {
             continue;
         };
         let color = lane(segment_column(true, segment));
         if segment.from == segment.to {
-            if vertical_visible(local_x(x0), cw) {
+            if segment.from != row.column && through.contains(&segment.from) {
+                continue; // a straight-through passing lane, drawn above
+            }
+            if !vertical_visible(local_x(x0), cw) {
+                continue;
+            }
+            if segment.from != row.column && folded(segment.from) {
+                let color = theme.colors.muted.opacity(0.6);
+                let end = f32::from(bounds.size.height) / 2.;
+                for (from, to) in dash_segments(0., end, dash_offset) {
+                    straight(
+                        window,
+                        line_width,
+                        point(x0, top + px(from)),
+                        point(x0, top + px(to)),
+                        color,
+                    );
+                }
+            } else {
                 straight(
                     window,
                     line_width,
@@ -161,17 +178,33 @@ pub fn paint_row(
     }
 
     // Outgoing lanes: a straight run out of the dot, or a curve to the column
-    // the line leads to.
+    // the line leads to. A compacted passing lane curves from its old column at
+    // the center line to its new column at the bottom edge.
     for segment in &row.below {
-        if segment.from == segment.to && segment.from != row.column {
-            continue; // a passing lane, drawn above
-        }
         let Some(x0) = x_of(segment.from) else {
             continue;
         };
-        let color = lane(segment_column(false, segment));
         if segment.from == segment.to {
-            if vertical_visible(local_x(x0), cw) {
+            if segment.from != row.column && through.contains(&segment.from) {
+                continue; // a straight-through passing lane, drawn above
+            }
+            if !vertical_visible(local_x(x0), cw) {
+                continue;
+            }
+            let color = lane(segment_column(false, segment));
+            if segment.from != row.column && folded(segment.from) {
+                let color = theme.colors.muted.opacity(0.6);
+                let end = f32::from(bounds.size.height);
+                for (from, to) in dash_segments(end / 2., end, dash_offset) {
+                    straight(
+                        window,
+                        line_width,
+                        point(x0, top + px(from)),
+                        point(x0, top + px(to)),
+                        color,
+                    );
+                }
+            } else {
                 straight(
                     window,
                     line_width,
@@ -183,6 +216,13 @@ pub fn paint_row(
         } else {
             let Some(x1) = x_of(segment.to) else {
                 continue;
+            };
+            // A compacted passing lane keeps the color it had in the upper
+            // half; an outgoing line takes the color of the lane it leads to.
+            let color = if segment.from != row.column {
+                lane(segment.from)
+            } else {
+                lane(segment_column(false, segment))
             };
             if curve_visible(local_x(x0), local_x(x1), cw) {
                 curve(window, line_width, point(x0, mid), point(x1, bottom), color);
@@ -260,41 +300,27 @@ fn paint_stub(window: &mut Window, width: Pixels, centre: Point<Pixels>, color: 
     circle(window, end, px(1.8), color);
 }
 
-/// The row's passing lanes (a full-height line in a column that is not the
-/// dot's) in column order. Every passing lane appears in both halves and both
-/// halves are sorted by `from`, so the merge keeps a lane's two entries next to
-/// each other: the painter's last-x dedup then draws each column once.
+/// The row's straight-through passing lanes: a column that carries a lane
+/// untouched through both halves and is not the dot's. They are returned in
+/// column order, so the painter's last-x dedup draws each column once.
+///
+/// A lower-half passing lane that compaction shifts left (`from != to`) is not
+/// straight through: the upper half is drawn to the center line and the lower
+/// half as a curve, so it is left out here.
 fn passing_lanes<'a>(row: &'a Row<Oid>) -> impl Iterator<Item = &'a Segment> + 'a {
     let column = row.column;
-    let mut above = row
-        .above
-        .iter()
-        .filter(move |s| s.from == s.to && s.from != column)
-        .peekable();
-    let mut below = row
-        .below
-        .iter()
-        .filter(move |s| s.from == s.to && s.from != column)
-        .peekable();
-    std::iter::from_fn(move || {
-        let take_above = match (above.peek(), below.peek()) {
-            (Some(a), Some(b)) => a.from <= b.from,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (None, None) => return None,
-        };
-        if take_above {
-            above.next()
-        } else {
-            below.next()
-        }
+    row.above.iter().filter(move |s| {
+        s.from == s.to
+            && s.from != column
+            && row.below.iter().any(|b| b.from == b.to && b.from == s.from)
     })
 }
 
 /// The column whose colour a segment takes: `above` segments are coloured by
 /// their source column (the lane the line comes from), `below` segments by
-/// their target column (the lane the line leads to). A passing lane has the
-/// same column on both ends.
+/// their target column (the lane the line leads to). A compacted passing lane
+/// is the exception: it keeps the source column's colour, handled by the
+/// caller.
 fn segment_column(above: bool, segment: &Segment) -> usize {
     if above {
         segment.from
@@ -488,20 +514,25 @@ mod tests {
     }
 
     #[test]
-    fn passing_lanes_merge_both_halves_in_column_order() {
+    fn passing_lanes_are_only_lanes_that_run_straight_through() {
         let row = Row {
             id: Oid::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap(),
             column: 2,
             color: 0,
-            // A lane change and the dot's own column are not passing lanes.
-            above: vec![segment(0, 0), segment(1, 2), segment(4, 4)],
-            below: vec![segment(0, 0), segment(2, 1), segment(3, 3), segment(4, 4)],
+            // A lane change, the dot's own column and a lane that only exists
+            // above are not straight-through passing lanes.
+            above: vec![segment(0, 0), segment(1, 2), segment(3, 3), segment(4, 4)],
+            below: vec![segment(0, 0), segment(2, 1), segment(3, 1), segment(4, 4)],
             width: 5,
             is_tip: true,
             is_merge: false,
         };
         let froms: Vec<usize> = passing_lanes(&row).map(|s| s.from).collect();
-        assert_eq!(froms, vec![0, 0, 3, 4, 4], "both halves, column order");
+        assert_eq!(
+            froms,
+            vec![0, 4],
+            "only straight-through lanes, column order"
+        );
         assert!(
             froms.windows(2).all(|w| w[0] <= w[1]),
             "the painter's early cull relies on non-decreasing columns"
