@@ -624,6 +624,15 @@ const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(30);
 /// How often the UI drains the job's progress channel.
 const NETWORK_POLL: Duration = Duration::from_millis(80);
 
+/// What [`RepositoryView::run_repo_action`] refreshes once the mutation
+/// succeeds. A checkout only moves HEAD, so it re-reads HEAD and the refs
+/// instead of re-walking the whole history (which would reset the scroll).
+#[derive(Clone, Copy)]
+enum PostRefresh {
+    Full,
+    Checkout,
+}
+
 impl RepositoryView {
     pub fn new(
         path: PathBuf,
@@ -1469,7 +1478,7 @@ impl RepositoryView {
                 self.open_ref_dialog(RefDialogKind::DeleteTag { name }, window, cx);
             }
             SidebarAction::ApplyStash(index) => {
-                self.run_repo_action(window, cx, move |repo| {
+                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
                     repo.stash_apply(index)?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -1482,7 +1491,7 @@ impl RepositoryView {
                 });
             }
             SidebarAction::PopStash(index) => {
-                self.run_repo_action(window, cx, move |repo| {
+                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
                     repo.stash_pop(index)?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -1698,7 +1707,7 @@ impl RepositoryView {
             }
             SidebarAction::SetUpstream(branch) => {
                 let fallback = self.default_remote_name();
-                self.run_repo_action(window, cx, move |repo| {
+                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
                     let remote = git_core::network::default_remote(repo)?
                         .unwrap_or_else(|| fallback.clone());
                     let upstream = format!("{remote}/{branch}");
@@ -1751,7 +1760,7 @@ impl RepositoryView {
             }
             SidebarAction::LockWorktree(path) => {
                 let path = PathBuf::from(path);
-                self.run_repo_action(window, cx, move |repo| {
+                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
                     repo.lock_worktree(&path, Some("locked manually"))?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -1761,7 +1770,7 @@ impl RepositoryView {
             }
             SidebarAction::UnlockWorktree(path) => {
                 let path = PathBuf::from(path);
-                self.run_repo_action(window, cx, move |repo| {
+                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
                     repo.unlock_worktree(&path)?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -1784,7 +1793,7 @@ impl RepositoryView {
                 });
             }
             SidebarAction::PruneWorktrees => {
-                self.run_repo_action(window, cx, |repo| {
+                self.run_repo_action(window, cx, PostRefresh::Full, |repo| {
                     repo.prune_worktrees()?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -2310,7 +2319,7 @@ impl RepositoryView {
             changes.staged_count() + changes.unstaged_count()
         };
         if dirty == 0 {
-            self.run_repo_action(window, cx, checkout);
+            self.run_repo_action(window, cx, PostRefresh::Checkout, checkout);
             return;
         }
         let body = ui::i18n::t_count("repo.checkout.dirty_body", dirty as u64, &[]);
@@ -2330,7 +2339,7 @@ impl RepositoryView {
                 move |window, cx| {
                     let checkout = take(&checkout);
                     view.update(cx, |view, cx| {
-                        view.run_repo_action(window, cx, move |repo| {
+                        view.run_repo_action(window, cx, PostRefresh::Checkout, move |repo| {
                             // An empty stash (nothing left to save) is fine:
                             // the switch still happens.
                             repo.stash_save(Some("GitWarp: stashed before switching"))?;
@@ -2344,7 +2353,9 @@ impl RepositoryView {
                 let checkout = checkout.clone();
                 move |window, cx| {
                     let checkout = take(&checkout);
-                    view.update(cx, |view, cx| view.run_repo_action(window, cx, checkout));
+                    view.update(cx, |view, cx| {
+                        view.run_repo_action(window, cx, PostRefresh::Checkout, checkout)
+                    });
                 }
             },
             {
@@ -2353,7 +2364,7 @@ impl RepositoryView {
                 move |window, cx| {
                     let checkout = take(&checkout);
                     view.update(cx, |view, cx| {
-                        view.run_repo_action(window, cx, move |repo| {
+                        view.run_repo_action(window, cx, PostRefresh::Checkout, move |repo| {
                             repo.discard_all()?;
                             checkout(repo)
                         });
@@ -2376,9 +2387,27 @@ impl RepositoryView {
         cx.notify();
     }
 
+    /// Like [`Self::after_ref_change`] but for a checkout: HEAD moved while the
+    /// commit set did not, so the history only re-reads its meta (badges and
+    /// the HEAD ring) and keeps the user's scroll position and selection.
+    fn after_checkout(&mut self, cx: &mut Context<Self>) {
+        self.history
+            .update(cx, |history, cx| history.refresh_meta(cx));
+        self.changes.update(cx, |changes, cx| changes.refresh(cx));
+        self.worktrees
+            .update(cx, |worktrees, cx| worktrees.refresh(cx));
+        self.refresh_with(hosting_status::INTERNAL_RELOAD, cx);
+        cx.notify();
+    }
+
     /// Runs a repository mutation without a dialog, then reloads the views.
-    fn run_repo_action<F>(&mut self, window: &mut Window, cx: &mut Context<Self>, action: F)
-    where
+    fn run_repo_action<F>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        post: PostRefresh,
+        action: F,
+    ) where
         F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)> + Send + 'static,
     {
         if self.ref_action_running {
@@ -2406,7 +2435,10 @@ impl RepositoryView {
                 match result {
                     Ok((kind, notice)) => {
                         toast::show(kind, notice, window, cx);
-                        view.after_ref_change(cx);
+                        match post {
+                            PostRefresh::Full => view.after_ref_change(cx),
+                            PostRefresh::Checkout => view.after_checkout(cx),
+                        }
                     }
                     Err(error) => {
                         toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
@@ -2421,7 +2453,7 @@ impl RepositoryView {
 
     /// The toolbar's Stash button: stashes every local change.
     fn stash_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_repo_action(window, cx, |repo| {
+        self.run_repo_action(window, cx, PostRefresh::Full, |repo| {
             if repo.stash_save(None)? {
                 Ok((ui::ToastKind::Ok, ui::t!("repo.toast.stashed").to_string()))
             } else {

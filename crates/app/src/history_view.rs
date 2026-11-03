@@ -2633,6 +2633,38 @@ impl HistoryView {
         cx.notify();
     }
 
+    /// Re-reads HEAD and the refs without re-walking the commit log. A
+    /// checkout only moves HEAD (the `--all` commit set is unchanged), so this
+    /// refreshes the badges and the HEAD ring while the scroll position and
+    /// the selected row stay exactly where the user left them.
+    pub fn refresh_meta(&mut self, cx: &mut Context<Self>) {
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(_) => return,
+        };
+        let path = self.path.clone();
+        cx.spawn(async move |this, cx| {
+            let meta = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &path)?;
+                    let root = repo.root().to_path_buf();
+                    Ok::<_, Error>((root, repo.head(), repo.refs()))
+                })
+                .await;
+            match meta {
+                Ok((root, head, refs)) => {
+                    this.update(cx, |view, cx| view.set_meta(root, head, refs, cx))
+                        .ok();
+                }
+                Err(e) => {
+                    log::warn!("could not refresh HEAD and refs after a checkout: {e}")
+                }
+            }
+        })
+        .detach();
+    }
+
     /// `git init` the folder, then load the new repository.
     fn init_repository(&mut self, cx: &mut Context<Self>) {
         let Ok(git) = self.git.clone() else {
