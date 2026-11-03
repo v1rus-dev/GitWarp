@@ -481,6 +481,11 @@ pub struct RepositoryView {
     sidebar_width: f32,
     /// The sidebar tree's scroll state, shared with its horizontal scrollbar.
     sidebar_scroll: ScrollHandle,
+    /// The current-branch node the sidebar has already scrolled into view, so it
+    /// reveals the checked-out branch when that changes but never re-applies the
+    /// scroll on every frame (which would fight a manual scroll or a just-
+    /// expanded folder).
+    sidebar_revealed: Option<SharedString>,
     /// The sidebar's expansion overrides over the defaults.
     sidebar: Expansion,
     /// The sidebar filter field's text.
@@ -834,6 +839,7 @@ impl RepositoryView {
                 .sidebar_width
                 .clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX),
             sidebar_scroll: ScrollHandle::new(),
+            sidebar_revealed: None,
             sidebar: Expansion::default(),
             filter: String::new(),
             sidebar_extras: None,
@@ -1202,7 +1208,13 @@ impl RepositoryView {
 
     /// Flips the expansion of any expandable sidebar row, by key. `current`
     /// is the row's effective state as it was built.
-    fn toggle_node(&mut self, key: &str, current: bool, cx: &mut Context<Self>) {
+    fn toggle_node(
+        &mut self,
+        key: &str,
+        current: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // While filtering every expandable row is forced open. Recording a
         // flip here would silently change the state restored when the filter
         // is cleared, so expansion toggles are ignored until then.
@@ -1211,6 +1223,12 @@ impl RepositoryView {
         }
         self.sidebar.toggle(key, current);
         cx.notify();
+        // The sidebar scrollbar reads the tree's scroll height a frame late: it
+        // is built during render, before the tree lays out the new rows. Without
+        // a second frame its vertical thumb keeps the old, shorter range and
+        // cannot reach the rows a just-expanded folder added. Re-render once more
+        // so it picks up the grown height.
+        cx.on_next_frame(window, |_, _, cx| cx.notify());
     }
 
     /// Click / Enter / Space on a leaf: selects it and reveals its commit in
@@ -4201,9 +4219,18 @@ impl RepositoryView {
             self.tree_nodes(&remotes, cx)
         };
         if let Some(index) = nodes.iter().position(|node| node.current) {
-            // ScrollHandle applies this during prepaint, so asking during
-            // render lands on the rows that are about to be laid out.
-            self.sidebar_scroll.scroll_to_item(index);
+            // Reveal the checked-out branch only when it actually changes.
+            // ScrollHandle re-applies a `scroll_to_item` on every prepaint, so
+            // doing this each render would snap the list back to the current
+            // branch forever, fighting a manual scroll and the rows a freshly
+            // expanded folder adds. The key guards against that.
+            let key = nodes[index].key.clone();
+            if self.sidebar_revealed.as_ref() != Some(&key) {
+                // ScrollHandle applies this during prepaint, so asking during
+                // render lands on the rows that are about to be laid out.
+                self.sidebar_scroll.scroll_to_item(index);
+                self.sidebar_revealed = Some(key);
+            }
         }
         let filtering = !self.filter.trim().is_empty();
         let no_matches = !worktrees_mode && !show_prs && filtering && nodes.is_empty();
@@ -4230,7 +4257,7 @@ impl RepositoryView {
                         view.run_sidebar_action(SidebarAction::AddAccountFor(remote), window, cx);
                         cx.notify();
                     } else if has_children {
-                        view.toggle_node(&key, expanded, cx);
+                        view.toggle_node(&key, expanded, window, cx);
                     } else {
                         view.activate_node(&key, cx);
                     }
@@ -4363,22 +4390,41 @@ impl RepositoryView {
                         )
                     })
                     .when(!no_matches && !worktrees_mode && !show_prs, |this| {
+                        // The tree scrolls both ways on one handle. The vertical
+                        // bar overlays its right edge (an in-flow track would cut
+                        // the row highlight short); the horizontal one sits below.
+                        let vscroll = div().absolute().top_0().bottom_0().right_0();
                         this.child(
-                            div().w_full().flex_1().min_w_0().min_h_0().child(
-                                Tree::new("sidebar-tree", nodes)
-                                    .horizontal_scroll()
-                                    .scroll_handle(self.sidebar_scroll.clone())
-                                    .on_toggle(node_toggler(rows.clone(), view.clone()))
-                                    .on_expand(node_toggler(rows.clone(), view.clone()))
-                                    .on_collapse(node_toggler(rows.clone(), view.clone()))
-                                    .on_activate(activate)
-                                    .on_confirm(confirm)
-                                    .on_rename(rename)
-                                    .on_delete(delete)
-                                    .on_open(open)
-                                    .on_context_menu(context_menu)
-                                    .on_pr_click(pr_click),
-                            ),
+                            div()
+                                .relative()
+                                .w_full()
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
+                                .child(
+                                    Tree::new("sidebar-tree", nodes)
+                                        .horizontal_scroll()
+                                        .scroll_handle(self.sidebar_scroll.clone())
+                                        .on_toggle(node_toggler(rows.clone(), view.clone()))
+                                        .on_expand(node_toggler(rows.clone(), view.clone()))
+                                        .on_collapse(node_toggler(rows.clone(), view.clone()))
+                                        .on_activate(activate)
+                                        .on_confirm(confirm)
+                                        .on_rename(rename)
+                                        .on_delete(delete)
+                                        .on_open(open)
+                                        .on_context_menu(context_menu)
+                                        .on_pr_click(pr_click),
+                                )
+                                .child(
+                                    vscroll.child(
+                                        Scrollbar::vertical(
+                                            "sidebar-vscrollbar",
+                                            self.sidebar_scroll.clone(),
+                                        )
+                                        .background(colors.sidebar),
+                                    ),
+                                ),
                         )
                         .child(Scrollbar::horizontal(
                             "sidebar-scrollbar",
@@ -6887,14 +6933,14 @@ fn node_toggler(
     rows: Vec<(SharedString, bool, bool)>,
     view: Entity<RepositoryView>,
 ) -> impl Fn(usize, &mut Window, &mut App) + 'static {
-    move |index, _, cx| {
+    move |index, window, cx| {
         let Some((key, has_children, expanded)) = rows.get(index).cloned() else {
             return;
         };
         if !has_children {
             return;
         }
-        view.update(cx, |view, cx| view.toggle_node(&key, expanded, cx));
+        view.update(cx, |view, cx| view.toggle_node(&key, expanded, window, cx));
     }
 }
 

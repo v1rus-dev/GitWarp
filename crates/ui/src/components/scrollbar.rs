@@ -79,7 +79,13 @@ pub fn thumb_metrics(
         return None;
     }
 
-    let size = (track_f * viewport_f / content_f).clamp(0., track_f);
+    // Keep a minimum so a very long list (thousands of commits or branches)
+    // still shows a grabbable thumb instead of a sliver, as Fork does. The
+    // offset below divides by the real travel, so dragging stays proportional.
+    const MIN_THUMB: f32 = 24.;
+    let size = (track_f * viewport_f / content_f)
+        .max(MIN_THUMB)
+        .min(track_f);
     let max_scroll = content_f - viewport_f;
     let travel = track_f - size;
     let scroll = scroll_f.clamp(0., max_scroll);
@@ -122,6 +128,9 @@ pub struct Scrollbar {
     id: ElementId,
     source: ScrollHandleSource,
     axis: Axis,
+    /// An opaque track colour, painted behind the thumb when it overlays content
+    /// so list text does not show through the track beside the thumb.
+    background: Option<gpui::Hsla>,
 }
 
 impl Scrollbar {
@@ -130,6 +139,7 @@ impl Scrollbar {
             id: id.into(),
             source: source.into(),
             axis: Axis::Vertical,
+            background: None,
         }
     }
 
@@ -138,12 +148,20 @@ impl Scrollbar {
             id: id.into(),
             source: source.into(),
             axis: Axis::Horizontal,
+            background: None,
         }
     }
 
     /// A vertical scrollbar for a `uniform_list`.
     pub fn uniform(id: impl Into<ElementId>, handle: UniformListScrollHandle) -> Self {
         Self::vertical(id, handle)
+    }
+
+    /// Paints an opaque track behind the thumb, matching the surrounding panel,
+    /// so an overlaid scrollbar never shows content through the track gaps.
+    pub fn background(mut self, color: gpui::Hsla) -> Self {
+        self.background = Some(color);
+        self
     }
 }
 
@@ -183,6 +201,12 @@ impl RenderOnce for Scrollbar {
             .flex_none()
             .when(vertical, |this| this.w(px(10.)).h_full())
             .when(!vertical, |this| this.h(px(10.)).w_full());
+
+        // Back the track only when a thumb is shown, so a scrollbar with nothing
+        // to scroll stays invisible over the content.
+        if let (Some(bg), true) = (self.background, metrics.is_some()) {
+            track = track.bg(bg);
+        }
 
         if let Some(metrics) = metrics {
             let thumb_id = ElementId::Name(format!("{}-thumb", self.id).into());
@@ -459,5 +483,15 @@ mod tests {
     fn content_that_fits_has_no_thumb() {
         assert_eq!(thumb_metrics(px(300.), px(300.), px(300.), px(0.)), None);
         assert_eq!(thumb_metrics(px(300.), px(300.), px(299.), px(0.)), None);
+    }
+
+    #[test]
+    fn a_huge_list_keeps_a_minimum_grabbable_thumb() {
+        // Natural size would be 300 * 10 / 100000 ≈ 0.03px; clamp to the minimum.
+        let thumb = thumb_metrics(px(300.), px(10.), px(100_000.), px(0.)).expect("overflow");
+        assert_eq!(thumb.size, px(24.));
+        // The end of the scroll still parks the thumb against the track end.
+        let end = thumb_metrics(px(300.), px(10.), px(100_000.), px(99_990.)).expect("overflow");
+        assert_eq!(end.offset, px(300.) - px(24.));
     }
 }
