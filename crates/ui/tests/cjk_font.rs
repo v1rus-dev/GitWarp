@@ -2,6 +2,10 @@
 //!
 //! `#[gpui::test]` uses a mock text system with no glyph data, so these tests build
 //! the context on the real platform text system (headless) instead.
+//!
+//! This target has `harness = false` (see `crates/ui/Cargo.toml`): on macOS the platform
+//! can only be created on the process main thread, while libtest runs tests on spawned
+//! threads. `main` runs the checks on the main thread and panics on failure.
 
 use gpui::{font, px, TestAppContext, TestDispatcher, TextRun};
 #[cfg(not(target_os = "windows"))]
@@ -20,9 +24,7 @@ fn real_text_context() -> TestAppContext {
 // real CJK rendering path is still covered by the layout test below, which does
 // pass on Windows through the font fallbacks.
 #[cfg(not(target_os = "windows"))]
-#[test]
-fn noto_sans_jp_covers_cjk_and_inter_does_not() {
-    let cx = real_text_context();
+fn noto_sans_jp_covers_cjk_and_inter_does_not(cx: &TestAppContext) {
     let system = cx.text_system();
     let size = px(14.);
 
@@ -40,9 +42,7 @@ fn noto_sans_jp_covers_cjk_and_inter_does_not() {
     );
 }
 
-#[test]
-fn base_families_with_fallbacks_lay_out_japanese_without_notdef() {
-    let mut cx = real_text_context();
+fn base_families_with_fallbacks_lay_out_japanese_without_notdef(mut cx: TestAppContext) {
     let window = cx.add_empty_window();
     let text = "日本語";
     for family in [FONT_UI, FONT_MONO] {
@@ -65,4 +65,12 @@ fn base_families_with_fallbacks_lay_out_japanese_without_notdef() {
             "{family}: .notdef glyph in 日本語"
         );
     }
+}
+
+fn main() {
+    // Build the platform once on the main thread and share it between the checks.
+    let cx = real_text_context();
+    #[cfg(not(target_os = "windows"))]
+    noto_sans_jp_covers_cjk_and_inter_does_not(&cx);
+    base_families_with_fallbacks_lay_out_japanese_without_notdef(cx);
 }
