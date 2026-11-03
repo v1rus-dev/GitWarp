@@ -384,7 +384,7 @@ fn main() {
                     titlebar: Some(TitlebarOptions {
                         title: Some("GitWarp".into()),
                         appears_transparent: true,
-                        ..Default::default()
+                        traffic_light_position: workspace::traffic_light_position(),
                     }),
                     app_id: Some("dev.v1rus.gitwarp".into()),
                     icon: app_icon::window_icon(),

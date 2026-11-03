@@ -229,7 +229,7 @@ impl Workspace {
                 titlebar: Some(TitlebarOptions {
                     title: Some(format!("{name} — GitWarp").into()),
                     appears_transparent: true,
-                    ..Default::default()
+                    traffic_light_position: traffic_light_position(),
                 }),
                 app_id: Some("dev.v1rus.gitwarp".into()),
                 icon: crate::app_icon::window_icon(),
@@ -481,6 +481,16 @@ pub fn titlebar(cx: &App) -> Div {
             // Draggable spacer so the content starts right of the traffic lights.
             d.child(titlebar_fill().flex_none().w(px(MAC_TRAFFIC_LIGHTS_SPACER)))
         })
+}
+
+/// Where macOS puts the traffic lights so they sit on the titlebar's centre line.
+///
+/// `y` is the gap above *and* below the buttons (gpui sizes the native titlebar
+/// container as button height + 2·y), so with the ~14px buttons it is
+/// (BAR - 14) / 2. `x` keeps the lights inside [`MAC_TRAFFIC_LIGHTS_INSET`].
+/// `None` elsewhere: only macOS reads the option.
+pub fn traffic_light_position() -> Option<Point<Pixels>> {
+    cfg!(target_os = "macos").then(|| point(px(14.), px(13.)))
 }
 
 /// Horizontal padding and child gap of [`titlebar`].
