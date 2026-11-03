@@ -11,6 +11,11 @@ Claude plans and verifies; OpenCode implements.
 - **OpenCode** with `opencode-go/deepseek-v4.1-flash` writes the code. This replaces the
   global "implementation subagents run on Sonnet" rule for this project.
   The `opencode/…` provider of the same model has no funds — do not use it.
+- **Fallback executor: Claude Sonnet.** If OpenCode stops responding (terminal stays busy with no
+  progress, crashes, hangs), or reports exhausted limits / quota / billing errors, do not wait and do
+  not retry in a loop: close its terminal and hand the same brief to an Agent subagent with
+  `model: "sonnet"` (default subagent type). The brief, verification and per-step commits stay the same.
+  Go back to OpenCode for the next step only if the failure was transient (not a limit).
 
 ### Delegating a step
 
@@ -18,9 +23,15 @@ Launch OpenCode through Orca, so the user sees it as an agent tab in the current
 (a plain background `opencode run` is invisible in Orca — do not use it):
 
 ```sh
-orca agent launch --agent opencode --model opencode-go/deepseek-v4.1-flash \
+orca agent launch --agent opencode2 \
   --surface terminal --prompt "<short pointer: read swarm-report/<stage>/<step>-brief.md and do it>" --json
 ```
+
+The Orca agent is `opencode2` (`opencode` is disabled) and it rejects `--model`. The model comes from an
+untracked `opencode.json` in the worktree root (listed in `.git/info/exclude`):
+`{"$schema": "https://opencode.ai/config.json", "model": "opencode-go/deepseek-v4.1-flash"}`.
+Create it in every new worktree before launching — the global OpenCode config defaults to another model.
+Check the TUI footer says "DeepSeek V4.1 Flash OpenCode Go" right after launch.
 
 Then wait with `orca terminal wait --terminal <handle> --for tui-idle --timeout-ms <ms> --json`
 and read the result with `orca terminal read --terminal <handle> --json`.
