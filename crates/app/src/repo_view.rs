@@ -3985,7 +3985,10 @@ impl RepositoryView {
 
         let sidebar_toggle = Button::ghost("sidebar-toggle")
             .icon_only(IconName::Sidebar)
-            .tooltip_kbd(ui::t!("repo.toolbar.toggle_sidebar"), "Ctrl+B")
+            .tooltip_kbd(
+                ui::t!("repo.toolbar.toggle_sidebar"),
+                ui::kbd::platform_label("Ctrl+B"),
+            )
             .on_click(cx.listener(|view, _, _, cx| view.toggle_sidebar(cx)));
 
         let repo_click = {
@@ -4060,7 +4063,10 @@ impl RepositoryView {
         let stash_view = cx.entity();
         let mut stash_button = Button::tool("toolbar-stash")
             .icon(IconName::Stash)
-            .tooltip_kbd(ui::t!("repo.toolbar.stash_tip"), "Ctrl+Shift+S")
+            .tooltip_kbd(
+                ui::t!("repo.toolbar.stash_tip"),
+                ui::kbd::platform_label("Ctrl+Shift+S"),
+            )
             .on_click(move |_, window, cx| {
                 stash_view.update(cx, |view, cx| view.stash_changes(window, cx));
             });
@@ -4209,7 +4215,7 @@ impl RepositoryView {
                 }))
                 .tooltip(Tooltip::with_kbd(
                     ui::t!("repo.search.placeholder"),
-                    "Ctrl+K",
+                    ui::kbd::platform_label("Ctrl+K"),
                 ))
                 .child(field),
         );
@@ -4223,7 +4229,10 @@ impl RepositoryView {
         bar = bar.child(no_shrink(
             Button::ghost("settings-button")
                 .icon_only(IconName::Gear)
-                .tooltip_kbd(ui::t!("repo.toolbar.settings"), "Ctrl+,")
+                .tooltip_kbd(
+                    ui::t!("repo.toolbar.settings"),
+                    ui::kbd::platform_label("Ctrl+,"),
+                )
                 .on_click(settings_click),
         ));
 
@@ -5567,7 +5576,7 @@ impl RepositoryView {
                     .hover(|this| this.bg(colors.hover))
                     .tooltip(Tooltip::with_kbd(
                         ui::t!("repo.toolbar.toggle_dock"),
-                        "Ctrl+J",
+                        ui::kbd::platform_label("Ctrl+J"),
                     ))
                     .on_click(
                         move |_: &gpui::ClickEvent, _window: &mut Window, cx: &mut App| {
@@ -6416,7 +6425,10 @@ fn switcher(
         .on_click(on_click)
         .child(Icon::new(icon).size(px(14.)).color(colors.muted));
     row = match tooltip.1 {
-        Some(kbd) => row.tooltip(Tooltip::with_kbd(tooltip.0.clone(), kbd)),
+        Some(kbd) => row.tooltip(Tooltip::with_kbd(
+            tooltip.0.clone(),
+            ui::kbd::platform_label(kbd),
+        )),
         None => row.tooltip(Tooltip::text(tooltip.0.clone())),
     };
     if let (Some(name), Some(max)) = (name, name_max) {

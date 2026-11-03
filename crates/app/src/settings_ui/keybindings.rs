@@ -165,11 +165,20 @@ fn action(id: &str) -> Option<&'static Action> {
 /// unknown id (an empty override counts as the default, as at startup).
 pub fn key_cap(cx: &gpui::App, id: &str) -> Option<String> {
     let action = action(id)?;
-    let keys = cx
+    let custom = cx
         .try_global::<crate::AppSettings>()
         .and_then(|state| state.settings.keybindings.get(id))
-        .filter(|keys| !keys.is_empty())
-        .map_or(action.default, String::as_str);
+        .filter(|keys| !keys.is_empty());
+    let Some(keys) = custom else {
+        // The defaults are bound as `secondary-` (Cmd on macOS) in `main.rs`,
+        // except the worktree switcher, which is a literal Ctrl+Alt+W.
+        let cap = display(action.default);
+        return Some(if id == "worktree_switcher" {
+            cap
+        } else {
+            ui::kbd::platform_label(&cap).to_string()
+        });
+    };
     Some(display(keys))
 }
 

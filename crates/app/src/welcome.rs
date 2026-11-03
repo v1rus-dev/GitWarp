@@ -1304,7 +1304,7 @@ fn action_row(
             div()
                 .flex_none()
                 .when(spec.disabled, |this| this.opacity(0.6))
-                .child(Kbd::new(kbd)),
+                .child(Kbd::new(ui::kbd::platform_label(kbd))),
         );
     }
 
