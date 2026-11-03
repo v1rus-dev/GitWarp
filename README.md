@@ -114,8 +114,20 @@ may warn about an unknown publisher: click **More info**, then **Run anyway**.
 
 **macOS**
 
-Open the `.dmg` and drag GitWarp to Applications. The app is not signed with
-a developer certificate or notarized, so macOS blocks the first launch. Open
+The easiest way is the install script. The app is not notarized, and macOS 15 and later
+refuse to launch a `.dmg` downloaded in a browser; files fetched with `curl` carry no quarantine
+flag, so this installs and starts GitWarp without any Gatekeeper prompt:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/v1rus-dev/GitWarp/main/packaging/macos/install.sh | sh
+```
+
+It verifies the checksum and installs into `/Applications` (or `~/Applications`). Set
+`GITWARP_VERSION=X.Y.Z` to install a specific release, and `GITWARP_NO_LAUNCH=1` to skip
+launching the app.
+
+Alternatively, open the downloaded `.dmg` and drag GitWarp to Applications. The app is not signed
+with a developer certificate or notarized, so macOS blocks the first launch. Open
 **System Settings → Privacy & Security** and click **Open Anyway** next to the GitWarp message,
 or remove the quarantine flag in a terminal:
 

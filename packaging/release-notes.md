@@ -9,7 +9,14 @@ certificate, so macOS and Windows show a warning on first launch.
 | Windows (x86_64) | `gitwarp-<version>-windows-x86_64-setup.exe` (or the portable `.zip`) |
 | Linux (x86_64, glibc 2.35+) | `gitwarp_<version>_amd64.deb`, `gitwarp-<version>-x86_64.AppImage` or `gitwarp-<version>-linux-x86_64.tar.gz` |
 
-**macOS:** open the `.dmg` and drag GitWarp to Applications. The app is not notarized, so macOS
+**macOS:** the easiest way is the install script. Files fetched with `curl` are not quarantined,
+so GitWarp starts without any Gatekeeper prompt (`GITWARP_VERSION=X.Y.Z` pins a release):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/v1rus-dev/GitWarp/main/packaging/macos/install.sh | sh
+```
+
+Or open the downloaded `.dmg` and drag GitWarp to Applications. The app is not notarized, so macOS
 refuses the first launch ("cannot verify that it is free of malware"); right-click → Open no
 longer helps on macOS 15 and later. Either run in Terminal:
 
