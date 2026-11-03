@@ -1,13 +1,13 @@
 # Release packaging
 
-Each archive is built in three steps: render the third-party licences, produce
-the bundled git, then package.
+Each artifact set is built in three steps: render the third-party licences,
+produce the bundled git, then package.
 
 ```sh
 cargo build --release -p app
 packaging/licenses.sh <linux|windows|macos> <bundle-dir>             # writes <bundle-dir>/THIRD-PARTY-LICENSES.html
 packaging/git/fetch-or-build.sh <linux|windows|macos> <bundle-dir>   # writes <bundle-dir>/git
-packaging/package.sh <linux|windows|macos> <bundle-dir> <out-dir>    # writes one archive, prints its path
+packaging/package.sh <linux|windows|macos> <bundle-dir> <out-dir>    # writes the artifacts, prints each path
 ```
 
 `licenses.sh` needs [cargo-about](https://github.com/EmbarkStudios/cargo-about)
@@ -17,8 +17,25 @@ licence that is not in the `accepted` list there: adding a licence to that list 
 a deliberate decision, not a fix for a red build.
 
 `CARGO_TARGET_DIR` is honoured when the binary is not in `target/`. Each
-archive must be built on its own OS: `iconutil`, `codesign` and `ditto` are
-needed on macOS; Windows uses `7z` (or `zip`) under Git Bash.
+set must be built on its own OS. Tools `package.sh` needs:
+
+- macOS: `iconutil`, `codesign`, `hdiutil` (all built in).
+- Windows (under Git Bash): `7z` or `zip`, and Inno Setup 6 (`iscc`, `ISCC.exe`
+  or `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`; preinstalled on
+  `windows-latest`). The script fails with a clear message when it is missing.
+- Linux: `dpkg-deb` and `dpkg-shlibdeps` (`dpkg-dev`, part of `build-essential`),
+  `file`, `curl`, `sha256sum`. The AppImage tools are downloaded and
+  checksum-verified (see below).
+
+## Updating the AppImage pins
+
+`linux/appimage.env` pins `appimagetool` and the type2 runtime (URL + SHA-256).
+The runtime is always passed with `--runtime-file`; otherwise appimagetool would
+download the moving "continuous" runtime. To update: take the new release URLs
+from the AppImage/appimagetool and AppImage/type2-runtime GitHub releases,
+download the files, compute `sha256sum`, and change version, URL and checksum
+together. For local runs `APPIMAGETOOL=/path/to/appimagetool` skips the tool
+download (the runtime is still downloaded and verified).
 
 ## Layouts
 
@@ -26,11 +43,30 @@ needed on macOS; Windows uses `7z` (or `zip`) under Git Bash.
   `gitwarp`, `git/`, `install.sh`, `dev.v1rus.gitwarp.desktop`, `icons/`,
   `LICENSE-MIT`, `LICENSE-APACHE`, `THIRD-PARTY-LICENSES.html`, `README.md`. `install.sh` installs into
   `~/.local` (or `$PREFIX`); `install.sh --uninstall` removes it.
+- `gitwarp_<debver>_amd64.deb` — `/usr/bin/gitwarp`, `/usr/lib/gitwarp/git/`,
+  `/usr/share/applications/dev.v1rus.gitwarp.desktop`, icons under
+  `/usr/share/icons/hicolor/`, licences and `copyright` in `/usr/share/doc/gitwarp/`.
+  `<debver>` is the Cargo version with `-` replaced by `~`, so `0.2.0~beta.1`
+  sorts before `0.2.0`. `Depends` comes from `dpkg-shlibdeps` plus the
+  libraries GPUI loads with dlopen (Vulkan, Wayland, xkbcommon, fontconfig,
+  freetype), which shlibdeps cannot see. No maintainer scripts.
+- `gitwarp-<ver>-x86_64.AppImage` — same `usr/` tree as the `.deb`, plus
+  `AppRun`, the desktop file and icon at the AppDir root. System shared libraries
+  are not bundled: the type2 runtime is static, and graphics and libc come from
+  the host (glibc 2.35 or newer, the floor of the `ubuntu-22.04` runner).
 - `gitwarp-<ver>-windows-x86_64.zip` — `gitwarp-<ver>-windows-x86_64/` with
-  `gitwarp.exe`, `git/`, licences, `README.md`.
-- `gitwarp-<ver>-macos-aarch64.zip` — `GitWarp.app` (`Contents/Info.plist`
+  `gitwarp.exe`, `git/`, licences, `README.md` (portable).
+- `gitwarp-<ver>-windows-x86_64-setup.exe` — Inno Setup installer
+  (`windows/gitwarp.iss`) with the same files. Per-user by default, optional
+  all-users install; `AppId` is fixed and must never change, since upgrades and
+  uninstall depend on it.
+- `gitwarp-<ver>-macos-aarch64.dmg` — a volume with `GitWarp.app` (`Contents/Info.plist`
   from `packaging/macos/Info.plist`, `Contents/MacOS/gitwarp`,
-  `Contents/Resources/gitwarp.icns`, `Contents/Resources/git/`, licences).
+  `Contents/Resources/gitwarp.icns`, `Contents/Resources/git/`, licences) and an
+  `Applications` symlink.
+
+`release-notes.md` holds the install instructions that the release workflow
+puts in front of the generated GitHub release notes.
 
 ## Signing
 

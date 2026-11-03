@@ -80,33 +80,41 @@ Bitbucket and Azure DevOps support accounts, git over HTTPS and opening links on
 
 ## Download and install
 
-Pick the archive for your system from the [latest release](https://github.com/v1rus-dev/GitWarp/releases/latest).
+Pick the file for your system from the [latest release](https://github.com/v1rus-dev/GitWarp/releases/latest).
 Git is bundled, so you do not need to install it separately.
 
-| OS | Archive | Requirements |
+| OS | Files | Requirements |
 |---|---|---|
-| Linux | [`gitwarp-<version>-linux-x86_64.tar.gz`](https://github.com/v1rus-dev/GitWarp/releases/latest) | x86_64, glibc 2.35 or newer; a GPU with Vulkan support |
-| Windows | [`gitwarp-<version>-windows-x86_64.zip`](https://github.com/v1rus-dev/GitWarp/releases/latest) | x86_64 |
-| macOS | [`gitwarp-<version>-macos-aarch64.zip`](https://github.com/v1rus-dev/GitWarp/releases/latest) | Apple Silicon, macOS 11 or newer |
+| Linux | `gitwarp_<version>_amd64.deb`, `gitwarp-<version>-x86_64.AppImage`, `gitwarp-<version>-linux-x86_64.tar.gz` | x86_64, glibc 2.35 or newer; a GPU with Vulkan support |
+| Windows | `gitwarp-<version>-windows-x86_64-setup.exe` (installer), `gitwarp-<version>-windows-x86_64.zip` (portable) | x86_64 |
+| macOS | `gitwarp-<version>-macos-aarch64.dmg` | Apple Silicon, macOS 11 or newer |
 
 **Linux**
 
 ```sh
+sudo apt install ./gitwarp_<version>_amd64.deb     # Debian / Ubuntu
+chmod +x gitwarp-<version>-x86_64.AppImage && ./gitwarp-<version>-x86_64.AppImage
+```
+
+Or use the tarball, which needs no root:
+
+```sh
 tar xzf gitwarp-<version>-linux-x86_64.tar.gz
 cd gitwarp-<version>-linux-x86_64
-./install.sh                 # installs into ~/.local, no root needed
+./install.sh                 # installs into ~/.local
 PREFIX=/some/prefix ./install.sh
 ./install.sh --uninstall     # removes it again
 ```
 
 **Windows**
 
-Unzip the archive and run `gitwarp.exe`. The build is not signed, so SmartScreen
+Run the setup program (it installs for the current user, no administrator rights needed), or
+unzip the portable archive and run `gitwarp.exe`. The build is not signed, so SmartScreen
 may warn about an unknown publisher: click **More info**, then **Run anyway**.
 
 **macOS**
 
-Unzip the archive and move `GitWarp.app` to Applications. The app is not signed with
+Open the `.dmg` and drag GitWarp to Applications. The app is not signed with
 a developer certificate or notarized, so macOS blocks the first launch. Open
 **System Settings → Privacy & Security** and click **Open Anyway** next to the GitWarp message,
 or remove the quarantine flag in a terminal:
@@ -117,7 +125,7 @@ xattr -dr com.apple.quarantine /Applications/GitWarp.app
 
 **Checksums**
 
-Download `SHA256SUMS.txt` next to the archive and verify it:
+Download `SHA256SUMS.txt` next to the file you downloaded and verify it:
 
 ```sh
 sha256sum -c SHA256SUMS.txt --ignore-missing

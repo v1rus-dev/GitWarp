@@ -1,0 +1,6 @@
+#!/bin/sh
+# AppImage entry point. APPDIR is set by the AppImage runtime; fall back to
+# the script's own directory when AppRun is started directly.
+APPDIR="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+export APPDIR
+exec "$APPDIR/usr/bin/gitwarp" "$@"
