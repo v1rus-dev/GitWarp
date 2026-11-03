@@ -39,6 +39,9 @@ impl TempRepo {
             &["config", "user.name", "Test"][..],
             &["config", "user.email", "test@example.com"],
             &["config", "commit.gpgsign", "false"],
+            // Keep line endings byte-exact so tests that read files back are not
+            // broken by the machine's global `core.autocrlf` (true by default on Windows).
+            &["config", "core.autocrlf", "false"],
             &["symbolic-ref", "HEAD", "refs/heads/main"],
         ] {
             let out = std::process::Command::new("git")
