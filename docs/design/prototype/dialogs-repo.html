@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — Dialogs: clone / open</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="dialogs.css">
+<script src="app.js"></script>
+<script src="dialogs.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const D = GLD;
+  const U = 'https://github.com/nexu-io/open-design.git';
+  const picker = (w) => D.toastStrip(w, [['error', 'Could not open the folder picker: no xdg-desktop-portal is running']]);
+  D.page('Dialogs: clone / open', [
+    ['Clone · empty', (w) => D.repo(w, {})],
+    ['Clone · HTTPS ready', (w) => D.repo(w, { url: U, touched: { url: true } })],
+    ['Clone · SSH address', (w) => D.repo(w, { url: 'git@github.com:nexu-io/open-design.git', touched: { url: true } })],
+    ['Clone · local path', (w) => D.repo(w, { url: '~/src/tree-sitter-rust', touched: { url: true } })],
+    ['Clone · invalid address', (w) => D.repo(w, { url: 'github.com/nexu-io', touched: { url: true } })],
+    ['Clone · folder exists', (w) => D.repo(w, { url: 'https://github.com/mira-k/gitwarp.git', touched: { name: true } })],
+    ['Clone · name has a slash', (w) => D.repo(w, { url: U, name: 'a/b', nameEdited: true, touched: { name: true } })],
+    ['Clone · shallow, bad depth', (w) => D.repo(w, { url: U, shallow: true, depth: '0', touched: { depth: true } })],
+    ['Clone · in progress (connecting)', (w) => D.repo(w, { url: U, phase: 'cloning', pct: null })],
+    ['Clone · in progress (receiving)', (w) => D.repo(w, { url: U, phase: 'cloning', pct: 45 })],
+    ['Clone · cancelling', (w) => D.repo(w, { url: U, phase: 'cloning', pct: 45, cancelling: true })],
+    ['Clone · failed (SSH key rejected)', (w) => D.repo(w, { url: 'git@github.com:acme/private-repo.git', failed: { text: 'The SSH key was rejected. Check that your key is loaded in ssh-agent and added to the account on the Git host.' } })],
+    ['Clone · failed (host unreachable)', (w) => D.repo(w, { url: 'https://unreachable.example/a/b.git', phase: 'error', err: 'net' })],
+    ['Clone · cancelled (info banner)', (w) => D.repo(w, { url: U, failed: { cancelled: true, text: 'Operation cancelled.' } })],
+    ['Clone · done', (w) => D.repo(w, { url: U, phase: 'done' })],
+    ['Open · empty', (w) => D.repo(w, { tab: 'open' })],
+    ['Open · checking the folder', (w) => D.repo(w, { tab: 'open', path: '~/develop/open-design', probing: true })],
+    ['Open · repository found', (w) => D.repo(w, { tab: 'open', path: '~/develop/open-design' })],
+    ['Open · not a repository (init controls)', (w) => D.repo(w, { tab: 'open', path: '~/develop/notes' })],
+    ['Open · not a repository, no branch name', (w) => D.repo(w, { tab: 'open', path: '~/develop/notes', ibranch: '' })],
+    ['Open · inside a repository', (w) => D.repo(w, { tab: 'open', path: '~/develop/gitwarp/src' })],
+    ['Open · folder missing', (w) => D.repo(w, { tab: 'open', path: '~/develop/nope', touched: { path: true } })],
+    ['Open · git unavailable', (w) => D.repo(w, { tab: 'open', path: '~/develop/open-design', force: 'gitmissing' })],
+    ['Open · could not read the folder', (w) => D.repo(w, { tab: 'open', path: '/mnt/data/notes', force: 'readfail' })],
+    ['Open · initializing (busy)', (w) => D.repo(w, { tab: 'open', path: '~/develop/notes', phase: 'running' })],
+    ['Open · init failed', (w) => D.repo(w, { tab: 'open', path: '~/develop/notes', initErr: 'fatal: cannot mkdir ~/develop/notes/.git: Read-only file system' })],
+    ['Folder picker failure (toast)', (w) => { D.repo(w, { tab: 'open' }); picker(w); }]
+  ]);
+})();
+</script>
+</body>
+</html>

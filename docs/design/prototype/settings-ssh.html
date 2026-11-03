@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — Settings → SSH keys</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="settings.css">
+<script src="app.js"></script>
+<script src="settings.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const S = GLS, G = GL, ic = G.ic, esc = G.esc;
+  /* Presentation switcher: feeds the page different situations; it is a stage-bar aid, not product UI. */
+  const DEMO = [['keys', 'Keys present'], ['empty', 'No keys yet'], ['agent', 'ssh-agent not running'], ['readerr', 'Could not read ~/.ssh']];
+  const PUB1 = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEq7ZcN4mV0pT2yHk8Lr3dXwB9aJ1eFg5uOs6iCz1xA0 mira@kovalenko.dev';
+  const KEYS0 = [
+    { id: 'k1', name: 'id_ed25519', type: 'ed25519', fp: 'SHA256:q7ZcN4mV0pT2yHk8Lr3dXwB9aJ1eFg5uOs6iCz1xA0E', pub: PUB1, created: '2026-03-14', agent: true, pass: true },
+    { id: 'k2', name: 'id_ed25519_work', type: 'ed25519', fp: '', pub: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHn2uP8kWq5Tz0RbYc7LdJ3xVm9aEo1gFs4iXy6NtK2A mira@corp.example', created: '2026-08-02', agent: false, pass: true },
+    { id: 'k3', name: 'id_rsa', type: 'rsa-2048', fp: 'SHA256:0bVeRk3Yq8LdTn5ZxJm2WcHa7PfGuEo1iS4yNt9XvB6', pub: '', created: '', agent: false, pass: false, legacy: true }
+  ];
+  const HOSTS0 = [
+    { host: 'github.com', alg: 'ED25519', fp: 'SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU' },
+    { host: 'gitlab.com', alg: 'ED25519', fp: 'SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8' },
+    { host: 'git.corp.example', alg: 'ED25519', fp: 'SHA256:Zk4mT9vQ1pLx7bYdW3nR0aCeHs8UfJ2oGi6tNyVq5Xc' }
+  ];
+  const RESULT = { 'github.com': [1, 'Hi mira-k! You’ve successfully authenticated, but GitHub does not provide shell access.'], 'gitlab.com': [1, 'Welcome to GitLab, @mira.kovalenko!'], 'git.corp.example': [0, 'Permission denied (publickey).'] };
+  let keys = KEYS0.map((k) => Object.assign({}, k)), hosts = HOSTS0.slice(), loading = false;
+  const tests = {}; /* keyId -> { host, state: run | ok | bad } (tested against ONE host) */
+  const chip = (c, i, t) => `<span class="chip ${c}">${ic(i, 10)}${t}</span>`;
+  /* "Test connection" targets one host: the first known host containing github or gitlab, else the first known host */
+  const testHost = () => (hosts.find((h) => /github|gitlab/.test(h.host)) || hosts[0] || {}).host;
+  const keyCard = (k, agentUp) => {
+    const t = tests[k.id];
+    return `<div class="kcard" data-k="${k.id}"><span class="kic">${ic('key', 16)}</span><div class="od-stack" style="--od-gap:4px;min-width:0">
+      <div class="kname">${esc(k.name)} ${chip('', 'key', esc(k.type))}${agentUp && k.agent ? chip('ok', 'check', 'in ssh-agent') : ''}${k.pass ? chip('', 'lock', 'passphrase') : chip('warn', 'warn', 'no passphrase')}${k.legacy ? chip('warn', 'warn', 'weak: RSA 2048') : ''}</div>
+      <div class="kfp">${k.fp ? esc(k.fp) : 'fingerprint unavailable (key needs its passphrase)'}</div>
+      <div class="kmeta">${k.created ? 'Created ' + esc(k.created) : 'Created date unknown'} · ${t && t.state !== 'run' ? 'tested against ' + esc(t.host) : 'not tested against any host'}</div>
+      ${t ? `<div class="ktest" aria-live="polite"><div class="${t.state}">${t.state === 'run' ? 'Connecting to ' + esc(t.host) + '…' : (t.state === 'ok' ? ic('check', 12) : ic('err', 12)) + esc(t.host) + ' — ' + esc(RESULT[t.host] ? RESULT[t.host][1] : 'Connected.')}</div></div>` : ''}
+      <div class="kact">
+        <button class="btn btn-sm" data-a="copy" data-id="${k.id}">${ic('copy', 12)}Copy public key</button>
+        <button class="btn btn-sm" data-a="test" data-id="${k.id}" ${hosts.length && !(t && t.state === 'run') ? '' : 'disabled'}>${ic('fetch', 12)}Test connection</button>
+        <button class="btn btn-sm" data-a="agent" data-id="${k.id}" ${agentUp ? '' : 'disabled'}>${k.agent ? 'Remove from agent' : 'Add to agent'}</button>
+        <button class="btn btn-sm btn-danger" data-a="del" data-id="${k.id}">${ic('trash', 12)}Delete…</button></div></div></div>`;
+  };
+  const ctx = S.mount('settings-ssh.html', 'SSH keys', () => {
+    const demo = S.get('ssh-demo', 'keys'), agentUp = demo !== 'agent', shown = demo === 'empty' || demo === 'readerr' ? [] : keys;
+    return `<h2>SSH keys</h2><p class="lead">Keys GitWarp can use to clone, fetch and push over SSH. Private keys stay in <span class="mono">~/.ssh</span>; only fingerprints and public keys are shown here.</p>
+      <div class="od-row" style="margin-bottom:16px"><button class="btn btn-primary" data-a="gen">${ic('plus', 14)}Generate key…</button><button class="btn" data-a="imp">${ic('folder', 14)}Import…</button><span class="od-fill"></span><button class="btn" data-a="refresh"${loading ? ' disabled' : ''}>${ic('fetch', 14)}Refresh</button></div>
+      ${demo === 'readerr' ? S.banner('error', 'Could not read ~/.ssh', 'Permission denied (os error 13)') : ''}
+      ${demo === 'readerr' ? '' : agentUp ? S.banner('info', 'ssh-agent is running', shown.filter((k) => k.agent).length + ' of ' + shown.length + ' keys loaded. Loaded keys are offered to hosts automatically.') : S.banner('error', 'ssh-agent is not running', 'Keys protected by a passphrase cannot be used until it starts. Start it with eval "$(ssh-agent -s)" or enable the ssh-agent user service, then retry.')}
+      ${agentUp || demo === 'readerr' ? '' : `<div style="margin:-4px 0 12px"><button class="btn" data-a="retry">${ic('fetch', 14)}Check again</button></div>`}
+      <section class="sgroup"><h3>Your keys</h3><div class="slist">${shown.length ? shown.map((k) => keyCard(k, agentUp)).join('') : `<div class="empty">${ic('key', 24)}<b>No SSH keys yet</b><span style="max-width:46ch">Create a key and add its public half to GitHub, GitLab or your own server to clone private repositories without typing a password.</span><div class="od-row"><button class="btn btn-primary" data-a="gen">${ic('plus', 14)}Generate key…</button><button class="btn" data-a="imp">${ic('folder', 14)}Import existing key…</button></div></div>`}</div></section>
+      <section class="sgroup"><h3>Trusted hosts</h3><div class="slist">${hosts.length ? hosts.map((h, i) => `<div class="hostrow"><div style="min-width:0"><div class="hn">${esc(h.host)}</div><div class="hf">${h.alg ? esc(h.alg) + ' ' + esc(h.fp) : '—'}</div></div><button class="btn btn-sm btn-ghost btn-icon" data-a="forget" data-i="${i}" aria-label="Forget ${esc(h.host)}" data-tip="Forget ${esc(h.host)}">${ic('trash', 14)}</button></div>`).join('') : '<div class="empty"><b>No trusted hosts</b><span>Hosts appear here after you confirm their fingerprint on first connection.</span></div>'}</div>
+        <div class="field-help" style="margin-top:6px">Stored in <span class="mono">~/.ssh/known_hosts</span>.</div></section>
+      <div class="sfoot">${ic('info', 12)}Caption: the agent buttons, Check again and Forget host act silently (no toast); the list just reloads.</div>`;
+  }, null, { stagebar: `<label class="scn">Demo state <select id="demo" aria-label="Demo state">${DEMO.map(([v, l]) => `<option value="${v}"${S.get('ssh-demo', 'keys') === v ? ' selected' : ''}>${l}</option>`).join('')}</select></label>` });
+  document.getElementById('demo').addEventListener('change', (e) => { S.set('ssh-demo', e.target.value); ctx.draw(); });
+  const pane = ctx.pane, win = ctx.win, byId = (id) => keys.find((k) => k.id === id);
+  const FP = 'SHA256:Wm8vJq2nT5xYpL0dKc3RzBe7HaUo1gFs4iNy6XtQ9Vc';
+
+  /* ---- result dialog (after generate or import) ---- */
+  function resultDialog(title, k, notLoaded) {
+    S.dialog(win, { st: {}, width: 560,
+      view: () => ({ title, icon: 'key', body: `${S.dbanner('ok', 'Add the public key to your Git host', 'Paste it in GitHub → Settings → SSH and GPG keys, or the same page on your host. The private key never leaves this machine.')}
+          <div class="od-stack" style="--od-gap:6px"><span class="field-label" style="margin:0">Public key</span><div class="codebox">${esc(k.pub)}</div></div>
+          <div class="muted" style="font-size:var(--fs-sm)">Fingerprint: ${esc(k.fp)}</div>
+          ${notLoaded ? '<div class="muted" style="font-size:var(--fs-sm)">The key was not added to ssh-agent: it needs its passphrase first.</div>' : ''}`,
+        foot: S.dbtn('Copy public key', { act: 'copy', icon: 'copy' }) + S.dbtn('Done', { kind: 'primary', def: 1 }) }),
+      actions: { copy: (s, api) => { try { navigator.clipboard.writeText(k.pub); } catch (x) {} api.close(); ctx.toast('Public key copied to clipboard', 'ok'); return false; } } });
+  }
+  /* ---- Generate SSH key ---- */
+  const TYPE_HELP = { ed25519: 'Recommended: short, fast, supported by GitHub, GitLab and Bitbucket.', rsa: 'Compatible with old servers; slower and larger.', ecdsa: 'Supported by most hosts; prefer Ed25519 when you can.' };
+  function generateDialog() {
+    S.dialog(win, { st: { name: 'id_ed25519_gitwarp', type: 'ed25519', comment: 'mira@kovalenko.dev', usePass: true, pass: '', pass2: '', addAgent: true, err: '', busy: false }, width: 520,
+      busy: (s) => s.busy,
+      view: (s) => ({ title: 'Generate SSH key', icon: 'key', body: `<div class="col10">
+          ${S.dfield('File name', 'name', `<div class="od-row"><span class="mono muted">~/.ssh/</span>${S.din('name', s.name, 'id_ed25519_gitwarp', { mono: 1 })}</div>`, 'The public key is saved next to it with a .pub extension.')}
+          ${S.dfield('Type', 'type', `<select class="input" id="type" data-f="type"><option value="ed25519"${s.type === 'ed25519' ? ' selected' : ''}>Ed25519</option><option value="rsa"${s.type === 'rsa' ? ' selected' : ''}>RSA 4096</option><option value="ecdsa"${s.type === 'ecdsa' ? ' selected' : ''}>ECDSA</option></select>`, TYPE_HELP[s.type])}
+          ${S.dfield('Comment', 'comment', S.din('comment', s.comment, 'you@example.com'), 'Helps you recognise the key on the host, usually your email.')}
+          ${S.dchk('usePass', s.usePass, 'Protect the key with a passphrase (recommended)')}
+          ${s.usePass ? `${S.dfield('Passphrase', 'pass', S.din('pass', s.pass, 'Passphrase', { type: 'password' }))}${S.dfield('Repeat passphrase', 'pass2', S.din('pass2', s.pass2, 'Repeat passphrase', { type: 'password' }))}` : S.dbanner('warn', 'Anyone who can read the file can use this key', 'Without a passphrase, a stolen backup or laptop gives access to every host this key is registered on.')}
+          ${S.dchk('addAgent', s.addAgent, 'Add the key to ssh-agent now')}
+          ${s.err ? `<div class="derr" role="alert">${esc(s.err)}</div>` : ''}</div>`,
+        foot: S.dbtn('Cancel', { dis: s.busy }) + S.dbtn(s.busy ? 'Generating…' : 'Generate key', { kind: 'primary', act: 'gen', dis: s.busy, def: 1 }) }),
+      actions: { gen: (s, api) => {
+        /* validation runs only on press; one red line at the bottom of the body */
+        const n = s.name.trim();
+        if (!n || n === '.' || n === '..' || /^-/.test(n) || /[\/\\ ]/.test(n)) { s.err = 'Choose a file name without spaces or slashes.'; return; }
+        if (s.usePass && (s.pass.length < 5 || s.pass !== s.pass2)) { s.err = 'The passphrases must match and be at least 5 characters.'; return; }
+        if (keys.some((k) => k.name === n)) { s.err = '~/.ssh/' + n + ' already exists.'; return; }
+        s.err = ''; s.busy = true; api.redraw();
+        setTimeout(() => {
+          const k = { id: 'k' + Date.now() % 100000, name: n, type: s.type === 'ed25519' ? 'ed25519' : s.type === 'rsa' ? 'rsa-4096' : 'ecdsa-521', fp: FP, pub: (s.type === 'ed25519' ? 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIWm8vJq2nT5xYpL0dKc3RzBe7HaUo1gFs4iNy6XtQ9V' : 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDWm8vJq2nT5xYpL0dKc3Rz') + ' ' + s.comment, created: '2026-11-02', agent: s.addAgent && !s.usePass, pass: s.usePass, hosts: [] };
+          keys.push(k); api.close(); ctx.draw(); resultDialog('Generate SSH key', k, s.addAgent && s.usePass);
+        }, 700);
+        return false; } } });
+  }
+  /* ---- Import SSH key ---- */
+  function importDialog() {
+    S.dialog(win, { st: { path: '', copy: true, err: '', busy: false }, width: 520, busy: (s) => s.busy,
+      view: (s) => ({ title: 'Import SSH key', icon: 'key', body: `<div class="col10">
+          ${S.dfield('Private key file', 'path', S.din('path', s.path, '~/.ssh/id_ed25519_old', { mono: 1 }), 'Choose the private file, for example id_ed25519, not the .pub file.')}
+          ${S.dchk('copy', s.copy, 'Copy into ~/.ssh (the original stays where it is)')}
+          ${s.err ? `<div class="derr" role="alert">${esc(s.err)}</div>` : ''}</div>`,
+        foot: S.dbtn('Cancel', { dis: s.busy }) + S.dbtn(s.busy ? 'Importing…' : 'Import key', { kind: 'primary', act: 'imp', dis: s.busy, def: 1 }) }),
+      actions: { imp: (s, api) => {
+        const p = s.path.trim();
+        if (!p) { s.err = 'Choose a private key file.'; return; }
+        if (/nope|missing/.test(p)) { s.err = 'No such file or directory (os error 2)'; return; }
+        s.err = ''; s.busy = true; api.redraw();
+        setTimeout(() => { const nm = p.split('/').pop(), enc = /enc|pass/.test(p);
+          const k = { id: 'k' + Date.now() % 100000, name: nm, type: 'ed25519', fp: FP, pub: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPe5Lx0cVb9RtYk2NqJ7dWz3HmUo8gFs1iXa4TyC6nB0 imported', created: '2026-11-02', agent: false, pass: enc };
+          keys.push(k); api.close(); ctx.draw(); resultDialog('Import SSH key', k, enc); }, 700);
+        return false; } } });
+  }
+  /* ---- Delete SSH key ---- */
+  function deleteDialog(k) {
+    S.dialog(win, { st: { ack: false }, width: 520,
+      view: (s) => ({ title: 'Delete SSH key', icon: 'trash', body: `<dl class="kv"><dt>Key</dt><dd>${esc(k.name)}</dd><dt>Fingerprint</dt><dd>${esc(k.fp || 'unavailable')}</dd></dl>
+          ${S.dbanner('warn', 'The private key file is deleted from ~/.ssh', 'Hosts that use it will reject you until you add another key. This cannot be undone.')}
+          ${S.dchk('ack', s.ack, 'I have a backup or no longer need this key')}`,
+        foot: S.dbtn('Cancel', { def: 1, af: 1 }) + S.dbtn('Delete key', { kind: 'danger', act: 'del', dis: !s.ack }) }),
+      actions: { del: (s, api) => { keys = keys.filter((x) => x.id !== k.id); delete tests[k.id]; api.close(); ctx.draw(); return false; } } }); /* no toast: the list just reloads */
+  }
+
+  pane.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-a]'); if (!b || b.disabled) return;
+    const a = b.dataset.a, k = b.dataset.id && byId(b.dataset.id);
+    if (a === 'gen') generateDialog();
+    else if (a === 'imp') importDialog();
+    else if (a === 'del') deleteDialog(k);
+    else if (a === 'refresh') { loading = true; ctx.draw(); setTimeout(() => { loading = false; ctx.draw(); }, 700); }
+    else if (a === 'copy') { if (!k.pub) ctx.toast('This key has no public half to copy', 'warn'); else { try { navigator.clipboard.writeText(k.pub); } catch (x) {} ctx.toast('Public key of ' + k.name + ' copied', 'ok'); } }
+    else if (a === 'agent') { k.agent = !k.agent; ctx.draw(); }
+    else if (a === 'test') { const h = testHost(); tests[k.id] = { host: h, state: 'run' }; ctx.draw(); setTimeout(() => { tests[k.id] = { host: h, state: RESULT[h] && !RESULT[h][0] ? 'bad' : 'ok' }; ctx.draw(); }, 900); }
+    else if (a === 'retry') { ctx.draw(); } /* re-reads silently; no toast */
+    else if (a === 'forget') { hosts.splice(+b.dataset.i, 1); ctx.draw(); }
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — Dialogs: checkout</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="dialogs.css">
+<script src="app.js"></script>
+<script src="dialogs.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const D = GLD, G = GL;
+  D.page('Dialogs: checkout with local changes', [
+    ['Switch to a local branch · 6 changes', (w) => D.checkout(w, { origin: 'branch', target: 'feat/palette' })],
+    ['Switch to a local branch · 1 change', (w) => D.checkout(w, { origin: 'branch', target: 'feat/palette', n: 1 })],
+    ['Check out a remote branch', (w) => D.checkout(w, { origin: 'remote', target: 'origin/fix/git-detect' })],
+    ['Check out a tag', (w) => D.checkout(w, { origin: 'tag', target: 'v0.3.0' })],
+    ['Check out a commit', (w) => D.checkout(w, { origin: 'commit', target: '8d41f6e' })],
+    ['Bring changes → git refuses (error toast)', (w) => D.checkout(w, { origin: 'branch', target: 'fix/git-detect', conflict: true })],
+    ['Clean work tree · no dialog, just a toast', (w) => D.toastStrip(w, [['ok', 'Switched to feat/palette']])]
+  ]);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,153 @@
+/* gitwarp design tokens. Two themes, one geometry: Dark and Light differ in colour only, so only colour needs maintaining.
+   Spec values for GPUI: every token below maps 1:1 to a `Hsla`/`Pixels` constant in the theme struct. */
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+  --stage: #101216;
+  --bg: #181b20;
+  --surface: #1d2026;
+  --sidebar: #15171c;
+  --hover: #22262d;
+  --active: #2a2f38;
+  --selection: #263c5e;
+  --selection-fg: var(--text);
+  --selection-sub: var(--muted);
+  --selection-inactive: #232d3e;
+  --border: #2a2e36;
+  --border-strong: #4a515d;
+
+  --text: #d9dce2;
+  --muted: #9aa1ad;
+  --disabled: #6b7280;
+
+  --accent: #6ea4f7;
+  --accent-hover: #86b5f9;
+  --accent-fg: #0f1722;
+  --accent-soft: rgba(110, 164, 247, .15);
+  --focus: #86b5f9;
+  --error: #e5767f;
+  --warning: #e5c07b;
+  --success: #8cc88f;
+  --info: #6bb2f0;
+  --st-added: #8cc88f;
+  --st-modified: #e5c07b;
+  --st-deleted: #e5767f;
+  --st-renamed: #6bb2f0;
+  --st-untracked: #b794e0;
+  --st-conflict: #e0966c;
+
+  --diff-add-bg: rgba(140, 200, 143, .11);
+  --diff-add-strong: rgba(140, 200, 143, .28);
+  --diff-del-bg: rgba(229, 118, 127, .12);
+  --diff-del-strong: rgba(229, 118, 127, .30);
+  --diff-hunk-bg: rgba(110, 164, 247, .09);
+  --code-kw: #c98be0;
+  --code-str: #98c379;
+  --code-num: #d9a26b;
+  --code-com: #8d94a1;
+  --code-ty: #e5c07b;
+  --code-fn: #6bb2f0;
+
+  --graph-l: 62%;
+
+  --overlay: rgba(6, 8, 12, .60);
+  --shadow-pop: 0 10px 32px rgba(0, 0, 0, .42), 0 0 0 1px rgba(255, 255, 255, .04);
+
+  /* graph saturation is shared by both themes */
+  --graph-s: 65%;
+
+  /* type */
+  --font-ui: "Inter", "Segoe UI", "Cantarell", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", "SF Mono", ui-monospace, Consolas, monospace;
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --lh-row: 26px;
+
+  /* spacing (4px grid, 2px half-step for dense rows) */
+  --sp-1: 2px;
+  --sp-2: 4px;
+  --sp-3: 6px;
+  --sp-4: 8px;
+  --sp-5: 12px;
+  --sp-6: 16px;
+  --sp-7: 24px;
+  --sp-8: 32px;
+
+  /* radii */
+  --r-xs: 3px;
+  --r-sm: 5px;
+  --r-md: 7px;
+  --r-lg: 12px;
+
+  /* sizes */
+  --row: 26px;
+  --ctl: 26px;
+  --ctl-sm: 22px;
+  --bar: 40px;
+  --status: 24px;
+  --lane-w: 14px;
+  --dot-r: 4.5px;
+  --line-w: 2px;
+}
+
+/* Row density (Appearance settings): Compact 22 / Normal 26 (default) / Roomy 30. Set on <html data-density="…">. */
+[data-density="compact"] { --row: 22px; }
+[data-density="roomy"] { --row: 30px; }
+
+/* Light theme: near-white chrome, hairline borders, a pale-blue selection instead of solid blue; same semantic names as dark. */
+[data-theme="light"] {
+  color-scheme: light;
+  --stage: #f1f4f9;
+  --bg: #ffffff;
+  --surface: #ffffff;         /* toolbar, status bar, panel headers: pure white, separated by hairlines only */
+  --sidebar: #fbfcfe;           /* a breath of blue-white, no grey */
+  --hover: #f2f6fd;               /* blue-tinted, not grey */
+  --active: #e7effc;
+  --selection: #dce9fc;       /* pale blue; dark text on it is 13:1 */
+  --selection-fg: var(--text);
+  --selection-sub: var(--muted);
+  --selection-inactive: #e9f1fe; /* unfocused selection stays blue-tinted instead of turning grey */
+  --border: #e8ecf3;          /* hairlines separate areas */
+  --border-strong: #b9c0cb;   /* control outlines stay readable (inputs, buttons) */
+
+  --text: #1f2329;
+  --muted: #5f6773;
+  --disabled: #a3aab5;
+
+  --accent: #2a66d6;
+  --accent-hover: #1f55b8;
+  --accent-fg: #ffffff;
+  --accent-soft: rgba(42, 102, 214, .10);
+  --focus: #2a66d6;
+  --error: #c93434;
+  --warning: #8f5f00;
+  --success: #1c7a3a;
+  --info: #1f5fbf;
+  --st-added: #1c7a3a;
+  --st-modified: #8f5f00;
+  --st-deleted: #c93434;
+  --st-renamed: #1f5fbf;
+  --st-untracked: #7b3fb0;
+  --st-conflict: #a8480f;
+
+  --diff-add-bg: rgba(46, 160, 67, .09);
+  --diff-add-strong: rgba(46, 160, 67, .24);
+  --diff-del-bg: rgba(214, 60, 60, .08);
+  --diff-del-strong: rgba(214, 60, 60, .22);
+  --diff-hunk-bg: rgba(42, 102, 214, .06);
+  --code-kw: #8f3fb0;
+  --code-str: #35761b;
+  --code-num: #9a5600;
+  --code-com: #66707d;
+  --code-ty: #8a5a00;
+  --code-fn: #1f5fbf;
+
+  --graph-l: 45%;
+
+  --overlay: rgba(31, 41, 58, .22);
+  --shadow-pop: 0 10px 32px rgba(24, 36, 56, .12), 0 0 0 1px rgba(24, 36, 56, .04);
+}

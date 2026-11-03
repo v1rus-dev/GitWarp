@@ -2,11 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
+  # Full debug info of the test binaries fills the ubuntu runner's disk (ld: Bus error).
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   build:
@@ -36,5 +38,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test core crates
         run: cargo test
+      # `ui` and `app` are not default members, so plain `cargo test` skips them.
+      - name: Test ui and app
+        run: cargo test -p ui -p app
+      - name: Build ui examples
+        run: cargo build -p ui --examples
       - name: Build app
         run: cargo build --release -p app

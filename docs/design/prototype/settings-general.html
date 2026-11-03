@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — Settings → General</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="settings.css">
+<script src="app.js"></script>
+<script src="settings.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const S = GLS, G = GL, ic = G.ic;
+  const LANGS = [['en', 'English'], ['de', 'Deutsch'], ['fr', 'Français'], ['es', 'Español'], ['ru', 'Русский'], ['ja', '日本語']];
+  const EVERY = [['1', 'Every minute'], ['5', 'Every 5 minutes'], ['15', 'Every 15 minutes'], ['60', 'Every hour']];
+  let langChanged = false;
+  S.mount('settings-general.html', 'General', () => {
+    const auto = S.get('upd-auto', true), fetchOn = S.get('fetch-auto', true);
+    return `<h2>General</h2><p class="lead">Startup, updates and safety prompts. Applies to every repository.</p>
+      ${langChanged ? S.banner('info', 'Restart required', 'The interface language changes the next time GitWarp starts.') : ''}
+      ${S.group('Startup', [
+        S.row('Language', 'Interface language.', S.sel('lang', S.get('lang', 'en'), LANGS, 'Interface language')),
+        S.row('On launch', 'What opens when GitWarp starts.', S.seg('launch', S.get('launch', 'last'), [['last', 'Last repository'], ['welcome', 'Welcome'], ['none', 'Nothing']]))
+      ])}
+      ${S.group('Updates', [
+        S.row('Check for updates automatically', 'GitWarp downloads updates in the background and asks before installing.', S.sw('upd-auto', auto, 'Check for updates automatically')),
+        S.row('Update channel', auto ? 'Beta builds ship weekly and may contain regressions.' : 'Turn on automatic updates to pick a channel.', S.seg('chan', S.get('chan', 'stable'), [['stable', 'Stable'], ['beta', 'Beta']], !auto), !auto)
+      ])}
+      ${S.group('Background fetch', [
+        S.row('Fetch remotes automatically', 'Keeps ahead/behind counts and the graph current without touching your working tree.', S.sw('fetch-auto', fetchOn, 'Fetch remotes automatically')),
+        S.row('Interval', fetchOn ? 'Fetch pauses while the window is in the background.' : 'Automatic fetch is off.', S.sel('fetch-int', S.get('fetch-int', '5'), EVERY, 'Fetch interval', !fetchOn), '', !fetchOn)
+      ])}
+      ${S.group('Ask before…', [
+        S.row('Force push', 'Rewrites remote history; always shows which commits will be lost.', S.chk('cf-force', S.get('cf-force', true), 'Confirm')),
+        S.row('Discarding changes', 'Discarded edits cannot be recovered.', S.chk('cf-discard', S.get('cf-discard', true), 'Confirm')),
+        S.row('Deleting a branch', 'Unmerged commits stay reachable from the reflog for 30 days.', S.chk('cf-branch', S.get('cf-branch', true), 'Confirm'))
+      ])}
+      ${S.group('Privacy', [
+        S.row('Send anonymous usage statistics', 'Counts of features used and crash reports. Never repository names, paths, commit messages or diffs.', S.sw('telemetry', S.get('telemetry', false), 'Send anonymous usage statistics'))
+      ])}
+      <div class="sfoot">${ic('info', 12)}Settings file: <span class="mono">~/.config/gitwarp/settings.json</span></div>`;
+  }, (kind, k) => {
+    if (k === 'lang') langChanged = true; /* no toast when Force push is unchecked: the app stays silent */
+  });
+})();
+</script>
+</body>
+</html>

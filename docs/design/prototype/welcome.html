@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — welcome</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<style>
+  .wl { display: grid; grid-template-columns: 300px minmax(0, 1fr); min-height: 0; }
+  .wl aside { padding: 28px 24px; border-right: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; gap: 8px; }
+  .logo { display: flex; align-items: center; gap: 10px; font-size: var(--fs-xl); font-weight: 700; margin-bottom: 4px; }
+  .act { display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--bg); cursor: default; width: 100%; text-align: left; }
+  .act:hover { background: var(--hover); } .act .kbd { margin-left: auto; }
+  .wl main { padding: 20px 24px; display: flex; flex-direction: column; min-height: 0; gap: 12px; }
+  .recent { overflow: auto; flex: 1; min-height: 0; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); outline: none; }
+  .rrow { display: grid; grid-template-columns: 24px minmax(0, 1fr) 150px 110px; gap: 12px; align-items: center; height: 44px; padding: 0 12px; cursor: default; border-bottom: 1px solid var(--border); }
+  .rrow:last-child { border-bottom: 0; }
+  .rrow:hover { background: var(--hover); } .rrow.sel { background: var(--selection); }
+  .rrow .n { font-weight: 600; } .rrow .p { color: var(--muted); font-size: var(--fs-sm); }
+</style>
+<link rel="stylesheet" href="dialogs.css">
+<script src="app.js"></script>
+<script src="dialogs.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL, ic = G.ic, esc = G.esc, D = GLD;
+  const SC = [['', 'Initialize dialog: closed'], ['empty', 'Initialize · empty'], ['plain', 'Initialize · plain folder'], ['missing', 'Initialize · folder will be created'], ['nobranch', 'Initialize · no branch name'], ['repo', 'Initialize · already a repository'], ['nested', 'Initialize · inside a repository'], ['probing', 'Initialize · checking the folder'], ['gitmissing', 'Initialize · git unavailable'], ['readfail', 'Initialize · could not read the folder'], ['running', 'Initialize · running git init'], ['failed', 'Initialize · init failed'], ['picker', 'Initialize · folder picker failure']];
+  const GIT = [['ok', 'git 2.56.0 · bundled'], ['old', 'git 2.19.1 too old'], ['none', 'git not found']];
+  const sel = (id, label, opts) => `<label style="display:inline-flex;gap:8px;align-items:center;font-size:12px">${label}<select id="${id}" aria-label="${label}" style="height:24px;background:var(--bg);color:var(--text);border:1px solid var(--border-strong);border-radius:var(--r-sm)">${opts.map((o, k) => `<option value="${o[0]}">${esc(o[1])}</option>`).join('')}</select></label>`;
+  G.stagebar(sel('lst', 'Recent list', [['full', 'With recents'], ['none', 'No recent repositories']]) + sel('git', 'Git', GIT) + sel('scn', 'Dialog state', SC));
+  const stage = G.h('<div class="stage"><div class="winwrap"></div></div>'); document.body.appendChild(stage);
+  const R = [['gitwarp', '~/develop/gitwarp', 'main', '12 min ago'], ['open-design', '~/develop/open-design', 'feat/prompt-bundle', '2 h ago'], ['zed-themes', '~/projects/zed-themes', 'main', 'yesterday'], ['dotfiles', '~/.dotfiles', 'master', '3 d ago'], ['tree-sitter-rust', '~/src/tree-sitter-rust', 'master', '2 weeks ago'], ['notes', '/mnt/data/notes', '—', '3 weeks ago']];
+  const win = G.h(`<div class="win" style="width:960px;height:620px;grid-template-rows:var(--bar) minmax(0,1fr) var(--status)">
+    <header class="titlebar"><span style="display:inline-flex;gap:8px;align-items:center;font-weight:600;padding-left:4px">${G.logo(16)}GitWarp</span><span class="od-fill"></span><div class="wc"><button class="btn btn-ghost" aria-label="Minimise">${ic('min', 14)}</button><button class="btn btn-ghost" aria-label="Maximise">${ic('max', 14)}</button><button class="btn btn-ghost close" aria-label="Close">${ic('x', 12)}</button></div></header>
+    <div class="wl"><aside><div class="logo">${G.logo(26)}GitWarp</div><div class="muted" style="margin-bottom:16px">A fast, keyboard-first git client.</div>
+      <button class="act" id="open" data-tip="Open an existing repository">${ic('folder', 16)}Open repository…<span class="kbd">Ctrl O</span></button>
+      <button class="act" id="clone" data-tip="Clone a repository from a URL">${ic('clone', 16)}Clone repository…<span class="kbd">Ctrl Shift O</span></button>
+      <button class="act" id="init" data-tip="Create a new repository">${ic('init', 16)}Init new repository…<span class="kbd">Ctrl N</span></button></aside>
+    <main><div class="od-row"><h2 style="margin:0;font-size:var(--fs-lg)" class="od-fill">Recent repositories</h2><label class="input-wrap" style="width:240px">${ic('search', 14)}<input class="input" id="flt" placeholder="Filter recent…" aria-label="Filter recent repositories"></label></div>
+      <div class="recent" id="recent" role="listbox" tabindex="0" aria-label="Recent repositories"></div>
+      <div class="muted" style="font-size:12px"><span class="kbd">↑</span> <span class="kbd">↓</span> select · <span class="kbd">Enter</span> open · <span class="kbd">Del</span> remove from list</div></main></div>
+    <footer class="statusbar"><span class="od-fill"></span><span class="sb-btn" id="gitlabel"></span></footer></div>`);
+  stage.firstChild.appendChild(win);
+  G.initTips(win);
+  const list = win.querySelector('#recent'); let sel_ = 0, rec = R.slice();
+  const rows = () => G.$$('.rrow', list);
+  const draw = () => {
+    const f = win.querySelector('#flt').value.trim().toLowerCase(), v = rec.filter((r) => !f || (r[0] + ' ' + r[1]).toLowerCase().includes(f));
+    list.innerHTML = !rec.length ? `<div class="empty" style="height:100%;align-content:center">${ic('folder', 24)}<b>No recent repositories</b><span>Open or clone a repository to see it here.</span></div>`
+      : !v.length ? `<div class="empty" style="height:100%;align-content:center">${ic('folder', 24)}<b>No matches</b><span>No recent repository matches “${esc(win.querySelector('#flt').value.trim())}”.</span></div>`
+      : v.map((r, i) => `<div class="rrow${i === 0 ? ' sel' : ''}" role="option" aria-selected="${i === 0}" data-n="${esc(r[0])}"><span>${ic('folder', 16)}</span><div style="min-width:0"><div class="n">${esc(r[0])}</div><div class="p od-truncate mono">${esc(r[1])}</div></div><span class="od-truncate muted" style="font-size:12px">${r[2] === '—' ? '—' : ic('branch', 12) + ' ' + esc(r[2])}</span><span class="muted" style="font-size:12px;text-align:right">${r[3]}</span></div>`).join('');
+    sel_ = 0;
+  };
+  const pick = (i) => { sel_ = Math.max(0, Math.min(rows().length - 1, i)); rows().forEach((r, k) => { r.classList.toggle('sel', k === sel_); r.setAttribute('aria-selected', k === sel_); }); };
+  win.querySelector('#flt').addEventListener('input', draw);
+  document.getElementById('lst').addEventListener('change', (e) => { rec = e.target.value === 'none' ? [] : R.slice(); draw(); });
+  list.addEventListener('click', (e) => { const r = e.target.closest('.rrow'); if (r) pick(rows().indexOf(r)); });
+  list.addEventListener('dblclick', (e) => { if (e.target.closest('.rrow')) location.href = 'main-1200.html'; });
+  list.addEventListener('keydown', (e) => { if (e.key === 'ArrowDown') { pick(sel_ + 1); e.preventDefault(); } else if (e.key === 'ArrowUp') { pick(sel_ - 1); e.preventDefault(); } else if (e.key === 'Enter' && rows().length) location.href = 'main-1200.html'; else if (e.key === 'Delete' && rows().length) { rec.splice(sel_, 1); draw(); } });
+  /* status-bar git label: text + tooltip (the tooltip carries the path, or the failure title when git is unusable) */
+  const gl = () => { const g = document.getElementById('git').value, l = win.querySelector('#gitlabel'); const t = { ok: ['git 2.56.0 · bundled', 'git 2.56.0 · bundled · /opt/gitwarp/git/bin/git'], old: ['git 2.19.1 too old', 'Git is too old: 2.19.1 found, 2.30 or newer is required'], none: ['git not found', 'Git was not found on this machine'] }[g]; l.innerHTML = ic('git', 12) + t[0]; l.dataset.tip = t[1]; };
+  document.getElementById('git').addEventListener('change', gl);
+  /* Init dialog scenes */
+  const scn = () => {
+    const k = document.getElementById('scn').value; D.closeAll(win); const tc = G.layer(win).querySelector('.toasts'); if (tc) tc.remove();
+    if (!k) return;
+    const P = { empty: {}, plain: { path: '~/develop/notes' }, missing: { path: '~/develop/new-project' }, nobranch: { path: '~/develop/notes', ibranch: '' }, repo: { path: '~/develop/open-design' }, nested: { path: '~/develop/gitwarp/src' }, probing: { path: '~/develop/notes', probing: true }, gitmissing: { path: '~/develop/notes', force: 'gitmissing' }, readfail: { path: '/mnt/data/notes', force: 'readfail' }, running: { path: '~/develop/notes', phase: 'running' }, failed: { path: '~/develop/notes', initErr: 'fatal: cannot mkdir ~/develop/notes/.git: Read-only file system' }, picker: {} }[k];
+    D.initRepo(win, P);
+    if (k === 'picker') D.toastStrip(win, [['error', 'Could not open the folder picker: no xdg-desktop-portal is running']]);
+  };
+  document.getElementById('scn').addEventListener('change', scn);
+  win.querySelector('#clone').onclick = () => D.repo(win, { tab: 'clone' });
+  win.querySelector('#init').onclick = () => D.initRepo(win, {});
+  win.querySelector('#open').onclick = () => D.repo(win, { tab: 'open' });
+  addEventListener('keydown', (e) => { if (!e.ctrlKey || e.shiftKey) return; if (e.key.toLowerCase() === 'n') { e.preventDefault(); D.initRepo(win, {}); } });
+  draw(); gl();
+  { const q = new URLSearchParams(location.search); if (q.get('t') && G.THEMES[q.get('t')]) G.setTheme(q.get('t')); if (q.has('s')) { document.getElementById('scn').value = q.get('s'); scn(); } if (q.get('l')) { document.getElementById('lst').value = q.get('l'); document.getElementById('lst').dispatchEvent(new Event('change')); } if (q.get('g')) { document.getElementById('git').value = q.get('g'); gl(); } if (q.get('f')) { win.querySelector('#flt').value = q.get('f'); draw(); } }
+  G.fit(win);
+})();
+</script>
+</body>
+</html>

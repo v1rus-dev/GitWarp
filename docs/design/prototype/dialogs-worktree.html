@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — Worktrees</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="dialogs.css">
+<script src="app.js"></script>
+<script src="dialogs.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const D = GLD;
+  const G = GL, ic = G.ic, esc = G.esc;
+  let WT = [
+    { path: '~/develop/gitwarp', branch: 'main', hash: 'e4f2a91', main: true, dirty: [] },
+    { path: '~/develop/gitwarp-hotfix', branch: 'fix/git-detect', hash: '8d41f6e', dirty: ['src/settings/git.rs', 'src/settings/detect.rs', 'Cargo.lock'] },
+    { path: '~/develop/gitwarp-review', branch: 'feat/palette', hash: 'a82c4d7', locked: true, lockReason: 'review in progress', dirty: [] },
+    { path: '~/develop/gitwarp-old', branch: 'feat/idle-lanes', hash: '19d8e4f', missing: true, dirty: [] }
+  ];
+  let W = null, draw = () => {}, view = 'ready';
+  const chips = (w) => [w.main && `<span class="chip acc">${ic('git', 10)}main worktree</span>`, w.locked && `<span class="chip warn">${ic('lock', 10)}locked</span>`, w.dirty.length && `<span class="chip warn">${ic('edit', 10)}${w.dirty.length} changed</span>`, w.missing && `<span class="chip err">${ic('warn', 10)}folder missing</span>`, !w.main && !w.locked && !w.dirty.length && !w.missing && `<span class="chip ok">${ic('check', 10)}clean</span>`].filter(Boolean).join(' ');
+  const center = (sh, win) => {
+    W = win;
+    sh.center.innerHTML = '<div class="wtview"></div>';
+    const v = sh.center.firstChild;
+    draw = () => {
+      const stale = view === 'ready' ? WT.filter((w) => w.missing).length : 0;
+      v.innerHTML = `<div class="od-row"><h2 class="od-fill">Worktrees ${view === 'ready' ? `<span class="muted" style="font-weight:400;font-size:var(--fs-base)">${WT.length}</span>` : ''}</h2>${stale ? `<button class="btn" data-w="prune">${ic('trash', 14)}Prune ${stale} missing</button>` : ''}<button class="btn btn-primary" data-w="add">${ic('plus', 14)}Add worktree…</button></div>
+        <div class="wtlist" role="table" aria-label="Worktrees"><div class="wtrow head" role="row"><span></span><span>Folder</span><span>Branch</span><span>HEAD</span><span>Status</span><span></span></div>
+        ${view === 'loading' ? `<div class="wtrow" style="min-height:80px;display:flex;justify-content:center;color:var(--muted);font-size:var(--fs-sm);gap:8px">${ic('fetch', 14, 'spin')}Loading worktrees…</div>` : view === 'error' ? '' : WT.map((w, i) => `<div class="wtrow${w.missing ? ' gone' : ''}" role="row"><span>${ic('worktree', 16)}</span><div style="min-width:0"><div class="pth od-truncate">${esc(w.path)}</div>${w.locked ? `<div class="sub">${w.lockReason ? 'Locked: ' + esc(w.lockReason) : 'Locked'}</div>` : ''}</div><span class="od-truncate mono">${w.branch ? esc(w.branch) : 'detached'}</span><span class="mono muted">${w.hash}</span><span class="od-cluster" style="--od-gap:4px">${chips(w)}</span>
+          <span class="acts"><button class="btn btn-sm" ${w.missing ? 'disabled' : ''} data-w="open" data-i="${i}">Open</button><button class="btn btn-sm btn-icon btn-ghost" data-w="lock" data-i="${i}" ${w.main ? 'disabled' : ''} aria-label="${w.locked ? 'Unlock' : 'Lock'} ${esc(w.path)}" data-tip="${w.locked ? 'Unlock' : 'Lock'}">${ic('lock', 14)}</button><button class="btn btn-sm btn-icon btn-ghost" data-w="rm" data-i="${i}" aria-label="Remove ${esc(w.path)}" data-tip="Remove worktree…">${ic('trash', 14)}</button></span></div>`).join('')}</div>
+        ${view === 'error' ? D.banner('error', 'Could not read the worktrees', 'fatal: not a git repository (or any of the parent directories): .git') : ''}
+        <div class="field-help" style="margin:0">Each worktree is its own folder with its own checked-out branch. A branch can only be open in one worktree at a time.</div>`;
+    };
+    v.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-w]'); if (!b || b.disabled) return;
+      const w = WT[+b.dataset.i], a = b.dataset.w;
+      if (view === 'loading' && a === 'add') G.toast(win, 'The worktree list is still loading', 'info');
+      else if (a === 'add') D.worktreeAdd(win, {}, (r) => { WT.push({ path: r.path, branch: r.branch, hash: 'e4f2a91', dirty: [] }); draw(); });
+      else if (a === 'rm') D.worktreeRemove(win, { wt: Object.assign({}, w) }, () => { WT = WT.filter((x) => x.path !== w.path); draw(); });
+      else if (a === 'lock') { w.locked = !w.locked; w.lockReason = w.locked ? 'locked manually' : ''; G.toast(win, w.locked ? 'Locked ' + w.path : 'Unlocked ' + w.path, 'info'); draw(); }
+      else if (a === 'open') G.toast(win, 'Opened ' + w.path + ' in a new window', 'ok');
+      else if (a === 'prune') { WT = WT.filter((x) => !x.missing); G.toast(win, 'Pruned stale worktree records', 'ok'); draw(); }
+    });
+    draw(); G.initTips(win);
+  };
+  const find = (p) => Object.assign({}, WT.find((w) => w.path === p) || {});
+  D.page('Worktrees', [
+    ['Worktree list (no dialog)', () => { view = 'ready'; draw(); }],
+    ['Worktree list · loading', () => { view = 'loading'; draw(); }],
+    ['Worktree list · could not read', () => { view = 'error'; draw(); }],
+    ['Worktree list · toasts', (w) => { view = 'ready'; draw(); D.toastStrip(w, [['info', 'The worktree list is still loading'], ['warn', 'The worktree is no longer in the list'], ['ok', 'Opened ~/develop/gitwarp-hotfix in a new window'], ['ok', 'Locked ~/develop/gitwarp-hotfix'], ['ok', 'Unlocked ~/develop/gitwarp-review'], ['ok', 'Pruned stale worktree records'], ['error', 'fatal: \'~/develop/gitwarp-hotfix\' is already locked']]); }],
+    ['Add · empty', (w) => D.worktreeAdd(w, {})],
+    ['Add · running', (w) => D.worktreeAdd(w, { path: '~/develop/gitwarp-palette', branch: 'feat/idle-lanes', phase: 'running' })],
+    ['Add · error', (w) => D.worktreeAdd(w, { path: '~/develop/gitwarp-palette', branch: 'feat/idle-lanes', phase: 'error', err: 'fatal: \'~/develop/gitwarp-palette\' already exists' })],
+    ['Add · no branches to check out', (w) => D.worktreeAdd(w, { path: '~/develop/gitwarp-palette', noBranches: true })],
+    ['Add · path is not a folder', (w) => D.worktreeAdd(w, { path: '~/develop/notes.txt', touched: { path: true } })],
+    ['Add · folder picker failure', (w) => { D.worktreeAdd(w, {}); D.toastStrip(w, [['error', 'Could not open the folder picker: no xdg-desktop-portal is running']]); }],
+    ['Add · existing branch ready', (w) => D.worktreeAdd(w, { path: '~/develop/gitwarp-palette', branch: 'feat/idle-lanes' })],
+    ['Add · branch already in use', (w) => D.worktreeAdd(w, { path: '~/develop/gitwarp-main', branch: 'main' })],
+    ['Add · new branch', (w) => D.worktreeAdd(w, { path: '~/develop/gitwarp-ssh', mode: 'new', newName: 'feat/ssh-keys' })],
+    ['Add · path inside repository', (w) => D.worktreeAdd(w, { path: '~/develop/gitwarp/tmp', touched: { path: true } })],
+    ['Add · path already a worktree', (w) => D.worktreeAdd(w, { path: '~/develop/gitwarp-hotfix', touched: { path: true } })],
+    ['Remove · uncommitted changes', (w) => D.worktreeRemove(w, { wt: find('~/develop/gitwarp-hotfix') })],
+    ['Remove · locked', (w) => D.worktreeRemove(w, { wt: find('~/develop/gitwarp-review') })],
+    ['Remove · folder missing', (w) => D.worktreeRemove(w, { wt: find('~/develop/gitwarp-old') })],
+    ['Remove · clean, with branch', (w) => D.worktreeRemove(w, { wt: { path: '~/develop/gitwarp-spike', branch: 'feat/spike', dirty: [] } })],
+    ['Remove · detached HEAD', (w) => D.worktreeRemove(w, { wt: { path: '~/develop/gitwarp-bisect', branch: '', dirty: [] } })],
+    ['Remove · dirty, discard confirmed', (w) => D.worktreeRemove(w, { wt: find('~/develop/gitwarp-hotfix'), force: true, delBranch: true })],
+    ['Remove · unlocking', (w) => D.worktreeRemove(w, { wt: find('~/develop/gitwarp-review'), phase: 'unlocking' })],
+    ['Remove · running', (w) => D.worktreeRemove(w, { wt: { path: '~/develop/gitwarp-spike', branch: 'feat/spike', dirty: [] }, phase: 'running' })],
+    ['Remove · error', (w) => D.worktreeRemove(w, { wt: { path: '~/develop/gitwarp-spike', branch: 'feat/spike', dirty: [] }, phase: 'error', err: 'fatal: \'~/develop/gitwarp-spike\' contains modified or untracked files, use --force to delete it' })],
+    ['Remove · branch kept (toast)', (w) => D.toastStrip(w, [['ok', 'Removed worktree ~/develop/gitwarp-spike'], ['ok', 'Removed worktree ~/develop/gitwarp-spike; kept feat/spike: error: the branch \'feat/spike\' is not fully merged']])],
+    ['Rename · folder name', (w) => D.rename(w, 'worktree', { name: 'gitwarp-hotfix-2' })],
+    ['Rename · unchanged', (w) => D.rename(w, 'worktree', {})],
+    ['Rename · slash in name', (w) => D.rename(w, 'worktree', { name: 'a/b', touched: { name: true } })],
+    ['Rename · git refuses (locked)', (w) => D.rename(w, 'worktree', { name: 'gitwarp-review-2', phase: 'error', err: 'fatal: cannot move a locked working tree, lock reason: review in progress' })],
+    ['Remove · main worktree', (w) => D.worktreeRemove(w, { wt: find('~/develop/gitwarp') })]
+  ], center);
+})();
+</script>
+</body>
+</html>

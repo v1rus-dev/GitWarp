@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — Settings → Identity</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="settings.css">
+<style>
+  .fld { display: grid; gap: 4px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .fld:last-child { border-bottom: 0; }
+  .fld .field-label { margin: 0; }
+  .acct { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto auto; gap: 12px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .acct:last-child { border-bottom: 0; }
+  .acct .av { width: 32px; height: 32px; border-radius: 50%; background: var(--active); display: inline-flex; align-items: center; justify-content: center; color: var(--muted); }
+  .acct .nm { font-weight: 500; }
+  .acct .st { font-size: var(--fs-sm); display: flex; align-items: center; gap: 4px; }
+  .acct .st.ok { color: var(--success); } .acct .st.bad { color: var(--error); } .acct .st.no { color: var(--muted); }
+  .acct .host { font-size: 11px; color: var(--muted); }
+  .fld .saving { color: var(--muted); font-size: var(--fs-sm); padding: 0 12px 10px; }
+</style>
+<script src="app.js"></script>
+<script src="settings.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const S = GLS, G = GL, ic = G.ic, esc = G.esc;
+  /* Signing keys are the SSH keys from ~/.ssh (no GPG, no expired-key state). */
+  const KEYS = [['', 'No signing key'], ['id_ed25519', 'id_ed25519'], ['id_ed25519_work', 'id_ed25519_work']];
+  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  /* Presentation switcher: the page-level error banner and its messages. */
+  const ERRS = { none: 'No error', norepo: 'Scope is repository, opened from welcome', nogit: 'Git is not available', cred: 'Credential helper did not store the token' };
+  const ERR_TEXT = { norepo: 'Open a repository to edit its identity.', nogit: 'Git is not available.', cred: 'Your git credential helper did not store the token. Configure one (for example credential.helper=store) and try again.' };
+  let err = 'none', saving = false, touched = false, timer = null;
+  const nameMsg = (n) => (touched && !n.trim() ? ['err', 'Name is required — git refuses to commit without it.'] : ['help', 'Visible in every commit you create.']);
+  const mailMsg = (m) => (touched && !EMAIL_RE.test(m) ? ['err', 'Enter a valid email address, like name@example.com.'] : ['help', 'Visible in every commit you create.']);
+  const msgHTML = (m) => (m[0] === 'err' ? `<div class="field-error">${ic('err', 12)}${m[1]}</div>` : `<div class="field-help">${m[1]}</div>`);
+  const ctx = S.mount('settings-identity.html', 'Identity', () => {
+    const scope = S.get('id-scope', 'global'), sign = S.get('id-sign', false), key = S.get('id-key', 'id_ed25519');
+    const name = S.get('id-name', 'Mira Kovalenko'), email = S.get('id-email', 'mira@kovalenko.dev');
+    return `<h2>Identity</h2><p class="lead">Who your commits are attributed to and how they are signed.</p>
+      ${err !== 'none' ? S.banner('error', 'Could not read or save the identity', ERR_TEXT[err]) : ''}
+      <section class="sgroup"><h3>Commit author</h3><div class="slist">
+        <div class="fld"><div class="field-label">Apply to</div><div>${S.seg('id-scope', scope, [['global', 'All repositories'], ['repo', 'This repository only']])}</div><div class="field-help">${scope === 'global' ? 'Written to ~/.gitconfig. A repository can still override it.' : 'Written to .git/config of the open repository.'}</div></div>
+        <div class="fld"><label class="field-label" for="idn">Name</label><input id="idn" class="input${nameMsg(name)[0] === 'err' ? ' error' : ''}" value="${esc(name)}" placeholder="Your name" data-idf="id-name" autocomplete="off"><div data-msg="id-name">${msgHTML(nameMsg(name))}</div></div>
+        <div class="fld"><label class="field-label" for="ide">Email</label><input id="ide" class="input${mailMsg(email)[0] === 'err' ? ' error' : ''}" value="${esc(email)}" placeholder="you@example.com" data-idf="id-email" inputmode="email" autocomplete="off"><div data-msg="id-email">${msgHTML(mailMsg(email))}</div></div>
+        <div class="saving" data-saving${saving ? '' : ' hidden'}>Saving…</div>
+      </div></section>
+      ${S.group('Signing', [
+        S.row('Sign commits', 'Adds a verified badge on hosts that know your key.', S.sw('id-sign', sign, 'Sign commits')),
+        S.row('Signing key', 'Used for commits and tags. SSH keys from ~/.ssh.', S.sel('id-key', key, KEYS, 'Signing key', !sign), !sign)
+      ])}
+      <section class="sgroup"><h3>Hosting accounts</h3><div class="field-help">Accounts for GitHub, GitLab and other services now live in <a class="link" href="settings-accounts.html" style="color:var(--accent)">Settings → Accounts</a>.</div></section>`;
+  }, null, { stagebar: `<label class="scn">Page state <select id="errsel" aria-label="Page state">${Object.entries(ERRS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select></label>` });
+  document.getElementById('errsel').addEventListener('change', (e) => { err = e.target.value; if (err === 'norepo') S.set('id-scope', 'repo'); ctx.draw(); });
+  const pane = ctx.pane;
+  /* Name and Email auto-save 600 ms after the last keystroke (through git config); validation shows after the first edit.
+     Patched in place so the caret is not lost on every keystroke. */
+  pane.addEventListener('input', (e) => {
+    const f = e.target.closest('[data-idf]'); if (!f) return;
+    S.set(f.dataset.idf, f.value); touched = true;
+    const m = f.dataset.idf === 'id-name' ? nameMsg(f.value) : mailMsg(f.value);
+    f.classList.toggle('error', m[0] === 'err'); pane.querySelector(`[data-msg="${f.dataset.idf}"]`).innerHTML = msgHTML(m);
+    clearTimeout(timer); const sv = pane.querySelector('[data-saving]'); if (sv) sv.hidden = false;
+    timer = setTimeout(() => { const el = pane.querySelector('[data-saving]'); if (el) el.hidden = true; }, 1400);
+    /* the Saving… line stays up while the write runs, then disappears */
+  });
+})();
+</script>
+</body>
+</html>

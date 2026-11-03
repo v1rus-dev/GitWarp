@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — commit activity heatmap</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="activity.css">
+<script src="app.js"></script>
+</head>
+<body>
+<script>GL.stagebar();</script>
+<div class="page" style="padding-bottom:0">
+  <h1>Commit activity — heatmap (proposal)</h1>
+  <p class="lead">A GitHub-style contribution graph: one square per day for the last 52 weeks, colour by number of commits. Two placements are drawn below; switch with <b>Placement</b>, and walk the states with <b>State</b>. Hover or focus a day for its count; click a day to act on it.</p>
+  <div class="panel rec">
+    <p><b>Recommendation: B — a collapsible “Activity” strip above History in the repository window.</b></p>
+    <ul>
+      <li>It is where people already are: the Welcome screen only shows with no repository open, and GitWarp reopens the last repository on start.</li>
+      <li>Clicking a day has an obvious, useful result — History filters to that day, in the same window. On Welcome a click has to open a repository first.</li>
+      <li>“Me” is well defined per repository (<span class="mono">user.email</span> resolves local → global); across many repositories identities differ.</li>
+      <li>Cost stays to one repository, and the counts can come from history already being loaded. Welcome would run <span class="mono">git log</span> in every recent repository on start, including slow or unmounted paths.</li>
+      <li>The strip collapses to a 34px header, so History keeps its rows. It is not in the details dock: the dock belongs to the selected commit, and the 666px grid does not fit a right-hand dock.</li>
+    </ul>
+    <p class="cap" style="margin:6px 0 0">A stays a valid later addition: a compact “Your activity” card on Welcome, reusing the same component in compact size.</p>
+  </div>
+  <div class="ctrls" id="act-ctrls"></div>
+</div>
+<div class="stage" id="act-stage"></div>
+<div class="stage-cap"><p class="cap" id="act-cap" style="font-size:var(--fs-sm);max-width:110ch;margin:0 auto 8px"></p></div>
+
+<div class="page" style="padding-top:0">
+  <h2>Spec</h2>
+  <div class="spec">
+    <div class="panel"><h4>Grid geometry</h4><ul>
+      <li>53 columns (52 full weeks + the current partial week) × 7 rows; weeks start on the locale’s first weekday (Monday here). Days after today are not drawn.</li>
+      <li>Cell <b>10px</b>, gap <b>2px</b> (<span class="mono">--sp-1</span>), radius 2px, pitch 12px → grid 634 × 82px.</li>
+      <li>Compact size <b>8px</b> cell, same gap (pitch 10 → 528px), used when the regular grid + 28px weekday column does not fit. Below that the grid scrolls horizontally, pinned to the newest week.</li>
+      <li>Weekday column 28px: “Mon”, “Wed”, “Fri” on rows 1, 3, 5; <span class="mono">--fs-xs</span>, <span class="mono">--muted</span>.</li>
+      <li>Month row 14px, 4px above the grid (<span class="mono">--sp-2</span>): the month name sits over the column that contains the 1st; it is dropped when less than 3 columns follow the previous label.</li>
+    </ul></div>
+    <div class="panel"><h4>Colour ramp — new tokens <span class="mono">--heat-0…4</span></h4>
+      <table class="ramp"><tr><th></th><th>Dark mix</th><th>on bg</th><th>Light mix</th><th>on bg</th></tr>
+        <tr><td><span class="hc"></span> 0</td><td>text 8%</td><td>1.20</td><td>text 8%</td><td>1.17</td></tr>
+        <tr><td><span class="hc l1"></span> 1</td><td>accent 30%</td><td>1.75</td><td>accent 36%</td><td>1.69</td></tr>
+        <tr><td><span class="hc l2"></span> 2</td><td>accent 50%</td><td>2.70</td><td>accent 56%</td><td>2.36</td></tr>
+        <tr><td><span class="hc l3"></span> 3</td><td>accent 75%</td><td>4.42</td><td>accent 78%</td><td>3.49</td></tr>
+        <tr><td><span class="hc l4"></span> 4</td><td>accent</td><td>6.84</td><td>accent</td><td>5.29</td></tr></table>
+      <p style="margin-top:6px">All are <span class="mono">color-mix(in srgb, token N%, var(--bg))</span>. Neighbouring steps differ by ≥ 1.40:1 in both themes, and the top step clears 4.5:1. Steps 1–2 are under 3:1, so colour is never the only channel: every day has a text label (tooltip and accessible name), the legend lists the ranges, and the total is text. The ramp is accent (blue), not green, to stay with the app’s single accent; the keyboard focus ring sits outside the cell, over the bg, so it stays visible on an accent cell.</p></div>
+    <div class="panel"><h4>Levels (0 + 4 buckets)</h4><ul>
+      <li>0 = no commits. Levels 1–4 are the quartiles of the <i>non-zero</i> days in view (current range + author filter): ≤ q25, ≤ q50, ≤ q75, above.</li>
+      <li>With ≤ 4 distinct non-zero counts, levels are linear: <span class="mono">ceil(4 × n / max)</span>, so a repository with one commit a day is not drawn as all-hot.</li>
+      <li>Buckets are recomputed when the range or the author filter changes. Hover a legend square to see its range (“3–5 commits a day”).</li>
+    </ul></div>
+    <div class="panel"><h4>Header, filter, range</h4><ul>
+      <li>Total: “<b>1,234</b> commits in the last year”, “… commits by you in the last year”, “… in 2025”. Grouped digits, tabular numbers.</li>
+      <li>Author: segmented <b>Me</b> | <b>Everyone</b>, default Me. Me = author email equals the repository’s effective <span class="mono">user.email</span>, case-insensitive, after <span class="mono">.mailmap</span>. No email → Me is disabled with a tooltip, Everyone is used, and the side text links to Settings → Identity.</li>
+      <li>Range: “Last 12 months” (default) or a calendar year with commits, from a small select. A year uses the same 53-column grid; days outside the year are blank.</li>
+    </ul></div>
+    <div class="panel"><h4>Tooltip, click, keyboard</h4><ul>
+      <li>Tooltip: “5 commits on Wed, 14 Oct 2026”, “1 commit on …”, “No commits on …”. It appears immediately above the cell, in the kit tooltip style. Unlike the 500 ms cursor tooltip, it must show at once for scanning and anchor to the cell for keyboard focus.</li>
+      <li>Hover: 1px <span class="mono">--border-strong</span> ring. Selected day: 2px <span class="mono">--text</span> ring with a 1px bg gap. Keyboard focus: 2px <span class="mono">--focus</span> ring with a 1px gap.</li>
+      <li>The grid is one Tab stop (role grid, 7 rows × 53 columns). <span class="kbd">↑</span>/<span class="kbd">↓</span> previous/next day, <span class="kbd">←</span>/<span class="kbd">→</span> previous/next week, <span class="kbd">Home</span>/<span class="kbd">End</span> first/last day, <span class="kbd">Enter</span>/<span class="kbd">Space</span> = click, <span class="kbd">Esc</span> clears the day filter. Focus shows the tooltip; each cell’s accessible name is the tooltip text.</li>
+      <li>Click (B): History is filtered to that day (author filter applied too), with an accent-soft bar “Showing 5 commits on Wed, 14 Oct 2026 · Clear filter Esc” between the strip and the list. The first commit of the day is selected in the dock.</li>
+    </ul></div>
+    <div class="panel"><h4>States</h4><ul>
+      <li><b>Loading</b>: every cell is a shimmering --heat-0 skeleton and the total is a skeleton bar. Size and layout do not change.</li>
+      <li><b>Large repository</b>: counting runs off the UI thread and streams newest-first. Counted weeks fill in from the right, uncounted ones shimmer, and the header shows “Counting… N commits so far”. Levels are recomputed per batch (≤ every 250 ms) and settle when counting ends. Day clicks wait until it ends.</li>
+      <li><b>Empty repository</b>: all cells at level 0, “No commits yet”. History shows its own empty state.</li>
+      <li><b>No commits by me</b>: all cells at level 0, “No commits by you in the last year”, plus a link “Show everyone’s commits”.</li>
+      <li><b>Error</b>: the grid area keeps its height and shows an error icon, “Could not count commits”, git’s message in mono, and Retry.</li>
+    </ul></div>
+    <div class="panel"><h4>Data (implementation note)</h4>
+      <p>Counts come from <span class="mono">git log --all --since=&lt;range start&gt; --format=%at%x09%aE</span>. That gives the author time and the mailmapped email; each commit is counted once and bucketed by local calendar day of the author date. Where history is already loaded in full, the counts are derived from it instead. Everything runs on a background executor; the UI gets a <span class="mono">[u32; 371]</span> per author filter and never blocks. Results are cached per repository and HEAD set, and refreshed after fetch or commit.</p></div>
+  </div>
+</div>
+<script src="activity.js"></script>
+</body>
+</html>

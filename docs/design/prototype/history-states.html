@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitwarp — history states</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="shell.css">
+<style>
+  .boards { display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: 24px; }
+  .board h3 { margin: 0 0 8px; }
+  .frame { height: 380px; border: 1px solid var(--border-strong); border-radius: var(--r-lg); overflow: hidden; background: var(--bg); display: flex; flex-direction: column; position: relative; }
+  .frame .hist { flex: 1; min-height: 0; }
+  .frame .hs-body { display: flex; }
+  .frame .hs-body > div { flex: 1; min-height: 0; overflow: auto; }
+  .note { margin-top: 6px; color: var(--muted); font-size: var(--fs-sm); }
+  h2.sec { margin: 28px 0 12px; font-size: var(--fs-lg); }
+</style>
+<script src="app.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL, ic = G.ic, esc = G.esc;
+  document.title = 'GitWarp — history states';
+  G.stagebar();
+  const head = '<div class="lhead" role="row"><div class="gh"><span>Graph</span></div><div>Summary</div><div>Author</div><div>Date</div><div>Hash</div></div>';
+  /* full-pane state: header + the state body; rows state: the real list with a strip above it */
+  const full = (k, strip) => `<div class="hist">${head}${strip ? G.stateStrip(strip) : ''}<div class="hs-body"><div>${G.stateBody(k)}</div></div></div>`;
+  const rows = (k) => `<div class="hist" data-rows="${k}"></div>`;
+  const board = (title, note, inner) => `<section class="board"><h3>${title}</h3><div class="frame" role="region" aria-label="${esc(title)}">${inner}</div><div class="note">${note}</div></section>`;
+  const A = [
+    board('1 · Loading with progress', 'Skeleton rows keep the row rhythm until the first page arrives; the count updates live while git log streams. “· 3 idle lanes folded” is appended when idle-lane collapse is on and lanes are folded. The indeterminate bar shows no percent when the total is unknown. Cancel stops the load.', full('loading', 'loading')),
+    board('2 · Empty repository', 'No commits yet: the call to action is the first commit, not an error. Both actions work now that Local changes ships; the app currently shows them disabled with a stale “arrive in a later version” tooltip (a code bug, not drawn).', full('empty')),
+    board('3 · Not a git repository', 'Shown when the opened folder has no .git ancestor. The path is selectable.', full('notgit')),
+    board('4 · Folder not found', 'A recent entry or CLI path that no longer exists. “Remove from recent” drops the entry and returns to the welcome screen.', full('nofolder')),
+    board('5 · Loading cancelled (no rows)', 'Cancel before the first page arrived: nothing to show, so the whole pane explains it and offers Retry. The status bar reads “Loading cancelled”.', full('cancelled')),
+    board('6a · Git not found', 'Blocking state. Open Git settings opens Settings (Git page) as the modal card; the status-bar git label reads “git not found” and is not clickable.', full('nogit')),
+    board('6b · Unsupported git version', 'Distinct from “not found”: the executable works but is too old. Same actions.', full('oldgit')),
+    board('7 · Generic git error', 'git’s own message is shown verbatim in a selectable monospace block, with the command that failed. Without stderr the box is omitted; if git was killed the body reads “was stopped.” instead of “failed with exit code N.”. Copy details copies the command, exit code and stderr.', full('giterr')),
+    board('8 · Non-git failure', 'An I/O or parse error with no git command: title “GitWarp could not read the history”, the message in the box.', full('nongit'))
+  ];
+  const B = [
+    board('9 · Loading bar above the rows', 'Once the first page has arrived the bar sits under the column header and the loaded rows stay below it.', rows('loading')),
+    board('10 · Cancelled, with rows', 'One-line strip: warning icon, text, Retry. The rows that loaded stay below.', rows('strip-cancelled')),
+    board('11 · Failed, with rows (git)', 'Error strip with the failed command; Retry and Copy details (failures only).', rows('strip-failed')),
+    board('12 · Failed, with rows (message)', 'No git command: the strip carries the message itself. Without a message it reads just “History is incomplete”.', rows('strip-failed-msg'))
+  ];
+  document.body.insertAdjacentHTML('beforeend', `<div class="page"><h1>History screen — states</h1><p class="lead">Every state keeps the toolbar, sidebar and back navigation of the main window; only the centre pane changes (the main windows have a History state switcher that draws the same states inside the real window). Use the theme button to check both themes.</p><h2 class="sec">Full-pane states</h2><div class="boards">${A.join('')}</div><h2 class="sec">In-list strips (rows already loaded)</h2><div class="boards">${B.join('')}</div></div>`);
+  document.querySelectorAll('[data-rows]').forEach((h) => {
+    const k = h.dataset.rows; h.dataset.menuHost = '';
+    G.history(h, G.commits, { gw: 112, sel: 0 }).strip(G.stateStrip(k));
+  });
+  document.addEventListener('click', (e) => { const b = e.target.closest('[data-act="git-settings"]'); if (b) location.href = 'settings-git.html'; });
+})();
+</script>
+</body>
+</html>

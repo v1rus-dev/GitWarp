@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — design</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="shell.css">
+<style>
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-top: 16px; }
+  .card { display: flex; flex-direction: column; gap: 4px; padding: 14px 16px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-lg); color: var(--text); }
+  .card:hover { border-color: var(--accent); text-decoration: none; background: var(--surface); }
+  .card b { display: flex; align-items: center; gap: 8px; } .card span { color: var(--muted); font-size: var(--fs-sm); }
+  .kb { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 4px 24px; font-size: var(--fs-sm); }
+  .kb div { display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); padding: 3px 0; }
+</style>
+<script src="app.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL, ic = G.ic;
+  G.stagebar();
+  const cards = [
+    ['tokens.html', 'Design tokens', 'Colour (dark + light, AA-checked live), type scale, spacing, radii, sizes.', 'palette'],
+    ['components.html', 'Component set', 'Buttons, inputs, tabs, tree, rows, menus, tooltips, dialogs, toasts — with states.', 'box'],
+    ['graph.html', 'Commit graph spec', 'Geometry, golden-angle lanes on both themes, clipping, widening, idle-lane collapse, header menu, monochrome and line width.', 'lanes'],
+    ['main-1200.html', 'Main window 1200×800', 'History + details docked bottom, unified diff. Interactive: context menus, switchers, Settings modal, state switchers.', 'sidebar'],
+    ['main-1600.html', 'Main window 1600×1000', 'Details docked right, side-by-side diff. Auto dock follows the window width.', 'panelR'],
+    ['changes.html', 'Local changes', 'Stage by file, hunk, line; commit editor with amend and character guides.', 'edit'],
+    ['settings-general.html', 'Settings → General', 'Language, startup, updates, background fetch, confirmations, privacy.', 'gear'],
+    ['settings-appearance.html', 'Settings → Appearance', 'Theme, accent, density, fonts, graph style, live preview.', 'palette'],
+    ['settings-git.html', 'Settings → Git', 'Auto / Bundled / System / Custom, with all warning and error states (scenario switcher).', 'gear'],
+    ['settings-keybindings.html', 'Settings → Keybindings', 'Searchable shortcut table, recording, conflicts, reset and export.', 'keyboard'],
+    ['settings-diff.html', 'Settings → Diff & merge', 'Layout, whitespace, context, merge tool with command validation, live preview.', 'split'],
+    ['settings-identity.html', 'Settings → Identity', 'Author and signing key, with validation states. Hosting accounts moved to Settings → Accounts.', 'user'],
+    ['history-states.html', 'History states', 'Loading, empty repo, not a repo, folder not found, cancelled, git missing / too old, git error, non-git failure, in-list strips.', 'warn'],
+    ['welcome.html', 'Welcome / repo picker', 'Recent repos, Open, Clone, Init dialogs.', 'folder'],
+    ['dialogs-repo.html', 'Dialogs: clone / open', 'Clone from URL (HTTPS/SSH, progress, errors) and open from folder, with all states.', 'clone'],
+    ['dialogs-ref.html', 'Dialogs: branch / tag / ref actions', 'Create, rename, delete, reset, cherry-pick, revert, remotes and stash dialogs, with validation and running states.', 'tag'],
+    ['dialogs-checkout.html', 'Dialogs: checkout', 'Uncommitted changes before a checkout.', 'branch'],
+    ['dialogs-network.html', 'Dialogs: network', 'Authentication, SSH host key prompts and network result toasts.', 'cloud'],
+    ['activity.html', 'Activity', 'Commit activity heatmap.', 'fetch'],
+    ['dialogs-worktree.html', 'Worktrees', 'Worktree list, add and remove dialogs, locked / dirty / missing states.', 'worktree'],
+    ['worktrees.html', 'Worktrees workspace', 'Titlebar switcher (Ctrl+Alt+W) with create-on-type, sidebar panel, detail pane and quick create from a branch name.', 'worktree'],
+    ['settings-worktrees.html', 'Settings → Worktrees', 'Base folder, folder template, behaviour after creating, confirmations.', 'worktree'],
+    ['settings-ssh.html', 'Settings → SSH keys', 'Key list, generate / import / delete, connection test, trusted hosts.', 'key'],
+    ['settings-accounts.html', 'Settings → Accounts', 'GitHub, GitLab, Gitea / Forgejo, Bitbucket and Azure DevOps accounts, self-hosted and several per service: statuses, reconnect, import from gh / glab.', 'cloud'],
+    ['dialogs-account.html', 'Dialogs: add / reconnect account', 'Service, instance probe (TLS, wrong type), token or browser sign-in (device code, redirect), results and errors.', 'key'],
+    ['remotes-accounts.html', 'Remotes & accounts', 'Remote rows with service icon and account, two push URLs, account picker, add-account affordance, per-target push toast.', 'cloud'],
+    ['hosting-features.html', 'Hosting features', 'Open on host, clone from account, PR badges and popover, CI status and checks, create pull request, pull requests panel.', 'pr'],
+    ['palette.html', 'Command palette', 'Ctrl+P quick launcher for commands, branches, commits, files.', 'command']
+  ];
+  document.body.insertAdjacentHTML('beforeend', `<div class="page">
+  <h1>GitWarp — design</h1>
+  <p class="lead">A fast, dense, keyboard-first desktop Git client for GPUI. Dark first, light from the same tokens. 13px text, 26px rows, monospace only for hashes, code and diffs. Everything is custom-drawn, so every control is specified here. Use the theme button (top right) to compare themes on any page.</p>
+  <div class="cards">${cards.map(([h, t, d, i]) => `<a class="card" href="${h}"><b>${ic(i, 16)}${t}</b><span>${d}</span></a>`).join('')}</div>
+  <h2>Keyboard model</h2>
+  <p class="kb-note">Default bindings; every one is rebindable in Settings → Keybindings.</p>
+  <div class="kb">${[['Toggle sidebar', 'Ctrl+B'], ['Toggle details dock', 'Ctrl+J'], ['Search commits', 'Ctrl+K'], ['Settings', 'Ctrl+,'], ['Open repository', 'Ctrl+O'], ['Switch branch', 'Ctrl+Shift+B'], ['Stash local changes', 'Ctrl+Shift+S'], ['Fetch all remotes', 'Ctrl+Shift+F'], ['Pull', 'Ctrl+Shift+L'], ['Push', 'Ctrl+Shift+P'], ['Command palette', 'Ctrl+P'], ['Clone repository (welcome)', 'Ctrl+Shift+O'], ['Sidebar: checkout / rename / delete', 'Enter / F2 / Del'], ['Create branch at the selected commit', 'B'], ['Stage / unstage file', 'Space'], ['Discard changes', 'Ctrl+Shift+Z'], ['Initialize repository (welcome)', 'Ctrl+N'], ['Remove recent entry (welcome)', 'Del'], ['Next / previous commit', 'j / k or ↓ / ↑'], ['Page through history', 'PgUp / PgDn'], ['Copy commit hash (history)', 'Ctrl+C'], ['Commit', 'Ctrl+Enter'], ['Search: next / previous', 'Enter, F3 / Shift+Enter'], ['Search: clear / to the list', 'Esc, ↓'], ['Close overlay', 'Esc'], ['Move in trees', 'Arrows, Space']].map(([a, b]) => `<div><span>${a}</span><span class="kbd">${b}</span></div>`).join('')}</div>
+  <h2>Design notes</h2>
+  <ul class="lead" style="line-height:1.7">
+    <li><b>Density:</b> 26px rows by default (Appearance: 22 / 26 / 30), 26px controls, 40px toolbar, 24px status bar, 4px spacing grid.</li>
+    <li><b>Flat:</b> separation by 1px borders and surface steps; shadows only on floating layers (menu, dialog, toast).</li>
+    <li><b>Focus:</b> a 2px ring appears only for keyboard focus (focus-visible); selection uses a fill, so both are distinguishable.</li>
+    <li><b>Contrast:</b> text pairs meet 4.5:1 in both themes (measured on the Tokens page). Status is never colour-only: letters, arrows and icons accompany colour.</li>
+    <li><b>Assumptions:</b> font faces are stacks (Inter / JetBrains Mono preferred, system fallback); sample repository data is fictional; icons are one custom 16px stroke family.</li>
+  </ul></div>`);
+})();
+</script>
+</body>
+</html>

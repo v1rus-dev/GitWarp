@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — command palette (future work)</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<style>
+  .pal { width: 600px; margin-top: 72px; max-height: 480px; overflow: hidden; }
+  .pal .pin { display: flex; align-items: center; gap: 8px; padding: 0 12px; height: 40px; border-bottom: 1px solid var(--border); color: var(--muted); }
+  .pal .pin .input { border: 0; box-shadow: none; background: transparent; height: 100%; font-size: var(--fs-md); padding: 0; }
+  .pal .pin .input:focus { box-shadow: none; }
+  .pal .res { overflow: auto; padding: 4px; max-height: 380px; }
+  .pal .gh { padding: 8px 8px 2px; font-size: var(--fs-xs); font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .pal .it { display: flex; align-items: center; gap: 10px; height: 28px; padding: 0 8px; border-radius: var(--r-sm); cursor: default; }
+  .pal .it.sel { background: var(--selection); }
+  .pal .it:hover { background: var(--hover); } .pal .it.sel:hover { background: var(--selection); }
+  .pal .it .od-icon { color: var(--muted); }
+  .pal .it .t { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .pal .it mark { background: transparent; color: var(--accent); font-weight: 700; }
+  .pal .pfoot { display: flex; gap: 16px; padding: 6px 12px; border-top: 1px solid var(--border); color: var(--muted); font-size: var(--fs-sm); }
+  .win-dim > .win-body, .win-dim > .titlebar, .win-dim > .statusbar { filter: saturate(.8); }
+</style>
+<script src="app.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL, ic = G.ic, esc = G.esc;
+  G.stagebar('<span class="muted" style="font-size:12px">type to filter · ↑ ↓ · Enter · Esc</span>');
+  const stage = G.h('<div class="stage"><div class="winwrap"></div></div>'); document.body.appendChild(stage);
+  const sh = G.shell({ host: stage.firstChild, w: 1200, h: 800 });
+  const win = sh.win;
+  sh.center.innerHTML = '<div class="work dock-bottom"><div class="hist-host" style="display:flex;flex:1;min-width:0;min-height:0"></div></div>';
+  G.history(sh.center.querySelector('.hist-host'), G.commits, {});
+  const items = [
+    ['Commands', 'command', 'Fetch all remotes', 'Ctrl+Shift+F'], ['Commands', 'command', 'Push current branch', 'Ctrl+Shift+P'], ['Commands', 'command', 'Toggle sidebar', 'Ctrl+B'], ['Commands', 'command', 'Collapse idle lanes in graph', ''], ['Commands', 'command', 'Open Settings → Git', 'Ctrl+,'],
+    ['Branches', 'branch', 'main', 'current'], ['Branches', 'branch', 'feat/idle-lanes', ''], ['Branches', 'branch', 'feat/palette', ''], ['Branches', 'branch', 'fix/git-detect', ''],
+    ['Commits', 'hash', 'e4f2a91  Merge branch ‘feat/idle-lanes’', ''], ['Commits', 'hash', '19d8e4f  feat(graph): collapse idle lanes into a single gap lane', ''], ['Commits', 'hash', 'f3a71c9  feat(graph): clip wide graphs with an edge fade', ''],
+    ['Files', 'file', 'src/history/graph.rs', ''], ['Files', 'file', 'src/settings/git_exec.rs', '']
+  ];
+  const scrim = G.h(`<div class="scrim"><div class="dialog pal" role="dialog" aria-modal="true" aria-label="Command palette"><div class="pin">${ic('search', 16)}<input class="input" placeholder="Type a command, branch, commit hash or file…" aria-label="Command palette input" value=""><span class="kbd">Esc</span></div><div class="res" role="listbox"></div><div class="pfoot"><span><span class="kbd">↑</span> <span class="kbd">↓</span> navigate</span><span><span class="kbd">Enter</span> run</span><span><span class="kbd">&gt;</span> commands</span><span><span class="kbd">@</span> branches</span><span><span class="kbd">#</span> commits</span><span class="od-fill"></span><span>14 results</span></div></div></div>`);
+  G.layer(win).appendChild(scrim);
+  const inp = scrim.querySelector('input'), res = scrim.querySelector('.res'); let sel = 0, vis = items;
+  const mark = (t, q) => { if (!q) return esc(t); const i = t.toLowerCase().indexOf(q.toLowerCase()); return i < 0 ? esc(t) : esc(t.slice(0, i)) + '<mark>' + esc(t.slice(i, i + q.length)) + '</mark>' + esc(t.slice(i + q.length)); };
+  function draw() {
+    const q = inp.value.trim(); vis = items.filter((x) => !q || x[2].toLowerCase().includes(q.toLowerCase()));
+    sel = Math.min(sel, Math.max(0, vis.length - 1)); let last = '', h = '';
+    vis.forEach((x, i) => { if (x[0] !== last) { h += `<div class="gh" role="presentation">${x[0]}</div>`; last = x[0]; } h += `<div class="it${i === sel ? ' sel' : ''}" role="option" aria-selected="${i === sel}" data-i="${i}">${ic(x[1], 14)}<span class="t">${mark(x[2], q)}</span>${x[3] ? (x[3] === 'current' ? '<span class="ref head">current</span>' : `<span class="kbd">${x[3]}</span>`) : ''}</div>`; });
+    res.innerHTML = vis.length ? h : `<div class="empty" style="min-height:120px"><p>No results for “${esc(q)}”</p></div>`;
+    const s = res.querySelector('.sel'); if (s) s.scrollIntoView({ block: 'nearest' });
+  }
+  inp.addEventListener('input', () => { sel = 0; draw(); });
+  inp.addEventListener('keydown', (e) => { if (e.key === 'ArrowDown') { sel = Math.min(vis.length - 1, sel + 1); draw(); e.preventDefault(); } else if (e.key === 'ArrowUp') { sel = Math.max(0, sel - 1); draw(); e.preventDefault(); } else if (e.key === 'Enter' && vis[sel]) G.toast(win, `Ran: ${vis[sel][2]}`, 'ok'); });
+  res.addEventListener('click', (e) => { const it = e.target.closest('.it'); if (it) G.toast(win, `Ran: ${vis[+it.dataset.i][2]}`, 'ok'); });
+  draw(); inp.focus(); G.fit(win);
+})();
+</script>
+</body>
+</html>

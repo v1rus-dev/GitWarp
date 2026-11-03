@@ -1,44 +1,27 @@
-//! Dark theme constants. A real theme system comes later; keeping the values
-//! in one place makes that move easy.
+//! Graph geometry for the history screen. Shared metrics come from the `ui`
+//! crate; only what this screen adds on top lives here.
 
-use gpui::{hsla, px, rgb, Hsla, Pixels, Rgba};
+use gpui::{px, Pixels};
 
-pub const ROW_HEIGHT: Pixels = px(26.);
-pub const LANE_WIDTH: Pixels = px(14.);
-pub const GRAPH_PADDING: Pixels = px(10.);
-pub const LINE_WIDTH: Pixels = px(2.);
-pub const DOT_RADIUS: Pixels = px(4.5);
-/// Wider graphs are clipped; the commit text must stay readable.
-pub const MAX_GRAPH_LANES: usize = 24;
+pub use ui::metrics::{DOT_R as DOT_RADIUS, LANE_W as LANE_WIDTH};
 
-pub fn background() -> Rgba {
-    rgb(0x1e2025)
-}
-pub fn surface() -> Rgba {
-    rgb(0x25282e)
-}
-pub fn selection() -> Rgba {
-    rgb(0x2f4a6d)
-}
-pub fn hover() -> Rgba {
-    rgb(0x2a2d34)
-}
-pub fn text() -> Rgba {
-    rgb(0xdcdfe4)
-}
-pub fn text_muted() -> Rgba {
-    rgb(0x8b919c)
-}
-pub fn border() -> Rgba {
-    rgb(0x33373e)
-}
-pub fn error() -> Rgba {
-    rgb(0xe06c75)
-}
-
-/// Lane colors: hues spread by the golden angle, so neighbours never clash
-/// and the palette never runs out.
-pub fn lane_color(id: u32) -> Hsla {
-    let hue = (id as f32 * 0.381_966).fract();
-    hsla(hue, 0.65, 0.62, 1.)
-}
+/// Radius of the ring painted in the row background around a plain dot.
+pub const DOT_HALO_RADIUS: Pixels = px(6.);
+/// Inner radius of a merge commit's hollow ring (its outer radius is
+/// [`DOT_RADIUS`], so the stroke is 2 px).
+pub const MERGE_INNER_RADIUS: Pixels = px(2.5);
+/// Radius of the extra ring around the HEAD commit.
+pub const HEAD_RING_RADIUS: Pixels = px(7.5);
+/// Stroke width of the HEAD ring.
+pub const HEAD_RING_WIDTH: Pixels = px(1.5);
+/// Width of the fade at the graph column's right edge when the graph is wider
+/// than the column.
+pub const GRAPH_FADE_WIDTH: Pixels = px(20.);
+/// Left inset of the graph's lanes, px: lane `n`'s centre is `14n + 7 + 2`, so
+/// the HEAD ring (radius 7.5 plus half its stroke) on lane 0 is not cut by the
+/// column's left edge. `git-graph` stays inset-free; this is added when its x
+/// is turned into pixels.
+pub const GRAPH_INSET: f32 = 2.;
+/// How far a straight lane segment runs past the top and bottom of its row, px,
+/// so no hairline seam shows between rows at fractional scale factors.
+pub const LANE_OVERDRAW: f32 = 1.;

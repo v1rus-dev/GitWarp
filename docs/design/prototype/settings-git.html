@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — Settings → Git</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<style>
+  .opt { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 4px 10px; align-items: start; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); cursor: default; }
+  .opt:hover { border-color: var(--border-strong); }
+  .opt.on { border-color: var(--accent); background: var(--accent-soft); }
+  .opt .pth { display: block; margin-top: 2px; font-family: var(--font-mono); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+  .opt:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .opt .dotbox { margin-top: 2px; }
+  .opt .sub { grid-column: 2 / 4; color: var(--muted); font-size: var(--fs-sm); }
+  .opt .ver { font-family: var(--font-mono); font-size: var(--fs-sm); text-align: right; }
+  .opt .ver.bad { color: var(--error); } .opt .ver.ok { color: var(--text); }
+  .active { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 4px 12px; padding: 12px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); font-size: var(--fs-sm); }
+  .active dt { color: var(--muted); } .active dd { margin: 0; font-family: var(--font-mono); overflow-wrap: anywhere; }
+  .ok-pill { display: inline-flex; align-items: center; gap: 4px; color: var(--success); font-family: var(--font-ui); }
+  .bad-pill { display: inline-flex; align-items: center; gap: 4px; color: var(--error); font-family: var(--font-ui); }
+  .scn { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; }
+  .scn select { height: 24px; background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--r-sm); }
+</style>
+<link rel="stylesheet" href="settings.css">
+<script src="app.js"></script>
+<script src="settings.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL, S0 = GLS, ic = G.ic, esc = G.esc, MIN = [2, 31], MINS = MIN.join('.');
+  /* Scenario switcher is a presentation aid: it feeds different detection results into the same page. */
+  const B = { ok: 1, v: '2.56.0', path: '/opt/gitwarp/git/bin/git' }, SYS = { ok: 1, v: '2.43.0', path: '/usr/bin/git' };
+  const SC = {
+    ok:      { label: '1 · Auto, bundled git works', mode: 'auto', bundled: B, system: SYS, custom: { path: '' } },
+    fell:    { label: '2 · Auto fell back from broken bundled git', mode: 'auto', bundled: { ok: 0, exists: 1, err: 'exited with code 127 — error while loading shared libraries: libpcre2-8.so.0: cannot open shared object file', path: '/opt/gitwarp/git/bin/git' }, system: SYS, custom: { path: '' } },
+    old:     { label: '3 · Selected git older than 2.31 (unusable)', mode: 'system', bundled: B, system: { ok: 1, v: '2.28.1', path: '/usr/bin/git' }, custom: { path: '' } },
+    both:    { label: '4 · Bundled and system both unusable', mode: 'auto', bundled: { ok: 0, err: 'binary is missing (file not found)', path: '/opt/gitwarp/git/bin/git' }, system: { ok: 0, err: '“git” was not found in PATH', path: '' }, custom: { path: '' } },
+    nobundle:{ label: '5 · Build ships no bundled git', mode: 'auto', bundled: { ok: 0, err: 'no bundled git is shipped with this build', path: '' }, system: SYS, custom: { path: '' } },
+    custom:  { label: '6 · Custom path, valid', mode: 'custom', bundled: B, system: SYS, custom: { path: '/home/mira/.local/git-2.49/bin/git', ok: 1, v: '2.49.1', validated: 1 } },
+    badcust: { label: '7 · Custom path, invalid', mode: 'custom', bundled: B, system: SYS, custom: { path: '/home/mira/Downloads/git.tar.gz', ok: 0, err: 'not an executable file', validated: 1 } },
+    oldcust: { label: '8 · Custom path, too old', mode: 'custom', bundled: B, system: SYS, custom: { path: '/home/mira/.local/git-2.28/bin/git', ok: 0, err: 'git 2.28.1 is too old; GitWarp needs ' + MINS + ' or newer', old: '2.28.1', validated: 1 } },
+    nopath:  { label: '9 · Custom path, nothing entered', mode: 'custom', bundled: B, system: SYS, custom: { path: '' } }
+  };
+  const fresh = (k) => { const o = JSON.parse(JSON.stringify(SC[k])); /* a probe older than the minimum counts as unusable, like in the app */
+    [o.bundled, o.system].forEach((p) => { if (p.ok && isOld(p.v)) { p.old = p.v; p.ok = 0; p.err = `git ${p.v} is too old; GitWarp needs ${MINS} or newer`; } }); return o; };
+  function isOld(v) { const [a, b] = v.split('.').map(Number); return a < MIN[0] || (a === MIN[0] && b < MIN[1]); }
+  let S = fresh('ok'), detecting = false;
+  /* too old = unusable: the banner is the mode's generic one, the body carries the version reason */
+  function resolve() {
+    const out = { banners: [], active: null, tooOld: null };
+    const { bundled: b, system: s, custom: c } = S;
+    const use = (src, o) => { out.active = { src, ...o }; };
+    const why = (p) => p.err;
+    if (S.mode === 'auto') {
+      if (b.ok) use('bundled', b);
+      else if (s.ok) { out.banners.push({ k: 'warn', t: 'Bundled git is broken — using system git', d: `Auto fell back to ${s.path} (${s.v}). Bundled git ${b.exists ? 'failed to start' : 'is unusable'}: ${why(b)}.` }); use('system', s); }
+      else { out.banners.push({ k: 'error', t: 'No usable git found', d: 'Both bundled and system git are unusable.', list: [`Bundled (${b.path || 'not shipped with this build'}): ${why(b)}`, `System (PATH): ${why(s)}`] }); out.tooOld = b.old || s.old || null; }
+    } else if (S.mode === 'bundled') { if (b.ok) use('bundled', b); else { out.banners.push({ k: 'error', t: 'Bundled git is unusable', d: `${b.path || 'not shipped with this build'}: ${why(b)}` }); out.tooOld = b.old; } }
+    else if (S.mode === 'system') { if (s.ok) use('system', s); else { out.banners.push({ k: 'error', t: 'System git is unusable', d: why(s) }); out.tooOld = s.old; } }
+    else { if (c.ok) use('custom', { v: c.v, path: c.path }); else if (c.path) { out.banners.push({ k: 'error', t: 'This file cannot be used as git', d: `${c.path}: ${why(c)}` }); out.tooOld = c.old; } else out.banners.push({ k: 'error', t: 'No path chosen', d: 'Enter or browse to a git executable.' }); }
+    return out;
+  }
+  /* version label: ok = mono version; too old = warn icon + version in error colour; otherwise err icon + "unusable"; not probed = dash */
+  const ver = (d) => !d ? '<span class="ver muted">—</span>' : d.ok ? `<span class="ver ok">${d.v}</span>` : d.old ? `<span class="ver bad">${ic('warn', 12)} ${d.old}</span>` : `<span class="ver bad">${ic('err', 12)} unusable</span>`;
+  function opt(m, title, sub, d) {
+    const on = S.mode === m;
+    return `<div class="opt${on ? ' on' : ''}" role="radio" aria-checked="${on}" tabindex="0" data-m="${m}"><span class="dotbox">${on ? '<i style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></i>' : ''}</span><div><b>${title}</b></div>${ver(d)}<div class="sub">${sub}</div></div>`;
+  }
+  const ctx = S0.mount('settings-git.html', 'Git', () => {
+    const r = resolve(), b = S.bundled, s = S.system, c = S.custom;
+    /* custom path block: indented 24px, mono input (no error colour), no Browse…, small Validate */
+    const note = !c.validated ? `<div class="field-help">Pick the git executable (not a directory). It is validated by running <span class="mono">git --version</span>.</div>`
+      : !c.path ? `<div class="field-help">Enter or browse to a git executable.</div>`
+      : c.ok ? `<div class="sline ok">${ic('check', 12)}git version ${c.v} detected</div>` : `<div class="sline err">${ic('err', 12)}${esc(c.err)}</div>`;
+    const customBlock = S.mode === 'custom' ? `<div style="grid-column:2/4;margin-top:6px;padding-left:24px"><div class="od-row" style="gap:8px"><input class="input mono" value="${esc(c.path)}" placeholder="/path/to/git" aria-label="Custom git path" data-cpath style="font-family:var(--font-mono);font-size:12px"><button class="btn btn-sm" id="val">Validate</button></div>${note}</div>` : '';
+    const bsub = `Shipped with GitWarp.<span class="pth">${b.path ? esc(b.path) : 'not shipped with this build'}</span>`;
+    const ssub = `From PATH.${s.path ? `<span class="pth">${esc(s.path)}</span>` : ''}`;
+    const sbLabel = r.active ? `git ${r.active.v} · ${r.active.src}` : r.tooOld ? `git ${r.tooOld} too old` : 'git not found';
+    S0.setGit({ label: sbLabel, tip: r.active ? `git ${r.active.v} · ${r.active.src} · ${r.active.path}` : (r.banners[0] ? r.banners[0].t : 'git not found'), bad: !r.active });
+    return `<h2>Git</h2><p class="lead">Choose which git executable GitWarp runs. Changes apply to all repositories after a restart of background operations.</p>
+      <div class="od-stack" style="--od-gap:12px">
+      ${r.banners.map((x) => `<div class="banner ${x.k}" role="${x.k === 'error' ? 'alert' : 'status'}">${ic(x.k === 'error' ? 'err' : 'warn', 16)}<div><div class="b-title">${esc(x.t)}</div><div>${esc(x.d)}</div>${x.list ? `<ul>${x.list.map((l) => `<li>${esc(l)}</li>`).join('')}</ul>` : ''}</div></div>`).join('')}
+      <div class="od-stack" role="radiogroup" aria-label="Git executable" style="--od-gap:8px">
+        ${opt('auto', 'Auto', 'Use the bundled git if present and working, otherwise the one from PATH. Recommended.', b.ok ? b : s.ok ? s : (b.old ? b : s.old ? s : null))}
+        ${opt('bundled', 'Bundled', bsub, b.ok || b.old ? b : null)}
+        ${opt('system', 'System', ssub, s.ok || s.old ? s : null)}
+        <div class="opt${S.mode === 'custom' ? ' on' : ''}" role="radio" aria-checked="${S.mode === 'custom'}" tabindex="0" data-m="custom"><span class="dotbox">${S.mode === 'custom' ? '<i style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></i>' : ''}</span><div><b>Custom path</b></div>${c.ok ? `<span class="ver ok">${c.v}</span>` : c.old ? `<span class="ver bad">${ic('warn', 12)} ${c.old}</span>` : '<span class="ver muted">—</span>'}<div class="sub">Use a git you installed yourself.</div>${customBlock}</div>
+      </div>
+      <div><div class="field-label">In use</div>${r.active ? `<dl class="active"><dt>Executable</dt><dd>${esc(r.active.path)}</dd><dt>Version</dt><dd>${r.active.v} <span class="ok-pill">${ic('check', 12)} supported</span></dd><dt>Source</dt><dd>${r.active.src}${S.mode === 'auto' ? ' (auto)' : ''}</dd></dl>` : `<dl class="active"><dt>Executable</dt><dd class="bad-pill" style="font-family:var(--font-ui)">${ic('err', 12)} none — repositories cannot be opened</dd></dl>`}</div>
+      <div class="od-row"><button class="btn" id="redetect"${detecting ? ' disabled' : ''}>${ic('fetch', 14)}Re-detect</button>${detecting ? ic('fetch', 14, 'spin') : ''}<span class="od-fill"></span><span class="muted" style="font-size:var(--fs-sm)">Status bar shows: ${r.active ? `git ${r.active.v} · ${r.active.src}` : 'git not found'}</span></div>
+      </div>`;
+  }, null, { stagebar: '<label class="scn">Detection scenario <select id="scn" aria-label="Detection scenario">' + Object.entries(SC).map(([k, v]) => `<option value="${k}">${v.label}</option>`).join('') + '</select></label>' });
+  const pane = ctx.pane;
+  const pick = (m) => { S.mode = m; ctx.draw(); const el = pane.querySelector(`[data-m=${m}]`); if (el) el.focus(); };
+  pane.addEventListener('click', (e) => {
+    const o = e.target.closest('.opt'); if (o && !e.target.closest('input,button')) pick(o.dataset.m);
+    /* Re-detect: button disabled with a spinner while detecting, then the result; no toast */
+    if (e.target.closest('#redetect') && !detecting) { detecting = true; ctx.draw(); setTimeout(() => { detecting = false; ctx.draw(); }, 900); }
+    if (e.target.closest('#val')) { S.custom.path = pane.querySelector('[data-cpath]').value; S.custom.validated = 1; ctx.draw(); }
+  });
+  pane.addEventListener('keydown', (e) => { const o = e.target.closest && e.target.closest('.opt'); if (o && (e.key === ' ' || e.key === 'Enter') && e.target === o) { e.preventDefault(); pick(o.dataset.m); } });
+  document.getElementById('scn').addEventListener('change', (e) => { S = fresh(e.target.value); detecting = false; ctx.draw(); });
+})();
+</script>
+</body>
+</html>

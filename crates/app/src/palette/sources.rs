@@ -1,0 +1,951 @@
+//! What the palette searches and how a query turns into grouped hits.
+//!
+//! Everything here is plain data and pure functions: the view builds a
+//! [`Sources`] snapshot when it opens and calls [`search`] on every keystroke.
+
+use std::cmp::Ordering;
+use std::io;
+use std::path::Path;
+use std::process::Command as Process;
+use std::sync::Arc;
+
+use git_core::{CommitInfo, Git, Head, Oid, Ref, RefKind};
+use gpui::{App, Global, SharedString};
+use ui::IconName;
+
+use super::matcher::{self, Match};
+use crate::settings_ui::Page;
+
+/// The most hits one group shows.
+pub const GROUP_CAP: usize = 50;
+/// Commands shown for an empty query.
+const EMPTY_COMMANDS: usize = 8;
+/// Branches shown for an empty query.
+const EMPTY_BRANCHES: usize = 5;
+/// How many recent commands and branches are remembered.
+const RECENT_CAP: usize = 16;
+/// Characters of the abbreviated hash a Commits row shows.
+const SHORT_HASH: usize = 7;
+/// The gap between the abbreviated hash and the summary in a Commits row.
+const HASH_GAP: &str = "  ";
+
+/// The palette's groups, in display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    Commands,
+    Branches,
+    Commits,
+    Files,
+}
+
+impl Group {
+    /// The header text, already upper case: GPUI has no text-transform.
+    pub fn header(self) -> SharedString {
+        match self {
+            Group::Commands => ui::t!("palette.group.commands"),
+            Group::Branches => ui::t!("palette.group.branches"),
+            Group::Commits => ui::t!("palette.group.commits"),
+            Group::Files => ui::t!("palette.group.files"),
+        }
+    }
+
+    pub fn icon(self) -> IconName {
+        match self {
+            Group::Commands => IconName::Command,
+            Group::Branches => IconName::Branch,
+            Group::Commits => IconName::Hash,
+            Group::Files => IconName::File,
+        }
+    }
+}
+
+/// An app action the palette can run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    FetchAll,
+    Pull,
+    Push,
+    StashChanges,
+    SwitchBranch,
+    CreateBranchHere,
+    CreateTagHere,
+    /// Only listed while a remote can take one: see [`Command::available`].
+    CreatePullRequest,
+    ShowBranchCommits,
+    AddRemote,
+    AddWorktree,
+    Refresh,
+    ToggleSidebar,
+    ToggleDetails,
+    ToggleActivity,
+    FocusSearch,
+    ShowHistory,
+    ShowChanges,
+    ShowWorktrees,
+    CollapseIdleLanes,
+    FitGraph,
+    OpenSettings(Page),
+    OpenRepository,
+    Clone,
+    CloseRepository,
+}
+
+/// The view state two commands' titles depend on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewState {
+    pub idle_lanes_collapsed: bool,
+    pub activity_collapsed: bool,
+    /// A remote with an account can take a pull request.
+    pub pull_requests: bool,
+    /// ...and the first such remote is on GitLab: "merge request".
+    pub merge_requests: bool,
+}
+
+impl Command {
+    /// Every command, in no particular order.
+    pub fn all() -> Vec<Command> {
+        let mut all = vec![
+            Command::FetchAll,
+            Command::Pull,
+            Command::Push,
+            Command::StashChanges,
+            Command::SwitchBranch,
+            Command::CreateBranchHere,
+            Command::CreateTagHere,
+            Command::AddRemote,
+            Command::AddWorktree,
+            Command::Refresh,
+            Command::ToggleSidebar,
+            Command::ToggleDetails,
+            Command::ToggleActivity,
+            Command::FocusSearch,
+            Command::ShowHistory,
+            Command::ShowChanges,
+            Command::ShowWorktrees,
+            Command::CollapseIdleLanes,
+            Command::FitGraph,
+            Command::ShowBranchCommits,
+            Command::OpenRepository,
+            Command::Clone,
+            Command::CloseRepository,
+        ];
+        all.extend(Page::ALL.into_iter().map(Command::OpenSettings));
+        all
+    }
+
+    /// [`Command::all`] plus the commands that depend on the repository: the
+    /// pull request one needs a remote with an account.
+    pub fn available(state: ViewState) -> Vec<Command> {
+        let mut all = Command::all();
+        if state.pull_requests {
+            all.push(Command::CreatePullRequest);
+        }
+        all
+    }
+
+    pub fn title(self, state: ViewState) -> String {
+        match self {
+            Command::FetchAll => ui::t!("palette.command.fetch_all").to_string(),
+            Command::Pull => ui::t!("palette.command.pull").to_string(),
+            Command::Push => ui::t!("palette.command.push").to_string(),
+            Command::StashChanges => ui::t!("palette.command.stash").to_string(),
+            Command::SwitchBranch => ui::t!("palette.command.switch_branch").to_string(),
+            Command::CreateBranchHere => ui::t!("palette.command.create_branch").to_string(),
+            Command::CreateTagHere => ui::t!("palette.command.create_tag").to_string(),
+            Command::CreatePullRequest if state.merge_requests => {
+                ui::t!("palette.command.create_merge_request").to_string()
+            }
+            Command::CreatePullRequest => ui::t!("palette.command.create_pull_request").to_string(),
+            Command::ShowBranchCommits => ui::t!("palette.command.show_branch_commits").to_string(),
+            Command::AddRemote => ui::t!("palette.command.add_remote").to_string(),
+            Command::AddWorktree => ui::t!("palette.command.add_worktree").to_string(),
+            Command::Refresh => ui::t!("palette.command.refresh").to_string(),
+            Command::ToggleSidebar => ui::t!("palette.command.toggle_sidebar").to_string(),
+            Command::ToggleDetails => ui::t!("palette.command.toggle_details").to_string(),
+            Command::ToggleActivity if state.activity_collapsed => {
+                ui::t!("palette.command.show_activity").to_string()
+            }
+            Command::ToggleActivity => ui::t!("palette.command.hide_activity").to_string(),
+            Command::FocusSearch => ui::t!("palette.command.search").to_string(),
+            Command::ShowHistory => ui::t!("palette.command.show_history").to_string(),
+            Command::ShowChanges => ui::t!("palette.command.show_changes").to_string(),
+            Command::ShowWorktrees => ui::t!("palette.command.show_worktrees").to_string(),
+            Command::CollapseIdleLanes if state.idle_lanes_collapsed => {
+                ui::t!("palette.command.expand_idle_lanes").to_string()
+            }
+            Command::CollapseIdleLanes => ui::t!("palette.command.collapse_idle_lanes").to_string(),
+            Command::FitGraph => ui::t!("palette.command.fit_graph").to_string(),
+            Command::OpenSettings(Page::General) => {
+                ui::t!("palette.command.open_settings").to_string()
+            }
+            Command::OpenSettings(page) => {
+                ui::t!("palette.command.open_settings_page", page = page_name(page)).to_string()
+            }
+            Command::OpenRepository => ui::t!("palette.command.open_repository").to_string(),
+            Command::Clone => ui::t!("palette.command.clone").to_string(),
+            Command::CloseRepository => ui::t!("palette.command.close_repository").to_string(),
+        }
+    }
+
+    /// The commands the workspace runs (they replace or cover the repository
+    /// view); the repository view runs the rest.
+    pub fn is_workspace_level(self) -> bool {
+        matches!(
+            self,
+            Command::OpenSettings(_)
+                | Command::OpenRepository
+                | Command::Clone
+                | Command::CloseRepository
+        )
+    }
+
+    /// The key cap of the command's binding: the user's override from the
+    /// Keybindings page when the command has an entry there, else the fixed
+    /// shortcut the app binds. `None` for a command without a shortcut.
+    pub fn key_cap(self, cx: &App) -> Option<String> {
+        let id = match self {
+            Command::FetchAll => "fetch",
+            Command::Pull => "pull",
+            Command::Push => "push",
+            Command::SwitchBranch => "branch",
+            Command::ToggleSidebar => "sidebar",
+            Command::ToggleDetails => "dock",
+            Command::FocusSearch => "search",
+            Command::OpenSettings(Page::General) => "settings",
+            // Bound in `main.rs` without an entry on the Keybindings page.
+            Command::StashChanges => {
+                return Some(ui::kbd::platform_label("Ctrl+Shift+S").to_string())
+            }
+            Command::OpenRepository => return Some(ui::kbd::platform_label("Ctrl+O").to_string()),
+            Command::Clone => return Some(ui::kbd::platform_label("Ctrl+Shift+O").to_string()),
+            _ => return None,
+        };
+        crate::settings_ui::keybindings::key_cap(cx, id)
+    }
+}
+
+/// The page's name in the settings navigation.
+fn page_name(page: Page) -> SharedString {
+    match page {
+        Page::General => ui::t!("settings.page.general"),
+        Page::Appearance => ui::t!("settings.page.appearance"),
+        // The product name of the tool, not translated (as in the settings navigation).
+        Page::Git => "Git".into(),
+        Page::Worktrees => ui::t!("settings.page.worktrees"),
+        Page::Ssh => ui::t!("settings.page.ssh"),
+        Page::Keybindings => ui::t!("settings.page.keybindings"),
+        Page::Diff => ui::t!("settings.diff.title"),
+        Page::Identity => ui::t!("settings.page.identity"),
+        Page::Accounts => ui::t!("settings.page.accounts"),
+    }
+}
+
+/// What picking a hit does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    Command(Command),
+    Branch { name: String, remote: bool },
+    Commit(Oid),
+    File(String),
+}
+
+/// One row of the results.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hit {
+    pub group: Group,
+    pub target: Target,
+    /// The text shown; `positions` index its characters.
+    pub title: String,
+    pub positions: Vec<usize>,
+    /// The checked-out branch: it gets the `current` badge.
+    pub current: bool,
+}
+
+/// The commands and branches used most recently this session, newest first.
+/// Kept in a global so a new palette starts from the last one's habits.
+#[derive(Clone, Debug, Default)]
+pub struct Recent {
+    commands: Vec<Command>,
+    branches: Vec<String>,
+}
+
+impl Global for Recent {}
+
+impl Recent {
+    pub fn touch_command(&mut self, command: Command) {
+        self.commands.retain(|c| *c != command);
+        self.commands.insert(0, command);
+        self.commands.truncate(RECENT_CAP);
+    }
+
+    pub fn touch_branch(&mut self, name: &str) {
+        self.branches.retain(|b| b != name);
+        self.branches.insert(0, name.to_owned());
+        self.branches.truncate(RECENT_CAP);
+    }
+}
+
+struct BranchSource {
+    name: String,
+    remote: bool,
+}
+
+struct CommitSource {
+    oid: Oid,
+    hex: String,
+    info: Arc<CommitInfo>,
+}
+
+/// The snapshot a palette searches.
+pub struct Sources {
+    state: ViewState,
+    current: Option<String>,
+    branches: Vec<BranchSource>,
+    commits: Vec<CommitSource>,
+    files: Vec<String>,
+}
+
+impl Sources {
+    /// `commits` are the loaded history rows, newest first.
+    pub fn new(
+        state: ViewState,
+        head: Option<&Head>,
+        refs: &[Ref],
+        commits: &[Arc<CommitInfo>],
+    ) -> Self {
+        let current = match head {
+            Some(Head::Branch { name, .. }) => Some(name.clone()),
+            _ => None,
+        };
+        let branches_of = |kind: RefKind| {
+            refs.iter()
+                .filter(move |r| r.kind == kind)
+                // `origin/HEAD` is a pointer, not a branch to switch to.
+                .filter(move |r| kind != RefKind::RemoteBranch || !r.name.ends_with("/HEAD"))
+                .map(move |r| BranchSource {
+                    name: r.name.clone(),
+                    remote: kind == RefKind::RemoteBranch,
+                })
+        };
+        let branches = branches_of(RefKind::LocalBranch)
+            .chain(branches_of(RefKind::RemoteBranch))
+            .collect();
+        let commits = commits
+            .iter()
+            .map(|info| CommitSource {
+                oid: info.id,
+                hex: info.id.to_string(),
+                info: info.clone(),
+            })
+            .collect();
+        Self {
+            state,
+            current,
+            branches,
+            commits,
+            files: Vec::new(),
+        }
+    }
+
+    /// The tracked files, once they have loaded.
+    pub fn set_files(&mut self, files: Vec<String>) {
+        self.files = files;
+    }
+}
+
+/// The hits for `query`, grouped in display order and capped per group.
+/// An empty query lists the habitual commands and branches instead.
+pub fn search(query: &str, sources: &Sources, recent: &Recent) -> Vec<Hit> {
+    let (scope, query) = split_scope(query);
+    if query.is_empty() {
+        let mut hits = default_hits(sources, recent);
+        hits.retain(|hit| scope.includes(hit.group));
+        return hits;
+    }
+    let mut hits = Vec::new();
+
+    let commands = if scope.includes(Group::Commands) {
+        Command::available(sources.state)
+    } else {
+        Vec::new()
+    };
+    let titles: Vec<String> = commands
+        .iter()
+        .map(|command| command.title(sources.state))
+        .collect();
+    for scored in top(titles
+        .iter()
+        .enumerate()
+        .filter_map(|(order, title)| scored(matcher::fuzzy(query, title), title, order)))
+    {
+        hits.push(Hit {
+            group: Group::Commands,
+            target: Target::Command(commands[scored.order]),
+            title: titles[scored.order].clone(),
+            positions: scored.positions,
+            current: false,
+        });
+    }
+
+    let branches: &[BranchSource] = if scope.includes(Group::Branches) {
+        &sources.branches
+    } else {
+        &[]
+    };
+    for scored in top(branches
+        .iter()
+        .enumerate()
+        .filter_map(|(order, b)| scored(matcher::fuzzy(query, &b.name), &b.name, order)))
+    {
+        let branch = &branches[scored.order];
+        hits.push(Hit {
+            group: Group::Branches,
+            target: Target::Branch {
+                name: branch.name.clone(),
+                remote: branch.remote,
+            },
+            title: branch.name.clone(),
+            positions: scored.positions,
+            current: is_current(sources, branch),
+        });
+    }
+
+    let commit_sources: &[CommitSource] = if scope.includes(Group::Commits) {
+        &sources.commits
+    } else {
+        &[]
+    };
+    for scored in top(commit_sources.iter().enumerate().filter_map(|(order, c)| {
+        let by_hash = matcher::hash_prefix(query, &c.hex, scope == Scope::Commits);
+        let by_summary = matcher::fuzzy(query, &c.info.summary);
+        // Positions index the displayed `hash  summary`, not the summary.
+        let shift = SHORT_HASH + HASH_GAP.len();
+        let by_summary = by_summary.map(|m| Match {
+            score: m.score,
+            positions: m.positions.into_iter().map(|p| p + shift).collect(),
+        });
+        let by_hash = by_hash.map(|m| Match {
+            score: m.score,
+            positions: m
+                .positions
+                .into_iter()
+                .filter(|p| *p < SHORT_HASH)
+                .collect(),
+        });
+        // Newest first among equals: no length tie-break for commits.
+        let best = match (by_hash, by_summary) {
+            (Some(hash), _) => hash,
+            (None, Some(summary)) => summary,
+            (None, None) => return None,
+        };
+        Some(Scored {
+            score: best.score,
+            len: 0,
+            order,
+            positions: best.positions,
+        })
+    })) {
+        let commit = &commit_sources[scored.order];
+        hits.push(Hit {
+            group: Group::Commits,
+            target: Target::Commit(commit.oid),
+            title: commit_title(commit),
+            positions: scored.positions,
+            current: false,
+        });
+    }
+
+    let files: &[String] = if scope.includes(Group::Files) {
+        &sources.files
+    } else {
+        &[]
+    };
+    for scored in top(files
+        .iter()
+        .enumerate()
+        .filter_map(|(order, path)| scored(matcher::fuzzy(query, path), path, order)))
+    {
+        hits.push(Hit {
+            group: Group::Files,
+            target: Target::File(files[scored.order].clone()),
+            title: files[scored.order].clone(),
+            positions: scored.positions,
+            current: false,
+        });
+    }
+    hits
+}
+
+/// Which groups a query searches: a leading `>`, `@` or `#` narrows it to the
+/// commands, the branches or the commits (the design's palette footer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    Commands,
+    Branches,
+    Commits,
+}
+
+impl Scope {
+    fn includes(self, group: Group) -> bool {
+        matches!(
+            (self, group),
+            (Scope::All, _)
+                | (Scope::Commands, Group::Commands)
+                | (Scope::Branches, Group::Branches)
+                | (Scope::Commits, Group::Commits)
+        )
+    }
+}
+
+/// Splits the scope prefix off `query`; the rest is trimmed, so `> fetch` and
+/// `>fetch` both match "fetch" against the commands only.
+pub fn split_scope(query: &str) -> (Scope, &str) {
+    let query = query.trim();
+    let scope = match query.chars().next() {
+        Some('>') => Scope::Commands,
+        Some('@') => Scope::Branches,
+        Some('#') => Scope::Commits,
+        _ => return (Scope::All, query),
+    };
+    // The prefixes are one byte each.
+    (scope, query[1..].trim())
+}
+
+fn commit_title(commit: &CommitSource) -> String {
+    format!(
+        "{}{HASH_GAP}{}",
+        &commit.hex[..SHORT_HASH.min(commit.hex.len())],
+        commit.info.summary
+    )
+}
+
+fn is_current(sources: &Sources, branch: &BranchSource) -> bool {
+    !branch.remote && sources.current.as_deref() == Some(branch.name.as_str())
+}
+
+/// Commands (the recent ones first, then A–Z) and branches (the current one,
+/// the recent ones, then the rest) for an empty query.
+fn default_hits(sources: &Sources, recent: &Recent) -> Vec<Hit> {
+    let state = sources.state;
+    let all = Command::available(state);
+    let mut commands: Vec<Command> = recent
+        .commands
+        .iter()
+        .copied()
+        .filter(|c| all.contains(c))
+        .collect();
+    let mut rest: Vec<Command> = all.into_iter().filter(|c| !commands.contains(c)).collect();
+    rest.sort_by_cached_key(|c| c.title(state).to_lowercase());
+    commands.extend(rest);
+    commands.truncate(EMPTY_COMMANDS);
+    let mut hits: Vec<Hit> = commands
+        .into_iter()
+        .map(|command| Hit {
+            group: Group::Commands,
+            target: Target::Command(command),
+            title: command.title(state),
+            positions: Vec::new(),
+            current: false,
+        })
+        .collect();
+
+    let mut order: Vec<&BranchSource> = Vec::new();
+    let by_name = |name: &str| sources.branches.iter().find(|b| b.name == name);
+    if let Some(current) = sources.current.as_deref().and_then(by_name) {
+        order.push(current);
+    }
+    for name in &recent.branches {
+        if let Some(branch) = by_name(name) {
+            if !order.iter().any(|b| std::ptr::eq(*b, branch)) {
+                order.push(branch);
+            }
+        }
+    }
+    for branch in sources.branches.iter().filter(|b| !b.remote) {
+        if !order.iter().any(|b| std::ptr::eq(*b, branch)) {
+            order.push(branch);
+        }
+    }
+    order.truncate(EMPTY_BRANCHES);
+    hits.extend(order.into_iter().map(|branch| Hit {
+        group: Group::Branches,
+        target: Target::Branch {
+            name: branch.name.clone(),
+            remote: branch.remote,
+        },
+        title: branch.name.clone(),
+        positions: Vec::new(),
+        current: is_current(sources, branch),
+    }));
+    hits
+}
+
+/// The tracked files of the work tree at `root` (`git ls-files`), as
+/// repository-relative paths in git's order. Blocks while git runs: call it
+/// on the background executor.
+pub fn tracked_files(git: &Git, root: &Path) -> io::Result<Vec<String>> {
+    let mut command = Process::new(git.path());
+    // -z: paths come NUL-separated and unquoted, whatever they contain.
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["--no-pager", "ls-files", "-z"])
+        .env("GIT_TERMINAL_PROMPT", "0");
+    #[cfg(windows)]
+    {
+        // Never pop up a console window on Windows.
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    Ok(parse_ls_files(&output.stdout))
+}
+
+/// Splits `git ls-files -z` output into paths.
+fn parse_ls_files(output: &[u8]) -> Vec<String> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect()
+}
+
+/// One match before it becomes a [`Hit`].
+struct Scored {
+    score: i32,
+    /// Shorter texts win ties: `Push` over `Push tags to the default remote`.
+    len: usize,
+    /// Index into the source list; the source's own order breaks last ties.
+    order: usize,
+    positions: Vec<usize>,
+}
+
+fn scored(found: Option<Match>, text: &str, order: usize) -> Option<Scored> {
+    found.map(|m| Scored {
+        score: m.score,
+        len: text.chars().count(),
+        order,
+        positions: m.positions,
+    })
+}
+
+/// The best [`GROUP_CAP`] matches, best first.
+fn top(matches: impl Iterator<Item = Scored>) -> Vec<Scored> {
+    let mut all: Vec<Scored> = matches.collect();
+    let rank = |a: &Scored, b: &Scored| -> Ordering {
+        b.score
+            .cmp(&a.score)
+            .then(a.len.cmp(&b.len))
+            .then(a.order.cmp(&b.order))
+    };
+    if all.len() > GROUP_CAP {
+        all.select_nth_unstable_by(GROUP_CAP, rank);
+        all.truncate(GROUP_CAP);
+    }
+    all.sort_by(rank);
+    all
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oid(byte: u8) -> Oid {
+        Oid::from_hex(&format!("{byte:02x}").repeat(20)).expect("valid hex")
+    }
+
+    fn commit(byte: u8, summary: &str) -> Arc<CommitInfo> {
+        Arc::new(CommitInfo {
+            id: oid(byte),
+            parents: Vec::new(),
+            author_name: "A".into(),
+            author_email: "a@example.com".into(),
+            author_time: 0,
+            summary: summary.into(),
+        })
+    }
+
+    #[test]
+    fn the_pull_request_command_needs_a_remote_with_an_account() {
+        let off = ViewState::default();
+        assert!(!Command::available(off).contains(&Command::CreatePullRequest));
+        let on = ViewState {
+            pull_requests: true,
+            ..ViewState::default()
+        };
+        assert!(Command::available(on).contains(&Command::CreatePullRequest));
+        assert_eq!(Command::CreatePullRequest.title(on), "Create pull request…");
+        let gitlab = ViewState {
+            merge_requests: true,
+            ..on
+        };
+        assert_eq!(
+            Command::CreatePullRequest.title(gitlab),
+            "Create merge request…"
+        );
+    }
+
+    fn reference(kind: RefKind, name: &str) -> Ref {
+        Ref {
+            full_name: format!("refs/{name}"),
+            name: name.into(),
+            kind,
+            target: oid(1),
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            upstream_gone: false,
+        }
+    }
+
+    fn sources(commits: &[Arc<CommitInfo>]) -> Sources {
+        let refs = [
+            reference(RefKind::LocalBranch, "main"),
+            reference(RefKind::LocalBranch, "feat/palette"),
+            reference(RefKind::RemoteBranch, "origin/main"),
+            reference(RefKind::RemoteBranch, "origin/HEAD"),
+            reference(RefKind::Tag, "v1.0"),
+        ];
+        let head = Head::Branch {
+            name: "main".into(),
+            target: Some(oid(1)),
+        };
+        Sources::new(ViewState::default(), Some(&head), &refs, commits)
+    }
+
+    fn titles(hits: &[Hit], group: Group) -> Vec<&str> {
+        hits.iter()
+            .filter(|h| h.group == group)
+            .map(|h| h.title.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn scope_prefix_is_split_off_and_trimmed() {
+        assert_eq!(split_scope("fe"), (Scope::All, "fe"));
+        assert_eq!(split_scope(" >  fetch "), (Scope::Commands, "fetch"));
+        assert_eq!(split_scope("@main"), (Scope::Branches, "main"));
+        assert_eq!(split_scope("#a1"), (Scope::Commits, "a1"));
+        assert_eq!(split_scope("#"), (Scope::Commits, ""));
+    }
+
+    #[test]
+    fn prefixes_search_one_group_only() {
+        let mut s = sources(&[commit(0xa1, "Fix the main picker")]);
+        s.set_files(vec!["src/main.rs".into()]);
+        let recent = Recent::default();
+
+        let all = search("main", &s, &recent);
+        assert!(all.iter().any(|h| h.group == Group::Branches));
+        assert!(all.iter().any(|h| h.group == Group::Commits));
+        assert!(all.iter().any(|h| h.group == Group::Files));
+
+        let branches = search("@main", &s, &recent);
+        assert!(!branches.is_empty());
+        assert!(branches.iter().all(|h| h.group == Group::Branches));
+
+        let commits = search("#main", &s, &recent);
+        assert_eq!(titles(&commits, Group::Commits).len(), 1);
+        assert!(commits.iter().all(|h| h.group == Group::Commits));
+        // The prefix is stripped before matching: `#` alone is not a query.
+        assert!(search("#", &s, &recent)
+            .iter()
+            .all(|h| h.group == Group::Commits));
+
+        let commands = search(">fetch", &s, &recent);
+        assert!(!commands.is_empty());
+        assert!(commands.iter().all(|h| h.group == Group::Commands));
+        assert!(search(">main", &s, &recent).is_empty());
+    }
+
+    #[test]
+    fn results_come_grouped_in_display_order() {
+        let mut s = sources(&[commit(0xa1, "Fix the feature picker")]);
+        s.set_files(vec!["src/feature.rs".into()]);
+        let hits = search("fe", &s, &Recent::default());
+        let groups: Vec<Group> = hits.iter().map(|h| h.group).collect();
+        let mut sorted = groups.clone();
+        sorted.sort_by_key(|g| *g as u8);
+        assert_eq!(groups, sorted);
+        for group in [
+            Group::Commands,
+            Group::Branches,
+            Group::Commits,
+            Group::Files,
+        ] {
+            assert!(!titles(&hits, group).is_empty(), "{group:?} has hits");
+        }
+    }
+
+    #[test]
+    fn remote_head_pointers_are_not_branches() {
+        let hits = search("origin", &sources(&[]), &Recent::default());
+        assert_eq!(titles(&hits, Group::Branches), vec!["origin/main"]);
+    }
+
+    #[test]
+    fn the_current_branch_is_flagged() {
+        let hits = search("main", &sources(&[]), &Recent::default());
+        let current: Vec<&str> = hits
+            .iter()
+            .filter(|h| h.current)
+            .map(|h| h.title.as_str())
+            .collect();
+        assert_eq!(current, vec!["main"]);
+    }
+
+    #[test]
+    fn a_hash_prefix_leads_the_commits_over_better_summary_matches() {
+        let commits = [
+            commit(0xb2, "a1a1 is mentioned here"),
+            commit(0xa1, "Something else"),
+        ];
+        let hits = search("a1a1", &sources(&commits), &Recent::default());
+        let found: Vec<&Hit> = hits.iter().filter(|h| h.group == Group::Commits).collect();
+        assert_eq!(found[0].target, Target::Commit(oid(0xa1)));
+        assert_eq!(found[0].title, "a1a1a1a  Something else");
+        // The highlight sits on the abbreviated hash.
+        assert_eq!(found[0].positions, vec![0, 1, 2, 3]);
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn three_hex_digits_are_a_hash_only_after_the_hash_scope() {
+        let commits = [
+            commit(0xb2, "a1a is mentioned here"),
+            commit(0xa1, "Something else"),
+        ];
+        let scoped = search("#a1a", &sources(&commits), &Recent::default());
+        let found: Vec<&Hit> = scoped
+            .iter()
+            .filter(|h| h.group == Group::Commits)
+            .collect();
+        assert_eq!(found[0].target, Target::Commit(oid(0xa1)));
+        assert_eq!(found[0].positions, vec![0, 1, 2]);
+
+        // Without the scope three digits stay a fuzzy summary query.
+        let plain = search("a1a", &sources(&commits), &Recent::default());
+        let found: Vec<&Hit> = plain.iter().filter(|h| h.group == Group::Commits).collect();
+        assert_eq!(found[0].target, Target::Commit(oid(0xb2)));
+    }
+
+    #[test]
+    fn a_summary_match_highlights_the_summary_part_of_the_row() {
+        let hits = search(
+            "parser",
+            &sources(&[commit(0xa1, "Fix parser")]),
+            &Recent::default(),
+        );
+        let hit = hits
+            .iter()
+            .find(|h| h.group == Group::Commits)
+            .expect("a commit hit");
+        let text: String = hit
+            .positions
+            .iter()
+            .filter_map(|p| hit.title.chars().nth(*p))
+            .collect();
+        assert_eq!(text, "parser");
+    }
+
+    #[test]
+    fn no_match_returns_no_hits() {
+        let mut s = sources(&[commit(0xa1, "Fix")]);
+        s.set_files(vec!["a.rs".into()]);
+        assert!(search("zzzzqqq", &s, &Recent::default()).is_empty());
+    }
+
+    #[test]
+    fn each_group_is_capped() {
+        let commits: Vec<_> = (0..200u8).map(|i| commit(i, "same summary")).collect();
+        let mut s = sources(&commits);
+        s.set_files((0..300).map(|i| format!("src/file{i}.rs")).collect());
+        let hits = search("s", &s, &Recent::default());
+        assert_eq!(titles(&hits, Group::Commits).len(), GROUP_CAP);
+        assert_eq!(titles(&hits, Group::Files).len(), GROUP_CAP);
+    }
+
+    #[test]
+    fn the_push_command_leads_for_push() {
+        let hits = search("push", &sources(&[]), &Recent::default());
+        assert_eq!(titles(&hits, Group::Commands)[0], "Push current branch");
+    }
+
+    #[test]
+    fn the_idle_lane_title_follows_the_state() {
+        let mut s = sources(&[]);
+        let before = search("idle lanes", &s, &Recent::default());
+        assert_eq!(
+            titles(&before, Group::Commands),
+            vec!["Collapse idle lanes in graph"]
+        );
+        s.state.idle_lanes_collapsed = true;
+        let after = search("idle lanes", &s, &Recent::default());
+        assert_eq!(
+            titles(&after, Group::Commands),
+            vec!["Expand idle lanes in graph"]
+        );
+    }
+
+    #[test]
+    fn an_empty_query_lists_recent_commands_then_a_to_z_and_the_current_branch_first() {
+        let mut recent = Recent::default();
+        recent.touch_command(Command::Clone);
+        recent.touch_command(Command::Push);
+        recent.touch_branch("feat/palette");
+        let hits = search("  ", &sources(&[commit(0xa1, "x")]), &recent);
+        let commands = titles(&hits, Group::Commands);
+        assert_eq!(commands.len(), EMPTY_COMMANDS);
+        assert_eq!(&commands[..2], ["Push current branch", "Clone repository…"]);
+        // The rest is alphabetical.
+        let rest: Vec<String> = commands[2..].iter().map(|t| t.to_lowercase()).collect();
+        let mut sorted = rest.clone();
+        sorted.sort();
+        assert_eq!(rest, sorted);
+        // Branches: the current one, the recent one, then the other locals.
+        assert_eq!(titles(&hits, Group::Branches), vec!["main", "feat/palette"]);
+        assert!(titles(&hits, Group::Commits).is_empty());
+        assert!(titles(&hits, Group::Files).is_empty());
+    }
+
+    #[test]
+    fn ls_files_output_splits_on_nul_and_keeps_odd_names() {
+        let output = b"src/main.rs\0docs/a b.md\0caf\xc3\xa9\nline.txt\0";
+        assert_eq!(
+            parse_ls_files(output),
+            vec!["src/main.rs", "docs/a b.md", "café\nline.txt"]
+        );
+        assert!(parse_ls_files(b"").is_empty());
+    }
+
+    #[test]
+    fn touching_a_recent_item_moves_it_to_the_front_once() {
+        let mut recent = Recent::default();
+        recent.touch_command(Command::Pull);
+        recent.touch_command(Command::Push);
+        recent.touch_command(Command::Pull);
+        assert_eq!(recent.commands, vec![Command::Pull, Command::Push]);
+    }
+
+    #[test]
+    fn every_settings_page_has_a_command() {
+        let titles: Vec<String> = Command::all()
+            .into_iter()
+            .map(|c| c.title(ViewState::default()))
+            .collect();
+        for expected in [
+            "Open Settings",
+            "Open Settings → Git",
+            "Open Settings → SSH keys",
+            "Open Settings → Keybindings",
+        ] {
+            assert!(titles.iter().any(|t| t == expected), "{expected}");
+        }
+    }
+}

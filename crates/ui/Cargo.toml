@@ -1,0 +1,20 @@
+[package]
+name = "ui"
+description = "GitWarp design system: theme and components (GPUI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gpui.workspace = true
+serde_json = "1.0.154"
+unicode-segmentation = "1.13"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+gpui_platform = { workspace = true, features = ["test-support"] }
+
+[[test]]
+name = "cjk_font"
+harness = false

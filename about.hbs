@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GitWarp third-party licenses</title>
+<style>
+body { font-family: sans-serif; max-width: 960px; margin: 2em auto; padding: 0 1em; color: #222; }
+pre { white-space: pre-wrap; background: #f4f4f4; padding: 1em; font-size: 0.85em; }
+.license { border-top: 1px solid #ccc; margin-top: 2em; }
+ul.crates { columns: 2; font-size: 0.9em; }
+</style>
+</head>
+<body>
+<h1>Third-party licenses</h1>
+<p>GitWarp is built from the following Rust crates. Their licenses are reproduced below.
+The bundled git is a separate program under the GPLv2; its license is in the <code>git</code> folder.</p>
+<h2>Overview</h2>
+<ul>
+{{#each overview}}
+<li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+{{/each}}
+</ul>
+{{#each licenses}}
+<div class="license">
+<h3 id="{{id}}">{{name}}</h3>
+<p>Used by:</p>
+<ul class="crates">
+{{#each used_by}}
+<li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+{{/each}}
+</ul>
+<pre>{{text}}</pre>
+</div>
+{{/each}}
+</body>
+</html>

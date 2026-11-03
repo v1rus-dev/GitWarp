@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — Hosting features</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="dialogs.css">
+<link rel="stylesheet" href="settings.css">
+<link rel="stylesheet" href="hosting.css">
+<script src="app.js"></script>
+<script src="settings.js"></script>
+<script src="dialogs.js"></script>
+<script src="hosting.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const G = GL, D = GLD, S = GLS, H = GLH, ic = G.ic, esc = G.esc;
+
+  /* ---------- sample data ---------- */
+  const BR = 'release/0.3-hotfix-for-the-detached-head-checkout-crash-on-windows';
+  const PRS = [
+    { n: 142, t: 'feat(graph): collapse idle lanes into a single gap lane', branch: 'feat/idle-lanes', author: 'mira-k', st: 'open', rv: 'approved', ci: 'passed', base: 'main', upd: '2 h ago' },
+    { n: 139, t: 'feat(palette): fuzzy match with hash-prefix lookup', branch: 'feat/palette', author: 'mira-k', st: 'draft', rv: 'none', ci: 'running', base: 'main', upd: 'yesterday' },
+    { n: 131, t: 'fix(settings): list both reasons when bundled and system git fail', branch: 'fix/git-detect', author: 'priya-n', st: 'merged', rv: 'approved', ci: 'passed', base: 'main', upd: '3 days ago' },
+    { n: 128, t: 'Remove the old experiment branch', branch: 'fix/old-experiment', author: 'mira-k', st: 'closed', rv: 'changes', ci: 'failed', base: 'main', upd: '1 week ago' },
+    { n: 146, t: 'fix(checkout): detached HEAD crash on Windows', branch: BR, author: 'mira-k', st: 'open', rv: 'required', ci: 'pending', base: 'release/0.3', upd: '20 min ago' },
+    { n: 145, t: 'fix(tree): keep selection when the filter changes', branch: 'fix/tree-filter', author: 'lin-zhao', st: 'open', rv: 'required', ci: 'pending', base: 'main', upd: '40 min ago', rr: true },
+    { n: 143, t: 'perf(history): chunked row models for 100k commits', branch: 'perf/row-chunks', author: 'tomas-r', st: 'open', rv: 'changes', ci: 'failed', base: 'main', upd: '5 h ago', rr: true },
+    { n: 137, t: 'docs: describe the account model', branch: 'docs/accounts', author: 'jonas-b', st: 'open', rv: 'required', ci: 'passed', base: 'main', upd: '2 days ago' }
+  ];
+  const ST = { open: ['pr', 'Open'], draft: ['prDraft', 'Draft'], merged: ['merge', 'Merged'], closed: ['prClosed', 'Closed'] };
+  const RV = { approved: ['check', 'Approved'], changes: ['comment', 'Changes requested'], required: ['eye', 'Review required'], none: null };
+  const CI = { passed: ['checkFill', 'passed'], failed: ['xFill', 'failed'], running: ['sync', 'running'], pending: ['hourglass', 'pending'], cancelled: ['skip', 'cancelled'] };
+  const ciG = (s, tip) => (CI[s] ? `<span class="ci ${s}" role="img" aria-label="Checks ${CI[s][1]}" data-tip="${esc(tip || 'Checks ' + CI[s][1])}">${ic(CI[s][0], 12, s === 'running' ? 'spin' : '')}</span>` : '');
+  const prFor = (b) => PRS.find((p) => p.branch === b);
+  const prBadge = (p) => { const rv = RV[p.rv]; return `<button type="button" class="prb ${p.st}" data-pr="${p.n}" data-tip="#${p.n} · ${ST[p.st][1]}${rv ? ' · ' + rv[1] : ''}" aria-label="Pull request #${p.n}, ${ST[p.st][1]}${rv ? ', ' + rv[1] : ''}">${ic(ST[p.st][0], 11)}#${p.n}${rv ? `<span class="rv">${ic(rv[0], 10)}</span>` : ''}</button>`; };
+  const GH = 'GitHub';
+  const CIX = [null, 'running', 'passed', 'passed', 'failed', 'passed', 'cancelled', 'pending', 'passed', 'passed', null, 'passed']; /* history rows */
+  const CHECKS = (s) => ({
+    passed: [['build / linux-x86_64', 'passed', '3m 12s'], ['build / windows-x86_64', 'passed', '4m 40s'], ['test / unit', 'passed', '1m 58s'], ['lint', 'passed', '24s']],
+    failed: [['build / linux-x86_64', 'passed', '3m 08s'], ['build / windows-x86_64', 'passed', '4m 51s'], ['test / unit', 'failed', '2m 03s'], ['lint', 'passed', '25s']],
+    running: [['build / linux-x86_64', 'passed', '3m 10s'], ['build / windows-x86_64', 'running', '2m 14s'], ['test / unit', 'pending', '—'], ['lint', 'passed', '22s']],
+    pending: [['build / linux-x86_64', 'pending', '—'], ['test / unit', 'pending', '—']],
+    cancelled: [['build / linux-x86_64', 'passed', '3m 09s'], ['test / unit', 'cancelled', '1m 02s']]
+  }[s] || []);
+  const overall = (l) => (l.some((x) => x[1] === 'failed') ? 'failed' : l.some((x) => x[1] === 'running') ? 'running' : l.some((x) => x[1] === 'pending') ? 'pending' : l.some((x) => x[1] === 'cancelled') ? 'cancelled' : 'passed');
+  const sumTxt = (l) => `${l.filter((x) => x[1] === 'passed').length} of ${l.length} passed`;
+
+  const V = { cur: G.commits[0], idx: 0, tab: 'repo', flt: 'mine', pstate: 'list', sel: null, cstate: null };
+  const toast = (w, m, k) => G.toast(w, m, k || 'info');
+  const opened = (w, what) => toast(w, `Opened ${what} in your browser`, 'info');
+
+  /* ---------- commit details ---------- */
+  function detailsHTML() {
+    const c = V.cur, pr = c.refs.map((r) => (r.t === 'br' ? prFor(r.n) : null)).find(Boolean);
+    const st = V.cstate || (CIX[V.idx] || 'none');
+    let checks;
+    if (st === 'none') checks = `<div class="empty" style="min-height:0;padding:20px 8px"><b>No checks configured</b><p style="margin:0;max-width:40ch">This commit has no CI runs on ${GH}. Add a workflow to see build and test results here.</p></div>`;
+    else if (st === 'error') checks = `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">Couldn’t load checks</div><div>${GH} answered 503 Service Unavailable.</div><div style="margin-top:8px"><button class="btn btn-sm" data-retry>${ic('sync', 12)}Try again</button></div></div></div>`;
+    else if (st === 'loading') checks = `<div class="checks" aria-busy="true">${[60, 72, 48, 66].map((w) => `<div class="chk"><span class="skel" style="width:12px;height:12px;border-radius:50%"></span><span class="skel" style="width:${w}%"></span><span></span><span></span></div>`).join('')}</div>`;
+    else {
+      const l = CHECKS(st), o = overall(l);
+      checks = `<div class="sec-h">${ciG(o)}<span>Checks · ${sumTxt(l)}</span></div><div class="checks" role="list">${l.map((x) => `<div class="chk" role="listitem">${ciG(x[1])}<span class="nmx" title="${esc(x[0])}">${esc(x[0])}</span><span class="dur">${x[2]}</span><button class="btn btn-icon btn-ghost btn-xs" data-chkopen="${esc(x[0])}" data-tip="Open on ${GH}" aria-label="Open ${esc(x[0])} on ${GH}">${ic('external', 12)}</button></div>`).join('')}</div>`;
+    }
+    return `<div class="col"><h3>${esc(c.summary)}</h3><div class="muted" style="font-size:var(--fs-sm)">${esc(c.author)} · ${G.rel(c.min)} · <span class="mono">${c.hash}</span></div>
+      <div class="tools"><button class="btn btn-sm" data-open="commit">${ic('external', 12)}Open on ${GH}</button><button class="btn btn-sm" data-copylink>${ic('copy', 12)}Copy link</button>${pr ? prBadge(pr) : ''}</div>
+      <div class="sec-h">Changed files · 3</div><div class="frows flist">${[['M', 'src/history/graph.rs'], ['M', 'src/ui/sidebar.rs'], ['A', 'src/settings/git_exec.rs']].map(([s, f]) => { const d = f.lastIndexOf('/'); return `<div class="frow" data-file="${f}" tabindex="0"><span class="fs ${s}">${s}</span><span class="fname"><bdi><span class="fdir">${f.slice(0, d + 1)}</span>${f.slice(d + 1)}</bdi></span></div>`; }).join('')}</div></div>
+      <div class="col">${checks}</div>`;
+  }
+  const renderDetails = (w) => { const el = w.querySelector('#hdet'); if (el) el.innerHTML = detailsHTML(); };
+
+  /* ---------- menus ---------- */
+  const openIt = (w, what) => ({ label: `Open ${what} on ${GH}`, icon: 'external', onClick: () => opened(w, 'github.com') });
+  const commitItems = (w, two) => {
+    const c = V.cur, pr = c.refs.map((r) => (r.t === 'br' ? prFor(r.n) : null)).find(Boolean);
+    return [{ label: 'Copy commit hash', icon: 'copy', key: 'Ctrl C', onClick: () => toast(w, 'Copied ' + c.hash, 'ok') }]
+      .concat(two ? [{ label: 'Open on GitHub (origin)', icon: 'external', onClick: () => opened(w, 'github.com') }, { label: 'Open on Codeberg (publish)', icon: 'external', onClick: () => opened(w, 'codeberg.org') }] : [{ label: `Open on ${GH}`, icon: 'external', onClick: () => opened(w, 'github.com') }])
+      .concat(pr ? [{ label: `Open pull request #${pr.n} on ${GH}`, icon: ST[pr.st][0], onClick: () => opened(w, 'github.com') }] : [])
+      .concat([{ sep: 1 }, { label: 'Create branch here…', icon: 'branch', key: 'B' }, { label: 'Create tag here…', icon: 'tag' }, { sep: 1 }, { label: 'Cherry-pick', icon: 'undo' }, { label: 'Revert commit', icon: 'undo' }, { label: 'Reset main to here…', icon: 'undo', danger: 1 }]);
+  };
+  const branchItems = (w, n) => { const pr = prFor(n); return [{ label: 'Checkout', icon: 'check', key: 'Enter' }, { label: `Show all commits of ${n.length > 28 ? n.slice(0, 27) + '…' : n}`, icon: 'branch' }, { sep: 1 }, { label: 'Rename…', icon: 'edit', key: 'F2' }, { label: 'Delete branch', icon: 'trash', key: 'Del', danger: 1 }, { sep: 1 }, { label: `Open on ${GH}`, icon: 'external', onClick: () => opened(w, 'github.com') }, pr ? { label: `Open pull request #${pr.n} on ${GH}`, icon: ST[pr.st][0], onClick: () => opened(w, 'github.com') } : { label: 'Create pull request…', icon: 'pr', onClick: () => createPR(w, { head: n }) }, { sep: 1 }, { label: 'Copy branch name', icon: 'copy' }]; };
+  const tagItems = (w) => [{ label: 'Checkout', icon: 'check' }, { label: 'Create branch here…', icon: 'branch' }, { sep: 1 }, { label: `Open on ${GH}`, icon: 'external', onClick: () => opened(w, 'github.com') }, { label: 'Copy tag name', icon: 'copy' }, { sep: 1 }, { label: 'Delete tag', icon: 'trash', danger: 1 }];
+  const fileItems = (w, f) => [{ label: `Open file on ${GH}`, icon: 'external', onClick: () => opened(w, 'github.com') }, { label: `Open blame on ${GH}`, icon: 'external', onClick: () => opened(w, 'github.com') }, { label: 'Copy permalink', icon: 'link', onClick: () => toast(w, 'Copied permalink to ' + f, 'ok') }, { sep: 1 }, { label: 'Copy path', icon: 'copy' }];
+  const anchor = (w, sel, dx, dy) => { const el = w.querySelector(sel); el.scrollIntoView && el.scrollIntoView({ block: 'nearest' }); const r = el.getBoundingClientRect(); return { clientX: r.left + (dx == null ? 40 : dx), clientY: r.bottom + (dy == null ? 0 : dy) }; };
+
+  /* ---------- PR popover ---------- */
+  function closePop(w) { w.querySelectorAll('.pop').forEach((p) => p.remove()); }
+  function openPop(w, el, p) {
+    closePop(w);
+    const l = CHECKS(p.ci), rv = RV[p.rv];
+    const pop = G.h(`<div class="pop" role="dialog" aria-label="Pull request #${p.n}"><div class="head"><span class="prb ${p.st}" style="cursor:default">${ic(ST[p.st][0], 11)}${ST[p.st][1]}</span><span class="muted">#${p.n} on ${GH}</span></div><h4>${esc(p.t)}</h4>
+      <div class="row2"><span>${esc(p.author)}</span><span aria-hidden="true">·</span><span style="overflow-wrap:anywhere">${esc(p.branch.length > 34 ? p.branch.slice(0, 33) + '…' : p.branch)} → ${esc(p.base)}</span><span aria-hidden="true">·</span><span>updated ${p.upd}</span></div>
+      <div class="row2" style="color:var(--text)">${rv ? `<span style="display:inline-flex;gap:4px;align-items:center">${ic(rv[0], 12)}${rv[1]}</span>` : '<span class="muted">No reviews yet</span>'}<span class="muted" aria-hidden="true">·</span><span style="display:inline-flex;gap:4px;align-items:center">${ciG(p.ci)}Checks ${l.length ? sumTxt(l) : CI[p.ci][1]}${p.ci === 'running' || p.ci === 'pending' ? ' so far' : ''}</span></div>
+      <div class="btns"><button class="btn btn-sm" data-pop="open">${ic('external', 12)}Open on ${GH}</button><button class="btn btn-sm btn-primary" data-pop="co"${p.st === 'merged' ? ' disabled data-tip="A merged pull request has no branch to check out"' : ''}>Checkout</button></div></div>`);
+    G.layer(w).appendChild(pop);
+    const r = el.getBoundingClientRect(), wr = w.getBoundingClientRect(), s = wr.width / w.offsetWidth || 1;
+    let x = (r.left - wr.left) / s, y = (r.bottom - wr.top) / s + 6; x = Math.max(8, Math.min(x, w.offsetWidth - pop.offsetWidth - 8)); if (y + pop.offsetHeight > w.offsetHeight - 30) y = (r.top - wr.top) / s - pop.offsetHeight - 6;
+    pop.style.left = x + 'px'; pop.style.top = y + 'px';
+    pop.querySelector('[data-pop=open]').onclick = () => { closePop(w); opened(w, 'github.com'); };
+    const co = pop.querySelector('[data-pop=co]'); co.onclick = () => { closePop(w); checkout(w, p); };
+    const out = (e) => { if (!pop.contains(e.target) && !e.target.closest('.prb')) { pop.remove(); document.removeEventListener('mousedown', out, true); document.removeEventListener('keydown', esc_, true); } };
+    const esc_ = (e) => { if (e.key === 'Escape') { pop.remove(); document.removeEventListener('mousedown', out, true); document.removeEventListener('keydown', esc_, true); } };
+    setTimeout(() => { document.addEventListener('mousedown', out, true); document.addEventListener('keydown', esc_, true); }, 0);
+  }
+  const checkout = (w, p) => toast(w, `Created local branch pr/${p.n} tracking origin/${p.branch.length > 30 ? p.branch.slice(0, 29) + '…' : p.branch} and checked it out`, 'ok');
+
+  /* ---------- sidebar: tabs + pull requests panel ---------- */
+  function panelHTML() {
+    const mine = PRS.filter((p) => p.author === 'mira-k'), rr = PRS.filter((p) => p.rr);
+    const list = V.flt === 'mine' ? mine : V.flt === 'rr' ? rr : PRS;
+    let body;
+    if (V.pstate === 'loading') body = `<div class="prlist" aria-busy="true">${[70, 55, 80, 62, 74, 50].map((w) => `<div class="skrow"><span class="skel" style="width:14px;height:14px;border-radius:50%"></span><span class="skel" style="width:${w}%"></span></div>`).join('')}</div>`;
+    else if (V.pstate === 'error') body = `<div class="prlist"><div class="empty"><div class="ei">${ic('err', 20)}</div><b>Can’t load pull requests</b><p>The token for mira-k on github.com was revoked.</p><button class="btn btn-sm btn-primary" data-reco>Reconnect</button></div></div>`;
+    else if (V.pstate === 'empty' || !list.length) body = `<div class="prlist"><div class="empty"><div class="ei">${ic('pr', 20)}</div><b>${V.flt === 'rr' ? 'Nothing to review' : 'No pull requests'}</b><p>${V.flt === 'rr' ? 'No one has asked for your review in this repository.' : 'This repository has no pull requests yet.'}</p></div></div>`;
+    else body = `<div class="prlist" role="listbox" aria-label="Pull requests">${list.map((p) => `<button type="button" class="prrow${V.sel === p.n ? ' sel' : ''}" role="option" aria-selected="${V.sel === p.n}" data-prrow="${p.n}" data-tip="#${p.n} · ${esc(p.t)} · ${esc(p.author)} · ${ST[p.st][1]} · updated ${p.upd}">${ic(ST[p.st][0], 14, 's-' + p.st)}<span class="num">#${p.n}</span><span class="ttl">${esc(p.t)}</span>${ciG(p.ci)}</button>`).join('')}</div>`;
+    const sp = V.pstate === 'list' && V.sel ? PRS.find((p) => p.n === V.sel) : null;
+    const det = sp && list.includes(sp) ? `<div class="prdet"><h4>${esc(sp.t)}</h4><div class="muted" style="font-size:var(--fs-sm)">${esc(sp.author)} · ${ST[sp.st][1]} · ${esc(sp.branch.length > 26 ? sp.branch.slice(0, 25) + '…' : sp.branch)} → ${esc(sp.base)} · ${sp.upd}</div><div style="display:flex;gap:8px;align-items:center;font-size:var(--fs-sm)">${RV[sp.rv] ? ic(RV[sp.rv][0], 12) + RV[sp.rv][1] : '<span class="muted">No reviews yet</span>'}<span class="muted">·</span>${ciG(sp.ci)}<span>Checks ${CI[sp.ci][1]}</span></div><div class="btns"><button class="btn btn-sm" data-prop>${ic('external', 12)}Open on ${GH}</button><button class="btn btn-sm btn-primary" data-prco${sp.st === 'merged' ? ' disabled data-tip="A merged pull request has no branch to check out"' : ''}>Checkout</button></div></div>` : '';
+    return `<div class="flt"><div class="seg" role="group" aria-label="Filter">${[['mine', 'Mine', mine.length], ['rr', 'Review requested', rr.length], ['all', 'All', PRS.length]].map(([k, l, n]) => `<button aria-pressed="${V.flt === k}" data-flt="${k}">${l}</button>`).join('')}</div></div>${body}${det}`;
+  }
+  function setupSidebar(win) {
+    const sb = win.querySelector('.sidebar'), flt = sb.querySelector('.sbfilter'), tree = sb.querySelector('.tree');
+    const nOpen = PRS.filter((p) => p.st === 'open' || p.st === 'draft').length;
+    const tabs = G.h(`<div class="sbtabs"><div class="seg" role="group" aria-label="Sidebar view"><button data-tab="repo" aria-pressed="true">Repository</button><button data-tab="pr" aria-pressed="false" data-tip="Pull requests" aria-label="Pull requests, ${nOpen} open">PRs <span class="counter">${nOpen}</span></button></div></div>`);
+    sb.insertBefore(tabs, flt);
+    const panel = G.h('<div class="prpanel" hidden></div>'); sb.appendChild(panel);
+    tree.querySelectorAll('.node[data-kind=branch]').forEach((n) => { const p = prFor(n.dataset.name); if (p) { n.insertAdjacentHTML('beforeend', prBadge(p)); n.classList.add('hrem'); n.dataset.tip = n.dataset.name; /* label truncates, badge stays visible */ } });
+    win._sb = { tabs, flt, tree, panel };
+    const draw = () => { panel.innerHTML = panelHTML(); tabs.querySelectorAll('[data-tab]').forEach((b) => b.setAttribute('aria-pressed', b.dataset.tab === V.tab)); flt.hidden = tree.hidden = V.tab === 'pr'; panel.hidden = V.tab !== 'pr'; };
+    win._sbDraw = draw; draw();
+    tabs.addEventListener('click', (e) => { const b = e.target.closest('[data-tab]'); if (b) { V.tab = b.dataset.tab; draw(); } });
+    panel.addEventListener('click', (e) => {
+      const f = e.target.closest('[data-flt]'), r = e.target.closest('[data-prrow]');
+      if (f) { V.flt = f.dataset.flt; V.sel = null; draw(); }
+      else if (r) { V.sel = +r.dataset.prrow; draw(); }
+      else if (e.target.closest('[data-prop]')) opened(win, 'github.com');
+      else if (e.target.closest('[data-prco]')) checkout(win, PRS.find((p) => p.n === V.sel));
+      else if (e.target.closest('[data-reco]')) H.accountDialog(win, { mode: 'reconnect', existing: [], st: { svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'token', login: 'mira-k' }, onDone: () => { V.pstate = 'list'; draw(); toast(win, 'Reconnected github.com · mira-k', 'ok'); } });
+    });
+  }
+
+  /* ---------- Clone dialog: new “From account” tab ---------- */
+  const REPOS = {
+    a1: [{ o: 'mira-k', n: 'gitwarp', d: 'A fast, keyboard-first git client built with GPUI', u: '2 h ago' }, { o: 'mira-k', n: 'dotfiles', d: 'Shell, editor and window manager configs', priv: 1, u: '3 days ago' }, { o: 'mira-k', n: 'tree-sitter-rust', d: '', fork: 1, u: '2 weeks ago' }, { o: 'nexu-io', n: 'open-design', d: 'Local-first design workspace', u: 'yesterday' }, { o: 'mira-k', n: 'old-notes', d: 'Notes from 2022, read-only', arch: 1, priv: 1, u: '3 years ago' }],
+    a2: [{ o: 'acme', n: 'payments-api', d: 'Internal payments service', priv: 1, u: '1 h ago' }, { o: 'acme', n: 'web-app', d: 'Customer web application', priv: 1, u: '5 h ago' }, { o: 'acme', n: 'infra', d: 'Terraform modules', priv: 1, u: '4 days ago' }, { o: 'acme', n: 'design-system', d: 'Shared UI components', u: '2 weeks ago' }],
+    a3: [{ o: 'mira-k', n: 'notes', d: 'Personal notes', priv: 1, u: 'yesterday' }, { o: 'mira-k', n: 'gitwarp-site', d: 'Landing page', u: '1 week ago' }],
+    a4: [{ o: 'modsen', n: 'backend', d: 'Core API', priv: 1, u: '3 h ago' }, { o: 'modsen', n: 'mobile-app', d: '', priv: 1, u: 'yesterday' }],
+    a5: [], a6: []
+  };
+  function cloneDlg(w, o) {
+    const accts = H.accounts();
+    const st = Object.assign({ tab: 'acct', acct: 'a1', q: '', phase: 'list', sel: null, url: '', dest: '~/develop', name: '' }, o || {});
+    st._a = st.acct; /* the account the list was loaded for; a change of account resets the selection */
+    const A = () => accts.find((a) => a.id === st.acct);
+    const urlOf = (r) => `https://${A().host}/${r.o}/${r.n}.git`;
+    const tabs = () => `<div class="seg dtabs" role="group" aria-label="Clone source"><button type="button" data-do="tab" data-v="url" aria-pressed="${st.tab === 'url'}">${ic('link', 14)}URL</button><button type="button" data-do="tab" data-v="acct" aria-pressed="${st.tab === 'acct'}">${ic('user', 14)}From account</button></div>`;
+    const repoRow = (r) => `<button type="button" class="repoitem" data-do="repo" data-v="${r.o}/${r.n}" aria-selected="${st.sel === r.o + '/' + r.n}">${ic(r.arch ? 'archive' : r.fork ? 'fork' : 'repo', 16)}<span class="rn"><span><span class="own">${esc(r.o)}/</span>${esc(r.n)}</span>${r.priv ? `<span class="tagc">${ic('lock', 10)}Private</span>` : ''}${r.fork ? `<span class="tagc">${ic('fork', 10)}Fork</span>` : ''}${r.arch ? `<span class="tagc">${ic('archive', 10)}Archived</span>` : ''}</span><span class="when">${r.u}</span>${r.d ? `<span class="rd">${esc(r.d)}</span>` : ''}</button>`;
+    const body = (s) => {
+      if (s.tab === 'url') return `<div class="col10">${tabs()}${S.dfield('Repository URL <span class="req" aria-hidden="true">*</span>', 'url', S.din('url', s.url, 'https://host/user/repo.git', { mono: 1 }), 'HTTPS or SSH address.')}<div class="pair">${S.dfield('Folder', 'dest', S.din('dest', s.dest, '~/develop', { mono: 1 }))}${S.dfield('Folder name', 'name', S.din('name', s.name, 'repo'))}</div></div>`;
+      const a = A(); let list;
+      const rep = (REPOS[a.id] || []).filter((r) => !s.q.trim() || (r.o + '/' + r.n + ' ' + r.d).toLowerCase().includes(s.q.trim().toLowerCase()));
+      if (s.phase === 'loading') list = `<div class="repolist" aria-busy="true">${[58, 72, 44, 66].map((w) => `<div class="repoitem" style="pointer-events:none"><span class="skel" style="width:16px;height:16px"></span><span class="skel" style="width:${w}%"></span><span class="skel" style="width:48px"></span></div>`).join('')}</div><div class="waitline" role="status">${ic('fetch', 14, 'spin')}<span>Loading repositories from ${esc(a.host)}…</span></div>`;
+      else if (s.phase === 'error' || a.status === 'invalid') list = `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">Couldn’t load repositories</div><div>The token for ${esc(a.login)} on ${esc(a.host)} was revoked. Reconnect the account to see its repositories.</div><div style="margin-top:8px">${S.dbtn('Reconnect', { act: 'reco', kind: 'primary' })}</div></div></div>`;
+      else if (!(REPOS[a.id] || []).length) list = `<div class="repolist"><div class="empty"><b>No repositories yet</b><p style="margin:0">${esc(a.login)} has no repositories on ${esc(a.host)}. Paste an address on the URL tab to clone someone else’s.</p></div></div>`;
+      else if (!rep.length) list = `<div class="repolist"><div class="empty"><b>No repositories match “${esc(s.q)}”</b><p style="margin:0">Check the spelling, or clear the search to see all ${(REPOS[a.id] || []).length}.</p></div></div>`;
+      else list = `<div class="repolist" role="listbox" aria-label="Repositories">${rep.map(repoRow).join('')}</div>`;
+      const sel = s.sel && (REPOS[a.id] || []).find((r) => r.o + '/' + r.n === s.sel);
+      return `<div class="col10">${tabs()}
+        <div class="pair">${S.dfield('Account', 'acct', `<select class="input select" id="acct" data-f="acct" aria-label="Account">${accts.map((x) => `<option value="${x.id}"${x.id === s.acct ? ' selected' : ''}>${esc(H.label(x))} · ${esc(x.host)}</option>`).join('')}</select>`)}${S.dfield('Search', 'q', `<input class="input" id="q" data-f="q" value="${esc(s.q)}" placeholder="Search repositories" autocomplete="off"${s.phase === 'loading' || (a.status === 'invalid') ? ' disabled' : ''}>`)}</div>
+        ${list}
+        ${sel ? `${S.dfield('Repository URL', 'u', `<input class="input mono" id="u" value="${esc(urlOf(sel))}" readonly style="font-family:var(--font-mono);font-size:12px">`)}<div class="pair">${S.dfield('Folder', 'dest', S.din('dest', s.dest, '~/develop', { mono: 1 }))}${S.dfield('Folder name', 'name', S.din('name', s.name || sel.n, sel.n))}</div>` : `<div class="field-help">Select a repository to fill in the address and folder.</div>`}</div>`;
+    };
+    return S.dialog(w, { st, width: 600,
+      view: (s) => { if (s.acct !== s._a) { s._a = s.acct; s.sel = null; s.q = ''; if (s.phase !== 'loading') s.phase = 'list'; } const ok = s.tab === 'acct' ? !!s.sel : /^(https?:\/\/|git@)\S+/.test(s.url.trim()); return { title: 'Clone repository', icon: 'clone', body: body(s), foot: S.dbtn('Cancel') + S.dbtn('Clone', { kind: 'primary', act: 'clone', dis: !ok, def: 1 }) }; },
+      actions: { tab: (s, api, d) => { s.tab = d.dataset.v; }, repo: (s, api, d) => { s.sel = d.dataset.v; s.name = ''; }, clone: (s, api) => { api.close(); toast(w, 'Cloning ' + (s.tab === 'acct' ? s.sel : s.url.trim()) + '…', 'info'); return false; },
+        reco: (s, api) => H.accountDialog(w, { mode: 'reconnect', existing: [], st: { svc: A().svc, step: 3, inst: H.isPublic(A().svc, A().host) ? 'public' : 'self', url: 'https://' + A().host, probe: 'ok', method: 'token', login: A().login }, onDone: () => { A().status = 'ok'; REPOS[s.acct] = REPOS[s.acct].length ? REPOS[s.acct] : [{ o: A().login, n: 'dotfiles', d: 'Shell and editor configs', priv: 1, u: '1 week ago' }]; s.phase = 'list'; api.redraw(); toast(w, 'Reconnected ' + A().host + ' · ' + A().login, 'ok'); } }) } });
+  }
+
+  /* ---------- Create pull request / merge request ---------- */
+  const REM = { origin: { svc: 'github', host: 'github.com', acc: 'mira-k', name: 'GitHub', term: 'pull request' }, work: { svc: 'gitlab', host: 'gitlab.modsen.app', acc: 'yegor.cheprasov', name: 'GitLab', term: 'merge request' } };
+  function createPR(w, o) {
+    const st = Object.assign({ head: 'feat/idle-lanes', remote: 'origin', base: 'main', title: 'feat(graph): collapse idle lanes into a single gap lane', body: '- feat(graph): collapse idle lanes into a single gap lane\n- feat(graph): clip wide graphs with an edge fade and +N badge', draft: false, rv: [], notpushed: false, phase: 'form', err: null, touched: false, n: 147 }, o || {});
+    const R = () => REM[st.remote], cap = (t) => t[0].toUpperCase() + t.slice(1);
+    const body = (s) => {
+      const r = R();
+      if (s.phase === 'done') return `<div class="donecard"><span style="display:flex;justify-content:center;color:var(--success)">${ic(s.draft ? 'prDraft' : 'pr', 24)}</span><div style="min-width:0"><div class="t">#${s.n} ${esc(s.title)}</div><div class="d">${s.draft ? 'Draft ' : ''}${r.term} on ${esc(r.host)} · ${esc(s.head.length > 30 ? s.head.slice(0, 29) + '…' : s.head)} → ${esc(s.base)}</div></div></div>${s.pushed ? '<div class="field-help">The branch was pushed to origin first.</div>' : ''}`;
+      const errs = s.err === 'exists' ? S.dbanner('error', `A ${r.term} already exists`, `#142 already covers ${s.head} → ${s.base}. Open it instead of creating a duplicate.`).replace('</div></div>', `</div><div style="margin-top:8px">${S.dbtn('Open #142 on ' + r.name, { act: 'openex', icon: 'external' })}</div></div>`) : s.err === 'pushfail' ? `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">Could not push ${esc(s.head)}</div><div>Nothing was created. git said:</div><div class="errbox" style="margin-top:6px;max-width:none">! [rejected] ${esc(s.head)} -> ${esc(s.head)} (non-fast-forward)\nerror: failed to push some refs to 'origin'</div></div></div>` : '';
+      const titleErr = s.touched && !s.title.trim() ? 'Enter a title.' : '';
+      return `<div class="col10">${errs}${s.notpushed && s.err !== 'pushfail' ? S.dbanner('info', 'Branch is not pushed', `${s.head} will be pushed to ${s.remote} first, then the ${r.term} is created.`) : ''}
+        <div class="pair">${S.dfield('From', 'h', `<div class="lockline">${ic('branch', 14)}<span class="od-truncate mono" style="font-size:var(--fs-sm)">${esc(s.head)}</span></div>`, '2 commits will be included.')}${S.dfield('Into', 'rem', `<div class="od-row"><select class="input select" id="rem" data-f="remote" aria-label="Target remote" style="flex:1.4">${Object.entries(REM).map(([k, v]) => `<option value="${k}"${k === s.remote ? ' selected' : ''}>${k} · ${esc(v.host)}</option>`).join('')}</select><select class="input select" id="base" data-f="base" aria-label="Target branch" style="flex:1">${['main', 'release/0.3'].map((b) => `<option${b === s.base ? ' selected' : ''}>${b}</option>`).join('')}</select></div>`, `As ${esc(r.acc)} on ${esc(r.host)}.`)}</div>
+        ${S.dfield('Title <span class="req" aria-hidden="true">*</span>', 'title', S.din('title', s.title, 'Summarise the change'), '', titleErr)}
+        ${S.dfield('Description', 'body', `<textarea class="input" id="body" data-f="body" rows="${s.err ? 3 : 5}" placeholder="What changed and why?" style="font-family:var(--font-mono);font-size:12px">${esc(s.body)}</textarea>`, 'Filled in from the commit messages.')}
+        <div class="fld2"><span class="field-label" id="rvl">Reviewers (optional)</span><div class="rvlist" role="list" aria-labelledby="rvl">${s.rv.map((x) => `<span class="rvchip" role="listitem">${ic('user', 12)}${esc(x)}<button type="button" data-do="rmrv" data-v="${x}" aria-label="Remove ${esc(x)}" data-tip="Remove">${ic('x', 12)}</button></span>`).join('')}${['lin-zhao', 'priya-n', 'tomas-r'].filter((x) => !s.rv.includes(x)).map((x) => `<button type="button" class="btn btn-sm btn-ghost" data-do="addrv" data-v="${x}">${ic('plus', 12)}${x}</button>`).join('')}</div></div>
+        ${S.dchk('draft', s.draft, 'Create as draft')}</div>`;
+    };
+    return S.dialog(w, { st, width: 600, busy: (s) => s.phase === 'creating',
+      view: (s) => {
+        const r = R(), busy = s.phase === 'creating';
+        if (s.phase === 'done') return { title: `${cap(r.term)} created`, icon: 'check', body: body(s), foot: S.dbtn('Close') + S.dbtn('Open on ' + r.name, { kind: 'primary', act: 'open', icon: 'external', def: 1, af: 1 }) };
+        return { title: `Create ${r.term}`, icon: s.draft ? 'prDraft' : 'pr', body: body(s), foot: `<span class="foot-hint">${esc(r.acc)} · ${esc(r.host)}</span>` + S.dbtn('Cancel', { dis: busy }) + S.dbtn(busy ? (s.notpushed ? 'Pushing and creating…' : 'Creating…') : `Create ${s.draft ? 'draft ' : ''}${r.term}`, { kind: 'primary', act: 'create', dis: busy || (s.touched && !s.title.trim()), def: 1 }) };
+      },
+      actions: {
+        addrv: (s, api, d) => { s.rv.push(d.dataset.v); }, rmrv: (s, api, d) => { s.rv = s.rv.filter((x) => x !== d.dataset.v); },
+        openex: () => opened(w, REM[st.remote].host), open: (s, api) => { api.close(); opened(w, R().host + '/pull/' + s.n); return false; },
+        create: (s, api) => { if (!s.title.trim()) { s.touched = true; return; } s.err = null; s.phase = 'creating'; api.redraw(); setTimeout(() => { if (!api.el.isConnected) return; s.phase = 'done'; s.pushed = s.notpushed; api.redraw(); }, 1100); return false; }
+      } });
+  }
+
+  /* ---------- window ---------- */
+  const centerFn = (sh, win) => {
+    sh.center.innerHTML = '<div class="hist-host" style="display:flex;flex:1;min-width:0;min-height:0;width:100%"></div><div class="hdet" id="hdet" style="flex:none;height:262px"></div>';
+    sh.center.style.flexDirection = 'column';
+    const host = sh.center.querySelector('.hist-host');
+    const hist = G.history(host, G.commits, { gw: 112, onSelect: (c, i) => { V.cur = c; V.idx = i; renderDetails(win); } });
+    win._hist = hist;
+    const lb = host.querySelector('.lbody');
+    const deco = () => lb.querySelectorAll('.lrow').forEach((r) => { if (r.dataset.dec) return; r.dataset.dec = '1'; const ci = CIX[+r.dataset.i], sm = r.querySelector('.summary'); if (ci && sm) sm.insertAdjacentHTML('afterbegin', ciG(ci)); r.querySelectorAll('.ref[data-rt=br]').forEach((rf) => { const p = prFor(rf.dataset.rn); if (p) rf.insertAdjacentHTML('afterend', prBadge(p)); }); });
+    new MutationObserver(deco).observe(lb, { childList: true }); deco();
+    setupSidebar(win); renderDetails(win);
+  };
+  const base = (w, o) => { o = o || {}; closePop(w); V.tab = o.tab || 'repo'; V.flt = o.flt || 'mine'; V.pstate = o.pstate || 'list'; V.sel = o.sel || null; V.cstate = o.cstate || null; w._sbDraw(); if (o.row != null) w._hist.select(o.row, false); else if (V.idx !== 0) w._hist.select(0, false); renderDetails(w); };
+  const tick = (ms, f) => setTimeout(f, ms);
+  const popAt = (w, n) => { const el = w.querySelector(`.lbody .prb[data-pr="${n}"]`) || w.querySelector(`.tree .prb[data-pr="${n}"]`); openPop(w, el, PRS.find((p) => p.n === n)); };
+  const scenes = [
+    ['Menu: commit row, Open on GitHub', (w) => { base(w, { row: 2 }); G.menu(w, anchor(w, '.lbody .lrow[data-i="2"]', 120), commitItems(w)); }],
+    ['Menu: commit that has a pull request', (w) => { base(w, { row: 2 }); G.menu(w, anchor(w, '.lbody .lrow[data-i="2"]', 120), commitItems(w)); }],
+    ['Menu: commit on two hosts (origin + publish)', (w) => { base(w, { row: 3 }); G.menu(w, anchor(w, '.lbody .lrow[data-i="3"]', 120), commitItems(w, true)); }],
+    ['Menu: branch with a pull request', (w) => { base(w); G.menu(w, anchor(w, '.tree .node[data-name="feat/idle-lanes"]', 30), branchItems(w, 'feat/idle-lanes')); }],
+    ['Menu: branch without a pull request', (w) => { base(w); G.menu(w, anchor(w, '.tree .node[data-name="fix/tree-filter"], .tree .node[data-name="main"]', 30), branchItems(w, 'main')); }],
+    ['Menu: tag', (w) => { base(w); G.menu(w, anchor(w, '.tree .node[data-kind=tag]', 30), tagItems(w)); }],
+    ['Menu: file in commit details', (w) => { base(w); G.menu(w, anchor(w, '#hdet .frow', 60), fileItems(w, 'src/history/graph.rs')); }],
+    ['Commit details: Open on GitHub + checks (passed)', (w) => base(w, { row: 2 })],
+    ['Commit details: checks with a failure', (w) => base(w, { row: 4 })],
+    ['Commit details: checks running', (w) => base(w, { row: 1 })],
+    ['Commit details: checks cancelled', (w) => base(w, { row: 6 })],
+    ['Commit details: loading checks', (w) => base(w, { row: 2, cstate: 'loading' })],
+    ['Commit details: no checks configured', (w) => base(w, { row: 0, cstate: 'none' })],
+    ['Commit details: couldn’t load checks', (w) => base(w, { row: 2, cstate: 'error' })],
+    ['Clone: From account, loading', (w) => { base(w); cloneDlg(w, { phase: 'loading' }); }],
+    ['Clone: From account, repository list', (w) => { base(w); cloneDlg(w); }],
+    ['Clone: From account, repository selected', (w) => { base(w); cloneDlg(w, { sel: 'mira-k/gitwarp' }); }],
+    ['Clone: From account, search with no match', (w) => { base(w); cloneDlg(w, { q: 'zzz' }); }],
+    ['Clone: From account, work account (private repos)', (w) => { base(w); cloneDlg(w, { acct: 'a2' }); }],
+    ['Clone: From account, no repositories', (w) => { base(w); cloneDlg(w, { acct: 'a6' }); }],
+    ['Clone: From account, token revoked (error)', (w) => { base(w); cloneDlg(w, { acct: 'a5' }); }],
+    ['Clone: URL tab (existing) next to From account', (w) => { base(w); cloneDlg(w, { tab: 'url', url: 'https://github.com/nexu-io/open-design.git' }); }],
+    ['PR badges: sidebar + history (open, draft, merged, closed)', (w) => base(w)],
+    ['PR popover: open, approved, checks passed', (w) => { base(w); tick(0, () => popAt(w, 142)); }],
+    ['PR popover: draft, checks running', (w) => { base(w); tick(0, () => popAt(w, 139)); }],
+    ['PR popover: merged', (w) => { base(w); tick(0, () => popAt(w, 131)); }],
+    ['PR popover: closed, changes requested', (w) => { base(w); tick(0, () => popAt(w, 128)); }],
+    ['Create pull request: ready', (w) => { base(w); createPR(w); }],
+    ['Create pull request: branch not pushed', (w) => { base(w); createPR(w, { notpushed: true }); }],
+    ['Create pull request: draft with reviewers', (w) => { base(w); createPR(w, { draft: true, rv: ['lin-zhao'] }); }],
+    ['Create pull request: title missing', (w) => { base(w); createPR(w, { title: '', touched: true }); }],
+    ['Create pull request: creating', (w) => { base(w); createPR(w, { phase: 'creating', notpushed: true }); }],
+    ['Create pull request: created', (w) => { base(w); createPR(w, { phase: 'done' }); }],
+    ['Create pull request: already exists', (w) => { base(w); createPR(w, { err: 'exists' }); }],
+    ['Create pull request: push failed', (w) => { base(w); createPR(w, { err: 'pushfail', notpushed: true }); }],
+    ['Create merge request (GitLab remote)', (w) => { base(w); createPR(w, { remote: 'work', head: 'fix/git-detect', title: 'fix(settings): list both reasons when git fails', notpushed: true }); }],
+    ['Pull requests panel: Mine', (w) => base(w, { tab: 'pr' })],
+    ['Pull requests panel: Review requested', (w) => base(w, { tab: 'pr', flt: 'rr' })],
+    ['Pull requests panel: All', (w) => base(w, { tab: 'pr', flt: 'all' })],
+    ['Pull requests panel: one selected (Checkout)', (w) => base(w, { tab: 'pr', flt: 'all', sel: 142 })],
+    ['Pull requests panel: merged selected', (w) => base(w, { tab: 'pr', flt: 'all', sel: 131 })],
+    ['Pull requests panel: loading', (w) => base(w, { tab: 'pr', pstate: 'loading' })],
+    ['Pull requests panel: empty', (w) => base(w, { tab: 'pr', flt: 'rr', pstate: 'empty' })],
+    ['Pull requests panel: token revoked (error)', (w) => base(w, { tab: 'pr', pstate: 'error' })]
+  ];
+  const page = D.page('Hosting features', scenes, centerFn, { label: 'Feature state', reopen: 'Replay state' });
+  const win = page.win;
+
+  /* ---------- live behaviour (works in every state) ---------- */
+  const capture = (el, type, fn) => el.addEventListener(type, fn, true);
+  capture(win.querySelector('.lbody'), 'contextmenu', (e) => { const r = e.target.closest('.lrow'); if (!r) return; e.stopPropagation(); e.preventDefault(); win._hist.select(+r.dataset.i, false); G.menu(win, e, commitItems(win)); });
+  capture(win.querySelector('.tree'), 'contextmenu', (e) => { const n = e.target.closest('.node'); if (!n || !['branch', 'tag'].includes(n.dataset.kind)) return; e.stopPropagation(); e.preventDefault(); G.menu(win, e, n.dataset.kind === 'tag' ? tagItems(win) : branchItems(win, n.dataset.name)); });
+  win.querySelector('#hdet').addEventListener('contextmenu', (e) => { const f = e.target.closest('.frow'); if (f) { e.preventDefault(); G.menu(win, e, fileItems(win, f.dataset.file)); } });
+  win.querySelector('#hdet').addEventListener('click', (e) => {
+    if (e.target.closest('[data-open]')) opened(win, 'github.com/mira-k/gitwarp/commit/' + V.cur.hash);
+    else if (e.target.closest('[data-copylink]')) toast(win, 'Copied link to ' + V.cur.hash, 'ok');
+    else if (e.target.closest('[data-chkopen]')) opened(win, 'github.com (check run)');
+    else if (e.target.closest('[data-retry]')) { V.cstate = 'loading'; renderDetails(win); tick(900, () => { V.cstate = null; renderDetails(win); }); }
+  });
+  win.addEventListener('click', (e) => { const b = e.target.closest('.prb[data-pr]'); if (b && !b.closest('.pop')) { e.stopPropagation(); openPop(win, b, PRS.find((p) => p.n === +b.dataset.pr)); } }, true);
+})();
+</script>
+</body>
+</html>
