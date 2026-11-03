@@ -85,7 +85,7 @@ deb_depends() {
     rm -rf "$tmp"
     deps="${deps#shlibs:Depends=}"
     printf '%s\n' "$deps, libvulkan1, libwayland-client0, libxkbcommon0, libxkbcommon-x11-0, libfontconfig1, libfreetype6" \
-        | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF && !seen[$0]++' | paste -sd, - | sed 's/,/, /g'
+        | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF && !seen[$1]++' | paste -sd, - | sed 's/,/, /g'
 }
 
 build_deb() {
