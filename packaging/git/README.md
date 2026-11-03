@@ -46,7 +46,7 @@ rolling-release dev machine.
 ## Updating the pin
 
 1. Pick the new git version. For Linux/macOS take the tarball URL from
-   <https://mirrors.edge.kernel.org/pub/software/scm/git/> and its SHA-256
+   <https://cdn.kernel.org/pub/software/scm/git/> and its SHA-256
    from `sha256sums.asc` in the same directory.
 2. For Windows take the latest `MinGit-<ver>-64-bit.zip` (not busybox) from
    <https://github.com/git-for-windows/git/releases> and the SHA-256 listed in

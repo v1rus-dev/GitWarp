@@ -40,7 +40,9 @@ sha256_of() {
 
 # fetch <url> <sha256> <file-in-dl-dir>; refuses anything whose sum differs.
 fetch() {
+  # Retries: runners occasionally fail to connect to the download host (curl exit 28).
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 30 --retry 4 --retry-delay 5 \
     --output "$work/dl/$3" "$1"
   local got
   got=$(sha256_of "$work/dl/$3")

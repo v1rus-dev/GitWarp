@@ -136,6 +136,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Only for packaging/release-notes.md.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
@@ -155,7 +159,8 @@ jobs:
           PRERELEASE: ${{ needs.version.outputs.prerelease }}
         run: |
           set -euo pipefail
-          args=(--verify-tag --generate-notes --title "GitWarp $VERSION")
+          # gh puts the notes file first and appends the generated notes after it.
+          args=(--verify-tag --notes-file packaging/release-notes.md --generate-notes --title "GitWarp $VERSION")
           if [ "$PRERELEASE" = "true" ]; then
             args+=(--prerelease)
           fi
