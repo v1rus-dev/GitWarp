@@ -5,7 +5,7 @@
 //! the answer: the status snapshot, the selected file's diff and the picks the
 //! user made for line-level staging.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1761,6 +1761,51 @@ fn status_letter(file: &WorkingFile) -> char {
     }
 }
 
+/// Changed paths of the work tree, grouped the way the sidebar's view nav
+/// shows them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChangeCounts {
+    /// Added and untracked paths.
+    pub added: usize,
+    /// Modified, renamed, copied, type-changed and conflicted paths.
+    pub modified: usize,
+    pub deleted: usize,
+}
+
+impl ChangeCounts {
+    pub fn is_empty(self) -> bool {
+        self.added == 0 && self.modified == 0 && self.deleted == 0
+    }
+}
+
+/// Counts the unique changed paths in `status`: a path on both sides of the
+/// index counts once, with the unstaged kind when the two differ. `None`
+/// (status loading or failed) counts nothing.
+pub fn change_counts(status: Option<&WorkingStatus>) -> ChangeCounts {
+    let Some(status) = status else {
+        return ChangeCounts::default();
+    };
+    // The index is the older state of a path; the work tree overrides it.
+    let mut files: HashMap<&str, &WorkingFile> = HashMap::new();
+    for file in &status.staged {
+        files.insert(file.path.as_str(), file);
+    }
+    for file in &status.unstaged {
+        files.insert(file.path.as_str(), file);
+    }
+    let mut counts = ChangeCounts::default();
+    for file in files.values() {
+        if file.untracked || file.kind == ChangeKind::Added {
+            counts.added += 1;
+        } else if file.kind == ChangeKind::Deleted {
+            counts.deleted += 1;
+        } else {
+            counts.modified += 1;
+        }
+    }
+    counts
+}
+
 /// The subject length and the longest body line, for the counters.
 fn message_counters(text: &str) -> (usize, usize) {
     let mut lines = text.split('\n');
@@ -1990,9 +2035,77 @@ mod tests {
     }
 
     #[test]
+    fn change_counts_are_empty_without_a_status() {
+        assert_eq!(change_counts(None), ChangeCounts::default());
+        assert!(change_counts(Some(&WorkingStatus::default())).is_empty());
+    }
+
+    #[test]
+    fn change_counts_group_paths_by_kind() {
+        let status = WorkingStatus {
+            staged: vec![
+                working_file("a.txt", ChangeKind::Added, false),
+                working_file("b.txt", ChangeKind::Deleted, false),
+            ],
+            unstaged: vec![
+                working_file("c.txt", ChangeKind::Added, true),
+                working_file("d.txt", ChangeKind::Modified, false),
+                working_file("e.txt", ChangeKind::Renamed, false),
+                working_file("f.txt", ChangeKind::Other('U'), false),
+            ],
+            ..WorkingStatus::default()
+        };
+        assert_eq!(
+            change_counts(Some(&status)),
+            ChangeCounts {
+                added: 2,
+                modified: 3,
+                deleted: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn change_counts_count_a_path_on_both_sides_once() {
+        let status = WorkingStatus {
+            staged: vec![
+                working_file("a.txt", ChangeKind::Added, false),
+                working_file("b.txt", ChangeKind::Deleted, false),
+            ],
+            unstaged: vec![
+                working_file("a.txt", ChangeKind::Modified, false),
+                working_file("b.txt", ChangeKind::Modified, false),
+            ],
+            ..WorkingStatus::default()
+        };
+        // The work tree's kind wins: both paths count as modified, once each.
+        assert_eq!(
+            change_counts(Some(&status)),
+            ChangeCounts {
+                added: 0,
+                modified: 2,
+                deleted: 0,
+            }
+        );
+    }
+
+    #[test]
     fn a_single_line_diff_is_never_narrower_than_the_pane() {
         assert!(diff_width(px(7.), 4, 400.) >= px(400.));
         assert!(split_width(400.) >= px(400.));
+    }
+
+    /// A changed file of `path`, for the counter tests.
+    fn working_file(path: &str, kind: ChangeKind, untracked: bool) -> WorkingFile {
+        WorkingFile {
+            kind,
+            old_path: None,
+            path: path.into(),
+            added: 1,
+            deleted: 0,
+            binary: false,
+            untracked,
+        }
     }
 
     /// Writes `content` to `file` under `dir`, creating parent directories.

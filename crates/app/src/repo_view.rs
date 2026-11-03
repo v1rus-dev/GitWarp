@@ -24,7 +24,7 @@ use gpui::{
 use git_core::network::{FetchOptions, Progress};
 use git_core::{ChangedFile, CommitDetails, CommitInfo, Error, Git, Head, Oid, RefKind, Repo};
 use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
-use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, R_SM, STATUS};
+use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, FS_XS, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
     menu, toast, Avatar, Banner, BannerKind, Button, ButtonSize, CiGlyph, CountPill, Counter,
@@ -34,7 +34,7 @@ use ui::{
 };
 
 use crate::activity_strip::ActivityStrip;
-use crate::changes_view::{ChangesEvent, ChangesView};
+use crate::changes_view::{change_counts, ChangesEvent, ChangesView};
 use crate::create_pr_dialog::{self, CreatePrDialog, PrDialogContext, PushRun};
 use crate::details::{read_details, read_diff, DetailsState, DiffState};
 use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
@@ -457,6 +457,8 @@ pub struct RepositoryView {
     activity: Entity<ActivityStrip>,
     changes: Entity<ChangesView>,
     _changes_observer: Subscription,
+    /// Redraws the sidebar's change counters when the status reloads.
+    _changes_redraw: Subscription,
     worktrees: Entity<WorktreesView>,
     /// The worktree list shared by the Worktrees page, the sidebar panel and,
     /// next, the titlebar switcher.
@@ -721,6 +723,7 @@ impl RepositoryView {
                 ChangesEvent::PushAfterCommit => this.push_branch(window, cx),
             },
         );
+        let changes_redraw = cx.observe(&changes, |_, _, cx| cx.notify());
         let worktrees_model =
             cx.new(|cx| WorktreesModel::new(path.clone(), git.clone(), workspace.clone(), cx));
         let worktrees = cx.new(|cx| WorktreesView::new(worktrees_model.clone(), window, cx));
@@ -814,6 +817,7 @@ impl RepositoryView {
             activity,
             changes,
             _changes_observer: changes_observer,
+            _changes_redraw: changes_redraw,
             worktrees,
             worktrees_model,
             _worktrees_observer: worktrees_observer,
@@ -4081,39 +4085,27 @@ impl RepositoryView {
             push,
         );
 
-        let mut bar = titlebar(cx)
-            .gap(px(layout.gap))
-            .px(px(layout.padding))
-            .child(no_shrink(sidebar_toggle))
-            .child(repo_switcher)
-            .child(branch_switcher)
-            .when(layout.worktree_button, |bar| bar.child(worktree_switcher))
-            .child(no_shrink(
-                div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(colors.border),
-            ))
-            .child(no_shrink(fetch_button))
-            .child(no_shrink(pull_button))
-            .child(no_shrink(push_button))
-            .child(no_shrink(stash_button))
-            .child(titlebar_fill());
-
-        let history_item = if layout.labels {
-            SegmentItem::new(ui::t!("repo.toolbar.view_history")).with_icon(IconName::Lanes)
-        } else {
-            SegmentItem::icon(IconName::Lanes)
-        };
-        let changes_item = if layout.labels {
-            SegmentItem::new(ui::t!("repo.toolbar.view_changes")).with_icon(IconName::Edit)
-        } else {
-            SegmentItem::icon(IconName::Edit)
-        };
-        let worktrees_item = if layout.labels {
-            SegmentItem::new(ui::t!("repo.toolbar.view_worktrees")).with_icon(IconName::Worktree)
-        } else {
-            SegmentItem::icon(IconName::Worktree)
-        };
-        let switch_view = cx.entity();
-        bar = bar.child(no_shrink(
+        // The sidebar carries the view nav while it is open; collapsing it
+        // keeps the switcher in the titlebar, right beside the toggle, so
+        // navigation is never lost.
+        let view_switch = (!self.sidebar_open).then(|| {
+            let history_item = if layout.labels {
+                SegmentItem::new(ui::t!("repo.toolbar.view_history")).with_icon(IconName::Lanes)
+            } else {
+                SegmentItem::icon(IconName::Lanes)
+            };
+            let changes_item = if layout.labels {
+                SegmentItem::new(ui::t!("repo.toolbar.view_changes")).with_icon(IconName::Edit)
+            } else {
+                SegmentItem::icon(IconName::Edit)
+            };
+            let worktrees_item = if layout.labels {
+                SegmentItem::new(ui::t!("repo.toolbar.view_worktrees"))
+                    .with_icon(IconName::Worktree)
+            } else {
+                SegmentItem::icon(IconName::Worktree)
+            };
+            let switch_view = cx.entity();
             Segmented::new("view-switch")
                 .item(history_item)
                 .item(changes_item.tooltip(ui::t!("repo.toolbar.local_changes")))
@@ -4129,8 +4121,27 @@ impl RepositoryView {
                 .on_select(move |index, window, cx| {
                     let mode = view_for_segment(index);
                     switch_view.update(cx, |view, cx| view.set_view(mode, window, cx));
-                }),
-        ));
+                })
+        });
+
+        let mut bar = titlebar(cx)
+            .gap(px(layout.gap))
+            .px(px(layout.padding))
+            .child(no_shrink(sidebar_toggle))
+            .when_some(view_switch, |bar, view_switch| {
+                bar.child(no_shrink(view_switch))
+            })
+            .child(repo_switcher)
+            .child(branch_switcher)
+            .when(layout.worktree_button, |bar| bar.child(worktree_switcher))
+            .child(no_shrink(
+                div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(colors.border),
+            ))
+            .child(no_shrink(fetch_button))
+            .child(no_shrink(pull_button))
+            .child(no_shrink(push_button))
+            .child(no_shrink(stash_button))
+            .child(titlebar_fill());
 
         let mut field = SearchField::new("toolbar-search", self.search.clone());
         match self.history.read(cx).search_status() {
@@ -4177,6 +4188,110 @@ impl RepositoryView {
         ));
 
         titlebar_end(bar, client)
+    }
+
+    /// The History / Changes / Worktrees switcher at the very top of the
+    /// sidebar, as a short vertical list (Fork's sidebar header).
+    fn render_view_nav(&self, cx: &mut Context<Self>) -> Div {
+        let colors = cx.theme().colors;
+        let view = cx.entity();
+        let go = |mode: ViewMode| {
+            let view = view.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                view.update(cx, |view, cx| view.set_view(mode, window, cx));
+            }
+        };
+        let worktrees_tip = {
+            let tooltip = Tooltip::new(ui::t!("repo.toolbar.view_worktrees"));
+            match crate::settings_ui::keybindings::key_cap(cx, "worktree_switcher") {
+                Some(cap) => tooltip.kbd(cap),
+                None => tooltip,
+            }
+        };
+        div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .px(px(6.))
+            .pt(px(10.))
+            .pb(px(4.))
+            .child(view_nav_row(
+                "view-nav-history",
+                IconName::Lanes,
+                ui::t!("repo.toolbar.view_history"),
+                self.view == ViewMode::History,
+                None,
+                None,
+                colors,
+                go(ViewMode::History),
+            ))
+            .child(view_nav_row(
+                "view-nav-changes",
+                IconName::Edit,
+                ui::t!("repo.toolbar.view_changes"),
+                self.view == ViewMode::Changes,
+                Some(Tooltip::new(ui::t!("repo.toolbar.local_changes"))),
+                self.change_counters(cx),
+                colors,
+                go(ViewMode::Changes),
+            ))
+            .child(view_nav_row(
+                "view-nav-worktrees",
+                IconName::Worktree,
+                ui::t!("repo.toolbar.view_worktrees"),
+                self.view == ViewMode::Worktrees,
+                Some(worktrees_tip),
+                None,
+                colors,
+                go(ViewMode::Worktrees),
+            ))
+    }
+
+    /// The coloured `+N ~N −N` counters of the Changes row.
+    fn change_counters(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let counts = change_counts(self.changes.read(cx).status());
+        if counts.is_empty() {
+            return None;
+        }
+        let colors = cx.theme().colors;
+        let counter = |id: &'static str, value: String, color: Hsla, tooltip: SharedString| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_owned())
+                .text_size(FS_XS)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color)
+                .tooltip(Tooltip::text(tooltip))
+                .child(value)
+        };
+        let mut group = div().flex().items_center().gap(px(6.));
+        if counts.added > 0 {
+            group = group.child(counter(
+                "view-nav-count-added",
+                format!("+{}", counts.added),
+                colors.st_added,
+                ui::t!("repo.sidebar.nav.added", n = counts.added),
+            ));
+        }
+        if counts.modified > 0 {
+            group = group.child(counter(
+                "view-nav-count-modified",
+                format!("~{}", counts.modified),
+                colors.st_modified,
+                ui::t!("repo.sidebar.nav.modified", n = counts.modified),
+            ));
+        }
+        if counts.deleted > 0 {
+            group = group.child(counter(
+                "view-nav-count-deleted",
+                format!("−{}", counts.deleted),
+                colors.st_deleted,
+                ui::t!("repo.sidebar.nav.deleted", n = counts.deleted),
+            ));
+        }
+        Some(group.into_any_element())
     }
 
     fn render_sidebar(&mut self, width: f32, cx: &mut Context<Self>) -> Div {
@@ -4329,6 +4444,7 @@ impl RepositoryView {
             .bg(colors.sidebar)
             .border_r_1()
             .border_color(colors.border)
+            .child(self.render_view_nav(cx))
             .when_some(tabs, |this, tabs| this.child(tabs))
             .when(!show_prs, |this| {
                 this.child(div().w_full().px(px(10.)).pt(px(12.)).pb(px(8.)).child(
@@ -6801,6 +6917,63 @@ fn meta_row(label: SharedString, value: impl IntoElement, colors: ThemeColors) -
         .child(div().flex_1().min_w_0().child(value))
 }
 
+/// One row of the sidebar's view nav: icon + label, bold with an accent bar
+/// when active, and an optional trailing element (the change counters).
+#[allow(clippy::too_many_arguments)]
+fn view_nav_row(
+    id: &'static str,
+    icon: IconName,
+    label: SharedString,
+    active: bool,
+    tooltip: Option<Tooltip>,
+    trailing: Option<AnyElement>,
+    colors: ThemeColors,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let mut row = div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .relative()
+        .w_full()
+        .h(px(28.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(10.))
+        .rounded(R_SM)
+        .cursor_pointer()
+        .text_size(FS_SM)
+        .text_color(if active { colors.text } else { colors.muted })
+        .when(active, |row| {
+            row.font_weight(FontWeight::BOLD).child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(5.))
+                    .bottom(px(5.))
+                    .w(px(2.))
+                    .rounded_full()
+                    .bg(colors.accent),
+            )
+        })
+        .hover(move |style| style.bg(colors.hover))
+        .on_click(on_click)
+        .child(
+            Icon::new(icon)
+                .size(px(14.))
+                .color(if active { colors.text } else { colors.muted }),
+        )
+        .child(div().flex_1().min_w_0().truncate().child(label));
+    if let Some(trailing) = trailing {
+        row = row.child(trailing);
+    }
+    if let Some(tooltip) = tooltip {
+        row = row.tooltip(move |_, cx| cx.new(|_| tooltip.clone()).into());
+    }
+    row
+}
+
 /// The toolbar segment that shows `view`: History, Changes, Worktrees.
 fn segment_for_view(view: ViewMode) -> usize {
     match view {
@@ -7226,6 +7399,51 @@ mod tests {
         cx.run_until_parked();
         view.read_with(&cx, |view, _| assert_eq!(view.view, ViewMode::History));
         assert!(cx.debug_bounds("changes-view").is_none());
+    }
+
+    /// The sidebar carries the three view rows; collapsing it moves the
+    /// switcher into the titlebar, beside the sidebar toggle.
+    #[gpui::test]
+    fn the_view_nav_lives_at_the_top_of_the_sidebar(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("view-nav");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+
+        for id in ["view-nav-history", "view-nav-changes", "view-nav-worktrees"] {
+            assert!(cx.debug_bounds(id).is_some(), "{id} was not drawn");
+        }
+        assert!(cx.debug_bounds("view-switch-segment-0").is_none());
+
+        cx.update(|_, cx| view.update(cx, |view, cx| view.toggle_sidebar(cx)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("view-nav-history").is_none());
+        assert!(cx.debug_bounds("view-switch-segment-0").is_some());
+    }
+
+    /// The Changes row shows a coloured counter per changed path, and the
+    /// counters update when the status reloads.
+    #[gpui::test]
+    fn the_changes_row_counts_the_changed_paths(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("view-nav-counts");
+        commit(repo.path(), "a.txt", "one\n");
+        std::fs::write(repo.path().join("a.txt"), "two\n").unwrap();
+        std::fs::write(repo.path().join("new.txt"), "new\n").unwrap();
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("view-nav-count-added").is_some());
+        assert!(cx.debug_bounds("view-nav-count-modified").is_some());
+        assert!(cx.debug_bounds("view-nav-count-deleted").is_none());
+
+        std::fs::remove_file(repo.path().join("new.txt")).unwrap();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.changes.update(cx, |changes, cx| changes.refresh(cx));
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("view-nav-count-added").is_none());
+        assert!(cx.debug_bounds("view-nav-count-modified").is_some());
     }
 
     /// The Worktrees page replaces the history pane and lists the repository's
