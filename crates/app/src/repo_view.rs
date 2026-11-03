@@ -40,7 +40,7 @@ use crate::details::{read_details, read_diff, DetailsState, DiffState};
 use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
 use crate::format::{absolute_time, format_count, relative_time};
 use crate::history_state::LoadState;
-use crate::history_view::HistoryView;
+use crate::history_view::{HistoryEvent, HistoryView};
 use crate::hosting_status::{
     self, CiEntry, ErrorEffect, HostingState, HostingView, PrPopover, PrTrigger, Request, Target,
 };
@@ -453,6 +453,9 @@ pub struct RepositoryView {
     git_tooltip: SharedString,
     history: Entity<HistoryView>,
     _history_observer: Subscription,
+    /// Visible rows reach the fetcher through an event, so reading the history
+    /// in the handler is safe (the emitting update has finished).
+    _history_events: Subscription,
     /// The commit heatmap above the history table.
     activity: Entity<ActivityStrip>,
     changes: Entity<ChangesView>,
@@ -564,6 +567,11 @@ pub struct RepositoryView {
     hosting: HostingState,
     /// What the rows were last given, to skip a redraw that changes nothing.
     hosting_view: Arc<HostingView>,
+    /// The commits the history currently shows, as its last report said.
+    ci_visible: Vec<Oid>,
+    /// Whether the CI dots, the checks block and check requests are wanted;
+    /// mirrored from the settings and kept current while the view renders.
+    show_ci_status: bool,
     /// The `meta_version` of the history the tracking was last read at.
     hosting_meta_version: u64,
     /// What the next sidebar reload means for the pull request map: the
@@ -620,6 +628,13 @@ const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(30);
 /// How often the UI drains the job's progress channel.
 const NETWORK_POLL: Duration = Duration::from_millis(80);
 
+/// Whether the settings ask for CI status. Read fresh, so a toggle takes
+/// effect without waiting for the view to render.
+fn ci_status_enabled(cx: &App) -> bool {
+    cx.try_global::<crate::AppSettings>()
+        .is_none_or(|state| state.settings.show_ci_status)
+}
+
 impl RepositoryView {
     pub fn new(
         path: PathBuf,
@@ -666,6 +681,10 @@ impl RepositoryView {
                 });
             }));
         });
+        let history_events =
+            cx.subscribe(&history, |this, _, event: &HistoryEvent, cx| match event {
+                HistoryEvent::VisibleRowsChanged(oids) => this.set_visible_ci(oids.clone(), cx),
+            });
         let observer = cx.observe(&history, |this, history, cx| {
             // A repository opened from a subdirectory is remembered by its
             // root, so the switcher's "current" marker must follow it.
@@ -814,6 +833,7 @@ impl RepositoryView {
             git_tooltip,
             history,
             _history_observer: observer,
+            _history_events: history_events,
             activity,
             changes,
             _changes_observer: changes_observer,
@@ -890,6 +910,8 @@ impl RepositoryView {
             background_fetch_running: false,
             hosting: HostingState::default(),
             hosting_view: Arc::default(),
+            ci_visible: Vec::new(),
+            show_ci_status: settings.show_ci_status,
             hosting_meta_version: 0,
             hosting_trigger: PrTrigger::Open,
             pr_popover: None,
@@ -5703,6 +5725,9 @@ impl RepositoryView {
     /// Asks for the selected commit's checks once the selection has rested for
     /// 300 ms; a newer selection cancels the wait.
     fn schedule_selected_ci(&mut self, cx: &mut Context<Self>) {
+        if !ci_status_enabled(cx) {
+            return;
+        }
         self.ci_debounce = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(300))
@@ -5715,14 +5740,28 @@ impl RepositoryView {
         }));
     }
 
+    /// The history's visible rows changed: ask for their checks without
+    /// waiting for the re-check timer.
+    fn set_visible_ci(&mut self, oids: Vec<Oid>, cx: &mut Context<Self>) {
+        if self.ci_visible == oids {
+            return;
+        }
+        self.ci_visible = oids;
+        self.hosting_fetch_ci(cx);
+    }
+
     /// Starts the 30 s re-check while a commit on screen has pending checks and
     /// the window is active. The loop ends itself when neither holds.
     fn ensure_ci_timer(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.ci_timer.is_some()
+        if !ci_status_enabled(cx)
+            || self.ci_timer.is_some()
             || !window.is_window_active()
-            || !self
-                .hosting
-                .has_pending_ci(self.details_oid, self.head_oid(cx))
+            || !self.hosting.has_pending_ci(
+                self.details_oid,
+                self.head_oid(cx),
+                &self.ci_visible,
+                true,
+            )
         {
             return;
         }
@@ -5742,9 +5781,16 @@ impl RepositoryView {
 
     /// One tick of the re-check; says whether the timer goes on.
     fn ci_timer_tick(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
-        let pending = self
-            .hosting
-            .has_pending_ci(self.details_oid, self.head_oid(cx));
+        if !ci_status_enabled(cx) {
+            self.ci_timer = None;
+            return false;
+        }
+        let pending = self.hosting.has_pending_ci(
+            self.details_oid,
+            self.head_oid(cx),
+            &self.ci_visible,
+            true,
+        );
         if !window.is_window_active() || !pending {
             self.ci_timer = None;
             return false;
@@ -5753,10 +5799,13 @@ impl RepositoryView {
         true
     }
 
-    /// Asks for the checks of the commits that are due: the selected one and
-    /// HEAD when the host has them, and the heads of branches with a pull
-    /// request.
+    /// Asks for the checks of the commits that are due: the selected one,
+    /// HEAD, the pull request tips and the rows visible on screen, when the
+    /// host has them.
     fn hosting_fetch_ci(&mut self, cx: &mut Context<Self>) {
+        if !ci_status_enabled(cx) {
+            return;
+        }
         let Some(target) = self.hosting.target.clone() else {
             return;
         };
@@ -5764,6 +5813,8 @@ impl RepositoryView {
         let due = self.hosting.ci_due(
             self.details_oid,
             self.head_oid(cx),
+            &self.ci_visible,
+            true,
             std::time::Instant::now(),
             hosting_status::unix_now(),
         );
@@ -5870,7 +5921,10 @@ impl RepositoryView {
 
     /// Gives the history rows and the sidebar the current badges and dots.
     fn publish_hosting(&mut self, cx: &mut Context<Self>) {
-        let view = HostingView::from(&self.hosting);
+        let mut view = HostingView::from(&self.hosting);
+        if !self.show_ci_status {
+            view.ci.clear();
+        }
         if view == *self.hosting_view {
             return;
         }
@@ -6084,6 +6138,9 @@ impl RepositoryView {
 
     /// "Try again" under the checks of the selected commit.
     fn retry_checks(&mut self, cx: &mut Context<Self>) {
+        if !ci_status_enabled(cx) {
+            return;
+        }
         if let Some(oid) = self.details_oid {
             self.hosting.ci.forget(&oid.to_string());
         }
@@ -6096,6 +6153,9 @@ impl RepositoryView {
     /// empty and failed state. `None` when the repository has no service with
     /// an API, or nothing was asked yet.
     fn render_checks(&self, oid: Oid, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.show_ci_status {
+            return None;
+        }
         let target = self.hosting.target.as_ref()?;
         if !self.hosting.health.badges_visible() {
             return None;
@@ -6222,6 +6282,22 @@ impl Render for RepositoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let client = matches!(window.window_decorations(), Decorations::Client { .. });
         let colors = cx.theme().colors;
+        // The settings page may have toggled CI status while this view stayed
+        // open: stop the loop, drop the dots and the checks block, or ask for
+        // the rows again, without a restart.
+        let show_ci = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.show_ci_status)
+            .unwrap_or(true);
+        if show_ci != self.show_ci_status {
+            self.show_ci_status = show_ci;
+            if !show_ci {
+                self.ci_timer = None;
+            }
+            self.publish_hosting(cx);
+            self.hosting_fetch_ci(cx);
+            self.ensure_ci_timer(window, cx);
+        }
         let width = f32::from(window.viewport_size().width);
         let height = f32::from(window.viewport_size().height);
         let layout = toolbar_layout(width, toolbar_label_extra(window));

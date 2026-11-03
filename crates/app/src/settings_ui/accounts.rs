@@ -27,7 +27,7 @@ use ui::{
 };
 
 use super::account_dialog;
-use super::{heading, SettingsView};
+use super::{form, group, heading, SettingsView};
 use crate::accounts::{self as logic, cached_store, AccountStatus, StoreResult};
 use crate::cli_import::{self, Candidate, CliError};
 use crate::settings::{AccountMethod, AccountRecord};
@@ -956,6 +956,31 @@ pub(super) fn render(
                     .child(ui::t!("settings.accounts.note.keychain")),
             ),
     );
+
+    let ci_switch = {
+        let entity = cx.entity();
+        form::switch(
+            "settings-show-ci".into(),
+            settings.show_ci_status,
+            false,
+            move |checked, _, cx| {
+                entity.update(cx, |view, cx| {
+                    view.change(cx, |settings| settings.show_ci_status = checked);
+                });
+            },
+        )
+    };
+    page = page.child(group(
+        ui::t!("settings.accounts.group.ci"),
+        vec![form::row(
+            "settings-show-ci-row",
+            ui::t!("settings.accounts.ci.title"),
+            ui::t!("settings.accounts.ci.desc"),
+            ci_switch,
+            false,
+        )],
+    ));
+
     page.into_any_element()
 }
 

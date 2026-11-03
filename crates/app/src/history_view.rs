@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex};
 use gpui::prelude::*;
 use gpui::{
     actions, canvas, container_query, div, px, uniform_list, AnyElement, App, AsyncApp, ClickEvent,
-    ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, FocusHandle, FontWeight,
-    IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, ScrollStrategy,
-    SharedString, StyledText, Task, TextRun, TextStyle, UniformListScrollHandle, WeakEntity,
-    Window,
+    ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, EventEmitter, FocusHandle,
+    FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render,
+    ScrollStrategy, SharedString, StyledText, Task, TextRun, TextStyle, UniformListScrollHandle,
+    WeakEntity, Window,
 };
 
 use git_core::{
@@ -52,12 +52,22 @@ pub(crate) type SidebarActionHandler = Rc<dyn Fn(SidebarAction, &mut Window, &mu
 /// Opens the pull request popover of a local branch at a window position.
 pub(crate) type PrClickHandler = Rc<dyn Fn(String, Point<Pixels>, &mut Window, &mut App)>;
 
+/// What the history tells the shell outside its render and action callbacks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HistoryEvent {
+    /// The commits of the rows on screen (with a small margin) changed after
+    /// the range stopped changing; the shell asks for their checks.
+    VisibleRowsChanged(Vec<Oid>),
+}
+
 /// Sets (`Some`) or clears (`None`) the History's branch filter.
 type FilterSetter = Rc<dyn Fn(Option<String>, &mut App)>;
 
 /// A sidebar node key's context-menu model.
 type RefMenuSource = Rc<dyn Fn(&str) -> Vec<SidebarMenuEntry>>;
-use crate::hosting_status::{ci_label, HostingView, PrBadgeView};
+use crate::hosting_status::{
+    ci_label, HostingView, PrBadgeView, CI_VISIBLE_DEBOUNCE, CI_VISIBLE_MARGIN,
+};
 use crate::remote_accounts::RemoteTargets;
 use crate::settings::{GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MAX, GRAPH_WIDTH_MIN};
 use crate::sidebar::{sidebar_menu_with_links, SidebarAction, SidebarExtras, SidebarMenuEntry};
@@ -665,6 +675,13 @@ pub struct HistoryView {
     hosting: Arc<HostingView>,
     /// What a click on a pull request badge does; installed by the shell.
     pr_click: Option<PrClickHandler>,
+    /// The commits of the rows the virtualized list last rendered, plus a
+    /// margin; the shell asks for their checks.
+    visible_oids: Vec<Oid>,
+    /// The set last reported to the shell, so a repeated range costs nothing.
+    visible_reported: Vec<Oid>,
+    /// Waits for the visible range to rest before reporting it.
+    visible_debounce: Option<Task<()>>,
     /// Bumped whenever HEAD and the refs were read again, so the shell knows
     /// to look at its branch tracking once more.
     meta_version: u64,
@@ -777,6 +794,8 @@ pub struct HistoryView {
     /// Bumped on every branch filter change; an older answer is dropped.
     branch_generation: u64,
 }
+
+impl EventEmitter<HistoryEvent> for HistoryView {}
 
 /// Adds one row-menu item that asks the shell to open a ref dialog.
 #[allow(clippy::too_many_arguments)]
@@ -1308,6 +1327,9 @@ impl HistoryView {
             remote_targets: Vec::new(),
             hosting: Arc::default(),
             pr_click: None,
+            visible_oids: Vec::new(),
+            visible_reported: Vec::new(),
+            visible_debounce: None,
             meta_version: 0,
             last_picked_branch: Rc::new(RefCell::new(None)),
             root: None,
@@ -2090,6 +2112,44 @@ impl HistoryView {
     /// Installs what a click on a pull request badge does.
     pub(crate) fn set_pr_click_handler(&mut self, handler: PrClickHandler) {
         self.pr_click = Some(handler);
+    }
+
+    /// Starts the short wait that lets a fast scroll pass before its rows are
+    /// reported. A wait already running picks up the latest range.
+    fn schedule_visible_rows(&mut self, cx: &mut Context<Self>) {
+        if self.visible_debounce.is_some() {
+            return;
+        }
+        self.visible_debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CI_VISIBLE_DEBOUNCE).await;
+            this.update(cx, |view, cx| view.report_visible_rows(cx))
+                .ok();
+        }));
+    }
+
+    /// Tells the shell the current visible set unless it is the one it has.
+    /// An event, not a callback: the shell reads this view from its handler,
+    /// which is only safe once this update has finished.
+    fn report_visible_rows(&mut self, cx: &mut Context<Self>) {
+        self.visible_debounce = None;
+        if self.visible_oids == self.visible_reported {
+            return;
+        }
+        self.visible_reported = self.visible_oids.clone();
+        cx.emit(HistoryEvent::VisibleRowsChanged(
+            self.visible_reported.clone(),
+        ));
+    }
+
+    /// The commits of the rows in `range`, plus [`CI_VISIBLE_MARGIN`] rows on
+    /// each side, in row order.
+    fn visible_commits(&self, items: &[Item], range: std::ops::Range<usize>) -> Vec<Oid> {
+        let start = range.start.saturating_sub(CI_VISIBLE_MARGIN);
+        let end = range.end.saturating_add(CI_VISIBLE_MARGIN).min(items.len());
+        items[start.min(end)..end]
+            .iter()
+            .map(|item| item.commit.id)
+            .collect()
     }
 
     /// Replaces the pull request badges and CI dots the rows draw.
@@ -3137,6 +3197,13 @@ impl HistoryView {
             .branch_rows
             .as_ref()
             .filter(|_| self.day_rows.is_none());
+        // The shell asks for the checks of what is actually on screen; a fast
+        // scroll only reports where it stopped.
+        let visible = self.visible_commits(items, range.clone());
+        if visible != self.visible_oids {
+            self.visible_oids = visible;
+            cx.defer_in(window, |view, _, cx| view.schedule_visible_rows(cx));
+        }
         let badges = &self.badges;
         let hosting = self.hosting.clone();
         let badge_widths = &mut self.badge_widths;

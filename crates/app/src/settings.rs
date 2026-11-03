@@ -128,6 +128,9 @@ pub struct Settings {
     pub background_fetch: bool,
     /// Show the commit activity heatmap on the Welcome screen and above History.
     pub show_activity: bool,
+    /// Show CI status in history rows and the details pane, and ask the host
+    /// for it. Off hides every badge and makes no checks requests.
+    pub show_ci_status: bool,
     /// Selection, focus-ring and primary-button colour.
     pub accent: Accent,
     /// Height of list and tree rows.
@@ -218,6 +221,7 @@ impl Default for Settings {
             diff_layout: DiffLayout::default(),
             background_fetch: true,
             show_activity: true,
+            show_ci_status: true,
             accent: Accent::default(),
             density: Density::default(),
             ui_font_size: 13,
@@ -845,6 +849,7 @@ fn settings_from_value(value: Value) -> Settings {
         diff_layout: take(&mut object, "diff_layout", defaults.diff_layout),
         background_fetch: take(&mut object, "background_fetch", defaults.background_fetch),
         show_activity: take(&mut object, "show_activity", defaults.show_activity),
+        show_ci_status: take(&mut object, "show_ci_status", defaults.show_ci_status),
         accent: take(&mut object, "accent", defaults.accent),
         density: take(&mut object, "density", defaults.density),
         ui_font_size: take(&mut object, "ui_font_size", defaults.ui_font_size),
@@ -1245,6 +1250,22 @@ mod tests {
         };
         store.save(&hidden).unwrap();
         assert!(!store.load().show_activity);
+    }
+
+    #[test]
+    fn ci_status_is_shown_by_default_and_remember_hiding() {
+        assert!(Settings::default().show_ci_status);
+        let dir = TempDir::new("show-ci-status");
+        // An older settings file without the key keeps CI status on.
+        assert!(load_json(dir.path(), r#"{"theme":"dark"}"#).show_ci_status);
+        assert!(!load_json(dir.path(), r#"{"show_ci_status":false}"#).show_ci_status);
+        let store = SettingsStore::new(settings_path(dir.path()));
+        let hidden = Settings {
+            show_ci_status: false,
+            ..Settings::default()
+        };
+        store.save(&hidden).unwrap();
+        assert!(!store.load().show_ci_status);
     }
 
     #[test]
