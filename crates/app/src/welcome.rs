@@ -33,8 +33,8 @@ use crate::init_flow::{banner_body, details, DialogKind, InitFlow, StatusKind};
 use crate::settings::RecentRepo;
 use crate::welcome_activity::WelcomeActivity;
 use crate::workspace::{
-    git_label, git_tooltip, inline_window_controls, repo_name, title_strip, titlebar, titlebar_end,
-    titlebar_fill, uses_title_strip, Workspace,
+    git_label, git_tooltip, inline_window_controls, repo_name, title_strip, titlebar_end,
+    titlebar_fill, uses_title_strip, window_titlebar, Workspace,
 };
 
 actions!(welcome, [NewRepository, RemoveSelected]);
@@ -688,7 +688,7 @@ impl Render for WelcomeView {
         let git = git_label(&self.git);
         let workspace = self.workspace.clone();
 
-        let bar = titlebar(cx)
+        let bar = window_titlebar(window, cx)
             .child(
                 div()
                     .flex()

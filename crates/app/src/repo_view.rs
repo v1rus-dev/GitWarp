@@ -66,8 +66,8 @@ use crate::sidebar::{
 use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::web_links::{self, HostLink};
 use crate::workspace::{
-    git_label, git_tooltip, inline_window_controls, repo_name, title_strip, titlebar, titlebar_end,
-    titlebar_fill, uses_title_strip, Workspace,
+    git_label, git_tooltip, inline_window_controls, repo_name, title_strip, titlebar_end,
+    titlebar_fill, uses_title_strip, window_titlebar, Workspace,
 };
 use crate::worktree_dialog::SelectedCommit;
 use crate::worktree_switcher;
@@ -3978,6 +3978,7 @@ impl RepositoryView {
         &mut self,
         layout: ToolbarLayout,
         client: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let colors = cx.theme().colors;
@@ -4138,7 +4139,7 @@ impl RepositoryView {
             push,
         );
 
-        let mut bar = titlebar(cx)
+        let mut bar = window_titlebar(window, cx)
             .gap(px(layout.gap))
             .px(px(layout.padding))
             .child(no_shrink(sidebar_toggle))
@@ -6246,7 +6247,7 @@ impl Render for RepositoryView {
             }
         }
 
-        let toolbar = self.render_toolbar(layout, client, cx);
+        let toolbar = self.render_toolbar(layout, client, window, cx);
 
         // The sidebar may take at most half of the visible area. Only the
         // rendered width is capped; the stored width stays as saved.

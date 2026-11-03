@@ -477,10 +477,16 @@ pub fn titlebar(cx: &App) -> Div {
         .border_color(colors.border)
         .text_size(FS_BASE)
         .font_family(FONT_UI)
-        .when(cfg!(target_os = "macos"), |d| {
-            // Draggable spacer so the content starts right of the traffic lights.
-            d.child(titlebar_fill().flex_none().w(px(MAC_TRAFFIC_LIGHTS_SPACER)))
-        })
+}
+
+/// [`titlebar`] for a bar that sits at the window's top-left edge.
+///
+/// On macOS it starts with a draggable spacer so the content clears the
+/// traffic lights. Full screen hides them, so the content then sits flush left.
+pub fn window_titlebar(window: &Window, cx: &App) -> Div {
+    titlebar(cx).when(cfg!(target_os = "macos") && !window.is_fullscreen(), |d| {
+        d.child(titlebar_fill().flex_none().w(px(MAC_TRAFFIC_LIGHTS_SPACER)))
+    })
 }
 
 /// Where macOS puts the traffic lights so they sit on the titlebar's centre line.
