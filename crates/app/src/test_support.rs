@@ -33,6 +33,26 @@ impl TempRepo {
         let path = std::env::temp_dir().join(format!("gitwarp-{name}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         Repo::init(git(), &path).expect("init the temp repository");
+        // The app's own git calls read this repository's config, so the identity and the
+        // `main` branch must not depend on the machine's global config (CI runners have none).
+        for args in [
+            &["config", "user.name", "Test"][..],
+            &["config", "user.email", "test@example.com"],
+            &["config", "commit.gpgsign", "false"],
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
         Self(path)
     }
 

@@ -1,0 +1,27 @@
+# Licences of the crates compiled into the GitWarp binary, for cargo-about
+# (https://github.com/EmbarkStudios/cargo-about). The release workflow renders
+# THIRD-PARTY-LICENSES.html from about.hbs; a crate under a licence that is not
+# listed here fails the build, so a new one is a deliberate decision.
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSL-1.0",
+    "CC0-1.0",
+    "NCSA",
+    "CDLA-Permissive-2.0",
+    # File-level copyleft; the crates are used unmodified (dwrote, option-ext).
+    "MPL-2.0",
+]
+
+# Build-time tools and dev-dependencies do not end up in the binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

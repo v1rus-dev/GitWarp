@@ -19,7 +19,7 @@ fn embed_icon() {
         .join("app-icon")
         .join("gitwarp.ico");
     winresource::WindowsResource::new()
-        .set_icon(icon)
+        .set_icon(icon.to_str().expect("the icon path is valid UTF-8"))
         .compile()
         .expect("failed to embed the Windows icon");
 }

@@ -250,7 +250,14 @@ fn lists_stashes_newest_first() {
 }
 
 fn worktree<'a>(list: &'a [Worktree], path: &Path) -> &'a Worktree {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // A removed worktree no longer exists, so canonicalize its parent instead: on macOS the
+    // temp dir is under /var, a symlink to the /private/var that git reports.
+    let path = path.canonicalize().unwrap_or_else(|_| {
+        match (path.parent().map(Path::canonicalize), path.file_name()) {
+            (Some(Ok(parent)), Some(name)) => parent.join(name),
+            _ => path.to_path_buf(),
+        }
+    });
     list.iter()
         .find(|w| w.path == path)
         .unwrap_or_else(|| panic!("no worktree at {}", path.display()))

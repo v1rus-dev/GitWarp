@@ -158,7 +158,7 @@ pub struct Settings {
     pub confirm_discard: bool,
     /// Ask before deleting a branch.
     pub confirm_delete_branch: bool,
-    /// Send anonymous usage statistics and crash reports (Sentry). On by default.
+    /// Send crash reports (Sentry). On by default.
     pub telemetry: bool,
     /// Highlight the characters that differ inside a modified diff line.
     pub diff_word_highlight: bool,
