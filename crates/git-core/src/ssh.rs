@@ -724,9 +724,11 @@ pub fn forget_host(host: &str) -> Result<()> {
     }
 }
 
-/// Opens `ssh -T git@host` and returns its message. GitHub and GitLab answer
-/// with exit code 1 even on success, so the text decides.
-pub fn test_connection(host: &str, timeout_secs: u32) -> Result<String> {
+/// Opens `ssh -T -i <key> git@host` and returns its message, forcing ssh to
+/// use only the specified private key (via `IdentitiesOnly=yes`). The result
+/// therefore reflects exactly whether that one key is accepted by the host.
+/// GitHub and GitLab answer with exit code 1 even on success, so the text decides.
+pub fn test_connection(host: &str, key: &Path, timeout_secs: u32) -> Result<String> {
     let out = Command::new("ssh")
         .args([
             "-T",
@@ -735,9 +737,13 @@ pub fn test_connection(host: &str, timeout_secs: u32) -> Result<String> {
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
+            "IdentitiesOnly=yes",
+            "-o",
             &format!("ConnectTimeout={timeout_secs}"),
-            &format!("git@{host}"),
         ])
+        .arg("-i")
+        .arg(key)
+        .arg(format!("git@{host}"))
         .stdin(Stdio::null())
         .output()
         .map_err(Error::Spawn)?;
