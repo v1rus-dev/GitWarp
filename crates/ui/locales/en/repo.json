@@ -133,6 +133,7 @@
   "repo.toolbar.stash_tip": "Stash local changes",
   "repo.toolbar.switch_branch": "Switch branch",
   "repo.toolbar.switch_repository": "Switch repository",
+  "repo.toolbar.toggle_dock": "Toggle details dock",
   "repo.toolbar.toggle_sidebar": "Toggle sidebar",
   "repo.toolbar.view_changes": "Changes",
   "repo.toolbar.view_history": "History",

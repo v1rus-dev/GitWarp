@@ -4163,6 +4163,14 @@ impl RepositoryView {
                 .child(field),
         );
 
+        let dock_toggle = Button::tool("dock-toggle")
+            .icon_only(IconName::PanelB)
+            .selected(!self.details_open)
+            .tooltip_kbd(ui::t!("repo.toolbar.toggle_dock"), "Ctrl+J")
+            .on_click(cx.listener(|view, _, _, cx| view.toggle_details(cx)));
+        if self.view == ViewMode::History {
+            bar = bar.child(no_shrink(dock_toggle));
+        }
         let settings_click = {
             let workspace = self.workspace.clone();
             move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {

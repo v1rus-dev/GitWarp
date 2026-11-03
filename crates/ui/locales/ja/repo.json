@@ -129,6 +129,7 @@
   "repo.toolbar.stash_tip": "ローカルの変更をスタッシュ",
   "repo.toolbar.switch_branch": "ブランチを切り替え",
   "repo.toolbar.switch_repository": "リポジトリを切り替え",
+  "repo.toolbar.toggle_dock": "詳細ドックの表示切り替え",
   "repo.toolbar.toggle_sidebar": "サイドバーの表示切り替え",
   "repo.toolbar.view_changes": "変更",
   "repo.toolbar.view_history": "履歴",

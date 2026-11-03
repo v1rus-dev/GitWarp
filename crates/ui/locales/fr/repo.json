@@ -133,6 +133,7 @@
   "repo.toolbar.stash_tip": "Remiser les modifications locales",
   "repo.toolbar.switch_branch": "Changer de branche",
   "repo.toolbar.switch_repository": "Changer de dépôt",
+  "repo.toolbar.toggle_dock": "Afficher/masquer le panneau de détails",
   "repo.toolbar.toggle_sidebar": "Afficher/masquer le panneau latéral",
   "repo.toolbar.view_changes": "Modifications",
   "repo.toolbar.view_history": "Historique",

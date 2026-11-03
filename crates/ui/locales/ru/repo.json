@@ -137,6 +137,7 @@
   "repo.toolbar.stash_tip": "Отложить локальные изменения",
   "repo.toolbar.switch_branch": "Переключить ветку",
   "repo.toolbar.switch_repository": "Переключить репозиторий",
+  "repo.toolbar.toggle_dock": "Переключить панель деталей",
   "repo.toolbar.toggle_sidebar": "Переключить боковую панель",
   "repo.toolbar.view_changes": "Изменения",
   "repo.toolbar.view_history": "История",
