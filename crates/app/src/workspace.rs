@@ -18,7 +18,7 @@ use gpui::{
     Decorations, Div, Entity, HitboxBehavior, InteractiveElement, IntoElement, MouseButton,
     MouseMoveEvent, ParentElement, Pixels, Point, Render, ResizeEdge, SharedString, Styled,
     Subscription, Task, Tiling, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowOptions,
+    WindowControlArea, WindowDecorations, WindowOptions,
 };
 
 use git_core::{Error, Git, GitChoice};
@@ -484,11 +484,20 @@ pub fn titlebar(cx: &App) -> Div {
 /// The empty area of the bar moves the window; a double-click toggles
 /// maximise, a right-click opens the system window menu. Buttons and other
 /// controls sit beside it, so pressing them never starts a window move.
+///
+/// On Windows `start_window_move` is a no-op and the window has no native title
+/// bar, so the drag is handed to the OS instead: marking the stretch as a
+/// [`WindowControlArea::Drag`] makes the Windows hit-test report `HTCAPTION`,
+/// which gives native move, Aero Snap, double-click-maximise and the system
+/// menu for free. Linux keeps the explicit handlers below.
 pub fn titlebar_fill() -> Div {
     div()
         .flex_1()
         .min_w_0()
         .h_full()
+        .when(cfg!(target_os = "windows"), |d| {
+            d.window_control_area(WindowControlArea::Drag)
+        })
         .on_mouse_down(MouseButton::Left, move |event, window, _| {
             if event.click_count == 2 {
                 window.zoom_window();
@@ -501,7 +510,70 @@ pub fn titlebar_fill() -> Div {
         })
 }
 
-/// Appends the window controls when the window uses client decorations.
+/// Whether the toolbar itself ends with the minimise/maximise/close buttons.
+///
+/// Only Linux client-side decorations put them there. Windows draws no native
+/// title bar either, but its buttons live in the dedicated [`title_strip`] above
+/// the toolbar, so the toolbar gets none; `window_decorations()` reports `Server`
+/// on Windows, so the check below already excludes it.
+pub fn inline_window_controls(window: &Window) -> bool {
+    matches!(window.window_decorations(), Decorations::Client { .. })
+}
+
+/// Whether to show the dedicated drag strip above the toolbar.
+///
+/// Windows has no native title bar and the toolbar is too packed to grab, so a
+/// slim strip (like Fork's) gives a wide drag area and holds the window buttons.
+pub fn uses_title_strip() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// The height of the Windows drag strip.
+const STRIP: Pixels = px(30.);
+
+/// The slim drag strip shown above the toolbar on Windows: a wide
+/// `WindowControlArea::Drag` region with the window buttons at its right end and
+/// the window title centred between them. Call it only when [`uses_title_strip`]
+/// is true.
+pub fn title_strip(title: SharedString, cx: &App) -> Div {
+    let colors = cx.theme().colors;
+    // A left spacer the width of the controls (8px margin + 3×32px) keeps the
+    // title centred over the window rather than over the drag region alone.
+    let controls_w = px(8. + 3. * 32.);
+    div()
+        .h(STRIP)
+        .w_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .bg(colors.bg)
+        .border_b_1()
+        .border_color(colors.border)
+        .child(
+            div()
+                .w(controls_w)
+                .h_full()
+                .flex_none()
+                .window_control_area(WindowControlArea::Drag),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .window_control_area(WindowControlArea::Drag)
+                .text_size(FS_BASE)
+                .text_color(colors.muted)
+                .child(div().truncate().child(title)),
+        )
+        .child(WindowControls::new("window-controls").height(STRIP))
+}
+
+/// Appends the window controls when the toolbar draws its own title bar end
+/// (Linux client-side decorations).
 pub fn titlebar_end(bar: Div, client: bool) -> Div {
     if client {
         // Never shrink: the three buttons must stay fully visible at the

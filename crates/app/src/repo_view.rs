@@ -15,7 +15,7 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, canvas, div, point, px, size, uniform_list, AnyElement, App, AppContext, Bounds,
-    ClickEvent, ClipboardItem, Context, Decorations, Div, Entity, FocusHandle, FontWeight, Hsla,
+    ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle, FontWeight, Hsla,
     InteractiveElement, IntoElement, ListHorizontalSizingBehavior, MouseButton, ParentElement,
     Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
     StyledText, Subscription, Task, TextRun, UniformListScrollHandle, WeakEntity, Window,
@@ -66,7 +66,8 @@ use crate::sidebar::{
 use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::web_links::{self, HostLink};
 use crate::workspace::{
-    git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
+    git_label, git_tooltip, inline_window_controls, repo_name, title_strip, titlebar, titlebar_end,
+    titlebar_fill, uses_title_strip, Workspace,
 };
 use crate::worktree_dialog::SelectedCommit;
 use crate::worktree_switcher;
@@ -4163,14 +4164,6 @@ impl RepositoryView {
                 .child(field),
         );
 
-        let dock_toggle = Button::tool("dock-toggle")
-            .icon_only(IconName::PanelB)
-            .selected(!self.details_open)
-            .tooltip_kbd(ui::t!("repo.toolbar.toggle_dock"), "Ctrl+J")
-            .on_click(cx.listener(|view, _, _, cx| view.toggle_details(cx)));
-        if self.view == ViewMode::History {
-            bar = bar.child(no_shrink(dock_toggle));
-        }
         let settings_click = {
             let workspace = self.workspace.clone();
             move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
@@ -5451,7 +5444,7 @@ impl RepositoryView {
         }
 
         let workspace = self.workspace.clone();
-        bar.child(
+        bar = bar.child(
             div()
                 .id("status-git")
                 .h(px(20.))
@@ -5473,7 +5466,40 @@ impl RepositoryView {
                 )
                 .child(Icon::new(IconName::Git).size(px(12.)).color(colors.muted))
                 .child(self.git_label.clone()),
-        )
+        );
+
+        // The details dock toggle (like Fork's) sits to the right of the git
+        // version. The dock belongs to History only, so it shows there; it
+        // highlights while the panel is hidden.
+        if self.view == ViewMode::History {
+            let view = cx.entity();
+            let hidden = !self.details_open;
+            let color = if hidden { colors.accent } else { colors.muted };
+            bar = bar.child(
+                div()
+                    .id("status-dock")
+                    .h(px(20.))
+                    .w(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(R_SM)
+                    .cursor_pointer()
+                    .when(hidden, |this| this.bg(colors.hover))
+                    .hover(|this| this.bg(colors.hover))
+                    .tooltip(Tooltip::with_kbd(
+                        ui::t!("repo.toolbar.toggle_dock"),
+                        "Ctrl+J",
+                    ))
+                    .on_click(
+                        move |_: &gpui::ClickEvent, _window: &mut Window, cx: &mut App| {
+                            view.update(cx, |view, cx| view.toggle_details(cx));
+                        },
+                    )
+                    .child(Icon::new(IconName::PanelB).size(px(14.)).color(color)),
+            );
+        }
+        bar
     }
 }
 
@@ -6112,7 +6138,7 @@ impl From<&HostingState> for HostingView {
 
 impl Render for RepositoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let client = matches!(window.window_decorations(), Decorations::Client { .. });
+        let client = inline_window_controls(window);
         let colors = cx.theme().colors;
         let width = f32::from(window.viewport_size().width);
         let height = f32::from(window.viewport_size().height);
@@ -6270,6 +6296,9 @@ impl Render for RepositoryView {
             .on_action(cx.listener(|view, _: &PushBranch, window, cx| {
                 view.push_branch(window, cx);
             }))
+            .when(uses_title_strip(), |column| {
+                column.child(title_strip(self.repo_name.clone(), cx))
+            })
             .child(toolbar)
             .child(body)
             .child(status)
