@@ -150,6 +150,18 @@
   "changes.editor.keep_version": "Garder la version de {branch}",
   "changes.editor.use_version": "Utiliser la version de {branch}",
   "changes.editor.delete_file": "Supprimer le fichier (comme dans {branch})",
+  "changes.editor.note_not_text": "Ce fichier n'est pas du texte UTF-8 : GitWarp ne peut pas le fusionner ligne par ligne. Gardez une version : GitWarp l'écrit dans l'arbre de travail et marque le fichier comme résolu.",
+  "changes.editor.kind_not_text": "Pas du texte UTF-8",
+  "changes.editor.note_added": "Un seul côté a ajouté ce fichier. Choisissez s'il reste : GitWarp l'applique et marque le fichier comme résolu.",
+  "changes.editor.note_deleted_both": "Les deux côtés ont supprimé ce fichier. Confirmez la suppression : GitWarp le retire et marque le fichier comme résolu.",
+  "changes.editor.title_added": "{path} a été ajouté uniquement dans {branch}",
+  "changes.editor.title_deleted_both": "{path} a été supprimé des deux côtés",
+  "changes.editor.keep_the_file": "Garder le fichier",
+  "changes.editor.delete_the_file": "Supprimer le fichier",
+  "changes.editor.changed_after_merge": "Ce fichier a changé après la fusion (par rerere ou un autre éditeur). L'enregistrement remplace ces changements.",
+  "changes.editor.replace_disk_ask": "Remplacer les changements sur le disque ?",
+  "changes.editor.changed_on_disk": "{path} a changé sur le disque : rouvrez-le pour voir les changements",
+  "changes.editor.not_same_conflict": "{path} n'est plus dans le même conflit : rechargé",
   "changes.editor.open_menu": "Résoudre dans GitWarp…",
   "changes.editor.open_button": "Résoudre…"
 }

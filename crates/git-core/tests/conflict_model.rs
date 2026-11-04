@@ -9,7 +9,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use git_core::{
-    ConflictKind, ConflictResolution, ConflictSide, Git, GitChoice, Operation, Repo, TextConflict,
+    ConflictKind, ConflictResolution, ConflictSide, Git, GitChoice, Operation, Repo, SaveOutcome,
+    TextConflict,
 };
 
 fn git_raw(dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Vec<u8> {
@@ -110,155 +111,304 @@ fn merge_file(
         .current_dir(scratch)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args(["merge-file", "-p"]);
+        .args(["merge-file", "-p", "--diff-algorithm=histogram"]);
     command.args(flag);
     command.args(["o", "b", "t"]);
     let out = command.output().unwrap();
     (out.status.code().unwrap(), out.stdout)
 }
 
-/// Loads the conflict for the three versions and compares it with git.
-/// Returns the conflict count.
-fn check_against_git(
-    dir: &Path,
-    repo: &Repo,
-    name: &str,
-    base: Option<&str>,
-    ours: &str,
-    theirs: &str,
-) -> usize {
-    let mut entries = vec![
-        (2, "100644", ours.as_bytes()),
-        (3, "100644", theirs.as_bytes()),
-    ];
-    if let Some(base) = base {
-        entries.insert(0, (1, "100644", base.as_bytes()));
-    }
-    index_conflict(dir, name, &entries);
-    let model = text(repo.conflict(name).unwrap());
-    let scratch = tempfile::tempdir().unwrap();
-    let base_bytes = base.unwrap_or("").as_bytes();
-    let (code, _) = merge_file(
-        scratch.path(),
-        None,
-        base_bytes,
-        ours.as_bytes(),
-        theirs.as_bytes(),
-    );
-    assert_eq!(
-        model.conflict_count() as i32,
-        code,
-        "{name}: conflict count\nbase={base:?}\nours={ours:?}\ntheirs={theirs:?}\nsegments={:#?}",
-        model.segments
-    );
-    let all = |sides: &[ConflictSide]| {
-        vec![ConflictResolution::Picked(sides.to_vec()); model.conflict_count()]
+fn git_command(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com");
+    command
+}
+
+/// One file of a real merge: the three versions (`base` `None`: both sides
+/// added the file).
+struct Case {
+    name: String,
+    base: Option<Vec<u8>>,
+    ours: Vec<u8>,
+    theirs: Vec<u8>,
+}
+
+/// Merges `side` into `main` with real `git merge` (`merge.conflictStyle=merge`)
+/// over all `cases` at once. Files that conflict stay conflicted in the repo
+/// with git's marker file in the work tree.
+fn real_merge(cases: &[Case]) -> (tempfile::TempDir, Repo) {
+    let (tmp, repo) = new_repo();
+    let dir = tmp.path();
+    git(dir, &["config", "merge.conflictStyle", "merge"]);
+    let write_all = |pick: &dyn Fn(&Case) -> Option<&Vec<u8>>| {
+        for case in cases {
+            if let Some(content) = pick(case) {
+                fs::write(dir.join(&case.name), content).unwrap();
+                git(dir, &["add", "--", &case.name]);
+            }
+        }
     };
-    for (flag, sides) in [
-        ("--ours", vec![ConflictSide::Ours]),
-        ("--theirs", vec![ConflictSide::Theirs]),
-        ("--union", vec![ConflictSide::Ours, ConflictSide::Theirs]),
-    ] {
-        let (_, expected) = merge_file(
-            scratch.path(),
-            Some(flag),
-            base_bytes,
-            ours.as_bytes(),
-            theirs.as_bytes(),
-        );
-        let rendered = model.render(&all(&sides)).unwrap();
-        assert_eq!(
-            rendered,
-            String::from_utf8(expected).unwrap(),
-            "{name} {flag}\nbase={base:?}\nours={ours:?}\ntheirs={theirs:?}\nsegments={:#?}",
-            model.segments
-        );
+    write_all(&|case| case.base.as_ref());
+    git(dir, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    git(dir, &["branch", "side"]);
+    write_all(&|case| Some(&case.ours));
+    git(dir, &["commit", "-q", "--allow-empty", "-m", "ours"]);
+    git(dir, &["switch", "-q", "side"]);
+    write_all(&|case| Some(&case.theirs));
+    git(dir, &["commit", "-q", "--allow-empty", "-m", "theirs"]);
+    git(dir, &["switch", "-q", "main"]);
+    git_command(dir)
+        .args(["merge", "side", "-q", "--no-edit"])
+        .output()
+        .unwrap();
+    (tmp, repo)
+}
+
+fn case(name: &str, base: Option<&str>, ours: &str, theirs: &str) -> Case {
+    Case {
+        name: name.to_string(),
+        base: base.map(|base| base.as_bytes().to_vec()),
+        ours: ours.as_bytes().to_vec(),
+        theirs: theirs.as_bytes().to_vec(),
     }
-    model.conflict_count()
+}
+
+/// The three whole-file resolutions read back from a marker file: every
+/// conflict block replaced by ours, by theirs, and by both.
+fn resolve_markers(markers: &str) -> [String; 3] {
+    let (mut ours, mut theirs, mut union) = (String::new(), String::new(), String::new());
+    let mut state = 0; // 0 outside, 1 ours, 2 theirs
+    let mut sides = (String::new(), String::new());
+    for line in markers.split_inclusive('\n') {
+        if state == 0 && line.starts_with("<<<<<<<") {
+            state = 1;
+            sides = (String::new(), String::new());
+        } else if state == 1 && line.starts_with("=======") {
+            state = 2;
+        } else if state == 2 && line.starts_with(">>>>>>>") {
+            state = 0;
+            ours.push_str(&sides.0);
+            theirs.push_str(&sides.1);
+            union.push_str(&sides.0);
+            union.push_str(&sides.1);
+        } else if state == 1 {
+            sides.0.push_str(line);
+        } else if state == 2 {
+            sides.1.push_str(line);
+        } else {
+            for out in [&mut ours, &mut theirs, &mut union] {
+                out.push_str(line);
+            }
+        }
+    }
+    [ours, theirs, union]
+}
+
+/// Compares the model of every conflicted case with the work-tree file the
+/// real merge wrote; returns how many cases conflicted. Disagreements are
+/// collected so one run reports them all.
+fn check_cases(dir: &Path, repo: &Repo, cases: &[Case]) -> (usize, Vec<String>) {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut conflicted = 0;
+    let mut failures = Vec::new();
+    for case in cases {
+        let unmerged = git(dir, &["ls-files", "-u", "--", &case.name]);
+        if unmerged.is_empty() {
+            continue;
+        }
+        conflicted += 1;
+        let ConflictKind::Text(model) = repo.conflict(&case.name).unwrap() else {
+            failures.push(format!("{}: not a text conflict", case.name));
+            continue;
+        };
+        let markers = fs::read(dir.join(&case.name)).unwrap();
+        let rendered = model.render_markers("HEAD", "side");
+        let describe = || {
+            format!(
+                "{}\nbase={:?}\nours={:?}\ntheirs={:?}\ngit wrote={:?}\nmodel wrote={:?}\nsegments={:#?}",
+                case.name,
+                case.base.as_deref().map(String::from_utf8_lossy),
+                String::from_utf8_lossy(&case.ours),
+                String::from_utf8_lossy(&case.theirs),
+                String::from_utf8_lossy(&markers),
+                rendered,
+                model.segments
+            )
+        };
+        if rendered.as_bytes() != markers {
+            failures.push(format!("markers differ: {}", describe()));
+            continue;
+        }
+        let all = |sides: &[ConflictSide]| {
+            vec![ConflictResolution::Picked(sides.to_vec()); model.conflict_count()]
+        };
+        let [ours, theirs, union] = resolve_markers(&rendered);
+        // Markers always end their lines, so a side without a final newline
+        // cannot be read back from them.
+        let terminated = |bytes: &[u8]| bytes.is_empty() || bytes.ends_with(b"\n");
+        let readable = terminated(&case.ours) && terminated(&case.theirs);
+        for (name, sides, expected) in [
+            ("ours", vec![ConflictSide::Ours], ours),
+            ("theirs", vec![ConflictSide::Theirs], theirs),
+            (
+                "union",
+                vec![ConflictSide::Ours, ConflictSide::Theirs],
+                union,
+            ),
+        ] {
+            if readable && model.render(&all(&sides)).as_deref() != Some(expected.as_str()) {
+                failures.push(format!("--{name} differs: {}", describe()));
+            }
+        }
+        // `git merge-file` has no "zealous" level, only "zealous alnum": it
+        // can join more conflicts, but taking one whole side is the same.
+        let base_bytes = case.base.clone().unwrap_or_default();
+        for (flag, sides) in [
+            ("--ours", vec![ConflictSide::Ours]),
+            ("--theirs", vec![ConflictSide::Theirs]),
+        ] {
+            let (code, expected) = merge_file(
+                scratch.path(),
+                Some(flag),
+                &base_bytes,
+                &case.ours,
+                &case.theirs,
+            );
+            if code >= 0
+                && model.render(&all(&sides)).as_deref()
+                    != Some(String::from_utf8_lossy(&expected).as_ref())
+            {
+                failures.push(format!("merge-file {flag} differs: {}", describe()));
+            }
+        }
+    }
+    (conflicted, failures)
 }
 
 #[test]
-fn oracle_fixtures_match_git_merge_file() {
-    let (tmp, repo) = new_repo();
-    let dir = tmp.path();
-    let fixtures: &[(&str, Option<&str>, &str, &str)] = &[
-        ("single", Some("a\nb\nc\n"), "a\nX\nc\n", "a\nY\nc\n"),
-        (
+fn oracle_fixtures_match_git_merge() {
+    let fixtures: Vec<Case> = vec![
+        case("single", Some("a\nb\nc\n"), "a\nX\nc\n", "a\nY\nc\n"),
+        case(
             "adjacent",
             Some("1\n2\n3\n4\n5\n6\n7\n"),
             "1\n2\n3\n4\nX\n6\n7\n",
             "1\n2\n3\n4\n5\nY\n7\n",
         ),
-        (
+        case(
             "multiple",
             Some("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n"),
             "a\nX\nc\nd\ne\nf\ng\nh\ni\nj\nK\nl\n",
             "a\nY\nc\nd\ne\nf\ng\nh\ni\nj\nZ\nl\n",
         ),
-        (
+        case(
             "one-sided-around-conflict",
             Some("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n"),
             "A\nb\nc\nd\ne\nf\nX\nh\ni\nj\nk\nl\n",
             "a\nb\nc\nd\ne\nf\nY\nh\ni\nj\nk\nL\n",
         ),
-        (
+        case(
             "identical-plus-conflict",
             Some("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n"),
             "a\nSAME\nc\nd\ne\nf\nX\nh\ni\nj\nk\nl\n",
             "a\nSAME\nc\nd\ne\nf\nY\nh\ni\nj\nk\nl\n",
         ),
-        (
+        case(
             "insert-at-same-point",
             Some("a\nb\n"),
             "a\nX\nb\n",
             "a\nY\nb\n",
         ),
-        ("deletion-vs-edit", Some("a\nb\nc\n"), "a\nc\n", "a\nX\nc\n"),
-        (
+        case("deletion-vs-edit", Some("a\nb\nc\n"), "a\nc\n", "a\nX\nc\n"),
+        case(
             "crlf",
             Some("a\r\nb\r\nc\r\n"),
             "a\r\nX\r\nc\r\n",
             "a\r\nY\r\nc\r\n",
         ),
-        ("no-final-newline", Some("a\nb\nc"), "a\nb\nX", "a\nb\nY"),
-        (
+        case("no-final-newline", Some("a\nb\nc"), "a\nb\nX", "a\nb\nY"),
+        case(
             "final-newline-on-one-side",
             Some("a\nb\nc\n"),
             "a\nX",
             "a\nY\nc\n",
         ),
-        ("both-added", None, "a\nb\nc\n", "a\nX\nc\n"),
-        ("both-added-different", None, "a\nb\n", "c\nd\n"),
-        (
+        case("both-added", None, "a\nb\nc\n", "a\nX\nc\n"),
+        case("both-added-different", None, "a\nb\n", "c\nd\n"),
+        case(
             "refined-with-shared-middle",
             Some("0\nb\nc\nd\ne\nf\ng\nh\n9\n"),
             "0\nA\nx\ny\nz\nw\nB\nh\n9\n",
             "0\nC\nx\ny\nz\nw\nD\nh\n9\n",
         ),
-        (
+        case(
             "mixed-endings",
             Some("a\nb\r\nc\n"),
             "a\nX\r\nc\n",
             "a\nY\nc\n",
         ),
-        (
+        case(
             "close-conflicts-join",
             Some("a\nb\nc\nd\ne\n"),
             "a\nX\nc\nZ\ne\n",
             "a\nY\nc\nW\ne\n",
         ),
+        // `git merge` does not join conflicts over lines without letters and
+        // digits the way `git merge-file` does: two blocks.
+        case(
+            "gap-without-alnum",
+            Some("0\nb\n-\n-\n-\n-\nf\n9\n"),
+            "0\nA\n-\n-\n-\n-\nB\n9\n",
+            "0\nC\n-\n-\n-\n-\nD\n9\n",
+        ),
+        // Histogram finds a conflict where Myers (and so `merge-file`'s
+        // default) finds none.
+        case(
+            "histogram-only",
+            Some(items("b a b \"\" \"\" } c \"\" x } a c").as_str()),
+            items("b a b \"\" \"\" c \"\" } a c x {").as_str(),
+            items("b a { { a b \"\" \"\" } c \"\" x } c").as_str(),
+        ),
     ];
-    for (name, base, ours, theirs) in fixtures {
-        let count = check_against_git(dir, &repo, &format!("{name}.txt"), *base, ours, theirs);
-        assert!(count > 0, "{name} must conflict");
+    let (tmp, repo) = real_merge(&fixtures);
+    let (conflicted, failures) = check_cases(tmp.path(), &repo, &fixtures);
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    // Every fixture is meant to conflict, except those git merges cleanly.
+    assert!(
+        conflicted >= fixtures.len() - 1,
+        "only {conflicted} conflicted"
+    );
+    for name in ["histogram-only", "gap-without-alnum"] {
+        let markers = fs::read_to_string(tmp.path().join(name)).unwrap();
+        assert!(
+            markers.contains("<<<<<<<"),
+            "{name} must conflict in git merge"
+        );
     }
+    // The gap case: git merge writes two blocks.
+    let gap = fs::read_to_string(tmp.path().join("gap-without-alnum")).unwrap();
+    assert_eq!(gap.matches("<<<<<<<").count(), 2);
 }
 
-/// Deterministic pseudo-random triples, compared with git as well.
+/// One item per line; `""` is an empty line.
+fn items(text: &str) -> String {
+    text.split(' ')
+        .map(|item| if item == "\"\"" { "" } else { item })
+        .map(|item| format!("{item}\n"))
+        .collect()
+}
+
+/// Deterministic pseudo-random triples, merged by real git as well.
 #[test]
-fn oracle_random_triples_match_git_merge_file() {
-    let (tmp, repo) = new_repo();
-    let dir = tmp.path();
+fn oracle_random_triples_match_git_merge() {
     let mut state: u64 = 0x2545_F491_4F6C_DD1D;
     let mut next = move |bound: u64| {
         state = state
@@ -267,11 +417,11 @@ fn oracle_random_triples_match_git_merge_file() {
         (state >> 33) % bound
     };
     let words = ["a", "b", "c", "d", "-", "{", "x1", "y2"];
-    let mut checked = 0;
-    for case in 0..150 {
-        let len = next(12) as usize;
+    let mut cases = Vec::new();
+    for index in 0..400 {
+        let len = next(30) as usize;
         let base: Vec<String> = (0..len)
-            .map(|_| words[next(5) as usize].to_string())
+            .map(|_| words[next(4) as usize].to_string())
             .collect();
         let mutate = |lines: &Vec<String>, next: &mut dyn FnMut(u64) -> u64| {
             let mut lines = lines.clone();
@@ -290,30 +440,31 @@ fn oracle_random_triples_match_git_merge_file() {
         let ours = mutate(&base, &mut next);
         let theirs = mutate(&base, &mut next);
         let join = |lines: &Vec<String>| {
-            let mut text = lines.join("\n");
-            if !lines.is_empty() {
-                text.push('\n');
+            // Mixed line endings and missing final newlines, by length.
+            let crlf = lines.len().is_multiple_of(3);
+            let nl = if crlf { "\r\n" } else { "\n" };
+            let mut text = lines.join(nl);
+            if !lines.is_empty() && lines.len() % 4 != 1 {
+                text.push_str(nl);
             }
             text
         };
-        let (b, o, t) = (join(&base), join(&ours), join(&theirs));
-        let scratch = tempfile::tempdir().unwrap();
-        let (code, _) = merge_file(
-            scratch.path(),
-            None,
-            b.as_bytes(),
-            o.as_bytes(),
-            t.as_bytes(),
-        );
-        if code < 1 {
-            continue;
-        }
-        check_against_git(dir, &repo, &format!("r{case}.txt"), Some(&b), &o, &t);
-        checked += 1;
+        // A file name unlike any other, so rename detection has nothing to pair.
+        cases.push(case(
+            &format!("r{index}.txt"),
+            Some(join(&base).as_str()),
+            join(&ours).as_str(),
+            join(&theirs).as_str(),
+        ));
     }
+    let (tmp, repo) = real_merge(&cases);
+    let (conflicted, failures) = check_cases(tmp.path(), &repo, &cases);
+    assert!(conflicted > 40, "only {conflicted} conflicting cases");
     assert!(
-        checked > 20,
-        "only {checked} conflicting cases were generated"
+        failures.is_empty(),
+        "{} of {conflicted} disagree with git merge:\n{}",
+        failures.len(),
+        failures.join("\n\n")
     );
 }
 
@@ -375,6 +526,51 @@ fn kinds_binary_deleted_and_symlink() {
     assert_eq!(repo.conflict("sub").unwrap(), ConflictKind::Submodule);
 
     assert!(repo.conflict("seed.txt").is_err(), "not conflicted");
+
+    // Added by one side only, or deleted by both.
+    index_conflict(dir, "mine.txt", &[(2, "100644", b"a\n")]);
+    assert_eq!(repo.conflict("mine.txt").unwrap(), ConflictKind::AddedByUs);
+    index_conflict(dir, "theirs.txt", &[(3, "100644", b"a\n")]);
+    assert_eq!(
+        repo.conflict("theirs.txt").unwrap(),
+        ConflictKind::AddedByThem
+    );
+    index_conflict(dir, "both-gone.txt", &[(1, "100644", b"a\n")]);
+    assert_eq!(
+        repo.conflict("both-gone.txt").unwrap(),
+        ConflictKind::DeletedByBoth
+    );
+}
+
+#[test]
+fn text_that_git_cannot_hand_back_as_utf8_is_not_edited_line_by_line() {
+    let (tmp, repo) = new_repo();
+    let dir = tmp.path();
+    // 0xE9 is "é" in Latin-1 and invalid UTF-8.
+    index_conflict(
+        dir,
+        "latin1.txt",
+        &[
+            (1, "100644", b"caf\xe9\n"),
+            (2, "100644", b"caf\xe9 ours\n"),
+            (3, "100644", b"caf\xe9 theirs\n"),
+        ],
+    );
+    assert_eq!(repo.conflict("latin1.txt").unwrap(), ConflictKind::NotText);
+
+    // Only the attribute matters: the index of a filtered path holds the
+    // clean form (an LFS pointer), which the work-tree file does not show.
+    fs::write(dir.join(".gitattributes"), "*.lfs filter=lfs\n").unwrap();
+    index_conflict(
+        dir,
+        "big.lfs",
+        &[
+            (1, "100644", b"version a\n"),
+            (2, "100644", b"version b\n"),
+            (3, "100644", b"version c\n"),
+        ],
+    );
+    assert_eq!(repo.conflict("big.lfs").unwrap(), ConflictKind::NotText);
 }
 
 /// Both sides change the same file; `main` and `side` end up in a conflicted merge.
@@ -449,7 +645,11 @@ fn save_resolution_stages_the_file_and_the_merge_can_finish() {
         .unwrap();
     assert_eq!(resolved, "a\nY\nX\nc\n");
     assert_eq!(repo.operation().unwrap(), Operation::Merge);
-    repo.save_resolution("f.txt", &resolved).unwrap();
+    assert_eq!(
+        repo.save_resolution("f.txt", &resolved, &model.guard)
+            .unwrap(),
+        SaveOutcome::Saved
+    );
     assert_eq!(
         fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
         resolved
@@ -461,5 +661,212 @@ fn save_resolution_stages_the_file_and_the_merge_can_finish() {
     );
     git(tmp.path(), &["commit", "-q", "--no-edit"]);
     assert_eq!(repo.operation().unwrap(), Operation::None);
-    assert!(repo.save_resolution("../escape.txt", "x").is_err());
+    assert!(repo
+        .save_resolution("../escape.txt", "x", &model.guard)
+        .is_err());
+}
+
+#[test]
+fn save_goes_through_git_so_eol_attributes_apply() {
+    let attrs = ".gitattributes";
+    let (tmp, repo) = conflicted_merge(&[
+        (
+            attrs,
+            "* text eol=crlf\n",
+            "* text eol=crlf\n",
+            "* text eol=crlf\n",
+        ),
+        ("f.txt", "a\nb\nc\n", "a\nX\nc\n", "a\nY\nc\n"),
+    ]);
+    let dir = tmp.path();
+    // git wrote the marker file with CRLF; it is what the merge left.
+    assert!(fs::read(dir.join("f.txt")).unwrap().contains(&b'\r'));
+    let model = text(repo.conflict("f.txt").unwrap());
+    assert!(!model.guard.changed_after_merge);
+    let resolved = model
+        .render(&[ConflictResolution::Picked(vec![
+            ConflictSide::Theirs,
+            ConflictSide::Ours,
+        ])])
+        .unwrap();
+    assert_eq!(resolved, "a\nY\nX\nc\n", "the index form is LF");
+    assert_eq!(
+        repo.save_resolution("f.txt", &resolved, &model.guard)
+            .unwrap(),
+        SaveOutcome::Saved
+    );
+    assert_eq!(
+        fs::read(dir.join("f.txt")).unwrap(),
+        b"a\r\nY\r\nX\r\nc\r\n"
+    );
+    // Staged, and the work-tree file is not modified against the index.
+    assert_eq!(git(dir, &["diff", "--name-only"]), "");
+    assert_eq!(git(dir, &["diff", "--cached", "--name-only"]), "f.txt");
+    assert!(git(dir, &["ls-files", "-u"]).is_empty());
+}
+
+#[test]
+fn save_keeps_the_mode_of_the_side_and_creates_a_missing_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, repo) = new_repo();
+    let dir = tmp.path();
+    index_conflict(
+        dir,
+        "bin/run.sh",
+        &[
+            (1, "100755", b"a\nb\nc\n"),
+            (2, "100755", b"a\nX\nc\n"),
+            (3, "100755", b"a\nY\nc\n"),
+        ],
+    );
+    let model = text(repo.conflict("bin/run.sh").unwrap());
+    assert_eq!(
+        model.guard.work_tree_digest, None,
+        "no file in the work tree"
+    );
+    let resolved = model
+        .render(&[ConflictResolution::Picked(vec![ConflictSide::Ours])])
+        .unwrap();
+    assert_eq!(
+        repo.save_resolution("bin/run.sh", &resolved, &model.guard)
+            .unwrap(),
+        SaveOutcome::Saved
+    );
+    let meta = fs::metadata(dir.join("bin/run.sh")).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o111, 0o111);
+    assert!(git(dir, &["ls-files", "-s", "bin/run.sh"]).starts_with("100755"));
+}
+
+#[test]
+fn save_refuses_paths_outside_the_work_tree_and_inside_git() {
+    let (_tmp, repo) = conflicted_merge(&[("f.txt", "a\nb\nc\n", "a\nX\nc\n", "a\nY\nc\n")]);
+    let model = text(repo.conflict("f.txt").unwrap());
+    for path in [
+        "../escape.txt",
+        ".git/hooks/post-checkout",
+        ".GIT/config",
+        "/abs",
+        "a/.Git/x",
+    ] {
+        assert!(
+            repo.save_resolution(path, "x", &model.guard).is_err(),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn a_file_changed_outside_the_editor_is_noticed_at_load_and_at_save() {
+    let (tmp, repo) = conflicted_merge(&[("f.txt", "a\nb\nc\n", "a\nX\nc\n", "a\nY\nc\n")]);
+    let dir = tmp.path();
+    let model = text(repo.conflict("f.txt").unwrap());
+    assert!(!model.guard.changed_after_merge, "git's own marker file");
+    let resolved = model
+        .render(&[ConflictResolution::Picked(vec![ConflictSide::Ours])])
+        .unwrap();
+
+    // Changed since the load: nothing is written, the conflict stays.
+    fs::write(dir.join("f.txt"), "edited elsewhere\n").unwrap();
+    assert_eq!(
+        repo.save_resolution("f.txt", &resolved, &model.guard)
+            .unwrap(),
+        SaveOutcome::WorkTreeChanged
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("f.txt")).unwrap(),
+        "edited elsewhere\n"
+    );
+    assert!(!git(dir, &["ls-files", "-u"]).is_empty());
+
+    // Loading it now reports that it is not the file the merge wrote.
+    let reloaded = text(repo.conflict("f.txt").unwrap());
+    assert!(reloaded.guard.changed_after_merge);
+    // ... and saving from that load is allowed (the user confirmed).
+    assert_eq!(
+        repo.save_resolution("f.txt", &resolved, &reloaded.guard)
+            .unwrap(),
+        SaveOutcome::Saved
+    );
+    assert_eq!(fs::read_to_string(dir.join("f.txt")).unwrap(), resolved);
+}
+
+#[test]
+fn saving_after_the_merge_was_aborted_writes_nothing() {
+    let (tmp, repo) = conflicted_merge(&[("f.txt", "a\nb\nc\n", "a\nX\nc\n", "a\nY\nc\n")]);
+    let dir = tmp.path();
+    let model = text(repo.conflict("f.txt").unwrap());
+    let resolved = model
+        .render(&[ConflictResolution::Picked(vec![ConflictSide::Theirs])])
+        .unwrap();
+    git(dir, &["merge", "--abort"]);
+    let after_abort = fs::read(dir.join("f.txt")).unwrap();
+    assert_eq!(
+        repo.save_resolution("f.txt", &resolved, &model.guard)
+            .unwrap(),
+        SaveOutcome::StagesChanged
+    );
+    assert_eq!(fs::read(dir.join("f.txt")).unwrap(), after_abort);
+    assert_eq!(git(dir, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn saving_after_the_sides_changed_writes_nothing() {
+    let (tmp, repo) = conflicted_merge(&[("f.txt", "a\nb\nc\n", "a\nX\nc\n", "a\nY\nc\n")]);
+    let dir = tmp.path();
+    let model = text(repo.conflict("f.txt").unwrap());
+    // Someone else resolved the path and put the conflict back with other sides.
+    git(dir, &["checkout", "--conflict=merge", "--", "f.txt"]);
+    index_conflict(
+        dir,
+        "f.txt",
+        &[
+            (1, "100644", b"a\nb\nc\n"),
+            (2, "100644", b"a\nOTHER\nc\n"),
+            (3, "100644", b"a\nY\nc\n"),
+        ],
+    );
+    let before = fs::read(dir.join("f.txt")).unwrap();
+    assert_eq!(
+        repo.save_resolution("f.txt", "a\nZ\nc\n", &model.guard)
+            .unwrap(),
+        SaveOutcome::StagesChanged
+    );
+    assert_eq!(fs::read(dir.join("f.txt")).unwrap(), before);
+}
+
+/// What the editor's cards do for the one-sided kinds: "Keep the file" takes
+/// the side that has it, "Delete the file" takes the side that does not (git
+/// then removes the path).
+#[test]
+fn one_sided_kinds_keep_or_delete_through_resolve_take() {
+    let (tmp, repo) = new_repo();
+    let dir = tmp.path();
+    let unmerged = |path: &str| git(dir, &["ls-files", "-u", "--", path]);
+    let tracked = |path: &str| git(dir, &["ls-files", "--", path]);
+
+    index_conflict(dir, "mine.txt", &[(2, "100644", b"a\n")]);
+    fs::write(dir.join("mine.txt"), "a\n").unwrap();
+    repo.resolve_take("mine.txt", ConflictSide::Ours).unwrap();
+    assert_eq!(unmerged("mine.txt"), "");
+    assert_eq!(tracked("mine.txt"), "mine.txt");
+
+    index_conflict(dir, "mine-del.txt", &[(2, "100644", b"a\n")]);
+    fs::write(dir.join("mine-del.txt"), "a\n").unwrap();
+    repo.resolve_take("mine-del.txt", ConflictSide::Theirs)
+        .unwrap();
+    assert_eq!(tracked("mine-del.txt"), "");
+    assert!(!dir.join("mine-del.txt").exists());
+
+    index_conflict(dir, "theirs.txt", &[(3, "100644", b"a\n")]);
+    fs::write(dir.join("theirs.txt"), "a\n").unwrap();
+    repo.resolve_take("theirs.txt", ConflictSide::Theirs)
+        .unwrap();
+    assert_eq!(unmerged("theirs.txt"), "");
+    assert_eq!(tracked("theirs.txt"), "theirs.txt");
+
+    index_conflict(dir, "both-gone.txt", &[(1, "100644", b"a\n")]);
+    repo.resolve_take("both-gone.txt", ConflictSide::Ours)
+        .unwrap();
+    assert_eq!(unmerged("both-gone.txt"), "");
+    assert_eq!(tracked("both-gone.txt"), "");
 }

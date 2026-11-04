@@ -2,21 +2,28 @@
 //! file, the file split into segments over the base, and the text a set of
 //! resolutions renders to.
 //!
-//! Line diffs come from the git CLI (base to each side); the three-way
-//! chunking is plain Rust, written to give the same regions as
-//! `git merge-file` (git's "zealous alnum" level): conflicts are refined by
-//! diffing the two sides against each other, and conflicts separated by at
-//! most three lines, or by lines without letters and digits, are joined.
+//! Line diffs come from the git CLI (base to each side, histogram); the
+//! three-way chunking is plain Rust, written to give the same regions as the
+//! file `git merge` (ort) writes to the work tree: git's `ll_merge` runs the
+//! histogram diff at the "zealous" level, so conflicts are refined by diffing
+//! the two sides against each other (histogram again, see [`diff_lines`]) and
+//! conflicts separated by at most three lines are joined. (`git merge-file`
+//! uses the stricter "zealous alnum" level, which also joins conflicts
+//! separated by lines without letters and digits; `git merge` does not.)
 
+use std::collections::HashMap;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::ops::Range;
 use std::path::{Component, Path};
+use std::process::Stdio;
 
-use crate::status::{literal_command, stage, ConflictSide, UNTRACKED_COUNT_CAP};
+use crate::status::{unmerged, ConflictSide, UNTRACKED_COUNT_CAP};
 use crate::{check_output, Error, Repo, Result};
 
 /// How one line of a side ends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LineEnding {
     /// `\n`
     Lf,
@@ -27,19 +34,66 @@ pub enum LineEnding {
 }
 
 /// What kind of conflict a path is in, with the data to resolve it.
+// One value per file load, moved straight into the editor: boxing the text
+// conflict would only add a deref to every caller.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictKind {
     Text(TextConflict),
     /// A side has a NUL byte: only whole-side picking is possible.
     Binary,
+    /// Not text GitWarp can merge line by line: a side is not valid UTF-8,
+    /// or the path goes through a git filter (LFS: the index holds pointers,
+    /// not the file's content). Only whole-side picking is possible.
+    NotText,
     /// We deleted the file (no stage 2), they changed it.
     DeletedByUs,
     /// They deleted the file (no stage 3), we changed it.
     DeletedByThem,
+    /// Added on our side only (stage 2 without a base).
+    AddedByUs,
+    /// Added on their side only (stage 3 without a base).
+    AddedByThem,
+    /// Deleted on both sides (a base and nothing else).
+    DeletedByBoth,
     /// Either side is a symlink (mode 120000).
     Symlink,
     /// Either side is a submodule (mode 160000).
     Submodule,
+}
+
+/// One unmerged index entry of a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexStage {
+    /// 1 base, 2 ours, 3 theirs.
+    pub stage: u8,
+    pub mode: String,
+    pub oid: String,
+}
+
+/// What a conflict looked like when it was loaded; [`Repo::save_resolution`]
+/// refuses to write when the repository no longer matches.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConflictGuard {
+    /// The path's unmerged entries at load.
+    pub stages: Vec<IndexStage>,
+    /// A hash of the work-tree file at load (`None`: it did not exist).
+    pub work_tree_digest: Option<u64>,
+    /// The work-tree file differed from the marker file `git merge` writes
+    /// (rerere resolved it, or it was edited elsewhere).
+    pub changed_after_merge: bool,
+}
+
+/// What [`Repo::save_resolution`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// Written and staged; the conflict is over.
+    Saved,
+    /// The path is not in the conflict that was loaded (merge aborted,
+    /// resolved elsewhere, or the sides changed). Nothing was written.
+    StagesChanged,
+    /// The work-tree file changed since the load. Nothing was written.
+    WorkTreeChanged,
 }
 
 /// A text conflict: the three versions and the file cut into segments.
@@ -47,7 +101,7 @@ pub enum ConflictKind {
 /// Lines are stored without their terminator (`\n` or `\r\n`); the
 /// `*_endings` vectors hold the terminator of each line, so rendering
 /// reproduces the bytes of mixed-ending files and a missing final newline.
-/// Invalid UTF-8 was replaced with U+FFFD when the blobs were read.
+/// Only valid UTF-8 gets here (anything else is [`ConflictKind::NotText`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextConflict {
     /// `None` when both sides added the file (an empty base).
@@ -59,6 +113,7 @@ pub struct TextConflict {
     pub ours_endings: Vec<LineEnding>,
     pub theirs_endings: Vec<LineEnding>,
     pub segments: Vec<ConflictSegment>,
+    pub guard: ConflictGuard,
 }
 
 /// One region of the file. All ranges are half-open and index the line
@@ -66,8 +121,9 @@ pub struct TextConflict {
 ///
 /// A conflict that git's refinement splits into several (common lines inside
 /// it become `Same`) cannot attribute base lines to the pieces: the first
-/// piece gets the base range of the whole region, the later ones an empty
-/// range at its end.
+/// `Conflict` piece gets the base range of the whole region, the other pieces
+/// an empty range (before the first `Conflict`: at the region's start; after
+/// it: at its end).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictSegment {
     /// Unchanged on both sides.
@@ -107,7 +163,10 @@ pub enum ConflictResolution {
     Picked(Vec<ConflictSide>),
     /// Hand-edited text for the region: lines separated by `\n` (a `\r\n`
     /// is accepted), a final newline optional. Every line is written with
-    /// the file's line ending. May be empty (the region is removed).
+    /// the file's line ending, except the last line of the file's last
+    /// region when the text has no final newline and neither side had one
+    /// (the file then stays unterminated). May be empty (the region is
+    /// removed).
     Custom(String),
 }
 
@@ -125,61 +184,205 @@ impl TextConflict {
         vec![ConflictResolution::Unresolved; self.conflict_count()]
     }
 
+    /// The lines `resolution` produces for conflict `conflict_index`, each
+    /// with its terminator; empty while the conflict is unresolved. The one
+    /// definition of "what a resolution writes": `render`, `render_markers`
+    /// and the editor's result pane all go through it.
+    pub fn region_lines(
+        &self,
+        conflict_index: usize,
+        resolution: &ConflictResolution,
+    ) -> Vec<(String, LineEnding)> {
+        let mut seen = 0;
+        for (at, segment) in self.segments.iter().enumerate() {
+            if let ConflictSegment::Conflict { ours, theirs, .. } = segment {
+                if seen == conflict_index {
+                    return self.conflict_lines(at, ours, theirs, resolution);
+                }
+                seen += 1;
+            }
+        }
+        Vec::new()
+    }
+
+    /// [`Self::region_lines`] for the conflict at `segments[at]`.
+    fn conflict_lines(
+        &self,
+        at: usize,
+        ours: &Range<usize>,
+        theirs: &Range<usize>,
+        resolution: &ConflictResolution,
+    ) -> Vec<(String, LineEnding)> {
+        let side_lines = |side: &ConflictSide| -> Vec<(String, LineEnding)> {
+            let (lines, endings, range) = match side {
+                ConflictSide::Ours => (&self.ours, &self.ours_endings, ours),
+                ConflictSide::Theirs => (&self.theirs, &self.theirs_endings, theirs),
+            };
+            range
+                .clone()
+                .map(|ix| (lines[ix].clone(), endings[ix]))
+                .collect()
+        };
+        match resolution {
+            ConflictResolution::Unresolved => Vec::new(),
+            ConflictResolution::Picked(sides) => {
+                let mut seen: Vec<ConflictSide> = Vec::new();
+                let mut out = Vec::new();
+                for side in sides {
+                    if seen.contains(side) {
+                        continue;
+                    }
+                    seen.push(*side);
+                    out.extend(side_lines(side));
+                }
+                out
+            }
+            ConflictResolution::Custom(text) => {
+                if text.is_empty() {
+                    return Vec::new();
+                }
+                let default_ending = self.default_ending();
+                let body = text.strip_suffix('\n').unwrap_or(text);
+                let mut out: Vec<(String, LineEnding)> = body
+                    .split('\n')
+                    .map(|line| {
+                        (
+                            line.strip_suffix('\r').unwrap_or(line).to_owned(),
+                            default_ending,
+                        )
+                    })
+                    .collect();
+                // The file stays unterminated when the typed text is its last
+                // content, has no final newline, and neither side had one.
+                let unterminated = |endings: &[LineEnding]| {
+                    endings
+                        .last()
+                        .is_none_or(|ending| *ending == LineEnding::None)
+                };
+                if !text.ends_with('\n')
+                    && unterminated(&self.ours_endings)
+                    && unterminated(&self.theirs_endings)
+                    && self.segments[at + 1..].iter().all(|s| self.is_empty(s))
+                {
+                    if let Some(last) = out.last_mut() {
+                        last.1 = LineEnding::None;
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Whether a segment writes no lines at all.
+    fn is_empty(&self, segment: &ConflictSegment) -> bool {
+        match segment {
+            ConflictSegment::Stable { ours, .. } | ConflictSegment::Same { ours, .. } => {
+                ours.is_empty()
+            }
+            ConflictSegment::Auto {
+                side, ours, theirs, ..
+            } => match side {
+                ConflictSide::Ours => ours.is_empty(),
+                ConflictSide::Theirs => theirs.is_empty(),
+            },
+            ConflictSegment::Conflict { .. } => false,
+        }
+    }
+
     /// The file text for `resolutions`, or `None` while a conflict is
     /// unresolved (or `resolutions` has the wrong length).
     pub fn render(&self, resolutions: &[ConflictResolution]) -> Option<String> {
         if resolutions.len() != self.conflict_count() {
             return None;
         }
-        let default_ending = self.default_ending();
         let mut out = Emitter::default();
         let mut next = resolutions.iter();
-        for segment in &self.segments {
+        for (at, segment) in self.segments.iter().enumerate() {
             match segment {
-                ConflictSegment::Stable { ours, .. } | ConflictSegment::Same { ours, .. } => {
-                    out.side(&self.ours, &self.ours_endings, ours);
+                ConflictSegment::Conflict { ours, theirs, .. } => {
+                    let resolution = next.next()?;
+                    if is_open(resolution) {
+                        return None;
+                    }
+                    for (line, ending) in self.conflict_lines(at, ours, theirs, resolution) {
+                        out.line(&line, ending);
+                    }
                 }
-                ConflictSegment::Auto {
-                    side, ours, theirs, ..
-                } => match side {
-                    ConflictSide::Ours => out.side(&self.ours, &self.ours_endings, ours),
-                    ConflictSide::Theirs => out.side(&self.theirs, &self.theirs_endings, theirs),
-                },
-                ConflictSegment::Conflict { ours, theirs, .. } => match next.next()? {
-                    ConflictResolution::Unresolved => return None,
-                    ConflictResolution::Picked(sides) => {
-                        if sides.is_empty() {
-                            return None;
-                        }
-                        let mut seen = Vec::new();
-                        for side in sides {
-                            if seen.contains(side) {
-                                continue;
-                            }
-                            seen.push(*side);
-                            match side {
-                                ConflictSide::Ours => {
-                                    out.side(&self.ours, &self.ours_endings, ours);
-                                }
-                                ConflictSide::Theirs => {
-                                    out.side(&self.theirs, &self.theirs_endings, theirs);
-                                }
-                            }
-                        }
-                    }
-                    ConflictResolution::Custom(text) => {
-                        let body = text.strip_suffix('\n').unwrap_or(text);
-                        if !text.is_empty() {
-                            for line in body.split('\n') {
-                                let line = line.strip_suffix('\r').unwrap_or(line);
-                                out.line(line, default_ending);
-                            }
-                        }
-                    }
-                },
+                other => self.emit_plain(&mut out, other),
             }
         }
         Some(out.finish())
+    }
+
+    /// The file as git writes it for an unresolved merge
+    /// (`merge.conflictStyle=merge`): every conflict as a marker block
+    /// `<<<<<<< ours_label` / `=======` / `>>>>>>> theirs_label`. Marker lines
+    /// end with CRLF when the lines around the conflict do, like git's.
+    pub fn render_markers(&self, ours_label: &str, theirs_label: &str) -> String {
+        let mut out = Emitter::default();
+        for segment in &self.segments {
+            let ConflictSegment::Conflict { ours, theirs, .. } = segment else {
+                self.emit_plain(&mut out, segment);
+                continue;
+            };
+            let cr = self.markers_need_cr(ours, theirs);
+            out.marker("<<<<<<<", ours_label, cr);
+            out.side(&self.ours, &self.ours_endings, ours);
+            out.close(cr);
+            out.marker("=======", "", cr);
+            out.side(&self.theirs, &self.theirs_endings, theirs);
+            out.close(cr);
+            out.marker(">>>>>>>", theirs_label, cr);
+        }
+        out.finish()
+    }
+
+    /// Writes a segment that is not a conflict.
+    fn emit_plain(&self, out: &mut Emitter, segment: &ConflictSegment) {
+        match segment {
+            ConflictSegment::Stable { ours, .. } | ConflictSegment::Same { ours, .. } => {
+                out.side(&self.ours, &self.ours_endings, ours);
+            }
+            ConflictSegment::Auto {
+                side, ours, theirs, ..
+            } => match side {
+                ConflictSide::Ours => out.side(&self.ours, &self.ours_endings, ours),
+                ConflictSide::Theirs => out.side(&self.theirs, &self.theirs_endings, theirs),
+            },
+            ConflictSegment::Conflict { .. } => {}
+        }
+    }
+
+    /// git's `is_cr_needed`: the marker lines of a conflict are CRLF when the
+    /// line before it (or the first line) is CRLF in both ours and theirs,
+    /// and the base's first line is CRLF too.
+    fn markers_need_cr(&self, ours: &Range<usize>, theirs: &Range<usize>) -> bool {
+        // `Some(false)` LF, `Some(true)` CRLF, `None` cannot tell.
+        fn eol_crlf(endings: &[LineEnding], i: usize) -> Option<bool> {
+            if endings.is_empty() {
+                return None;
+            }
+            let i = i.min(endings.len() - 1);
+            let crlf = |ending: LineEnding| ending == LineEnding::CrLf;
+            if i + 1 < endings.len() || endings[i] != LineEnding::None {
+                return Some(crlf(endings[i]));
+            }
+            if i == 0 {
+                return None;
+            }
+            Some(crlf(endings[i - 1]))
+        }
+        let before = |range: &Range<usize>| range.start.saturating_sub(1);
+        // git tests each answer for "truthy", which includes "cannot tell";
+        // the last answer stands, and "cannot tell" ends up as LF.
+        let mut answer = eol_crlf(&self.ours_endings, before(ours));
+        if answer != Some(false) {
+            answer = eol_crlf(&self.theirs_endings, before(theirs));
+        }
+        if answer != Some(false) {
+            answer = eol_crlf(&self.base_endings, 0);
+        }
+        answer == Some(true)
     }
 
     /// The ending used for lines the user typed: CRLF when every terminated
@@ -208,30 +411,42 @@ impl TextConflict {
     /// Builds the model from the three sides and the line diffs base→ours
     /// and base→theirs.
     fn from_sides(
-        base: Option<&SideText>,
-        ours: &SideText,
-        theirs: &SideText,
+        base: Option<SideText>,
+        ours: SideText,
+        theirs: SideText,
         ours_hunks: &[DiffHunk],
         theirs_hunks: &[DiffHunk],
     ) -> Self {
         let empty = SideText::default();
-        let base_side = base.unwrap_or(&empty);
         let segments = build_segments(
-            &base_side.keys(),
+            &base.as_ref().unwrap_or(&empty).keys(),
             &ours.keys(),
             &theirs.keys(),
             ours_hunks,
             theirs_hunks,
         );
         Self {
-            base: base.map(|side| side.lines.clone()),
-            ours: ours.lines.clone(),
-            theirs: theirs.lines.clone(),
-            base_endings: base.map(|side| side.endings.clone()).unwrap_or_default(),
-            ours_endings: ours.endings.clone(),
-            theirs_endings: theirs.endings.clone(),
+            base_endings: base
+                .as_ref()
+                .map(|side| side.endings.clone())
+                .unwrap_or_default(),
+            base: base.map(|side| side.lines),
+            ours: ours.lines,
+            theirs: theirs.lines,
+            ours_endings: ours.endings,
+            theirs_endings: theirs.endings,
             segments,
+            guard: ConflictGuard::default(),
         }
+    }
+}
+
+/// Whether `resolution` leaves its conflict open.
+fn is_open(resolution: &ConflictResolution) -> bool {
+    match resolution {
+        ConflictResolution::Unresolved => true,
+        ConflictResolution::Picked(sides) => sides.is_empty(),
+        ConflictResolution::Custom(_) => false,
     }
 }
 
@@ -248,10 +463,7 @@ struct Emitter {
 
 impl Emitter {
     fn line(&mut self, text: &str, ending: LineEnding) {
-        if self.open {
-            self.out.push_str(if self.crlf { "\r\n" } else { "\n" });
-            self.open = false;
-        }
+        self.close(self.crlf);
         self.out.push_str(text);
         match ending {
             LineEnding::Lf => {
@@ -264,6 +476,25 @@ impl Emitter {
             }
             LineEnding::None => self.open = true,
         }
+    }
+
+    /// Terminates an unterminated last line.
+    fn close(&mut self, crlf: bool) {
+        if self.open {
+            self.out.push_str(if crlf { "\r\n" } else { "\n" });
+            self.open = false;
+        }
+    }
+
+    /// A conflict marker line (`label` empty: no label, no space).
+    fn marker(&mut self, marker: &str, label: &str, crlf: bool) {
+        self.close(crlf);
+        self.out.push_str(marker);
+        if !label.is_empty() {
+            self.out.push(' ');
+            self.out.push_str(label);
+        }
+        self.out.push_str(if crlf { "\r\n" } else { "\n" });
     }
 
     fn side(&mut self, lines: &[String], endings: &[LineEnding], range: &Range<usize>) {
@@ -316,7 +547,7 @@ impl SideText {
 
 /// A line as git compares it: the text together with its terminator
 /// (`a\r\n` differs from `a\n`, a last line without newline from one with).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Line<'a> {
     text: &'a str,
     ending: LineEnding,
@@ -434,8 +665,8 @@ fn build_segments(
     simplify_conflicts(segments, ours)
 }
 
-/// Above this many line pairs the refinement does not diff a conflict's two
-/// sides (the table would be too big) and keeps the conflict whole.
+/// Above this many line pairs the classic fallback of [`diff_lines`] does not
+/// diff a region (the table would be too big) and keeps it as one change.
 const REFINE_CELL_CAP: usize = 4_000_000;
 
 /// Splits each conflict along the lines its two sides share: git diffs the
@@ -458,13 +689,19 @@ fn refine_conflicts(
             continue;
         };
         let changes = diff_lines(&ours[o.clone()], &theirs[t.clone()]);
-        // The base range goes to the first piece, the rest get an empty one.
-        let first = std::cell::Cell::new(true);
-        let piece_base = || {
-            if first.replace(false) {
-                base.clone()
-            } else {
+        // The whole base range goes to the first `Conflict` piece; the other
+        // pieces get an empty range (`Same` ones before it at the start of the
+        // region, after it at the end). No change at all: one `Same` piece.
+        let mut base_for_conflict = Some(base.clone());
+        let mut after_conflict = false;
+        let mut piece_base = |conflict: bool| {
+            if conflict {
+                after_conflict = true;
+                base_for_conflict.take().unwrap_or(base.end..base.end)
+            } else if after_conflict {
                 base.end..base.end
+            } else {
+                base.start..base.start
             }
         };
         let (mut oc, mut tc) = (o.start, t.start);
@@ -475,7 +712,7 @@ fn refine_conflicts(
             );
             if co.start > oc {
                 out.push(ConflictSegment::Same {
-                    base: piece_base(),
+                    base: piece_base(false),
                     ours: oc..co.start,
                     theirs: tc..ct.start,
                 });
@@ -483,14 +720,19 @@ fn refine_conflicts(
             oc = co.end;
             tc = ct.end;
             out.push(ConflictSegment::Conflict {
-                base: piece_base(),
+                base: piece_base(true),
                 ours: co,
                 theirs: ct,
             });
         }
-        if oc < o.end || first.get() {
+        if oc < o.end || !after_conflict {
+            let base = if after_conflict {
+                base.end..base.end
+            } else {
+                base.clone()
+            };
             out.push(ConflictSegment::Same {
-                base: piece_base(),
+                base,
                 ours: oc..o.end,
                 theirs: tc..t.end,
             });
@@ -499,10 +741,11 @@ fn refine_conflicts(
     out
 }
 
-/// Joins conflicts that are close together, like git's zealous alnum level:
-/// when the lines between two conflicts number at most three, or contain no
-/// letter or digit, they are one conflict. Only unchanged and `Same` text may
-/// lie between; a one-sided change keeps conflicts apart.
+/// Joins conflicts that are close together, like git's zealous level: when
+/// at most three lines lie between two conflicts they are one conflict. Only
+/// unchanged and `Same` text may lie between; a one-sided change keeps
+/// conflicts apart. (`git merge-file`'s "zealous alnum" level also joins over
+/// any number of lines without letters and digits; `git merge` does not.)
 fn simplify_conflicts(segments: Vec<ConflictSegment>, ours: &[Line<'_>]) -> Vec<ConflictSegment> {
     let mut out: Vec<ConflictSegment> = Vec::with_capacity(segments.len());
     for segment in segments {
@@ -532,14 +775,9 @@ fn simplify_conflicts(segments: Vec<ConflictSegment>, ours: &[Line<'_>]) -> Vec<
             else {
                 unreachable!()
             };
-            let gap = &ours[po.end..o.start];
-            let close = gap.len() <= 3
-                || !gap
-                    .iter()
-                    .any(|line| line.text.bytes().any(|b| b.is_ascii_alphanumeric()));
-            if close {
+            if ours[po.end..o.start].len() <= 3 {
                 let joined = ConflictSegment::Conflict {
-                    base: pb.start..base.end,
+                    base: pb.start.min(base.start)..pb.end.max(base.end),
                     ours: po.start..o.end,
                     theirs: pt.start..t.end,
                 };
@@ -553,10 +791,210 @@ fn simplify_conflicts(segments: Vec<ConflictSegment>, ours: &[Line<'_>]) -> Vec<
     out
 }
 
-/// The changes turning `a` into `b`, as ranges of `a` and of `b`. Common
-/// lines are matched as early as possible, so a change inside a run of equal
-/// lines lands at the end of the run (git slides changes down too).
+/// The changes turning `a` into `b`, as ranges of `a` and of `b`: git's
+/// histogram diff (`xdl_do_histogram_diff`) followed by the same sliding of
+/// changes (`xdl_change_compact`, without the indent heuristic) that git
+/// applies, so a change inside a run of equal lines lands where git puts it.
+/// Regions where every common line is too frequent for the histogram fall
+/// back to a plain LCS diff (git: Myers).
 fn diff_lines(a: &[Line<'_>], b: &[Line<'_>]) -> Vec<(Range<usize>, Range<usize>)> {
+    let (mut changed_a, mut changed_b) = (vec![false; a.len()], vec![false; b.len()]);
+    histogram(a, b, 0..a.len(), 0..b.len(), &mut changed_a, &mut changed_b);
+    compact(a, &mut changed_a, &changed_b);
+    compact(b, &mut changed_b, &changed_a);
+    let mut changes = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        let (ca, cb) = (i < a.len() && changed_a[i], j < b.len() && changed_b[j]);
+        if !ca && !cb {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        let (si, sj) = (i, j);
+        while i < a.len() && changed_a[i] {
+            i += 1;
+        }
+        while j < b.len() && changed_b[j] {
+            j += 1;
+        }
+        changes.push((si..i, sj..j));
+    }
+    changes
+}
+
+/// A line of `a` may occur at most this often for the histogram to anchor on
+/// it (git: `MAX_CHAIN_LENGTH`).
+const HISTOGRAM_CHAIN: usize = 64;
+
+/// A common run found by the histogram: `a[a_start..=a_end]` equals
+/// `b[b_start..=b_end]` (inclusive ends, like git's region).
+struct Region {
+    a_start: usize,
+    a_end: usize,
+    b_start: usize,
+    b_end: usize,
+}
+
+/// git's `histogram_diff`: marks the lines of `a[ar]` / `b[br]` that are
+/// not part of the longest low-frequency common run, recursing on both sides
+/// of that run.
+fn histogram(
+    a: &[Line<'_>],
+    b: &[Line<'_>],
+    mut ar: Range<usize>,
+    mut br: Range<usize>,
+    changed_a: &mut [bool],
+    changed_b: &mut [bool],
+) {
+    loop {
+        if ar.is_empty() && br.is_empty() {
+            return;
+        }
+        if ar.is_empty() {
+            changed_b[br.clone()].fill(true);
+            return;
+        }
+        if br.is_empty() {
+            changed_a[ar.clone()].fill(true);
+            return;
+        }
+        match find_region(a, b, &ar, &br) {
+            Lcs::Fallback => {
+                for (ca, cb) in classic_diff(&a[ar.clone()], &b[br.clone()]) {
+                    changed_a[ar.start + ca.start..ar.start + ca.end].fill(true);
+                    changed_b[br.start + cb.start..br.start + cb.end].fill(true);
+                }
+                return;
+            }
+            Lcs::None => {
+                changed_a[ar.clone()].fill(true);
+                changed_b[br.clone()].fill(true);
+                return;
+            }
+            Lcs::Found(region) => {
+                histogram(
+                    a,
+                    b,
+                    ar.start..region.a_start,
+                    br.start..region.b_start,
+                    changed_a,
+                    changed_b,
+                );
+                ar = region.a_end + 1..ar.end;
+                br = region.b_end + 1..br.end;
+            }
+        }
+    }
+}
+
+enum Lcs {
+    Found(Region),
+    /// No line of `a` occurs in `b`.
+    None,
+    /// Common lines exist but all occur too often: use the classic diff.
+    Fallback,
+}
+
+/// git's `find_lcs` over `a[ar]` and `b[br]`.
+fn find_region(a: &[Line<'_>], b: &[Line<'_>], ar: &Range<usize>, br: &Range<usize>) -> Lcs {
+    // One record per distinct line of `a[ar]`: its occurrence count (capped)
+    // and its first position; `next[i - ar.start]` chains the occurrences.
+    const NONE: usize = usize::MAX;
+    struct Record {
+        count: usize,
+        first: usize,
+    }
+    let mut records: Vec<Record> = Vec::new();
+    let mut by_line: HashMap<Line<'_>, usize> = HashMap::new();
+    let mut record_of = vec![0usize; ar.len()];
+    let mut next = vec![NONE; ar.len()];
+    for ptr in ar.clone().rev() {
+        let id = *by_line.entry(a[ptr]).or_insert_with(|| {
+            records.push(Record {
+                count: 0,
+                first: NONE,
+            });
+            records.len() - 1
+        });
+        let record = &mut records[id];
+        next[ptr - ar.start] = record.first;
+        record.first = ptr;
+        record.count = (record.count + 1).min(HISTOGRAM_CHAIN);
+        record_of[ptr - ar.start] = id;
+    }
+    let count_at = |ptr: usize| records[record_of[ptr - ar.start]].count;
+
+    let mut best: Option<Region> = None;
+    let mut cnt = HISTOGRAM_CHAIN + 1;
+    let mut has_common = false;
+    let mut b_ptr = br.start;
+    while b_ptr < br.end {
+        let mut b_next = b_ptr + 1;
+        if let Some(&id) = by_line.get(&b[b_ptr]) {
+            let record = &records[id];
+            if record.count > cnt {
+                has_common = true;
+            } else {
+                has_common = true;
+                let mut a_ptr = record.first;
+                loop {
+                    let mut rc = record.count;
+                    let (mut a_start, mut b_start) = (a_ptr, b_ptr);
+                    let (mut a_end, mut b_end) = (a_ptr, b_ptr);
+                    while ar.start < a_start
+                        && br.start < b_start
+                        && a[a_start - 1] == b[b_start - 1]
+                    {
+                        a_start -= 1;
+                        b_start -= 1;
+                        if rc > 1 {
+                            rc = rc.min(count_at(a_start));
+                        }
+                    }
+                    while a_end + 1 < ar.end && b_end + 1 < br.end && a[a_end + 1] == b[b_end + 1] {
+                        a_end += 1;
+                        b_end += 1;
+                        if rc > 1 {
+                            rc = rc.min(count_at(a_end));
+                        }
+                    }
+                    if b_next <= b_end {
+                        b_next = b_end + 1;
+                    }
+                    let best_len = best.as_ref().map_or(0, |r| r.a_end - r.a_start);
+                    if best_len < a_end - a_start || rc < cnt {
+                        best = Some(Region {
+                            a_start,
+                            a_end,
+                            b_start,
+                            b_end,
+                        });
+                        cnt = rc;
+                    }
+                    // Skip the occurrences inside the run just found.
+                    let mut np = next[a_ptr - ar.start];
+                    while np != NONE && np <= a_end {
+                        np = next[np - ar.start];
+                    }
+                    if np == NONE {
+                        break;
+                    }
+                    a_ptr = np;
+                }
+            }
+        }
+        b_ptr = b_next;
+    }
+    match best {
+        Some(region) => Lcs::Found(region),
+        None if has_common && HISTOGRAM_CHAIN < cnt => Lcs::Fallback,
+        None => Lcs::None,
+    }
+}
+
+/// A plain LCS diff of two slices (the stand-in for git's Myers fallback).
+fn classic_diff(a: &[Line<'_>], b: &[Line<'_>]) -> Vec<(Range<usize>, Range<usize>)> {
     let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
     let suffix = a[prefix..]
         .iter()
@@ -612,79 +1050,185 @@ fn diff_lines(a: &[Line<'_>], b: &[Line<'_>]) -> Vec<(Range<usize>, Range<usize>
     changes
 }
 
+/// A run of changed lines `start..end` of one file.
+#[derive(Clone, Copy)]
+struct Group {
+    start: usize,
+    end: usize,
+}
+
+fn flag(changed: &[bool], i: usize) -> bool {
+    changed.get(i).copied().unwrap_or(false)
+}
+
+fn group_init(changed: &[bool]) -> Group {
+    let mut end = 0;
+    while flag(changed, end) {
+        end += 1;
+    }
+    Group { start: 0, end }
+}
+
+/// Moves to the next group; `false` when there is none.
+fn group_next(changed: &[bool], g: &mut Group) -> bool {
+    if g.end == changed.len() {
+        return false;
+    }
+    g.start = g.end + 1;
+    g.end = g.start;
+    while flag(changed, g.end) {
+        g.end += 1;
+    }
+    true
+}
+
+fn group_previous(changed: &[bool], g: &mut Group) -> bool {
+    if g.start == 0 {
+        return false;
+    }
+    g.end = g.start - 1;
+    g.start = g.end;
+    while g.start > 0 && changed[g.start - 1] {
+        g.start -= 1;
+    }
+    true
+}
+
+fn slide_up(lines: &[Line<'_>], changed: &mut [bool], g: &mut Group) -> bool {
+    if g.start > 0 && lines[g.start - 1] == lines[g.end - 1] {
+        g.start -= 1;
+        g.end -= 1;
+        changed[g.start] = true;
+        changed[g.end] = false;
+        while g.start > 0 && changed[g.start - 1] {
+            g.start -= 1;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn slide_down(lines: &[Line<'_>], changed: &mut [bool], g: &mut Group) -> bool {
+    if g.end < lines.len() && lines[g.start] == lines[g.end] {
+        changed[g.start] = false;
+        changed[g.end] = true;
+        g.start += 1;
+        g.end += 1;
+        while flag(changed, g.end) {
+            g.end += 1;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// git's `xdl_change_compact` for one file: slides every group of changed
+/// lines of `lines` as far down as it goes, merging with groups it meets,
+/// then back up to line up with the last group of the other file it can
+/// match.
+fn compact(lines: &[Line<'_>], changed: &mut [bool], other: &[bool]) {
+    let mut g = group_init(changed);
+    let mut go = group_init(other);
+    loop {
+        if g.end != g.start {
+            let mut end_matching_other;
+            let mut earliest_end;
+            loop {
+                let group_size = g.end - g.start;
+                end_matching_other = None::<usize>;
+                while slide_up(lines, changed, &mut g) {
+                    group_previous(other, &mut go);
+                }
+                earliest_end = g.end;
+                if go.end > go.start {
+                    end_matching_other = Some(g.end);
+                }
+                while slide_down(lines, changed, &mut g) {
+                    group_next(other, &mut go);
+                    if go.end > go.start {
+                        end_matching_other = Some(g.end);
+                    }
+                }
+                if group_size == g.end - g.start {
+                    break;
+                }
+            }
+            if g.end != earliest_end && end_matching_other.is_some() {
+                while go.end == go.start {
+                    if !slide_up(lines, changed, &mut g) || !group_previous(other, &mut go) {
+                        break;
+                    }
+                }
+            }
+        }
+        if !group_next(changed, &mut g) {
+            break;
+        }
+        group_next(other, &mut go);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reading a conflicted path from the repository
 // ---------------------------------------------------------------------------
 
-/// One index entry of a conflicted path.
-struct StageEntry {
-    mode: String,
-    oid: String,
-}
-
-/// The index entries (stage 1 base, 2 ours, 3 theirs) of `path`.
-fn stages(repo: &Repo, path: &str) -> Result<[Option<StageEntry>; 3]> {
-    let out = literal_command(repo)
-        .args(["ls-files", "-u", "-z", "--"])
-        .arg(path)
-        .output()
+/// The blobs `oids` through one `git cat-file --batch` process, in order;
+/// one over the display cap is [`Error::TooLarge`].
+fn read_blobs(repo: &Repo, oids: &[&str]) -> Result<Vec<Vec<u8>>> {
+    let mut child = repo
+        .command()
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(Error::Spawn)?;
-    let out = check_output(out, "ls-files -u")?;
-    let mut entries: [Option<StageEntry>; 3] = [None, None, None];
-    // `<mode> SP <oid> SP <stage> TAB <path> NUL`
-    for record in out.stdout.split(|&byte| byte == 0) {
-        let Some(tab) = record.iter().position(|&b| b == b'\t') else {
-            continue;
+    // A handful of object names: far below the pipe buffer, so writing them
+    // all before reading cannot block.
+    let mut stdin = child.stdin.take().ok_or(Error::Parse("cat-file stdin"))?;
+    let request: String = oids.iter().map(|oid| format!("{oid}\n")).collect();
+    let written = stdin.write_all(request.as_bytes());
+    drop(stdin);
+    written.map_err(Error::Io)?;
+    let mut stdout = BufReader::new(child.stdout.take().ok_or(Error::Parse("cat-file stdout"))?);
+    let mut blobs = Vec::with_capacity(oids.len());
+    for _ in oids {
+        // `<oid> SP <type> SP <size> LF` (or `<oid> SP missing LF`).
+        let mut header = String::new();
+        stdout.read_line(&mut header).map_err(Error::Io)?;
+        let mut fields = header.split_whitespace().skip(1);
+        let (Some("blob"), Some(size)) = (fields.next(), fields.next()) else {
+            drop(stdout);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Parse("cat-file --batch header"));
         };
-        if &record[tab + 1..] != path.as_bytes() {
-            continue;
+        let size: u64 = size.parse().map_err(|_| Error::Parse("cat-file size"))?;
+        if size > UNTRACKED_COUNT_CAP {
+            drop(stdout);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::TooLarge { what: "diff" });
         }
-        let head = String::from_utf8_lossy(&record[..tab]);
-        let mut fields = head.split(' ');
-        let (Some(mode), Some(oid), Some(stage)) = (fields.next(), fields.next(), fields.next())
-        else {
-            return Err(Error::Parse("ls-files -u entry"));
-        };
-        let slot = match stage {
-            "1" => 0,
-            "2" => 1,
-            "3" => 2,
-            _ => return Err(Error::Parse("ls-files -u stage")),
-        };
-        entries[slot] = Some(StageEntry {
-            mode: mode.to_string(),
-            oid: oid.to_string(),
-        });
+        let mut bytes = vec![0u8; size as usize];
+        stdout.read_exact(&mut bytes).map_err(Error::Io)?;
+        // The LF after the content.
+        let mut lf = [0u8; 1];
+        stdout.read_exact(&mut lf).map_err(Error::Io)?;
+        blobs.push(bytes);
     }
-    Ok(entries)
-}
-
-/// A blob's bytes; over the display cap is [`Error::TooLarge`].
-fn read_blob(repo: &Repo, oid: &str) -> Result<Vec<u8>> {
-    let out = repo
-        .command()
-        .args(["cat-file", "-s", oid])
-        .output()
-        .map_err(Error::Spawn)?;
-    let out = check_output(out, "cat-file -s")?;
-    let size: u64 = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .map_err(|_| Error::Parse("cat-file -s size"))?;
-    if size > UNTRACKED_COUNT_CAP {
-        return Err(Error::TooLarge { what: "diff" });
-    }
-    let out = repo
-        .command()
-        .args(["cat-file", "blob", oid])
-        .output()
-        .map_err(Error::Spawn)?;
-    check_output(out, "cat-file blob").map(|out| out.stdout)
+    drop(stdout);
+    let out = child.wait_with_output().map_err(Error::Io)?;
+    check_output(out, "cat-file --batch")?;
+    Ok(blobs)
 }
 
 /// The line changes from blob `base` to blob `side`, from `git diff -U0`
-/// with everything that could vary with user configuration pinned.
-fn blob_hunks(repo: &Repo, base: &StageEntry, side: &StageEntry) -> Result<Vec<DiffHunk>> {
+/// with everything that could vary with user configuration pinned. The
+/// histogram algorithm is the one `git merge` merges file contents with.
+fn blob_hunks(repo: &Repo, base: &IndexStage, side: &IndexStage) -> Result<Vec<DiffHunk>> {
     if base.oid == side.oid {
         return Ok(Vec::new());
     }
@@ -698,7 +1242,7 @@ fn blob_hunks(repo: &Repo, base: &StageEntry, side: &StageEntry) -> Result<Vec<D
             "--no-textconv",
             "--no-renames",
             "--text",
-            "--diff-algorithm=myers",
+            "--diff-algorithm=histogram",
             "--no-indent-heuristic",
             "--inter-hunk-context=0",
         ])
@@ -723,13 +1267,78 @@ fn blob_hunks(repo: &Repo, base: &StageEntry, side: &StageEntry) -> Result<Vec<D
     Ok(hunks)
 }
 
+/// Whether a git filter (LFS, ...) is set for `path`: the index then holds
+/// the clean form (or a pointer), not what the work tree shows.
+fn has_filter(repo: &Repo, path: &str) -> Result<bool> {
+    let out = repo
+        .command()
+        .args(["check-attr", "-z", "filter", "--"])
+        .arg(path)
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "check-attr")?;
+    // `<path> NUL <attr> NUL <value> NUL`
+    let value = out.stdout.split(|&byte| byte == 0).nth(2).unwrap_or(b"");
+    Ok(!matches!(value, b"" | b"unspecified" | b"unset"))
+}
+
+fn digest(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Brings marker lines to a label-free, LF-only form so the file `git merge`
+/// wrote can be compared with [`TextConflict::render_markers`] whatever the
+/// labels (merge, rebase, cherry-pick, squash all name the sides differently)
+/// and the work-tree line endings (`core.autocrlf`, `eol` attributes) are.
+fn normalize_markers(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .split('\n')
+        .map(|line| {
+            if line.starts_with("<<<<<<<") {
+                "<<<<<<<"
+            } else if line.starts_with(">>>>>>>") {
+                ">>>>>>>"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether the file git left in the work tree is not what an unresolved merge
+/// writes (rerere, an IDE, a half-done manual resolution). Only judged for
+/// the default `merge` conflict style: with `diff3`/`zdiff3` configured the
+/// file has a different layout and the answer is "no".
+fn changed_after_merge(repo: &Repo, model: &TextConflict, disk: Option<&[u8]>) -> bool {
+    let style = repo
+        .command()
+        .args(["config", "--get", "merge.conflictStyle"])
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_lowercase())
+        .unwrap_or_default();
+    if !style.is_empty() && style != "merge" {
+        return false;
+    }
+    let Some(disk) = disk else {
+        return true;
+    };
+    normalize_markers(&String::from_utf8_lossy(disk))
+        != normalize_markers(&model.render_markers("", ""))
+}
+
 /// Loads the conflict at `path` (repo-relative, literal).
 pub(crate) fn conflict(repo: &Repo, path: &str) -> Result<ConflictKind> {
-    let [base, ours, theirs] = stages(repo, path)?;
-    if ours.is_none() && theirs.is_none() {
+    let stages = unmerged(repo, path)?;
+    let entry = |stage: u8| stages.iter().find(|entry| entry.stage == stage).cloned();
+    let (base, ours, theirs) = (entry(1), entry(2), entry(3));
+    if stages.is_empty() {
         return Err(Error::Parse("path has no conflict entries"));
     }
-    let mode_of = |entry: &Option<StageEntry>, mode: &str| {
+    let mode_of = |entry: &Option<IndexStage>, mode: &str| {
         entry.as_ref().is_some_and(|entry| entry.mode == mode)
     };
     if mode_of(&ours, "120000") || mode_of(&theirs, "120000") {
@@ -740,37 +1349,60 @@ pub(crate) fn conflict(repo: &Repo, path: &str) -> Result<ConflictKind> {
     }
     let (ours, theirs) = match (ours, theirs) {
         (Some(ours), Some(theirs)) => (ours, theirs),
-        (Some(_), None) => return Ok(ConflictKind::DeletedByThem),
-        _ => return Ok(ConflictKind::DeletedByUs),
+        (Some(_), None) if base.is_some() => return Ok(ConflictKind::DeletedByThem),
+        (Some(_), None) => return Ok(ConflictKind::AddedByUs),
+        (None, Some(_)) if base.is_some() => return Ok(ConflictKind::DeletedByUs),
+        (None, Some(_)) => return Ok(ConflictKind::AddedByThem),
+        (None, None) => return Ok(ConflictKind::DeletedByBoth),
     };
-    let ours_bytes = read_blob(repo, &ours.oid)?;
-    let theirs_bytes = read_blob(repo, &theirs.oid)?;
-    let base_bytes = match &base {
-        Some(base) => Some(read_blob(repo, &base.oid)?),
-        None => None,
-    };
+    if has_filter(repo, path)? {
+        return Ok(ConflictKind::NotText);
+    }
+    let mut oids = vec![ours.oid.as_str(), theirs.oid.as_str()];
+    oids.extend(base.as_ref().map(|base| base.oid.as_str()));
+    let mut blobs = read_blobs(repo, &oids)?.into_iter();
+    let (ours_bytes, theirs_bytes) = (blobs.next().unwrap(), blobs.next().unwrap());
+    let base_bytes = blobs.next();
     let binary = |bytes: &[u8]| bytes.contains(&0);
     if binary(&ours_bytes) || binary(&theirs_bytes) || base_bytes.as_deref().is_some_and(binary) {
         return Ok(ConflictKind::Binary);
     }
-    let parse = |bytes: &[u8]| SideText::parse(&String::from_utf8_lossy(bytes));
-    let (ours_text, theirs_text) = (parse(&ours_bytes), parse(&theirs_bytes));
-    let base_text = base_bytes.as_deref().map(parse);
-    let (ours_hunks, theirs_hunks) = match (&base, &base_text) {
-        (Some(base), Some(_)) => (
+    // Invalid UTF-8 would be rewritten as U+FFFD on save: not editable as text.
+    let utf8 = |bytes: Vec<u8>| String::from_utf8(bytes).ok();
+    let (Some(ours_text), Some(theirs_text)) = (utf8(ours_bytes), utf8(theirs_bytes)) else {
+        return Ok(ConflictKind::NotText);
+    };
+    let base_text = match base_bytes {
+        Some(bytes) => match utf8(bytes) {
+            Some(text) => Some(text),
+            None => return Ok(ConflictKind::NotText),
+        },
+        None => None,
+    };
+    let (ours_side, theirs_side) = (SideText::parse(&ours_text), SideText::parse(&theirs_text));
+    let base_side = base_text.as_deref().map(SideText::parse);
+    let (ours_hunks, theirs_hunks) = match &base {
+        Some(base) => (
             blob_hunks(repo, base, &ours)?,
             blob_hunks(repo, base, &theirs)?,
         ),
         // Both added the file: an empty base, every line an insertion.
-        _ => (insertion(&ours_text), insertion(&theirs_text)),
+        None => (insertion(&ours_side), insertion(&theirs_side)),
     };
-    Ok(ConflictKind::Text(TextConflict::from_sides(
-        base_text.as_ref(),
-        &ours_text,
-        &theirs_text,
+    let mut model = TextConflict::from_sides(
+        base_side,
+        ours_side,
+        theirs_side,
         &ours_hunks,
         &theirs_hunks,
-    )))
+    );
+    let disk = fs::read(repo.root().join(path)).ok();
+    model.guard = ConflictGuard {
+        stages,
+        work_tree_digest: disk.as_deref().map(digest),
+        changed_after_merge: changed_after_merge(repo, &model, disk.as_deref()),
+    };
+    Ok(ConflictKind::Text(model))
 }
 
 /// The hunk list of a side against an empty base.
@@ -785,18 +1417,77 @@ fn insertion(side: &SideText) -> Vec<DiffHunk> {
     }
 }
 
-/// Writes `content` to the work-tree file `path` and stages it, which ends
-/// the conflict for that path.
-pub(crate) fn save_resolution(repo: &Repo, path: &str, content: &str) -> Result<()> {
-    // The path is written to, so it must stay inside the work tree.
-    let inside = Path::new(path)
-        .components()
-        .all(|part| matches!(part, Component::Normal(_)));
-    if !inside {
+/// Writes `content` (the clean, index form of the resolved file) as the
+/// resolution of `path` and stages it, which ends the conflict for that path.
+///
+/// Goes through git like a manual resolution does: the content is hashed
+/// without filters, put in the index (clearing the conflict stages) and
+/// checked out, so smudge filters, `eol` and `core.autocrlf` shape the
+/// work-tree file. Nothing is written when the path is no longer in the
+/// conflict `guard` describes, or its work-tree file changed since.
+pub(crate) fn save_resolution(
+    repo: &Repo,
+    path: &str,
+    content: &str,
+    guard: &ConflictGuard,
+) -> Result<SaveOutcome> {
+    // The path is written to, so it must stay inside the work tree, and out
+    // of `.git` (a `.git` entry in the work tree is how a checkout runs code).
+    let safe = Path::new(path).components().all(|part| match part {
+        Component::Normal(name) => !name.to_string_lossy().eq_ignore_ascii_case(".git"),
+        _ => false,
+    });
+    if !safe {
         return Err(Error::Parse("path is not inside the work tree"));
     }
-    fs::write(repo.root().join(path), content).map_err(Error::Io)?;
-    stage(repo, &[path.to_string()])
+    let current = unmerged(repo, path)?;
+    if current.is_empty() || current != guard.stages {
+        return Ok(SaveOutcome::StagesChanged);
+    }
+    let disk = fs::read(repo.root().join(path)).ok();
+    if disk.as_deref().map(digest) != guard.work_tree_digest {
+        return Ok(SaveOutcome::WorkTreeChanged);
+    }
+    let mode = current
+        .iter()
+        .find(|entry| entry.stage == 2)
+        .or_else(|| current.iter().find(|entry| entry.stage == 3))
+        .map(|entry| entry.mode.clone())
+        .ok_or(Error::Parse("path has no side to take the mode from"))?;
+
+    let mut child = repo
+        .command()
+        .args(["hash-object", "-w", "--no-filters", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(Error::Spawn)?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or(Error::Parse("hash-object stdin"))?;
+    let written = stdin.write_all(content.as_bytes());
+    drop(stdin);
+    let out = child.wait_with_output().map_err(Error::Io)?;
+    let out = check_output(out, "hash-object")?;
+    written.map_err(Error::Io)?;
+    let oid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+
+    // `--cacheinfo` replaces the path's conflict stages with one entry.
+    let out = repo
+        .command()
+        .args(["update-index", "--add", "--cacheinfo", &mode, &oid, path])
+        .output()
+        .map_err(Error::Spawn)?;
+    check_output(out, "update-index")?;
+    let out = repo
+        .command()
+        .args(["checkout-index", "-f", "--", path])
+        .output()
+        .map_err(Error::Spawn)?;
+    check_output(out, "checkout-index")?;
+    Ok(SaveOutcome::Saved)
 }
 
 #[cfg(test)]
@@ -818,7 +1509,7 @@ mod tests {
                 .map(|(base, side)| DiffHunk { base, side })
                 .collect()
         };
-        TextConflict::from_sides(b.as_ref(), &o, &t, &hunks(&o), &hunks(&t))
+        TextConflict::from_sides(b.clone(), o.clone(), t.clone(), &hunks(&o), &hunks(&t))
     }
 
     fn keys(lines: &[&'static str]) -> Vec<Line<'static>> {
@@ -1043,13 +1734,89 @@ mod tests {
     }
 
     #[test]
-    fn conflicts_with_a_gap_without_alnum_are_joined() {
+    fn conflicts_with_a_gap_without_alnum_stay_apart() {
+        // `git merge-file` joins these (zealous alnum); `git merge` writes
+        // two blocks (zealous), and the model follows `git merge`.
         let m = model(
             Some("0\nb\n-\n-\n-\n-\nf\n9\n"),
             "0\nA\n-\n-\n-\n-\nB\n9\n",
             "0\nC\n-\n-\n-\n-\nD\n9\n",
         );
-        assert_eq!(m.conflict_count(), 1);
+        assert_eq!(m.conflict_count(), 2);
+    }
+
+    #[test]
+    fn a_refined_conflict_keeps_its_base_lines_in_the_conflict_pieces() {
+        let m = model(
+            Some("0\nb\nc\nd\ne\nf\ng\nh\n9\n"),
+            "0\nA\nx\ny\nz\nw\nB\nh\n9\n",
+            "0\nC\nx\ny\nz\nw\nD\nh\n9\n",
+        );
+        let pieces: Vec<_> = m
+            .segments
+            .iter()
+            .filter_map(|segment| match segment {
+                ConflictSegment::Conflict { base, .. } => Some(base.clone()),
+                _ => None,
+            })
+            .collect();
+        // The first conflict shows the whole region's base (lines 1..7), the
+        // second has none of its own.
+        assert_eq!(pieces, vec![1..7, 7..7]);
+        for segment in &m.segments {
+            if let ConflictSegment::Same { base, .. } = segment {
+                assert!(base.is_empty(), "a Same piece must not hold base lines");
+            }
+        }
+    }
+
+    #[test]
+    fn region_lines_is_what_render_and_markers_use() {
+        let m = model(Some("a\nb\nc\n"), "a\nX\nc\n", "a\nY\nc\n");
+        let lines = |resolution: ConflictResolution| {
+            m.region_lines(0, &resolution)
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lines(ConflictResolution::Unresolved), Vec::<String>::new());
+        assert_eq!(lines(picked(&[Theirs, Ours])), vec!["Y", "X"]);
+        assert_eq!(lines(picked(&[Ours, Ours])), vec!["X"]);
+        assert_eq!(
+            lines(ConflictResolution::Custom("p\nq\n".into())),
+            vec!["p", "q"]
+        );
+        assert!(m.region_lines(5, &picked(&[Ours])).is_empty());
+        assert_eq!(
+            m.render_markers("HEAD", "side"),
+            "a\n<<<<<<< HEAD\nX\n=======\nY\n>>>>>>> side\nc\n"
+        );
+    }
+
+    #[test]
+    fn typed_text_ending_the_file_stays_unterminated_only_when_neither_side_had_a_newline() {
+        let custom = |text: &str| ConflictResolution::Custom(text.to_string());
+        // Neither side ends with a newline, the region is the file's end.
+        let m = model(Some("a\nb\nc"), "a\nb\nX", "a\nb\nY");
+        assert_eq!(m.render(&[custom("Z")]).unwrap(), "a\nb\nZ");
+        assert_eq!(m.render(&[custom("Z\n")]).unwrap(), "a\nb\nZ\n");
+        assert_eq!(m.render(&[custom("Z\nW")]).unwrap(), "a\nb\nZ\nW");
+        // One side ends with a newline: the typed line gets a terminator.
+        let m = model(Some("a\nb\nc\n"), "a\nb\nX", "a\nb\nY\n");
+        assert_eq!(m.render(&[custom("Z")]).unwrap(), "a\nb\nZ\n");
+        // Not the last content of the file: always terminated.
+        let m = model(
+            Some("a\nb\nc\nd\ne\nf\ng\nh\ni"),
+            "a\nX\nc\nd\ne\nf\ng\nh\ni",
+            "a\nY\nc\nd\ne\nf\ng\nh\ni",
+        );
+        assert_eq!(
+            m.render(&[custom("Z")]).unwrap(),
+            "a\nZ\nc\nd\ne\nf\ng\nh\ni"
+        );
+        // CRLF files: the typed lines take CRLF, the unterminated last one none.
+        let m = model(Some("a\r\nb\r\nc"), "a\r\nb\r\nX", "a\r\nb\r\nY");
+        assert_eq!(m.render(&[custom("Z\nW")]).unwrap(), "a\r\nb\r\nZ\r\nW");
     }
 
     #[test]
@@ -1129,5 +1896,14 @@ mod tests {
         let b = keys(&["x"]);
         assert_eq!(diff_lines(&a, &b), vec![(1..2, 1..1)]);
         assert_eq!(diff_lines(&a, &a), vec![]);
+    }
+
+    #[test]
+    fn diff_lines_anchors_on_rare_lines_like_histogram() {
+        // Myers would match the many "x" lines; the histogram anchors on the
+        // unique "u" and treats the rest as changed around it.
+        let a = keys(&["x", "x", "u", "x", "x"]);
+        let b = keys(&["y", "u", "y"]);
+        assert_eq!(diff_lines(&a, &b), vec![(0..2, 0..1), (3..5, 2..3)]);
     }
 }

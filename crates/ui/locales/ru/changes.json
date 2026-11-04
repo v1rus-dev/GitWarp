@@ -163,6 +163,18 @@
   "changes.editor.keep_version": "Оставить версию {branch}",
   "changes.editor.use_version": "Взять версию {branch}",
   "changes.editor.delete_file": "Удалить файл (как в {branch})",
+  "changes.editor.note_not_text": "Этот файл не в кодировке UTF-8, поэтому GitWarp не может слить его построчно. Оставьте одну версию: GitWarp запишет её в рабочее дерево и пометит файл решённым.",
+  "changes.editor.kind_not_text": "Не текст UTF-8",
+  "changes.editor.note_added": "Файл добавила только одна сторона. Выберите, останется ли он: GitWarp применит выбор и пометит файл решённым.",
+  "changes.editor.note_deleted_both": "Обе стороны удалили этот файл. Подтвердите удаление: GitWarp удалит его и пометит файл решённым.",
+  "changes.editor.title_added": "{path} добавлен только в {branch}",
+  "changes.editor.title_deleted_both": "{path} удалён с обеих сторон",
+  "changes.editor.keep_the_file": "Оставить файл",
+  "changes.editor.delete_the_file": "Удалить файл",
+  "changes.editor.changed_after_merge": "Файл изменился после слияния (rerere или другим редактором). Сохранение заменит эти изменения.",
+  "changes.editor.replace_disk_ask": "Заменить изменения на диске?",
+  "changes.editor.changed_on_disk": "{path} изменился на диске — откройте его заново, чтобы увидеть изменения",
+  "changes.editor.not_same_conflict": "{path} больше не в том же конфликте — перечитан",
   "changes.editor.open_menu": "Решить в GitWarp…",
   "changes.editor.open_button": "Решить…"
 }

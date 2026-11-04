@@ -8,6 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::process::Stdio;
 
+use crate::conflict::IndexStage;
 use crate::diff::{parse_name_status, parse_numstat};
 use crate::{check_output, ChangeKind, Error, FileDiff, Oid, Repo, Result};
 
@@ -299,6 +300,45 @@ pub enum ConflictSide {
     Theirs,
 }
 
+/// The unmerged index entries (stage 1 base, 2 ours, 3 theirs) of `path`,
+/// from `git ls-files -u -z`; empty when the path is not conflicted.
+pub(crate) fn unmerged(repo: &Repo, path: &str) -> Result<Vec<IndexStage>> {
+    let out = literal_command(repo)
+        .args(["ls-files", "-u", "-z", "--"])
+        .arg(path)
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "ls-files -u")?;
+    let mut entries = Vec::new();
+    // `<mode> SP <oid> SP <stage> TAB <path> NUL`
+    for record in out.stdout.split(|&byte| byte == 0) {
+        let Some(tab) = record.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        if &record[tab + 1..] != path.as_bytes() {
+            continue;
+        }
+        let head = String::from_utf8_lossy(&record[..tab]);
+        let mut fields = head.split(' ');
+        let (Some(mode), Some(oid), Some(stage)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(Error::Parse("ls-files -u entry"));
+        };
+        let stage = match stage {
+            "1" => 1,
+            "2" => 2,
+            "3" => 3,
+            _ => return Err(Error::Parse("ls-files -u stage")),
+        };
+        entries.push(IndexStage {
+            stage,
+            mode: mode.to_string(),
+            oid: oid.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
 /// Resolves a conflicted `path` by taking one side as is.
 ///
 /// If the chosen side does not have the file (it deleted it: a modify/delete
@@ -306,22 +346,12 @@ pub enum ConflictSide {
 /// `checkout --ours|--theirs` followed by `git add`.
 pub(crate) fn resolve_take(repo: &Repo, path: &str, side: ConflictSide) -> Result<()> {
     let (side_stage, flag) = match side {
-        ConflictSide::Ours => (b'2', "--ours"),
-        ConflictSide::Theirs => (b'3', "--theirs"),
+        ConflictSide::Ours => (2, "--ours"),
+        ConflictSide::Theirs => (3, "--theirs"),
     };
-    let out = literal_command(repo)
-        .args(["ls-files", "-u", "-z", "--"])
-        .arg(path)
-        .output()
-        .map_err(Error::Spawn)?;
-    let out = check_output(out, "ls-files -u")?;
-    // `<mode> SP <oid> SP <stage> TAB <path> NUL`
-    let has_side = out.stdout.split(|&byte| byte == 0).any(|record| {
-        record
-            .iter()
-            .position(|&b| b == b'\t')
-            .is_some_and(|tab| record[..tab].last() == Some(&side_stage))
-    });
+    let has_side = unmerged(repo, path)?
+        .iter()
+        .any(|entry| entry.stage == side_stage);
     if has_side {
         let out = literal_command(repo)
             .args(["checkout", flag, "--", path])

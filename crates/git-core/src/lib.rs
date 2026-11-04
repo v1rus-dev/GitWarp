@@ -41,7 +41,10 @@ pub use branch_log::BranchLog;
 pub use config::{
     global_get, global_identity, set_global_identity, set_global_signing, ConfigScope, Identity,
 };
-pub use conflict::{ConflictKind, ConflictResolution, ConflictSegment, LineEnding, TextConflict};
+pub use conflict::{
+    ConflictGuard, ConflictKind, ConflictResolution, ConflictSegment, IndexStage, LineEnding,
+    SaveOutcome, TextConflict,
+};
 pub use credential::Credential;
 pub use diff::{
     ChangeKind, ChangedFile, CommitDetails, DiffLine, DiffOptions, DiffWhitespace, FileDiff,
@@ -424,10 +427,18 @@ impl Repo {
         conflict::conflict(self, path)
     }
 
-    /// Writes `content` to the work-tree file `path` and stages it, which
-    /// ends the conflict for that path.
-    pub fn save_resolution(&self, path: &str, content: &str) -> Result<()> {
-        conflict::save_resolution(self, path, content)
+    /// Saves `content` (the clean, index form) as the resolution of `path`:
+    /// hashes it, replaces the conflict stages with it and checks the file out
+    /// through git's conversions (`eol`, smudge filters). Writes nothing when
+    /// the path left the conflict `guard` (from the loaded [`TextConflict`])
+    /// describes or its work-tree file changed since; see [`SaveOutcome`].
+    pub fn save_resolution(
+        &self,
+        path: &str,
+        content: &str,
+        guard: &ConflictGuard,
+    ) -> Result<SaveOutcome> {
+        conflict::save_resolution(self, path, content, guard)
     }
 
     /// Removes `paths` from the index, leaving the work tree alone.

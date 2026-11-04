@@ -24,7 +24,8 @@ use gpui::{
 };
 
 use git_core::{
-    ConflictKind, ConflictResolution, ConflictSegment, ConflictSide, Git, Repo, TextConflict,
+    ConflictGuard, ConflictKind, ConflictResolution, ConflictSegment, ConflictSide, Git, Repo,
+    SaveOutcome, TextConflict,
 };
 use ui::actions::{key_binding, Cancel};
 use ui::components::menu::{self, MenuEntry, MenuItem};
@@ -215,21 +216,13 @@ impl Source {
 }
 
 /// The file as `resolutions` rebuild it, with the conflicts marked: the rows
-/// of the result pane. Mirrors `TextConflict::render` (same lines, same order);
-/// an unresolved conflict contributes a placeholder instead of lines.
+/// of the result pane. Mirrors `TextConflict::render` (same lines, same order:
+/// a conflict's lines come from `TextConflict::region_lines`); an unresolved
+/// conflict contributes a placeholder instead of lines.
 pub(crate) fn result_lines(
     conflict: &TextConflict,
     resolutions: &[ConflictResolution],
 ) -> Vec<ResultLine> {
-    fn text(out: &mut Vec<ResultLine>, no: &mut usize, source: Source, region: Option<usize>) {
-        *no += 1;
-        out.push(ResultLine::Text {
-            no: *no,
-            source,
-            region,
-            last: false,
-        });
-    }
     let mut out = Vec::new();
     let mut no = 0;
     let mut index = 0;
@@ -237,7 +230,13 @@ pub(crate) fn result_lines(
         match segment {
             ConflictSegment::Stable { ours, .. } | ConflictSegment::Same { ours, .. } => {
                 for ix in ours.clone() {
-                    text(&mut out, &mut no, Source::Ours(ix), None);
+                    no += 1;
+                    out.push(ResultLine::Text {
+                        no,
+                        source: Source::Ours(ix),
+                        region: None,
+                        last: false,
+                    });
                 }
             }
             ConflictSegment::Auto {
@@ -251,56 +250,26 @@ pub(crate) fn result_lines(
                     out.push(ResultLine::AutoLabel { side: *side });
                 }
                 for ix in range.clone() {
-                    let source = match side {
-                        ConflictSide::Ours => Source::Ours(ix),
-                        ConflictSide::Theirs => Source::Theirs(ix),
-                    };
-                    text(&mut out, &mut no, source, None);
+                    no += 1;
+                    out.push(ResultLine::Text {
+                        no,
+                        source: match side {
+                            ConflictSide::Ours => Source::Ours(ix),
+                            ConflictSide::Theirs => Source::Theirs(ix),
+                        },
+                        region: None,
+                        last: false,
+                    });
                 }
             }
-            ConflictSegment::Conflict { ours, theirs, .. } => {
-                let region = Some(index);
+            ConflictSegment::Conflict { .. } => {
                 out.push(ResultLine::Head { index });
-                let before = out.len();
-                match resolutions.get(index) {
-                    None | Some(ConflictResolution::Unresolved) => {
-                        out.push(ResultLine::Placeholder { index });
-                    }
-                    Some(ConflictResolution::Picked(sides)) if sides.is_empty() => {
-                        out.push(ResultLine::Placeholder { index });
-                    }
-                    Some(ConflictResolution::Picked(sides)) => {
-                        let mut seen: Vec<ConflictSide> = Vec::new();
-                        for side in sides {
-                            if seen.contains(side) {
-                                continue;
-                            }
-                            seen.push(*side);
-                            match side {
-                                ConflictSide::Ours => {
-                                    for ix in ours.clone() {
-                                        text(&mut out, &mut no, Source::Ours(ix), region);
-                                    }
-                                }
-                                ConflictSide::Theirs => {
-                                    for ix in theirs.clone() {
-                                        text(&mut out, &mut no, Source::Theirs(ix), region);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Some(ConflictResolution::Custom(custom)) => {
-                        for line in custom_lines(custom) {
-                            text(&mut out, &mut no, Source::Custom(line.to_owned()), region);
-                        }
-                    }
-                }
-                if out.len() == before {
-                    out.push(ResultLine::Empty { index });
-                } else if let Some(ResultLine::Text { last, .. }) = out.last_mut() {
-                    *last = true;
-                }
+                let resolution = resolutions
+                    .get(index)
+                    .unwrap_or(&ConflictResolution::Unresolved);
+                let (body, lines) = region_body(conflict, index, resolution, no, None);
+                out.extend(body);
+                no += lines;
                 index += 1;
             }
         }
@@ -308,16 +277,48 @@ pub(crate) fn result_lines(
     out
 }
 
-/// The lines of a hand-edited region. Same splitting as `TextConflict::render`:
-/// a final newline is a terminator, not an extra empty line.
-fn custom_lines(custom: &str) -> Vec<&str> {
-    if custom.is_empty() {
-        return Vec::new();
+/// The result rows under the header of conflict `index` for `resolution`, and
+/// how many file lines they are. `first_no` is the number of file lines
+/// before the region; `edit_rows` reserves that many rows for the text area
+/// instead of the region's lines.
+fn region_body(
+    conflict: &TextConflict,
+    index: usize,
+    resolution: &ConflictResolution,
+    first_no: usize,
+    edit_rows: Option<usize>,
+) -> (Vec<ResultLine>, usize) {
+    let lines = if is_unresolved(resolution) {
+        Vec::new()
+    } else {
+        conflict.region_lines(index, resolution)
+    };
+    let count = lines.len();
+    if let Some(rows) = edit_rows {
+        let body = (0..rows)
+            .map(|row| ResultLine::EditRow {
+                index,
+                last: row + 1 == rows,
+            })
+            .collect();
+        return (body, count);
     }
-    let body = custom.strip_suffix('\n').unwrap_or(custom);
-    body.split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line))
-        .collect()
+    let mut body: Vec<ResultLine> = Vec::with_capacity(count.max(1));
+    if is_unresolved(resolution) {
+        body.push(ResultLine::Placeholder { index });
+    } else if lines.is_empty() {
+        body.push(ResultLine::Empty { index });
+    } else {
+        for (offset, (text, _)) in lines.into_iter().enumerate() {
+            body.push(ResultLine::Text {
+                no: first_no + offset + 1,
+                source: Source::Custom(text),
+                region: Some(index),
+                last: offset + 1 == count,
+            });
+        }
+    }
+    (body, count)
 }
 
 /// The text a text area starts from for a region made of `lines`. A final
@@ -484,12 +485,60 @@ fn conflict_ranges(conflict: &TextConflict) -> Vec<(Range<usize>, Range<usize>, 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Whole {
     Binary,
+    /// Not UTF-8 text (or a filtered file): not editable line by line.
+    NotText,
     Symlink,
     Submodule,
     /// We deleted the file, they changed it.
     DeletedByUs,
     /// They deleted the file, we changed it.
     DeletedByThem,
+    /// Only we added the file.
+    AddedByUs,
+    /// Only they added the file.
+    AddedByThem,
+    /// Both sides deleted the file.
+    DeletedByBoth,
+}
+
+impl Whole {
+    /// The side that does not have the file (taking it deletes the file);
+    /// `None` when both sides have it, or when neither does.
+    fn absent_side(self) -> Option<ConflictSide> {
+        match self {
+            Self::DeletedByUs | Self::AddedByThem => Some(ConflictSide::Ours),
+            Self::DeletedByThem | Self::AddedByUs => Some(ConflictSide::Theirs),
+            _ => None,
+        }
+    }
+}
+
+/// Where a save stands. A finished job leaves the editor waiting for the
+/// status read that follows it, so the file cannot be saved twice; only that
+/// read (successful or not) ends the wait. A status read that has nothing to
+/// do with the save must not end a save that is still running.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SaveState {
+    #[default]
+    Idle,
+    /// The job is running.
+    Running,
+    /// The job succeeded; the status read is pending.
+    SavedWaiting,
+}
+
+impl SaveState {
+    fn is_busy(self) -> bool {
+        self != Self::Idle
+    }
+
+    /// A status read finished (`Ok` or `Err`).
+    fn status_arrived(self) -> Self {
+        match self {
+            Self::SavedWaiting => Self::Idle,
+            other => other,
+        }
+    }
 }
 
 struct TextState {
@@ -505,6 +554,9 @@ struct TextState {
     head_rows: Vec<usize>,
     result: Vec<ResultLine>,
     result_heads: Vec<usize>,
+    /// The number of file lines each conflict's region has now, so a keystroke
+    /// can renumber the lines after it without rebuilding the whole result.
+    region_counts: Vec<usize>,
     focused: Option<usize>,
     /// The conflict whose result region shows the text area, and the number
     /// of result rows reserved for it.
@@ -524,6 +576,7 @@ impl TextState {
             head_rows: Vec::new(),
             result: Vec::new(),
             result_heads: Vec::new(),
+            region_counts: Vec::new(),
             focused,
             editing: None,
         };
@@ -539,6 +592,16 @@ impl TextState {
 
     fn rebuild_result(&mut self) {
         let lines = result_lines(&self.conflict, &self.resolutions);
+        self.region_counts = vec![0; self.resolutions.len()];
+        for line in &lines {
+            if let ResultLine::Text {
+                region: Some(index),
+                ..
+            } = line
+            {
+                self.region_counts[*index] += 1;
+            }
+        }
         self.result = match self.editing {
             Some((index, rows)) => with_edit_rows(lines, index, rows),
             None => lines,
@@ -587,31 +650,18 @@ impl TextState {
 
     /// The lines conflict `index` renders from its picks (`None` while it has
     /// none: an edit then has nothing to compare with).
-    fn picked_lines(&self, index: usize) -> Option<Vec<&str>> {
-        let ConflictResolution::Picked(sides) = self.picks.get(index)? else {
-            return None;
-        };
-        if sides.is_empty() {
+    fn picked_lines(&self, index: usize) -> Option<Vec<String>> {
+        let picks = self.picks.get(index)?;
+        if is_unresolved(picks) {
             return None;
         }
-        let (_, ours, theirs) = &self.ranges[index];
-        let mut lines = Vec::new();
-        let mut seen: Vec<ConflictSide> = Vec::new();
-        for side in sides {
-            if seen.contains(side) {
-                continue;
-            }
-            seen.push(*side);
-            match side {
-                ConflictSide::Ours => {
-                    lines.extend(ours.clone().map(|ix| self.conflict.ours[ix].as_str()))
-                }
-                ConflictSide::Theirs => {
-                    lines.extend(theirs.clone().map(|ix| self.conflict.theirs[ix].as_str()))
-                }
-            }
-        }
-        Some(lines)
+        Some(
+            self.conflict
+                .region_lines(index, picks)
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect(),
+        )
     }
 
     /// The text the text area of conflict `index` starts from: the hand edit,
@@ -619,7 +669,10 @@ impl TextState {
     fn edit_text(&self, index: usize) -> String {
         match self.resolutions.get(index) {
             Some(ConflictResolution::Custom(text)) => text.clone(),
-            _ => lines_text(&self.picked_lines(index).unwrap_or_default()),
+            _ => {
+                let lines = self.picked_lines(index).unwrap_or_default();
+                lines_text(&lines.iter().map(String::as_str).collect::<Vec<_>>())
+            }
         }
     }
 
@@ -627,20 +680,83 @@ impl TextState {
     /// edit when it renders differently from the picks; an unresolved conflict
     /// has no picks to compare with, so any change makes it one. (Entering the
     /// edit without typing never gets here.)
+    ///
+    /// Only the edited region's rows are rebuilt (see [`Self::update_region`]):
+    /// this runs on every keystroke, and the result of a big file is big.
     fn apply_edit(&mut self, index: usize, text: String, rows: usize) {
         if index >= self.resolutions.len() {
             return;
         }
-        self.editing = Some((index, rows));
-        let same = self
-            .picked_lines(index)
-            .is_some_and(|picked| picked == custom_lines(&text));
+        let same = self.picked_lines(index).is_some_and(|picked| {
+            let typed = self
+                .conflict
+                .region_lines(index, &ConflictResolution::Custom(text.clone()));
+            picked.len() == typed.len() && picked.iter().zip(&typed).all(|(a, (b, _))| a == b)
+        });
         self.resolutions[index] = if same {
             self.picks[index].clone()
         } else {
             ConflictResolution::Custom(text)
         };
-        self.rebuild_result();
+        let already_editing = self.editing.is_some_and(|(at, _)| at == index);
+        self.editing = Some((index, rows));
+        if already_editing {
+            self.update_region(index);
+        } else {
+            self.rebuild_result();
+        }
+    }
+
+    /// Rebuilds the rows of conflict `index` only, shifting the line numbers
+    /// and header rows after it by what its line and row counts changed by.
+    fn update_region(&mut self, index: usize) {
+        let Some(&head) = self.result_heads.get(index) else {
+            return;
+        };
+        let in_body = |line: &ResultLine| match line {
+            ResultLine::Text { region, .. } => *region == Some(index),
+            ResultLine::Placeholder { index: at }
+            | ResultLine::Empty { index: at }
+            | ResultLine::EditRow { index: at, .. } => *at == index,
+            _ => false,
+        };
+        let old_len = self.result[head + 1..]
+            .iter()
+            .take_while(|line| in_body(line))
+            .count();
+        let first_no = self.result[..head]
+            .iter()
+            .rev()
+            .find_map(|line| match line {
+                ResultLine::Text { no, .. } => Some(*no),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let edit_rows = self.editing.filter(|(at, _)| *at == index).map(|(_, r)| r);
+        let (body, lines) = region_body(
+            &self.conflict,
+            index,
+            &self.resolutions[index],
+            first_no,
+            edit_rows,
+        );
+        let row_delta = body.len() as isize - old_len as isize;
+        let line_delta = lines as isize - self.region_counts[index] as isize;
+        self.region_counts[index] = lines;
+        let end = head + 1 + body.len();
+        self.result.splice(head + 1..head + 1 + old_len, body);
+        if line_delta != 0 {
+            for line in &mut self.result[end..] {
+                if let ResultLine::Text { no, .. } = line {
+                    *no = (*no as isize + line_delta) as usize;
+                }
+            }
+        }
+        if row_delta != 0 {
+            for later in &mut self.result_heads[index + 1..] {
+                *later = (*later as isize + row_delta) as usize;
+            }
+        }
     }
 
     /// "Reset to picks": the picks the conflict had before the edit.
@@ -683,12 +799,15 @@ enum Load {
 }
 
 /// Where a confirmed "discard your picks" goes (or, for `TakeAll`, a confirmed
-/// "replace your edits too").
+/// "replace your edits too"; for `ReplaceDisk`, a confirmed save).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Leave {
     Close,
     File(String),
     TakeAll(ConflictSide),
+    /// "Replace the changes on disk?": the file changed after the merge
+    /// wrote it, and saving replaces those changes.
+    ReplaceDisk,
 }
 
 /// The open text area of a hand-edited result region.
@@ -700,7 +819,8 @@ struct EditArea {
 
 /// What reaches the repository on save.
 enum Job {
-    Content(String),
+    /// The resolved text and the state of the conflict it was made from.
+    Content(String, ConflictGuard),
     Take(ConflictSide),
 }
 
@@ -711,6 +831,8 @@ pub(crate) enum EditorEvent {
     Close,
     /// The resolution of the open file was written and staged.
     Saved,
+    /// Something changed under the editor: re-read the status.
+    Refresh,
 }
 
 actions!(
@@ -728,11 +850,13 @@ actions!(
 /// Binds the editor's keys. Called once at startup.
 pub fn bind_keys(cx: &mut App) {
     let editor = Some("conflict-editor");
+    let outside_text_area = Some("conflict-editor && !TextArea");
     cx.bind_keys([
-        key_binding(cx, "alt-up", PrevConflict, editor),
-        key_binding(cx, "alt-down", NextConflict, editor),
-        key_binding(cx, "alt-1", PickOurs, editor),
-        key_binding(cx, "alt-2", PickTheirs, editor),
+        // Not inside the edit text area: its keys are for the text.
+        key_binding(cx, "alt-up", PrevConflict, outside_text_area),
+        key_binding(cx, "alt-down", NextConflict, outside_text_area),
+        key_binding(cx, "alt-1", PickOurs, outside_text_area),
+        key_binding(cx, "alt-2", PickTheirs, outside_text_area),
         key_binding(cx, "secondary-s", SaveResolution, editor),
         key_binding(cx, "f2", EditResult, editor),
         // Enter belongs to the focused button / checkbox / text area when
@@ -761,7 +885,9 @@ pub(crate) struct ConflictEditor {
     /// The result region being edited by hand, if any.
     edit: Option<EditArea>,
     /// A save is running (or its status refresh is pending).
-    saving: bool,
+    saving: SaveState,
+    /// The user agreed to replace the changes made on disk after the merge.
+    replace_confirmed: bool,
     focus: FocusHandle,
     needs_focus: bool,
     top_scroll: UniformListScrollHandle,
@@ -793,7 +919,8 @@ impl ConflictEditor {
             show_base: false,
             confirm: None,
             edit: None,
-            saving: false,
+            saving: SaveState::Idle,
+            replace_confirmed: false,
             focus: cx.focus_handle().tab_stop(true),
             needs_focus: true,
             top_scroll: UniformListScrollHandle::new(),
@@ -834,6 +961,21 @@ impl ConflictEditor {
         self.confirm.is_some()
     }
 
+    /// Whether the open text conflict shows the "changed after the merge"
+    /// warning.
+    #[cfg(test)]
+    pub(crate) fn changed_after_merge(&self) -> bool {
+        matches!(&self.load, Load::Text(state) if state.conflict.guard.changed_after_merge)
+    }
+
+    /// Answers the pending confirm with its destructive button.
+    #[cfg(test)]
+    pub(crate) fn accept_confirm(&mut self, cx: &mut Context<Self>) {
+        if let Some(leave) = self.confirm.clone() {
+            self.leave(leave, cx);
+        }
+    }
+
     /// The conflict whose result region has the text area open.
     #[cfg(test)]
     pub(crate) fn editing(&self) -> Option<usize> {
@@ -858,6 +1000,7 @@ impl ConflictEditor {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.load = Load::Loading;
+        self.replace_confirmed = false;
         self.edit = None;
         self.top_scroll = UniformListScrollHandle::new();
         self.result_scroll = UniformListScrollHandle::new();
@@ -892,10 +1035,14 @@ impl ConflictEditor {
                 Load::Text(Box::new(TextState::new(conflict, self.show_base)))
             }
             Ok(ConflictKind::Binary) => whole(Whole::Binary),
+            Ok(ConflictKind::NotText) => whole(Whole::NotText),
             Ok(ConflictKind::Symlink) => whole(Whole::Symlink),
             Ok(ConflictKind::Submodule) => whole(Whole::Submodule),
             Ok(ConflictKind::DeletedByUs) => whole(Whole::DeletedByUs),
             Ok(ConflictKind::DeletedByThem) => whole(Whole::DeletedByThem),
+            Ok(ConflictKind::AddedByUs) => whole(Whole::AddedByUs),
+            Ok(ConflictKind::AddedByThem) => whole(Whole::AddedByThem),
+            Ok(ConflictKind::DeletedByBoth) => whole(Whole::DeletedByBoth),
             Err(error) => Load::Failed(error),
         };
         cx.notify();
@@ -914,7 +1061,7 @@ impl ConflictEditor {
     ) -> bool {
         self.ours_label = ours_label;
         self.theirs_label = theirs_label;
-        self.saving = false;
+        self.saving = self.saving.status_arrived();
         if files.is_empty() {
             return false;
         }
@@ -957,7 +1104,7 @@ impl ConflictEditor {
     }
 
     pub(crate) fn can_save(&self) -> bool {
-        !self.saving
+        !self.saving.is_busy()
             && match &self.load {
                 Load::Text(state) => can_save(&state.resolutions),
                 Load::Whole { choice, .. } => choice.is_some(),
@@ -1034,7 +1181,7 @@ impl ConflictEditor {
     /// Opens the text area over the result region of conflict `index`,
     /// prefilled with what the region holds now, and focuses it.
     fn start_edit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving {
+        if self.saving.is_busy() {
             return;
         }
         if let Some(edit) = &self.edit {
@@ -1187,7 +1334,7 @@ impl ConflictEditor {
 
     /// Leaves for `leave`, asking first when picks would be lost.
     fn request_leave(&mut self, leave: Leave, cx: &mut Context<Self>) {
-        if self.saving {
+        if self.saving.is_busy() {
             return;
         }
         if self.dirty() {
@@ -1205,6 +1352,11 @@ impl ConflictEditor {
             Leave::TakeAll(side) => {
                 self.confirm = None;
                 self.take_all(side, cx);
+            }
+            Leave::ReplaceDisk => {
+                self.confirm = None;
+                self.replace_confirmed = true;
+                self.save(cx);
             }
         }
     }
@@ -1240,7 +1392,16 @@ impl ConflictEditor {
         }
         let job = match &self.load {
             Load::Text(state) => match state.conflict.render(&state.resolutions) {
-                Some(content) => Job::Content(content),
+                Some(content) => {
+                    // The file on disk is not what the merge wrote: saving
+                    // replaces whatever it holds, so ask once.
+                    if state.conflict.guard.changed_after_merge && !self.replace_confirmed {
+                        self.confirm = Some(Leave::ReplaceDisk);
+                        cx.notify();
+                        return;
+                    }
+                    Job::Content(content, state.conflict.guard.clone())
+                }
                 None => return,
             },
             Load::Whole {
@@ -1253,55 +1414,87 @@ impl ConflictEditor {
 
     /// The whole-file take of a file that failed to load.
     fn take_whole(&mut self, side: ConflictSide, cx: &mut Context<Self>) {
-        if !self.saving {
+        if !self.saving.is_busy() {
             self.start_job(Job::Take(side), cx);
         }
     }
 
     fn start_job(&mut self, job: Job, cx: &mut Context<Self>) {
-        self.saving = true;
+        self.saving = SaveState::Running;
         cx.notify();
         let (git, root, path) = (self.git.clone(), self.root.clone(), self.path.clone());
         let notice = ui::t!("changes.editor.resolved", path = path).to_string();
+        let changed_on_disk = ui::t!("changes.editor.changed_on_disk", path = path).to_string();
+        let not_same = ui::t!("changes.editor.not_same_conflict", path = path).to_string();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let repo = Repo::open(git, &root).map_err(|error| error.to_string())?;
                     match job {
-                        Job::Content(content) => repo.save_resolution(&path, &content),
-                        Job::Take(side) => repo.resolve_take(&path, side),
+                        Job::Content(content, guard) => {
+                            repo.save_resolution(&path, &content, &guard)
+                        }
+                        Job::Take(side) => {
+                            repo.resolve_take(&path, side).map(|()| SaveOutcome::Saved)
+                        }
                     }
                     .map_err(|error| error.to_string())
                 })
                 .await;
             this.update_in(cx, |editor, window, cx| {
-                editor.finish_job(result, notice, window, cx)
+                editor.finish_job(result, [notice, changed_on_disk, not_same], window, cx)
             })
             .ok();
         })
         .detach();
     }
 
+    /// `notices`: the texts for saved, changed on disk, not the same conflict.
     fn finish_job(
         &mut self,
-        result: Result<(), String>,
-        notice: String,
+        result: Result<SaveOutcome, String>,
+        notices: [String; 3],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let [saved, changed_on_disk, not_same] = notices;
         match result {
-            Ok(()) => {
-                toast::show(ToastKind::Ok, notice, window, cx);
-                // `saving` stays set until the Changes view's status refresh
-                // reaches `sync`, so the file cannot be saved twice.
+            Ok(SaveOutcome::Saved) => {
+                toast::show(ToastKind::Ok, saved, window, cx);
+                // The editor waits for the Changes view's status read (it ends
+                // in `sync`, or in `status_failed`), so the file cannot be
+                // saved twice meanwhile.
+                self.saving = SaveState::SavedWaiting;
                 cx.emit(EditorEvent::Saved);
             }
+            Ok(outcome) => {
+                // Nothing was written: show what is there now.
+                self.saving = SaveState::Idle;
+                let message = match outcome {
+                    SaveOutcome::WorkTreeChanged => changed_on_disk,
+                    _ => not_same,
+                };
+                toast::show(ToastKind::Error, message, window, cx);
+                self.confirm = None;
+                self.replace_confirmed = false;
+                self.start_load(cx);
+                cx.emit(EditorEvent::Refresh);
+            }
             Err(error) => {
-                self.saving = false;
+                self.saving = SaveState::Idle;
                 toast::show(ToastKind::Error, error, window, cx);
                 cx.notify();
             }
+        }
+    }
+
+    /// The status read that follows a save failed: stops waiting for it.
+    pub(crate) fn status_failed(&mut self, cx: &mut Context<Self>) {
+        let next = self.saving.status_arrived();
+        if next != self.saving {
+            self.saving = next;
+            cx.notify();
         }
     }
 }
@@ -1449,9 +1642,12 @@ impl ConflictEditor {
     fn kind_note(&self, kind: Whole) -> SharedString {
         match kind {
             Whole::Binary => ui::t!("changes.editor.note_binary"),
+            Whole::NotText => ui::t!("changes.editor.note_not_text"),
             Whole::Symlink => ui::t!("changes.editor.note_symlink"),
             Whole::Submodule => ui::t!("changes.editor.note_submodule"),
             Whole::DeletedByUs | Whole::DeletedByThem => ui::t!("changes.editor.note_deleted"),
+            Whole::AddedByUs | Whole::AddedByThem => ui::t!("changes.editor.note_added"),
+            Whole::DeletedByBoth => ui::t!("changes.editor.note_deleted_both"),
         }
     }
 
@@ -1604,6 +1800,34 @@ impl ConflictEditor {
             );
         }
         bar
+    }
+
+    /// The warning under the header when the file on disk is not what the
+    /// merge wrote (rerere, another editor).
+    fn render_disk_banner(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let Load::Text(state) = &self.load else {
+            return None;
+        };
+        if !state.conflict.guard.changed_after_merge {
+            return None;
+        }
+        let colors = cx.theme().colors;
+        Some(
+            div()
+                .id("cfe-disk-banner")
+                .flex_none()
+                .px(px(12.))
+                .py(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .bg(colors.surface)
+                .border_b_1()
+                .border_color(colors.border)
+                .text_size(FS_SM)
+                .child(Icon::new(IconName::Warn).color(colors.warning))
+                .child(ui::t!("changes.editor.changed_after_merge")),
+        )
     }
 
     fn pane_headers(&self, colors: ThemeColors) -> Div {
@@ -2253,36 +2477,55 @@ impl ConflictEditor {
     ) -> Div {
         let colors = cx.theme().colors;
         let view = cx.entity();
-        let deleted_side = match kind {
-            Whole::DeletedByUs => Some(ConflictSide::Ours),
-            Whole::DeletedByThem => Some(ConflictSide::Theirs),
-            _ => None,
-        };
-        let title = match deleted_side {
-            Some(side) => ui::t!(
+        // The side without the file: its card deletes it.
+        let absent_side = kind.absent_side();
+        let added = matches!(kind, Whole::AddedByUs | Whole::AddedByThem);
+        let title = match kind {
+            Whole::DeletedByUs => ui::t!(
                 "changes.editor.title_deleted",
                 path = self.path,
-                branch = self.side_label(side)
+                branch = self.side_label(ConflictSide::Ours)
             ),
-            None => ui::t!("changes.editor.title_both", path = self.path),
+            Whole::DeletedByThem => ui::t!(
+                "changes.editor.title_deleted",
+                path = self.path,
+                branch = self.side_label(ConflictSide::Theirs)
+            ),
+            Whole::AddedByUs | Whole::AddedByThem => {
+                let adder = if kind == Whole::AddedByUs {
+                    ConflictSide::Ours
+                } else {
+                    ConflictSide::Theirs
+                };
+                ui::t!(
+                    "changes.editor.title_added",
+                    path = self.path,
+                    branch = self.side_label(adder)
+                )
+            }
+            Whole::DeletedByBoth => ui::t!("changes.editor.title_deleted_both", path = self.path),
+            _ => ui::t!("changes.editor.title_both", path = self.path),
         };
         let kind_line = |side: ConflictSide| -> SharedString {
-            if deleted_side == Some(side) {
+            if absent_side == Some(side) || kind == Whole::DeletedByBoth {
                 return ui::t!("changes.editor.card_removed");
             }
             match kind {
                 Whole::Binary => ui::t!("changes.editor.kind_binary"),
+                Whole::NotText => ui::t!("changes.editor.kind_not_text"),
                 Whole::Symlink => ui::t!("changes.editor.kind_symlink"),
                 Whole::Submodule => ui::t!("changes.editor.kind_submodule"),
-                Whole::DeletedByUs | Whole::DeletedByThem => {
-                    ui::t!("changes.editor.card_kept", branch = self.side_label(side))
-                }
+                _ => ui::t!("changes.editor.card_kept", branch = self.side_label(side)),
             }
         };
         let card = |side: ConflictSide| {
             let selected = choice == Some(side);
             let branch = self.side_label(side);
-            let label = if deleted_side == Some(side) {
+            let label = if kind == Whole::DeletedByBoth || (added && absent_side == Some(side)) {
+                ui::t!("changes.editor.delete_the_file")
+            } else if added {
+                ui::t!("changes.editor.keep_the_file")
+            } else if absent_side == Some(side) {
                 ui::t!("changes.editor.delete_file", branch = branch)
             } else if side == ConflictSide::Ours {
                 ui::t!("changes.editor.keep_version", branch = branch)
@@ -2350,6 +2593,17 @@ impl ConflictEditor {
                         .child(kind_line(side)),
                 )
         };
+        // Deleted by both: only the deletion is left to confirm (any side's
+        // pick removes the path).
+        let cards = if kind == Whole::DeletedByBoth {
+            div().flex().gap(px(12.)).child(card(ConflictSide::Ours))
+        } else {
+            div()
+                .flex()
+                .gap(px(12.))
+                .child(card(ConflictSide::Ours))
+                .child(card(ConflictSide::Theirs))
+        };
         div()
             .flex_1()
             .min_h_0()
@@ -2377,13 +2631,7 @@ impl ConflictEditor {
                             .text_color(colors.muted)
                             .child(self.kind_note(kind)),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(12.))
-                            .child(card(ConflictSide::Ours))
-                            .child(card(ConflictSide::Theirs)),
-                    ),
+                    .child(cards),
             )
     }
 
@@ -2397,7 +2645,7 @@ impl ConflictEditor {
                     "changes.conflict.take",
                     branch = self.side_label(side)
                 ))
-                .disabled(self.saving)
+                .disabled(self.saving.is_busy())
                 .on_click(move |_, _, cx| {
                     view.update(cx, |editor, cx| editor.take_whole(side, cx));
                 })
@@ -2445,6 +2693,10 @@ impl ConflictEditor {
             let (ask, discard) = match leave {
                 Leave::TakeAll(_) => (
                     ui::t!("changes.editor.replace_ask"),
+                    ui::t!("changes.editor.replace"),
+                ),
+                Leave::ReplaceDisk => (
+                    ui::t!("changes.editor.replace_disk_ask"),
                     ui::t!("changes.editor.replace"),
                 ),
                 _ => (
@@ -2588,7 +2840,7 @@ impl ConflictEditor {
                 .on_click(move |_, _, cx| {
                     save_view.update(cx, |editor, cx| editor.save(cx));
                 });
-            if !can_save && !self.saving {
+            if !can_save && !self.saving.is_busy() {
                 save = save.tooltip(ui::t!("changes.editor.save_blocked"));
             }
             bar = bar.child(save);
@@ -2641,6 +2893,7 @@ impl Render for ConflictEditor {
             )
             .on_action(cx.listener(|editor, _: &Cancel, _, cx| editor.cancel(cx)))
             .child(self.render_header(cx))
+            .children(self.render_disk_banner(cx))
             .child(body)
             .child(self.render_footer(cx))
     }
@@ -2667,6 +2920,7 @@ mod tests {
             ours_endings: vec![git_core::LineEnding::Lf; ours.len()],
             theirs_endings: vec![git_core::LineEnding::Lf; theirs.len()],
             segments,
+            guard: ConflictGuard::default(),
         }
     }
 
@@ -3109,8 +3363,15 @@ mod tests {
         assert_eq!(lines_text(&["a"]), "a");
         assert_eq!(lines_text(&["a", ""]), "a\n\n");
         assert_eq!(lines_text(&[""]), "\n");
+        // What the text area gives back reads as the same lines again.
+        let conflict = sample();
         for lines in [vec![], vec!["a"], vec!["a", ""], vec![""], vec!["", ""]] {
-            assert_eq!(custom_lines(&lines_text(&lines)), lines);
+            let back: Vec<String> = conflict
+                .region_lines(0, &ConflictResolution::Custom(lines_text(&lines)))
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect();
+            assert_eq!(back, lines);
         }
     }
 
@@ -3182,5 +3443,89 @@ mod tests {
             .result
             .iter()
             .any(|l| matches!(l, ResultLine::EditRow { .. })));
+    }
+    #[test]
+    fn only_the_status_read_after_a_save_ends_the_wait() {
+        // An unrelated status result must not end a save that is still running.
+        assert_eq!(SaveState::Running.status_arrived(), SaveState::Running);
+        assert_eq!(SaveState::Idle.status_arrived(), SaveState::Idle);
+        // After a finished save the next status result ends the wait, whether
+        // it was read or failed (the view calls `status_arrived` for both).
+        assert_eq!(SaveState::SavedWaiting.status_arrived(), SaveState::Idle);
+        assert!(SaveState::Running.is_busy());
+        assert!(SaveState::SavedWaiting.is_busy());
+        assert!(!SaveState::Idle.is_busy());
+    }
+
+    #[test]
+    fn typing_rebuilds_only_the_edited_region_and_matches_a_full_rebuild() {
+        let full = |state: &TextState| {
+            let lines = result_lines(&state.conflict, &state.resolutions);
+            let lines = match state.editing {
+                Some((index, rows)) => with_edit_rows(lines, index, rows),
+                None => lines,
+            };
+            (result_heads(&lines), lines)
+        };
+        let mut state = TextState::new(sample(), false);
+        // First edit enters the edit (a full rebuild), the rest are keystrokes.
+        for (index, text, rows) in [
+            (0, "x", 4),
+            (0, "x\ny\nz", 4),
+            (0, "x\ny\nz\nw\nv\nu", 5),
+            (0, "", 4),
+            (0, "one\ntwo", 4),
+        ] {
+            state.apply_edit(index, text.to_owned(), rows);
+            let (heads, lines) = full(&state);
+            assert_eq!(state.result, lines, "after {text:?}");
+            assert_eq!(state.result_heads, heads, "after {text:?}");
+        }
+        // Another region after the first: its numbers follow the first's size.
+        state.set_editing(None);
+        for (text, rows) in [("p", 4), ("p\nq\nr\ns", 4), ("", 4)] {
+            state.apply_edit(1, text.to_owned(), rows);
+            let (heads, lines) = full(&state);
+            assert_eq!(state.result, lines, "region 1 after {text:?}");
+            assert_eq!(state.result_heads, heads);
+        }
+    }
+
+    #[test]
+    fn the_result_takes_its_conflict_lines_from_the_model() {
+        let conflict = sample();
+        let resolutions = vec![
+            ConflictResolution::Picked(vec![ConflictSide::Theirs, ConflictSide::Ours]),
+            ConflictResolution::Custom("typed\nlines".into()),
+        ];
+        let from_model: Vec<String> = (0..2)
+            .flat_map(|index| conflict.region_lines(index, &resolutions[index]))
+            .map(|(text, _)| text)
+            .collect();
+        let lines = result_lines(&conflict, &resolutions);
+        let shown: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| match line {
+                ResultLine::Text {
+                    source: Source::Custom(text),
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, from_model);
+    }
+
+    #[test]
+    fn deleting_kinds_know_which_side_has_no_file() {
+        assert_eq!(Whole::DeletedByUs.absent_side(), Some(ConflictSide::Ours));
+        assert_eq!(
+            Whole::DeletedByThem.absent_side(),
+            Some(ConflictSide::Theirs)
+        );
+        assert_eq!(Whole::AddedByUs.absent_side(), Some(ConflictSide::Theirs));
+        assert_eq!(Whole::AddedByThem.absent_side(), Some(ConflictSide::Ours));
+        assert_eq!(Whole::DeletedByBoth.absent_side(), None);
+        assert_eq!(Whole::NotText.absent_side(), None);
     }
 }

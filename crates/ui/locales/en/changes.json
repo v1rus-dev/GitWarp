@@ -150,6 +150,18 @@
   "changes.editor.keep_version": "Keep {branch}'s version",
   "changes.editor.use_version": "Use {branch}'s version",
   "changes.editor.delete_file": "Delete the file (as in {branch})",
+  "changes.editor.note_not_text": "This file is not UTF-8 text, so GitWarp can't merge it line by line. Keep one version: GitWarp writes it to the working tree and marks the file resolved.",
+  "changes.editor.kind_not_text": "Not UTF-8 text",
+  "changes.editor.note_added": "Only one side added this file. Choose whether it stays: GitWarp applies it and marks the file resolved.",
+  "changes.editor.note_deleted_both": "Both sides deleted this file. Confirm the deletion: GitWarp removes it and marks the file resolved.",
+  "changes.editor.title_added": "{path} was added only in {branch}",
+  "changes.editor.title_deleted_both": "{path} was deleted on both sides",
+  "changes.editor.keep_the_file": "Keep the file",
+  "changes.editor.delete_the_file": "Delete the file",
+  "changes.editor.changed_after_merge": "This file was changed after the merge (by rerere or another editor). Saving replaces those changes.",
+  "changes.editor.replace_disk_ask": "Replace the changes on disk?",
+  "changes.editor.changed_on_disk": "{path} changed on disk — reopen it to see the changes",
+  "changes.editor.not_same_conflict": "{path} is no longer in the same conflict — reloaded",
   "changes.editor.open_menu": "Resolve in GitWarp…",
   "changes.editor.open_button": "Resolve…"
 }

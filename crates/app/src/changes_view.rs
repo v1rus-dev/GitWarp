@@ -468,6 +468,11 @@ impl ChangesView {
             Err(error) => {
                 self.state = StatusState::Failed(error, self.last_arc());
                 self.diff = DiffState::Empty;
+                // An editor waiting for the status of its save must not wait
+                // for ever.
+                if let Some((editor, _)) = &self.editor {
+                    editor.update(cx, |editor, cx| editor.status_failed(cx));
+                }
                 cx.notify();
                 return;
             }
@@ -536,6 +541,10 @@ impl ChangesView {
 
     /// Moves the file selection through both lists with the arrow keys.
     fn step_selection(&mut self, step: isize, cx: &mut Context<Self>) {
+        // The lists are hidden behind the conflict editor.
+        if self.editor.is_some() {
+            return;
+        }
         let Some(status) = self.status() else {
             return;
         };
@@ -573,6 +582,11 @@ impl ChangesView {
     }
 
     fn start_diff(&mut self, cx: &mut Context<Self>) {
+        // The conflict editor covers the diff pane: leave the hidden pane alone
+        // (the editor's close reloads it).
+        if self.editor.is_some() {
+            return;
+        }
         self.diff_generation = self.diff_generation.wrapping_add(1);
         let generation = self.diff_generation;
         self.diff_scroll = UniformListScrollHandle::new();
@@ -1060,12 +1074,15 @@ impl ChangesView {
                 match event {
                     EditorEvent::Close => {
                         view.editor = None;
+                        // The diff pane was not following the status while the
+                        // editor covered it: catch up.
+                        view.start_diff(cx);
                         window.focus(&view.focus, cx);
                         cx.notify();
                     }
                     // The status read that follows tells the editor what is
                     // left (see `sync_editor`).
-                    EditorEvent::Saved => view.start_status(cx),
+                    EditorEvent::Saved | EditorEvent::Refresh => view.start_status(cx),
                 }
             },
         );
@@ -1100,6 +1117,7 @@ impl ChangesView {
         if !keep {
             self.editor = None;
             self.refocus = true;
+            self.start_diff(cx);
         }
     }
 
@@ -1481,17 +1499,26 @@ impl ChangesView {
             .debug_selector(|| "changes-view".to_string())
             .key_context("changes")
             .track_focus(&self.focus)
+            // While the conflict editor covers the lists, their keys do nothing.
             .on_action(cx.listener(|view, _: &CommitChanges, window, cx| {
-                view.commit(window, cx);
+                if view.editor.is_none() {
+                    view.commit(window, cx);
+                }
             }))
             .on_action(cx.listener(|view, _: &StageSelected, _, cx| {
-                view.stage_selected(cx);
+                if view.editor.is_none() {
+                    view.stage_selected(cx);
+                }
             }))
             .on_action(cx.listener(|view, _: &DiscardSelected, _, cx| {
-                view.ask_discard_selected(cx);
+                if view.editor.is_none() {
+                    view.ask_discard_selected(cx);
+                }
             }))
             .on_action(cx.listener(|view, _: &OpenConflictMenu, window, cx| {
-                view.open_selected_conflict_menu(window, cx);
+                if view.editor.is_none() {
+                    view.open_selected_conflict_menu(window, cx);
+                }
             }))
             // Esc in the abort confirm is "Keep merging"; otherwise it goes on.
             .on_action(cx.listener(|view, _: &Cancel, _, cx| {
@@ -3502,6 +3529,181 @@ mod tests {
         assert_eq!(repo.operation().unwrap(), Operation::None);
     }
 
+    /// While the conflict editor covers the lists, the hidden lists do not
+    /// react: a status refresh loads no diff, the arrow-key selection does not
+    /// move; closing the editor catches the diff pane up with the selection.
+    #[gpui::test]
+    fn the_hidden_lists_stay_still_while_the_conflict_editor_is_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = crate::test_support::TempRepo::new("changes-editor-hidden");
+        let dir = repo.path();
+        write(dir, "a.txt", "1\n2\n3\n");
+        write(dir, "z.txt", "z\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        write(dir, "a.txt", "1\nmain\n3\n");
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", "1\nside\n3\n");
+        git(dir, &["commit", "-q", "-am", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        let outcome = Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::FastForwardIfPossible)
+            .unwrap();
+        assert!(matches!(outcome, git_core::MergeOutcome::Stopped { .. }));
+        // An unstaged change gives the lists a second row to move to.
+        write(dir, "z.txt", "z2\n");
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_conflict_editor("a.txt".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let (selection, generation) =
+            view.read_with(&cx, |view, _| (view.selection, view.diff_generation));
+        assert_eq!(selection.map(|s| s.side), Some(Side::Conflicted));
+
+        view.update(&mut cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| view.step_selection(1, cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(view.editor.is_some());
+            assert_eq!(view.diff_generation, generation, "no diff while hidden");
+            assert_eq!(view.selection, selection, "the selection did not move");
+        });
+
+        // Closing the editor loads the diff of the (unchanged) selection.
+        let editor = view.read_with(&cx, |view, _| view.editor.as_ref().unwrap().0.clone());
+        editor.update(&mut cx, |editor, cx| editor.cancel(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(view.editor.is_none());
+            assert_eq!(view.selection, selection);
+            assert_ne!(view.diff_generation, generation, "the diff pane caught up");
+        });
+    }
+
+    /// A merge of `a.txt` (`one` on main, `two` on side) that stops with a conflict.
+    fn conflicted_a_txt(name: &str) -> crate::test_support::TempRepo {
+        let repo = crate::test_support::TempRepo::new(name);
+        let dir = repo.path();
+        git(dir, &["config", "core.autocrlf", "false"]);
+        write(dir, "a.txt", "1\nbase\n3\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        write(dir, "a.txt", "1\none\n3\n");
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", "1\ntwo\n3\n");
+        git(dir, &["commit", "-q", "-am", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        let outcome = Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::FastForwardIfPossible)
+            .unwrap();
+        assert!(matches!(outcome, git_core::MergeOutcome::Stopped { .. }));
+        repo
+    }
+
+    /// Work done outside the editor is not overwritten silently: a file that
+    /// changed after the merge warns at load and asks before saving; one that
+    /// changed while the editor was open is not written and is reloaded; one
+    /// whose merge was aborted is not written either.
+    #[gpui::test]
+    fn the_conflict_editor_protects_work_done_elsewhere(cx: &mut gpui::TestAppContext) {
+        let repo = conflicted_a_txt("changes-editor-outside");
+        let dir = repo.path();
+        let ours = git_core::ConflictResolution::Picked(vec![ConflictSide::Ours]);
+
+        // rerere / an IDE changed the file after the merge, before the editor.
+        write(dir, "a.txt", "1\nresolved by rerere\n3\n");
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_conflict_editor("a.txt".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let editor = view.read_with(&cx, |view, _| view.editor.as_ref().unwrap().0.clone());
+        editor.read_with(&cx, |editor, _| assert!(editor.changed_after_merge()));
+        cx.simulate_keystrokes("alt-1");
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.resolution(0), Some(&ours))
+        });
+        // Save asks first and writes nothing yet.
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+        editor.read_with(&cx, |editor, _| assert!(editor.confirming()));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "1\nresolved by rerere\n3\n"
+        );
+        editor.update(&mut cx, |editor, cx| editor.accept_confirm(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "1\none\n3\n"
+        );
+        view.read_with(&cx, |view, _| assert!(view.editor.is_none()));
+    }
+
+    #[gpui::test]
+    fn a_file_changed_while_the_editor_is_open_is_not_overwritten(cx: &mut gpui::TestAppContext) {
+        let repo = conflicted_a_txt("changes-editor-changed-open");
+        let dir = repo.path();
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_conflict_editor("a.txt".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let editor = view.read_with(&cx, |view, _| view.editor.as_ref().unwrap().0.clone());
+        editor.read_with(&cx, |editor, _| assert!(!editor.changed_after_merge()));
+        cx.simulate_keystrokes("alt-1");
+        write(dir, "a.txt", "1\nedited meanwhile\n3\n");
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+        // Nothing was written; the editor is open again on the file as it is.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "1\nedited meanwhile\n3\n"
+        );
+        view.read_with(&cx, |view, _| {
+            assert!(view.editor.is_some());
+            assert_eq!(view.conflicted_count(), 1);
+        });
+        editor.read_with(&cx, |editor, _| {
+            assert!(editor.changed_after_merge(), "reloaded: now it warns");
+            assert!(!editor.can_save(), "the picks were dropped by the reload");
+        });
+    }
+
+    #[gpui::test]
+    fn saving_after_the_merge_was_aborted_writes_nothing(cx: &mut gpui::TestAppContext) {
+        let repo = conflicted_a_txt("changes-editor-aborted");
+        let dir = repo.path();
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_conflict_editor("a.txt".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let editor = view.read_with(&cx, |view, _| view.editor.as_ref().unwrap().0.clone());
+        cx.simulate_keystrokes("alt-2");
+        git(dir, &["merge", "--abort"]);
+        let after_abort = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            after_abort
+        );
+        // No merge left: the status read closes the editor.
+        view.read_with(&cx, |view, _| assert!(view.editor.is_none()));
+        drop(editor);
+    }
+
     /// The conflict editor end to end on a real merge: two conflicts in
     /// `a.txt`, one in `b.txt`. Picks rebuild the file, save writes and stages
     /// it and moves to the next conflicted file, Esc with picks asks first, and
@@ -3660,6 +3862,15 @@ mod tests {
             assert_eq!(editor.editing(), Some(0));
             assert_eq!(editor.resolution(0), Some(&ours));
             assert_eq!(editor.edit_area().unwrap().read(cx).text(), "one-main");
+        });
+
+        // The editor's Alt keys are not for the text area: pressing one while
+        // typing neither toggles a pick nor leaves the text area.
+        cx.simulate_keystrokes("alt-2 alt-down alt-up");
+        cx.run_until_parked();
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.editing(), Some(0));
+            assert_eq!(editor.resolution(0), Some(&ours));
         });
 
         // Typing makes the region a hand edit: resolved, picks locked.

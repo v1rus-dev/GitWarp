@@ -150,6 +150,18 @@
   "changes.editor.keep_version": "Version von {branch} behalten",
   "changes.editor.use_version": "Version von {branch} verwenden",
   "changes.editor.delete_file": "Datei löschen (wie in {branch})",
+  "changes.editor.note_not_text": "Diese Datei ist kein UTF-8-Text, daher kann GitWarp sie nicht zeilenweise zusammenführen. Behalte eine Version: GitWarp schreibt sie in den Arbeitsbaum und markiert die Datei als gelöst.",
+  "changes.editor.kind_not_text": "Kein UTF-8-Text",
+  "changes.editor.note_added": "Nur eine Seite hat diese Datei hinzugefügt. Wähle, ob sie bleibt: GitWarp wendet es an und markiert die Datei als gelöst.",
+  "changes.editor.note_deleted_both": "Beide Seiten haben diese Datei gelöscht. Bestätige das Löschen: GitWarp entfernt sie und markiert die Datei als gelöst.",
+  "changes.editor.title_added": "{path} wurde nur in {branch} hinzugefügt",
+  "changes.editor.title_deleted_both": "{path} wurde auf beiden Seiten gelöscht",
+  "changes.editor.keep_the_file": "Datei behalten",
+  "changes.editor.delete_the_file": "Datei löschen",
+  "changes.editor.changed_after_merge": "Diese Datei wurde nach dem Merge geändert (durch rerere oder einen anderen Editor). Speichern ersetzt diese Änderungen.",
+  "changes.editor.replace_disk_ask": "Änderungen auf der Festplatte ersetzen?",
+  "changes.editor.changed_on_disk": "{path} hat sich auf der Festplatte geändert — öffne die Datei erneut, um die Änderungen zu sehen",
+  "changes.editor.not_same_conflict": "{path} gehört nicht mehr zum selben Konflikt — neu geladen",
   "changes.editor.open_menu": "In GitWarp lösen…",
   "changes.editor.open_button": "Lösen…"
 }

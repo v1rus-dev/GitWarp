@@ -137,6 +137,18 @@
   "changes.editor.keep_version": "{branch} のバージョンを残す",
   "changes.editor.use_version": "{branch} のバージョンを使う",
   "changes.editor.delete_file": "ファイルを削除する({branch} と同じ)",
+  "changes.editor.note_not_text": "このファイルは UTF-8 のテキストではないため、GitWarp は行単位でマージできません。どちらかのバージョンを残してください。GitWarp が作業ツリーに書き込み、解決済みにします。",
+  "changes.editor.kind_not_text": "UTF-8 テキストではありません",
+  "changes.editor.note_added": "このファイルは片方だけが追加しました。残すかどうかを選んでください。GitWarp が適用して解決済みにします。",
+  "changes.editor.note_deleted_both": "両方がこのファイルを削除しました。削除を確定してください。GitWarp が削除して解決済みにします。",
+  "changes.editor.title_added": "{path} は {branch} でのみ追加されました",
+  "changes.editor.title_deleted_both": "{path} は両方で削除されました",
+  "changes.editor.keep_the_file": "ファイルを残す",
+  "changes.editor.delete_the_file": "ファイルを削除",
+  "changes.editor.changed_after_merge": "このファイルはマージ後に変更されました（rerere または別のエディターによる）。保存するとその変更は置き換えられます。",
+  "changes.editor.replace_disk_ask": "ディスク上の変更を置き換えますか？",
+  "changes.editor.changed_on_disk": "{path} がディスク上で変更されました — 開き直して変更を確認してください",
+  "changes.editor.not_same_conflict": "{path} は同じコンフリクトではなくなりました — 再読み込みしました",
   "changes.editor.open_menu": "GitWarp で解決…",
   "changes.editor.open_button": "解決…"
 }
