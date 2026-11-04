@@ -8,17 +8,21 @@
 //! a badge's popover.
 //!
 //! Request budget per repository open (N = local branches tracking the primary
-//! remote, T = commits asked for, at most [`MAX_CI_TIPS`] + 2):
+//! remote, T = commits asked for: selected + HEAD + at most [`MAX_CI_TIPS`] PR
+//! tips + at most [`MAX_CI_VISIBLE`] visible rows):
 //! - pull requests: 1 call on GitHub and Gitea, min(N, [`MAX_PR_BRANCHES`])
 //!   calls on GitLab (one `source_branch` query each);
 //! - checks: 2 calls per commit on GitHub and GitLab, 1 on Gitea, only for
 //!   commits whose answer is missing or not final (see [`CiCache::needs_fetch`]);
+//!   at most [`MAX_CI_CONCURRENT`] calls run at once, in candidate order; the
+//!   visible rows also share [`CI_VISIBLE_BUDGET`] requests per
+//!   [`CI_VISIBLE_WINDOW`], so scrolling cannot spend the rate limit;
 //! - review state: 1 call each time a popover opens.
 //!
 //! Requests share one `forge::api::Client`, whose conditional-request cache
 //! answers unchanged resources with a free 304.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -55,6 +59,20 @@ pub const CI_EMPTY_RECHECK: Duration = Duration::from_secs(300);
 pub const MAX_PR_BRANCHES: usize = 30;
 /// Checks are requested for at most this many pull request branch tips.
 pub const MAX_CI_TIPS: usize = 10;
+/// How many rows above and below the viewport are also asked about, so a small
+/// scroll does not wait for a new request.
+pub const CI_VISIBLE_MARGIN: usize = 3;
+/// At most this many visible commits are asked about per batch, in row order.
+pub const MAX_CI_VISIBLE: usize = 60;
+/// Visible-row commits asked about in one rolling window: scrolling through a
+/// long history must not spend the whole hourly rate limit.
+pub const CI_VISIBLE_BUDGET: usize = 120;
+/// The window of [`CI_VISIBLE_BUDGET`].
+pub const CI_VISIBLE_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// A changing visible range rests this long before its rows are asked about.
+pub const CI_VISIBLE_DEBOUNCE: Duration = Duration::from_millis(300);
+/// One batch of checks requests runs at most this many calls at once.
+pub const MAX_CI_CONCURRENT: usize = 4;
 /// A rate limit without a reset time pauses requests for this long.
 const RATE_LIMIT_FALLBACK: u64 = 60;
 /// The popover shows the head branch cut to this many characters.
@@ -229,19 +247,72 @@ pub fn pr_refresh_due(trigger: PrTrigger, attempted_at: Option<Instant>, now: In
 }
 
 /// The commits worth a checks request, most wanted first, without repeats: the
-/// selected one, HEAD, then the tips of branches with a pull request.
-pub fn ci_wanted(selected: Option<Oid>, head: Option<Oid>, pr_tips: &[Oid]) -> Vec<Oid> {
+/// selected one, HEAD, the tips of branches with a pull request, then the rows
+/// currently visible on screen (at most [`MAX_CI_VISIBLE`], in row order).
+/// With `show_ci_status` off nothing is wanted at all.
+pub fn ci_wanted(
+    selected: Option<Oid>,
+    head: Option<Oid>,
+    pr_tips: &[Oid],
+    visible: &[Oid],
+    show_ci_status: bool,
+) -> Vec<Oid> {
+    if !show_ci_status {
+        return Vec::new();
+    }
     let mut wanted: Vec<Oid> = Vec::new();
     let candidates = selected
         .into_iter()
         .chain(head)
-        .chain(pr_tips.iter().copied().take(MAX_CI_TIPS));
+        .chain(pr_tips.iter().copied().take(MAX_CI_TIPS))
+        .chain(visible.iter().copied().take(MAX_CI_VISIBLE));
     for oid in candidates {
         if !wanted.contains(&oid) {
             wanted.push(oid);
         }
     }
     wanted
+}
+
+/// A rolling budget of visible-row checks requests. Selected, HEAD and pull
+/// request tip commits are not counted: only the rows that scroll past.
+#[derive(Debug, Default)]
+pub struct CiBudget {
+    /// Grants inside the window, oldest first.
+    grants: VecDeque<(Instant, usize)>,
+}
+
+impl CiBudget {
+    /// How many of `n` visible-row requests may go out at `now`, recording the
+    /// grant. Zero while the window is full; the rest wait for the next one.
+    pub fn allow(&mut self, now: Instant, n: usize) -> usize {
+        self.expire(now);
+        let used = self.used(now);
+        let allowed = n.min(CI_VISIBLE_BUDGET.saturating_sub(used));
+        if allowed > 0 {
+            self.grants.push_back((now, allowed));
+        }
+        allowed
+    }
+
+    /// How many requests the window holds at `now`.
+    pub fn used(&self, now: Instant) -> usize {
+        self.grants
+            .iter()
+            .filter(|(at, _)| now.saturating_duration_since(*at) < CI_VISIBLE_WINDOW)
+            .map(|(_, count)| count)
+            .sum()
+    }
+
+    fn expire(&mut self, now: Instant) {
+        while self
+            .grants
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= CI_VISIBLE_WINDOW)
+        {
+            self.grants.pop_front();
+        }
+    }
 }
 
 /* -------------------------------- health --------------------------------- */
@@ -769,6 +840,8 @@ pub struct HostingState {
     reach: HashSet<Oid>,
     /// How many loaded commits `reach` was computed over; `None` = outdated.
     reach_loaded: Option<usize>,
+    /// The rolling limit of visible-row checks requests.
+    ci_budget: CiBudget,
 }
 
 impl Default for HostingState {
@@ -788,6 +861,7 @@ impl Default for HostingState {
             remote_tips: Vec::new(),
             reach: HashSet::new(),
             reach_loaded: None,
+            ci_budget: CiBudget::default(),
         }
     }
 }
@@ -812,6 +886,7 @@ impl HostingState {
             self.reviews.clear();
             self.ci.clear();
             self.health = Health::default();
+            self.ci_budget = CiBudget::default();
         }
         self.target = target;
         self.tracked = tracked;
@@ -938,40 +1013,93 @@ impl HostingState {
             .collect()
     }
 
-    /// The commits worth asking checks for: PR heads, plus the selected commit
-    /// and HEAD when the host is known to have them.
-    pub fn ci_candidates(&self, selected: Option<Oid>, head: Option<Oid>) -> Vec<Oid> {
+    /// The commits worth asking checks for: PR heads, plus the selected commit,
+    /// HEAD and the visible rows when the host is known to have them. The
+    /// visible rows come last, in row order, and are capped per batch.
+    pub fn ci_candidates(
+        &self,
+        selected: Option<Oid>,
+        head: Option<Oid>,
+        visible: &[Oid],
+        show_ci_status: bool,
+    ) -> Vec<Oid> {
+        if !show_ci_status {
+            return Vec::new();
+        }
+        let visible: Vec<Oid> = visible
+            .iter()
+            .copied()
+            .filter(|oid| self.on_remote(*oid))
+            .collect();
         ci_wanted(
             selected.filter(|oid| self.on_remote(*oid)),
             head.filter(|oid| self.on_remote(*oid)),
             &self.pr_tips(),
+            &visible,
+            show_ci_status,
         )
     }
 
     /// Whether a commit the rows show still has pending or running checks.
-    pub fn has_pending_ci(&self, selected: Option<Oid>, head: Option<Oid>) -> bool {
-        self.ci_candidates(selected, head).iter().any(|oid| {
-            self.ci
-                .checks(&oid.to_string())
-                .is_some_and(|c| matches!(c.overall, CiState::Pending | CiState::Running))
-        })
-    }
-
-    /// The commits whose checks should be asked for now.
-    pub fn ci_due(
+    pub fn has_pending_ci(
         &self,
         selected: Option<Oid>,
         head: Option<Oid>,
+        visible: &[Oid],
+        show_ci_status: bool,
+    ) -> bool {
+        self.ci_candidates(selected, head, visible, show_ci_status)
+            .iter()
+            .any(|oid| {
+                self.ci
+                    .checks(&oid.to_string())
+                    .is_some_and(|c| matches!(c.overall, CiState::Pending | CiState::Running))
+            })
+    }
+
+    /// The commits whose checks should be asked for now. Selected, HEAD and
+    /// pull request tips are always asked first and are never counted by the
+    /// visible-row budget; the rows that scroll past wait once it is spent.
+    pub fn ci_due(
+        &mut self,
+        selected: Option<Oid>,
+        head: Option<Oid>,
+        visible: &[Oid],
+        show_ci_status: bool,
         now: Instant,
         now_unix: u64,
     ) -> Vec<Oid> {
         if self.target.is_none() || !self.health.can_request(now_unix) {
             return Vec::new();
         }
-        self.ci_candidates(selected, head)
+        let candidates = self.ci_candidates(selected, head, visible, show_ci_status);
+        // The same set `ci_candidates` puts first, so a row that is also
+        // selected, HEAD or a pull request tip is never charged to the budget.
+        let priority: HashSet<Oid> = ci_wanted(
+            selected.filter(|oid| self.on_remote(*oid)),
+            head.filter(|oid| self.on_remote(*oid)),
+            &self.pr_tips(),
+            &[],
+            show_ci_status,
+        )
+        .into_iter()
+        .collect();
+        let due: Vec<Oid> = candidates
             .into_iter()
             .filter(|oid| self.ci.needs_fetch(&oid.to_string(), now))
-            .collect()
+            .collect();
+        let mut wanted = Vec::with_capacity(due.len());
+        let mut rows = Vec::new();
+        for oid in due {
+            if priority.contains(&oid) {
+                wanted.push(oid);
+            } else {
+                rows.push(oid);
+            }
+        }
+        let allowed = self.ci_budget.allow(now, rows.len());
+        wanted.extend(rows.into_iter().take(allowed));
+        wanted
     }
 
     /// What the rows draw.
@@ -1018,6 +1146,16 @@ impl HostingState {
 
 /* -------------------------------- requests -------------------------------- */
 
+/// The rows of `chunk` still wanted when a batch starts it. A row that
+/// scrolled away is skipped instead of spending a call; `None` asks all.
+fn wanted_chunk(wanted: Option<&HashSet<String>>, chunk: &[String]) -> Vec<String> {
+    chunk
+        .iter()
+        .filter(|sha| wanted.is_none_or(|wanted| wanted.contains(*sha)))
+        .cloned()
+        .collect()
+}
+
 /// One batch of blocking calls against the target; build it on the UI thread,
 /// run it on the background executor.
 #[derive(Clone)]
@@ -1027,6 +1165,9 @@ pub struct Request {
     coords: RepoCoords,
     account_id: Option<String>,
     store: Option<Arc<dyn SecretStore>>,
+    /// The commits still wanted, shared with the view: a row scrolled away
+    /// before its chunk starts is skipped rather than asked and cached.
+    wanted: Option<Arc<Mutex<HashSet<String>>>>,
 }
 
 impl Request {
@@ -1037,7 +1178,14 @@ impl Request {
             coords: target.link.coords.clone(),
             account_id: target.account_id.clone(),
             store,
+            wanted: None,
         }
+    }
+
+    /// Restricts a checks batch to the commits still wanted at each chunk.
+    pub fn only_wanted(mut self, wanted: Arc<Mutex<HashSet<String>>>) -> Self {
+        self.wanted = Some(wanted);
+        self
     }
 
     /// The account's token and how to send it (a browser sign-in's token is
@@ -1076,25 +1224,62 @@ impl Request {
         pull_request_review(&self.client, &self.instance, &self.coords, &auth, number)
     }
 
-    /// Asks for each sha in turn; stops at the first failure that would repeat
-    /// (rejected token, rate limit, unsupported service) and leaves the rest
-    /// unanswered.
+    /// Asks for each sha in turn, up to [`MAX_CI_CONCURRENT`] at once, in the
+    /// order given. Before each chunk the shared wanted set is tested, so a
+    /// row the user scrolled past is not asked for and not cached as answered.
+    /// Stops after the batch that hit a failure that would repeat (rejected
+    /// token, rate limit, unsupported service) and leaves the rest unanswered.
     pub fn checks(&self, shas: &[String]) -> Vec<(String, Result<CommitChecks, ApiError>)> {
         let token = self.token();
         let auth = Request::auth_of(&token);
-        let mut answers = Vec::new();
-        for sha in shas {
-            let result = commit_checks(&self.client, &self.instance, &self.coords, &auth, sha);
-            let stop = result.as_ref().err().is_some_and(|e| {
-                matches!(
-                    classify(e),
-                    ErrorEffect::TokenRejected
-                        | ErrorEffect::RateLimited { .. }
-                        | ErrorEffect::Unsupported
-                        | ErrorEffect::Offline
-                )
+        let mut answers = Vec::with_capacity(shas.len());
+        let mut stop = false;
+        for chunk in shas.chunks(MAX_CI_CONCURRENT) {
+            let chunk = match &self.wanted {
+                Some(wanted) => {
+                    let wanted = wanted.lock().unwrap_or_else(|e| e.into_inner());
+                    wanted_chunk(Some(&wanted), chunk)
+                }
+                None => wanted_chunk(None, chunk),
+            };
+            if chunk.is_empty() {
+                continue;
+            }
+            let batch: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|sha| {
+                        scope.spawn(|| {
+                            (
+                                sha.clone(),
+                                commit_checks(
+                                    &self.client,
+                                    &self.instance,
+                                    &self.coords,
+                                    &auth,
+                                    sha,
+                                ),
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().ok())
+                    .collect()
             });
-            answers.push((sha.clone(), result));
+            for (sha, result) in batch {
+                stop |= result.as_ref().err().is_some_and(|e| {
+                    matches!(
+                        classify(e),
+                        ErrorEffect::TokenRejected
+                            | ErrorEffect::RateLimited { .. }
+                            | ErrorEffect::Unsupported
+                            | ErrorEffect::Offline
+                    )
+                });
+                answers.push((sha, result));
+            }
             if stop {
                 break;
             }
@@ -1511,12 +1696,56 @@ mod tests {
     #[test]
     fn ci_wants_selected_head_and_pr_tips_without_repeats_and_bounded() {
         let tips: Vec<Oid> = (10..40).map(oid).collect();
-        let wanted = ci_wanted(Some(oid(10)), Some(oid(1)), &tips);
+        let wanted = ci_wanted(Some(oid(10)), Some(oid(1)), &tips, &[], true);
         assert_eq!(wanted[0], oid(10));
         assert_eq!(wanted[1], oid(1));
         // selected + head + at most MAX_CI_TIPS tips, the selected one deduped.
         assert_eq!(wanted.len(), 2 + MAX_CI_TIPS - 1);
-        assert_eq!(ci_wanted(None, None, &[]), Vec::<Oid>::new());
+        assert_eq!(ci_wanted(None, None, &[], &[], true), Vec::<Oid>::new());
+    }
+
+    #[test]
+    fn ci_wants_visible_rows_after_the_priority_commits_and_honours_the_setting() {
+        let visible = [oid(4), oid(2), oid(5)];
+        assert_eq!(
+            ci_wanted(Some(oid(1)), Some(oid(2)), &[oid(3)], &visible, true),
+            vec![oid(1), oid(2), oid(3), oid(4), oid(5)]
+        );
+        // Hiding CI status asks for nothing, whoever is on screen.
+        assert!(ci_wanted(Some(oid(1)), Some(oid(2)), &[oid(3)], &visible, false).is_empty());
+        // At most MAX_CI_VISIBLE visible rows, in row order.
+        let many: Vec<Oid> = (0..MAX_CI_VISIBLE as u8 + 10).map(oid).collect();
+        let capped = ci_wanted(None, None, &[], &many, true);
+        assert_eq!(capped.len(), MAX_CI_VISIBLE);
+        assert_eq!(capped.first(), Some(&oid(0)));
+        assert_eq!(capped.last(), Some(&oid(MAX_CI_VISIBLE as u8 - 1)));
+    }
+
+    #[test]
+    fn the_visible_row_budget_is_a_rolling_window() {
+        let now = Instant::now();
+        let mut budget = CiBudget::default();
+        assert_eq!(budget.allow(now, 50), 50);
+        let later = now + Duration::from_secs(1);
+        assert_eq!(budget.allow(later, 100), 70);
+        assert_eq!(budget.allow(later, 10), 0);
+        assert_eq!(budget.used(later), CI_VISIBLE_BUDGET);
+        // The first grant ages out; its 50 are free again.
+        let rolled = now + CI_VISIBLE_WINDOW;
+        assert_eq!(budget.used(rolled), 70);
+        assert_eq!(budget.allow(rolled, 100), 50);
+    }
+
+    #[test]
+    fn a_chunk_keeps_only_the_commits_still_wanted() {
+        let chunk = ["a", "b", "c", "d"].map(str::to_owned).to_vec();
+        assert_eq!(wanted_chunk(None, &chunk), chunk);
+        let wanted: HashSet<String> = ["a", "c"].map(str::to_owned).into_iter().collect();
+        assert_eq!(
+            wanted_chunk(Some(&wanted), &chunk),
+            vec!["a".to_owned(), "c".to_owned()]
+        );
+        assert!(wanted_chunk(Some(&HashSet::new()), &chunk).is_empty());
     }
 
     #[test]
@@ -1583,14 +1812,17 @@ mod tests {
         // HEAD (1) is on the host; the PR head is the remote-tracking tip (2).
         state.set_reach(HashSet::from([oid(1), oid(2)]), 0);
         let now = Instant::now();
-        let due = state.ci_due(None, Some(oid(1)), now, 0);
+        let due = state.ci_due(None, Some(oid(1)), &[], true, now, 0);
         assert_eq!(due, vec![oid(1), oid(2)]);
         state.ci.store(
             &oid(1).to_string(),
             Ok(checks(CiState::Passed, &[CiState::Passed])),
             now,
         );
-        assert_eq!(state.ci_due(None, Some(oid(1)), now, 0), vec![oid(2)]);
+        assert_eq!(
+            state.ci_due(None, Some(oid(1)), &[], true, now, 0),
+            vec![oid(2)]
+        );
         state.health.apply(
             &ApiError::RateLimited {
                 reset_at: Some(100),
@@ -1598,8 +1830,38 @@ mod tests {
             0,
             false,
         );
-        assert!(state.ci_due(None, Some(oid(1)), now, 50).is_empty());
-        assert_eq!(state.ci_due(None, Some(oid(1)), now, 100), vec![oid(2)]);
+        assert!(state
+            .ci_due(None, Some(oid(1)), &[], true, now, 50)
+            .is_empty());
+        assert_eq!(
+            state.ci_due(None, Some(oid(1)), &[], true, now, 100),
+            vec![oid(2)]
+        );
+    }
+
+    #[test]
+    fn visible_rows_wait_once_the_rolling_budget_is_spent() {
+        let mut state = state_with(&[], None);
+        let head = oid(1);
+        let visible: Vec<Oid> = (10..100).map(oid).collect();
+        let mut reach: HashSet<Oid> = visible.iter().copied().collect();
+        reach.insert(head);
+        state.set_reach(reach, 0);
+        let now = Instant::now();
+
+        // The priority commit is first and always asked; at most 60 rows.
+        let first = state.ci_due(None, Some(head), &visible, true, now, 0);
+        assert_eq!(first.first(), Some(&head));
+        assert_eq!(first.len(), 1 + MAX_CI_VISIBLE);
+        // 60 more rows fit the 120-request window; then only the priority one.
+        let second = state.ci_due(None, Some(head), &visible, true, now, 0);
+        assert_eq!(second.len(), 1 + (CI_VISIBLE_BUDGET - MAX_CI_VISIBLE));
+        let third = state.ci_due(None, Some(head), &visible, true, now, 0);
+        assert_eq!(third, vec![head]);
+        // The window rolled over: visible rows are allowed again.
+        let rolled = now + CI_VISIBLE_WINDOW;
+        let again = state.ci_due(None, Some(head), &visible, true, rolled, 0);
+        assert_eq!(again.len(), 1 + MAX_CI_VISIBLE);
     }
 
     // ----- errors -----
@@ -2000,14 +2262,51 @@ mod tests {
         let mut state = state_with(&refs, None);
         assert_eq!(state.remote_tips(), [oid(5)]);
         // Nothing known to be on the host yet except the tips.
-        assert!(state.ci_candidates(Some(oid(1)), Some(oid(2))).is_empty());
+        assert!(state
+            .ci_candidates(Some(oid(1)), Some(oid(2)), &[], true)
+            .is_empty());
         state.set_reach(HashSet::from([oid(5), oid(2)]), 3);
         assert!(!state.reach_outdated(3) && state.reach_outdated(4));
         // HEAD (2) is pushed, the selected commit (1) is not.
         assert_eq!(
-            state.ci_candidates(Some(oid(1)), Some(oid(2))),
+            state.ci_candidates(Some(oid(1)), Some(oid(2)), &[], true),
             vec![oid(2)]
         );
+    }
+
+    #[test]
+    fn visible_rows_get_checks_when_the_host_has_them_and_are_capped() {
+        let mut state = state_with(&[], None);
+        let pushed: HashSet<Oid> = (0..MAX_CI_VISIBLE as u8 + 10).map(oid).collect();
+        state.set_reach(pushed.clone(), 0);
+        // Everything is on the host: priority commits first, then rows in order,
+        // capped, with the selected and HEAD commits not repeated.
+        let visible: Vec<Oid> = (0..MAX_CI_VISIBLE as u8 + 10).map(oid).collect();
+        let candidates = state.ci_candidates(Some(oid(1)), Some(oid(2)), &visible, true);
+        assert_eq!(candidates[0], oid(1));
+        assert_eq!(candidates[1], oid(2));
+        assert_eq!(candidates.len(), MAX_CI_VISIBLE);
+        // Local-only rows are skipped without a request.
+        let mut local = state_with(&[], None);
+        local.set_reach(HashSet::from([oid(7)]), 0);
+        assert_eq!(
+            local.ci_candidates(None, None, &[oid(6), oid(7), oid(8)], true),
+            vec![oid(7)]
+        );
+    }
+
+    #[test]
+    fn hiding_ci_status_yields_no_candidates_or_requests() {
+        let mut state = state_with(&[], None);
+        state.set_reach(HashSet::from([oid(1), oid(2), oid(3)]), 0);
+        let visible = [oid(1), oid(2), oid(3)];
+        assert!(state
+            .ci_candidates(None, Some(oid(1)), &visible, false)
+            .is_empty());
+        assert!(!state.has_pending_ci(None, None, &visible, false));
+        assert!(state
+            .ci_due(None, None, &visible, false, Instant::now(), 0)
+            .is_empty());
     }
 
     #[test]
@@ -2049,19 +2348,19 @@ mod tests {
             0,
         );
         let now = Instant::now();
-        assert!(!state.has_pending_ci(None, None));
+        assert!(!state.has_pending_ci(None, None, &[], true));
         state.ci.store(
             &oid(2).to_string(),
             Ok(checks(CiState::Running, &[CiState::Running])),
             now,
         );
-        assert!(state.has_pending_ci(None, None));
+        assert!(state.has_pending_ci(None, None, &[], true));
         state.ci.store(
             &oid(2).to_string(),
             Ok(checks(CiState::Passed, &[CiState::Passed])),
             now,
         );
-        assert!(!state.has_pending_ci(None, None));
+        assert!(!state.has_pending_ci(None, None, &[], true));
     }
 
     #[test]

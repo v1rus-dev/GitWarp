@@ -25,5 +25,6 @@
   "kit.heatmap.weekday.thu": "木",
   "kit.heatmap.weekday.tue": "火",
   "kit.heatmap.weekday.wed": "水",
-  "kit.toast.dismiss": "閉じる"
+  "kit.toast.dismiss": "閉じる",
+  "kit.toast.copy": "コピー"
 }

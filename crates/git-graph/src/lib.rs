@@ -1,7 +1,7 @@
 //! Incremental lane layout for a commit graph.
 //!
-//! Feed commits in topological order (children before parents, as
-//! `git log --topo-order` prints them) one at a time with
+//! Feed commits in date order (children before parents, as
+//! `git log --date-order` prints them) one at a time with
 //! [`GraphBuilder::push`]. Each call returns a [`Row`] describing everything
 //! a renderer needs to draw that one row: where the commit dot sits and which
 //! line segments cross the row. Rows never change after they are produced, so
@@ -22,7 +22,9 @@
 //! is already expected by another lane, the commit's line bends into that lane
 //! on its own row instead of running a second line down to the parent; a
 //! merged-in parent that is not expected yet gets a new lane in the leftmost
-//! free column, which may be left of the merge commit.
+//! free column, which may be left of the merge commit. After every row the
+//! lanes are compacted to the left, so a column freed by a closing line is
+//! reused by the rows below instead of leaving a gap in the graph.
 
 use std::hash::Hash;
 
@@ -61,7 +63,8 @@ pub struct Row<Id> {
     pub above: Vec<Segment>,
     /// Segments in the lower half: from the center down to the bottom edge.
     /// A segment starting at `column` leads to one of this commit's parents;
-    /// any other segment is a lane passing by (`from == to`).
+    /// any other segment is a lane passing by. A passing lane may shift left
+    /// (`from != to`) when the lanes are compacted below this row.
     pub below: Vec<Segment>,
     /// Number of columns this row occupies (max column used + 1).
     pub width: usize,
@@ -115,6 +118,13 @@ impl<Id: Clone + Eq + Hash> GraphBuilder<Id> {
     /// Number of lanes that are open after the last pushed row.
     pub fn open_lanes(&self) -> usize {
         self.lanes.iter().filter(|l| l.is_some()).count()
+    }
+
+    /// Whether any column is a hole. Test-only: compaction keeps the lanes
+    /// dense, so this must always be false after a row.
+    #[cfg(test)]
+    fn has_holes(&self) -> bool {
+        self.lanes.iter().any(Option::is_none)
     }
 
     /// Lay out the next commit. `parents` must be in git order: the first
@@ -247,7 +257,27 @@ impl<Id: Clone + Eq + Hash> GraphBuilder<Id> {
             }
         }
 
-        self.trim();
+        // ---- compaction -------------------------------------------------
+        // Close every hole a closing line left behind: occupied columns keep
+        // their relative order and move to the left. `from` still names the
+        // column the segment had at the center line; only its bottom end moves,
+        // so a shifted passing lane becomes `{ from: old, to: new }`.
+        let mut remap = Vec::with_capacity(self.lanes.len());
+        let mut dense = 0;
+        for lane in &self.lanes {
+            if lane.is_some() {
+                remap.push(dense);
+                dense += 1;
+            } else {
+                remap.push(usize::MAX);
+            }
+        }
+        for segment in &mut below {
+            debug_assert_ne!(remap[segment.to], usize::MAX, "segment targets a free lane");
+            segment.to = remap[segment.to];
+        }
+        self.lanes.retain(|lane| lane.is_some());
+
         self.rows_emitted += 1;
 
         above.sort_by_key(|s| (s.from, s.to));
@@ -310,12 +340,6 @@ impl<Id: Clone + Eq + Hash> GraphBuilder<Id> {
         }
         self.lanes.push(Some(lane));
         self.lanes.len() - 1
-    }
-
-    fn trim(&mut self) {
-        while matches!(self.lanes.last(), Some(None)) {
-            self.lanes.pop();
-        }
     }
 }
 

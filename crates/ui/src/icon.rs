@@ -2,7 +2,9 @@
 //! `assets/icons/OCTICONS-LICENSE`), plus our own git, keyboard, command and
 //! window-control glyphs, which Octicons does not have.
 
-use gpui::{px, svg, App, Hsla, IntoElement, Pixels, RenderOnce, Styled, Window};
+use gpui::{
+    px, radians, svg, App, Hsla, IntoElement, Pixels, RenderOnce, Styled, Transformation, Window,
+};
 
 use crate::theme::ActiveTheme;
 
@@ -218,6 +220,7 @@ pub struct Icon {
     name: IconName,
     size: Pixels,
     color: Option<Hsla>,
+    flipped: bool,
 }
 
 impl Icon {
@@ -226,6 +229,7 @@ impl Icon {
             name,
             size: px(14.),
             color: None,
+            flipped: false,
         }
     }
 
@@ -240,15 +244,26 @@ impl Icon {
         self.color = Some(color);
         self
     }
+
+    /// Turns the glyph half a turn: a left chevron from `ChevR`, a "back" from "forward".
+    pub fn flipped(mut self) -> Self {
+        self.flipped = true;
+        self
+    }
 }
 
 impl RenderOnce for Icon {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let color = self.color.unwrap_or(cx.theme().colors.text);
-        svg()
+        let icon = svg()
             .path(self.name.path())
             .w(self.size)
             .h(self.size)
-            .text_color(color)
+            .text_color(color);
+        if self.flipped {
+            icon.with_transformation(Transformation::rotate(radians(std::f32::consts::PI)))
+        } else {
+            icon
+        }
     }
 }

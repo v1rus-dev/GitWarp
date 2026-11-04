@@ -20,7 +20,7 @@
   "sidebar.menu.fetch_tags_from_origin": "Tags von origin fetchen",
   "sidebar.menu.lock": "Sperren",
   "sidebar.menu.manage_worktrees": "Worktrees verwalten…",
-  "sidebar.menu.merge_into": "{name} in {head} mergen",
+  "sidebar.menu.merge_into": "{name} in {head} mergen…",
   "sidebar.menu.open_in_new_window": "In neuem Fenster öffnen",
   "sidebar.menu.open_on_host": "Auf {service} öffnen",
   "sidebar.menu.pop_stash": "Stash anwenden und entfernen",

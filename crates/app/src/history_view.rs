@@ -14,14 +14,15 @@ use std::sync::{Arc, Mutex};
 use gpui::prelude::*;
 use gpui::{
     actions, canvas, container_query, div, px, uniform_list, AnyElement, App, AsyncApp, ClickEvent,
-    ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, FocusHandle, FontWeight,
-    IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, ScrollStrategy,
-    SharedString, StyledText, Task, TextRun, TextStyle, UniformListScrollHandle, WeakEntity,
-    Window,
+    ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, EventEmitter, FocusHandle,
+    FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render,
+    ScrollStrategy, SharedString, StyledText, Task, TextRun, TextStyle, UniformListScrollHandle,
+    WeakEntity, Window,
 };
 
 use git_core::{
-    BranchLog, CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo,
+    BranchLog, CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Operation, Ref,
+    Repo,
 };
 use git_graph::{ColumnGeometry, GraphBuilder, IdleLanes, Row};
 use ui::actions::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrev};
@@ -30,8 +31,8 @@ use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD, R_SM};
 use ui::theme::ThemeColors;
 use ui::{
     menu, ActiveTheme, Avatar, Button, ButtonSize, CiGlyph, EmptyState, Icon, IconName, ListRow,
-    MenuEntry, MenuItem, PrBadge, Progress, RefBadge, RefKind, Scrollbar, Skeleton, Spinner,
-    ToastKind, Tooltip,
+    MenuEntry, MenuItem, PrBadge, Progress, RefBadge, RefKind, Scrollbar, SelectableText, Skeleton,
+    Spinner, ToastKind, Tooltip,
 };
 
 use crate::format::{format_count, relative_time};
@@ -52,14 +53,27 @@ pub(crate) type SidebarActionHandler = Rc<dyn Fn(SidebarAction, &mut Window, &mu
 /// Opens the pull request popover of a local branch at a window position.
 pub(crate) type PrClickHandler = Rc<dyn Fn(String, Point<Pixels>, &mut Window, &mut App)>;
 
+/// What the history tells the shell outside its render and action callbacks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HistoryEvent {
+    /// The commits of the rows on screen (with a small margin) changed after
+    /// the range stopped changing; the shell asks for their checks.
+    VisibleRowsChanged(Vec<Oid>),
+}
+
 /// Sets (`Some`) or clears (`None`) the History's branch filter.
 type FilterSetter = Rc<dyn Fn(Option<String>, &mut App)>;
 
 /// A sidebar node key's context-menu model.
 type RefMenuSource = Rc<dyn Fn(&str) -> Vec<SidebarMenuEntry>>;
-use crate::hosting_status::{ci_label, HostingView, PrBadgeView};
+use crate::hosting_status::{
+    ci_label, HostingView, PrBadgeView, CI_VISIBLE_DEBOUNCE, CI_VISIBLE_MARGIN,
+};
 use crate::remote_accounts::RemoteTargets;
-use crate::settings::{GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MAX, GRAPH_WIDTH_MIN};
+use crate::settings::{
+    AUTHOR_WIDTH_DEFAULT, AUTHOR_WIDTH_MIN, DATE_WIDTH_DEFAULT, DATE_WIDTH_MIN,
+    GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MIN, HASH_WIDTH_DEFAULT, HASH_WIDTH_MIN,
+};
 use crate::sidebar::{sidebar_menu_with_links, SidebarAction, SidebarExtras, SidebarMenuEntry};
 use crate::theme;
 use crate::web_links::{self, HostLink};
@@ -71,26 +85,15 @@ const PAGE: usize = 2_000;
 /// How long the field waits after the last keystroke before the search runs.
 const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// Column widths of the history table, shared by the header and the rows.
+/// The gap between the history table's columns.
 const COL_GAP: f32 = 18.;
-/// Author and date columns on a wide pane.
-const COL_AUTHOR: f32 = 130.;
-const COL_DATE: f32 = 104.;
-/// The narrower author and date columns below [`PANE_MEDIUM`].
-const COL_AUTHOR_NARROW: f32 = 104.;
-const COL_DATE_NARROW: f32 = 76.;
-const COL_HASH: f32 = 64.;
 /// The pane widths where the table drops a column, as the design's container
 /// queries do: 560 px loses Hash, 460 px loses Author.
 const PANE_MEDIUM: f32 = 560.;
 const PANE_NARROW: f32 = 460.;
-/// The graph column's design cap on a wide pane and on top of that its share
-/// of the pane, so the summary always keeps room. The user width `gw` (40–480)
-/// replaces the old lane auto-fit; the 480 cap stays a belt-and-braces bound.
-const GRAPH_MAX_WIDE: f32 = GRAPH_WIDTH_MAX;
-const GRAPH_SHARE_WIDE: f32 = 0.40;
-const GRAPH_SHARE_MEDIUM: f32 = 0.40;
-const GRAPH_SHARE_NARROW: f32 = 0.36;
+/// The summary column is flexible; a fixed column may never be dragged so far
+/// that it leaves the summary less room than this.
+const SUMMARY_MIN: f32 = 80.;
 /// The header and the rows share this side margin and padding.
 const SIDE_MARGIN: f32 = 6.;
 const PAD_LEFT: f32 = 14.;
@@ -116,6 +119,8 @@ const BADGE_LABEL_MAX: f32 = 160.;
 /// a kind with an icon adds the 11 px icon and its 3 px gap.
 const BADGE_PADDING: f32 = 14.;
 const BADGE_ICON: f32 = 14.;
+/// The space between a local badge's label and its `+origin` remote suffix.
+const BADGE_SUFFIX_GAP: f32 = 4.;
 /// The narrowest room the summary text keeps beside its badges, and at most
 /// 40 % of the cell when the cell is narrower than 200 px.
 const BADGE_TEXT_MIN: f32 = 80.;
@@ -192,6 +197,16 @@ fn pr_badge_of<'a>(
         .flatten()
 }
 
+/// The muted tail of a merged local/remote badge: `+origin` for one remote,
+/// `+2` for several (their menus still list every ref).
+fn remote_suffix(remotes: &[SharedString]) -> Option<SharedString> {
+    match remotes {
+        [] => None,
+        [remote] => Some(format!("+{remote}").into()),
+        several => Some(format!("+{}", several.len()).into()),
+    }
+}
+
 /// One ref badge on a history row, derived from HEAD and the refs once they
 /// load — never per frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,6 +216,10 @@ pub struct BadgeSpec {
     pub label: SharedString,
     /// The full ref name, shown on hover.
     pub tooltip: SharedString,
+    /// The remotes whose branch of the same name is on this commit. A local
+    /// branch and its remote counterparts then render as one badge with a
+    /// `+origin` suffix instead of two badges.
+    pub remotes: Vec<SharedString>,
 }
 
 /// How many of a row's badges fit beside its summary text.
@@ -260,24 +279,77 @@ pub fn badge_overflow(widths: &[f32], available: f32, gap: f32, plus_width: f32)
 /// badge (never also a local one), symbolic `origin/HEAD` remotes, stashes and
 /// other refs are hidden, and the order is HEAD, local, remote, tag with
 /// alphabetical names inside a kind.
+///
+/// A local branch (or HEAD's branch) and its same-named remote branches on the
+/// same commit become one badge carrying [`BadgeSpec::remotes`]; a remote
+/// branch on another commit stays a badge of its own.
 pub fn build_badges(head: Option<&Head>, refs: &[Ref]) -> HashMap<Oid, Vec<BadgeSpec>> {
     let mut badges: HashMap<Oid, Vec<BadgeSpec>> = HashMap::new();
-    let mut current_branch = None;
-    match head {
-        Some(Head::Branch { name, target }) => {
-            current_branch = Some(name.as_str());
-            if let Some(target) = target {
-                badges.entry(*target).or_default().push(BadgeSpec {
-                    kind: RefKind::Head,
-                    label: name.as_str().into(),
-                    tooltip: format!("refs/heads/{name}").into(),
-                });
-            }
+    let current_branch = match head {
+        Some(Head::Branch { name, .. }) => Some(name.as_str()),
+        Some(Head::Detached(_)) | None => None,
+    };
+
+    // Remote branches by the commit and local branch name they would check out
+    // as, plus the ones that merge into a local or HEAD badge.
+    let mut remote_names: HashMap<(Oid, &str), Vec<&str>> = HashMap::new();
+    let mut merged: HashSet<&str> = HashSet::new();
+    for reference in refs
+        .iter()
+        .filter(|reference| reference.kind == git_core::RefKind::RemoteBranch)
+    {
+        let Some((remote, leaf)) = reference.name.split_once('/') else {
+            continue;
+        };
+        if remote.is_empty() || leaf.is_empty() || leaf == "HEAD" {
+            continue;
         }
+        remote_names
+            .entry((reference.target, leaf))
+            .or_default()
+            .push(remote);
+        let local_here = refs.iter().any(|local| {
+            local.kind == git_core::RefKind::LocalBranch
+                && local.target == reference.target
+                && local.name == leaf
+                && Some(local.name.as_str()) != current_branch
+        });
+        let head_here = matches!(
+            head,
+            Some(Head::Branch { name, target })
+                if name == leaf && *target == Some(reference.target)
+        );
+        if local_here || head_here {
+            merged.insert(reference.full_name.as_str());
+        }
+    }
+    for remotes in remote_names.values_mut() {
+        remotes.sort_unstable();
+        remotes.dedup();
+    }
+    let remotes_for = |target: Oid, branch: &str| -> Vec<SharedString> {
+        remote_names
+            .get(&(target, branch))
+            .map(|remotes| remotes.iter().map(|remote| (*remote).into()).collect())
+            .unwrap_or_default()
+    };
+
+    match head {
+        Some(Head::Branch {
+            name,
+            target: Some(target),
+        }) => badges.entry(*target).or_default().push(BadgeSpec {
+            kind: RefKind::Head,
+            label: name.as_str().into(),
+            tooltip: format!("refs/heads/{name}").into(),
+            remotes: remotes_for(*target, name),
+        }),
+        Some(Head::Branch { target: None, .. }) => {}
         Some(Head::Detached(oid)) => badges.entry(*oid).or_default().push(BadgeSpec {
             kind: RefKind::Head,
             label: "HEAD".into(),
             tooltip: "HEAD".into(),
+            remotes: Vec::new(),
         }),
         None => {}
     }
@@ -296,13 +368,23 @@ pub fn build_badges(head: Option<&Head>, refs: &[Ref]) -> HashMap<Oid, Vec<Badge
             })
             // `origin/HEAD` is a symbolic duplicate of a real remote branch.
             .filter(|reference| !(kind == RefKind::Remote && reference.name.ends_with("/HEAD")))
+            // A remote merged into a local/HEAD badge is drawn there.
+            .filter(|reference| {
+                !(kind == RefKind::Remote && merged.contains(reference.full_name.as_str()))
+            })
             .collect();
         group.sort_by(|a, b| a.name.cmp(&b.name));
         for reference in group {
+            let remotes = if kind == RefKind::Local {
+                remotes_for(reference.target, &reference.name)
+            } else {
+                Vec::new()
+            };
             badges.entry(reference.target).or_default().push(BadgeSpec {
                 kind,
                 label: reference.name.clone().into(),
                 tooltip: reference.full_name.clone().into(),
+                remotes,
             });
         }
     }
@@ -350,9 +432,10 @@ fn measure_badge(
     window: &Window,
     label: &SharedString,
     kind: RefKind,
-    cache: &mut HashMap<(SharedString, RefKind), Pixels>,
+    remote_suffix: Option<&SharedString>,
+    cache: &mut HashMap<(SharedString, RefKind, Option<SharedString>), Pixels>,
 ) -> Pixels {
-    let key = (label.clone(), kind);
+    let key = (label.clone(), kind, remote_suffix.cloned());
     if let Some(width) = cache.get(&key) {
         return *width;
     }
@@ -372,7 +455,24 @@ fn measure_badge(
         .layout_line(label, FS_XS, &[run], None)
         .width
         .min(px(BADGE_LABEL_MAX));
-    let width = text + px(BADGE_PADDING + icon);
+    let mut width = text + px(BADGE_PADDING + icon);
+    if let Some(suffix) = remote_suffix {
+        let mut font = gpui::font(FONT_UI);
+        font.weight = FontWeight::MEDIUM;
+        let run = TextRun {
+            len: suffix.len(),
+            font,
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let suffix = window
+            .text_system()
+            .layout_line(suffix, FS_XS, &[run], None)
+            .width;
+        width += px(BADGE_SUFFIX_GAP) + suffix;
+    }
     cache.insert(key, width);
     width
 }
@@ -391,58 +491,157 @@ pub struct Columns {
     pub hash: Option<f32>,
 }
 
-/// The table layout for a history pane `pane_width` wide whose graph column
-/// has the user width `graph_width` (`gw`, 40–480).
-///
-/// This is the design's container-query table: the user width shrinks to a
-/// share of the pane (40 % down to 560 px, 36 % below 460 px), the hash column
-/// goes at 560 px and the author column at 460 px.
-pub fn columns(pane_width: f32, graph_width: f32) -> Columns {
-    let gw = clamp_graph_width(graph_width);
-    let share = if pane_width <= PANE_NARROW {
-        GRAPH_SHARE_NARROW
-    } else if pane_width <= PANE_MEDIUM {
-        GRAPH_SHARE_MEDIUM
-    } else {
-        GRAPH_SHARE_WIDE
-    };
-    let graph = gw
-        .min(GRAPH_MAX_WIDE)
-        .min(share * pane_width)
-        .max(GRAPH_MIN);
+/// A fixed-width column the grips can resize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResizeColumn {
+    Graph,
+    Author,
+    Date,
+    Hash,
+}
 
-    if pane_width <= PANE_NARROW {
-        Columns {
-            graph,
-            author: None,
-            date: COL_DATE_NARROW,
-            hash: None,
+impl ResizeColumn {
+    /// The narrowest the column may get.
+    fn min(self) -> f32 {
+        match self {
+            Self::Graph => GRAPH_MIN,
+            Self::Author => AUTHOR_WIDTH_MIN,
+            Self::Date => DATE_WIDTH_MIN,
+            Self::Hash => HASH_WIDTH_MIN,
         }
-    } else if pane_width <= PANE_MEDIUM {
-        Columns {
-            graph,
-            author: Some(COL_AUTHOR_NARROW),
-            date: COL_DATE_NARROW,
-            hash: None,
+    }
+
+    /// The width a double-click restores.
+    fn default_width(self) -> f32 {
+        match self {
+            Self::Graph => GRAPH_WIDTH_DEFAULT,
+            Self::Author => AUTHOR_WIDTH_DEFAULT,
+            Self::Date => DATE_WIDTH_DEFAULT,
+            Self::Hash => HASH_WIDTH_DEFAULT,
         }
-    } else {
-        Columns {
-            graph,
-            author: Some(COL_AUTHOR),
-            date: COL_DATE,
-            hash: Some(COL_HASH),
+    }
+
+    /// The drag direction: the graph's grip sits on its right edge, so moving
+    /// right widens it; the others sit on their left edge, so moving right
+    /// narrows them.
+    fn drag_sign(self) -> f32 {
+        match self {
+            Self::Graph => 1.,
+            Self::Author | Self::Date | Self::Hash => -1.,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Graph => "history-graph-grip",
+            Self::Author => "history-author-grip",
+            Self::Date => "history-date-grip",
+            Self::Hash => "history-hash-grip",
         }
     }
 }
 
-/// The graph width clamped to its persisted range; a value from a broken file
-/// falls back to the design default.
-fn clamp_graph_width(graph_width: f32) -> f32 {
-    if graph_width.is_finite() {
-        graph_width.clamp(GRAPH_MIN, GRAPH_MAX_WIDE)
+/// The table layout for a history pane `pane_width` wide with the user widths
+/// of the four resizable columns.
+///
+/// The hash column goes at 560 px and the author column at 460 px. Otherwise
+/// the saved widths are used as they are (each at least its own minimum); no
+/// fixed cap applies, only the pane's room and the summary's minimum.
+pub fn columns(
+    pane_width: f32,
+    graph_width: f32,
+    author_width: f32,
+    date_width: f32,
+    hash_width: f32,
+) -> Columns {
+    let graph = clamp_graph_width(graph_width);
+    let author = clamp_width(author_width, AUTHOR_WIDTH_MIN, AUTHOR_WIDTH_DEFAULT);
+    let date = clamp_width(date_width, DATE_WIDTH_MIN, DATE_WIDTH_DEFAULT);
+    let hash = clamp_width(hash_width, HASH_WIDTH_MIN, HASH_WIDTH_DEFAULT);
+
+    let mut table = if pane_width <= PANE_NARROW {
+        Columns {
+            graph,
+            author: None,
+            date,
+            hash: None,
+        }
+    } else if pane_width <= PANE_MEDIUM {
+        Columns {
+            graph,
+            author: Some(author),
+            date,
+            hash: None,
+        }
     } else {
-        GRAPH_WIDTH_DEFAULT
+        Columns {
+            graph,
+            author: Some(author),
+            date,
+            hash: Some(hash),
+        }
+    };
+    // Keep the summary's minimum even when a saved width no longer fits the
+    // pane (a window may have shrunk since the drag). Later clamps only shrink
+    // the total, so one pass leaves the table within the pane's room.
+    table.graph = clamp_column_width(ResizeColumn::Graph, table.graph, pane_width, table);
+    if let Some(author) = table.author {
+        table.author = Some(clamp_column_width(
+            ResizeColumn::Author,
+            author,
+            pane_width,
+            table,
+        ));
     }
+    table.date = clamp_column_width(ResizeColumn::Date, table.date, pane_width, table);
+    if let Some(hash) = table.hash {
+        table.hash = Some(clamp_column_width(
+            ResizeColumn::Hash,
+            hash,
+            pane_width,
+            table,
+        ));
+    }
+    table
+}
+
+/// Clamps a resized (or saved) column width to its own minimum and to the room
+/// the pane leaves after the other fixed columns, the gaps and the summary's
+/// minimum. There is deliberately no fixed maximum.
+fn clamp_column_width(
+    column: ResizeColumn,
+    requested: f32,
+    pane_width: f32,
+    columns: Columns,
+) -> f32 {
+    let panel = pane_width - 2. * SIDE_MARGIN - PAD_LEFT - PAD_RIGHT;
+    let count = 3 + usize::from(columns.author.is_some()) + usize::from(columns.hash.is_some());
+    let gaps = (count - 1) as f32 * COL_GAP;
+    let others =
+        columns.graph + columns.date + columns.author.unwrap_or(0.) + columns.hash.unwrap_or(0.)
+            - match column {
+                ResizeColumn::Graph => columns.graph,
+                ResizeColumn::Author => columns.author.unwrap_or(0.),
+                ResizeColumn::Date => columns.date,
+                ResizeColumn::Hash => columns.hash.unwrap_or(0.),
+            };
+    let max = (panel - gaps - SUMMARY_MIN - others).max(column.min());
+    requested.clamp(column.min(), max)
+}
+
+/// A saved column width: finite and at least `min`, otherwise `default`.
+fn clamp_width(width: f32, min: f32, default: f32) -> f32 {
+    if width.is_finite() {
+        width.max(min)
+    } else {
+        default
+    }
+}
+
+/// The graph width clamped to its floor; a value from a broken file falls back
+/// to the design default. There is no upper cap.
+fn clamp_graph_width(graph_width: f32) -> f32 {
+    clamp_width(graph_width, GRAPH_MIN, GRAPH_WIDTH_DEFAULT)
 }
 
 /// The "fit the graph to its content" width: the graph's current full width
@@ -508,11 +707,14 @@ impl PendingReveal {
     }
 }
 
-/// The grip drag in flight: where the pointer started and the width it is
-/// resizing from. A click that never moved does not persist anything.
+/// The grip drag in flight: which column it resizes, where the pointer started
+/// and the width it is resizing from. A click that never moved does not persist
+/// anything.
 struct GripDrag {
+    column: ResizeColumn,
     start_x: f32,
     start_width: f32,
+    pane_width: f32,
     dragging: bool,
 }
 
@@ -661,10 +863,20 @@ pub struct HistoryView {
     /// The repository's remotes, for the "Open on <host>" menu items; set by
     /// the shell whenever it reloads them.
     remote_targets: Vec<RemoteTargets>,
+    /// The operation the repository is stopped in, for the badge and row
+    /// menus (Merge is disabled while there is one). The shell keeps it current.
+    operation: Operation,
     /// The pull request badges and CI dots, pushed by the shell.
     hosting: Arc<HostingView>,
     /// What a click on a pull request badge does; installed by the shell.
     pr_click: Option<PrClickHandler>,
+    /// The commits of the rows the virtualized list last rendered, plus a
+    /// margin; the shell asks for their checks.
+    visible_oids: Vec<Oid>,
+    /// The set last reported to the shell, so a repeated range costs nothing.
+    visible_reported: Vec<Oid>,
+    /// Waits for the visible range to rest before reporting it.
+    visible_debounce: Option<Task<()>>,
     /// Bumped whenever HEAD and the refs were read again, so the shell knows
     /// to look at its branch tracking once more.
     meta_version: u64,
@@ -677,11 +889,18 @@ pub struct HistoryView {
     /// A reload is in flight and the rows still belong to the previous walk.
     /// The first page of the new walk replaces them.
     pending_rows: bool,
+    /// The commit the reload should select again, once its new row arrives.
+    /// Only set when the rows were already shown and the user had a selection.
+    pending_selection: Option<Oid>,
     max_lanes: usize,
     selected: Option<usize>,
     state: LoadState,
     /// Bumped for every load; results from an older load are dropped.
     generation: u64,
+    /// Bumped for every HEAD/refs read; a stale answer never overwrites a
+    /// newer one. Separate from `generation` because a refs-only refresh does
+    /// not restart the history walk.
+    meta_generation: u64,
     /// The running load. Dropping it cancels the page task and the git log.
     task: Option<Task<()>>,
     /// The `commit_count` probe that feeds the load bar; cancelled with the
@@ -702,7 +921,7 @@ pub struct HistoryView {
     badges: HashMap<Oid, Vec<BadgeSpec>>,
     /// Measured badge widths, cached per label and kind so the per-frame work
     /// stays proportional to the visible rows.
-    badge_widths: HashMap<(SharedString, RefKind), Pixels>,
+    badge_widths: HashMap<(SharedString, RefKind, Option<SharedString>), Pixels>,
     /// The table layout for the pane's last measured width, so the virtualized
     /// rows paint with the same columns the header was built for.
     columns: Columns,
@@ -711,9 +930,13 @@ pub struct HistoryView {
     /// Notifies once a minute so relative dates stay fresh; dropped with the
     /// view.
     clock_task: Option<Task<()>>,
-    /// The user's graph column width (`gw`), kept live while the grip drags
-    /// and persisted on drag end.
+    /// The user's graph column width, kept live while its grip drags and
+    /// persisted on drag end.
     graph_width: f32,
+    /// The user's author, date and hash widths, handled like `graph_width`.
+    author_width: f32,
+    date_width: f32,
+    hash_width: f32,
     /// Per-column statistics for the idle-lane collapse, fed every emitted row
     /// in order. Reset whenever the graph is rebuilt.
     idle_lanes: IdleLanes,
@@ -777,6 +1000,8 @@ pub struct HistoryView {
     /// Bumped on every branch filter change; an older answer is dropped.
     branch_generation: u64,
 }
+
+impl EventEmitter<HistoryEvent> for HistoryView {}
 
 /// Adds one row-menu item that asks the shell to open a ref dialog.
 #[allow(clippy::too_many_arguments)]
@@ -907,6 +1132,18 @@ fn badge_menu_key(spec: &BadgeSpec) -> Option<String> {
         RefKind::Tag => Some(format!("tag:{}", spec.label)),
         _ => None,
     }
+}
+
+/// Every ref a badge's right-click menu covers: the badge's own ref first,
+/// then the remote counterparts of a merged local/HEAD badge.
+fn badge_menu_keys(spec: &BadgeSpec) -> Vec<String> {
+    let mut keys: Vec<String> = badge_menu_key(spec).into_iter().collect();
+    if matches!(spec.kind, RefKind::Local | RefKind::Head) {
+        for remote in &spec.remotes {
+            keys.push(format!("rbranch:{remote}/{}", spec.label));
+        }
+    }
+    keys
 }
 
 /// A sidebar menu model as menu entries; the items dispatch their
@@ -1287,18 +1524,30 @@ impl HistoryView {
         on_action: RefActionHandler,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (graph_width, collapse) = cx
+        let (graph_width, author_width, date_width, hash_width, collapse) = cx
             .try_global::<crate::AppSettings>()
             .map(|state| {
                 (
                     state.settings.graph_width,
+                    state.settings.author_width,
+                    state.settings.date_width,
+                    state.settings.hash_width,
                     state.settings.collapse_idle_lanes,
                 )
             })
-            .unwrap_or((GRAPH_WIDTH_DEFAULT, false));
+            .unwrap_or((
+                GRAPH_WIDTH_DEFAULT,
+                AUTHOR_WIDTH_DEFAULT,
+                DATE_WIDTH_DEFAULT,
+                HASH_WIDTH_DEFAULT,
+                false,
+            ));
         let graph_width = clamp_graph_width(graph_width);
+        let author_width = clamp_width(author_width, AUTHOR_WIDTH_MIN, AUTHOR_WIDTH_DEFAULT);
+        let date_width = clamp_width(date_width, DATE_WIDTH_MIN, DATE_WIDTH_DEFAULT);
+        let hash_width = clamp_width(hash_width, HASH_WIDTH_MIN, HASH_WIDTH_DEFAULT);
         // Replaced with the pane's real width in the first prepaint.
-        let columns = columns(1200., graph_width);
+        let columns = columns(1200., graph_width, author_width, date_width, hash_width);
         let mut view = Self {
             path,
             git,
@@ -1306,17 +1555,23 @@ impl HistoryView {
             on_action,
             sidebar_action: None,
             remote_targets: Vec::new(),
+            operation: Operation::None,
             hosting: Arc::default(),
             pr_click: None,
+            visible_oids: Vec::new(),
+            visible_reported: Vec::new(),
+            visible_debounce: None,
             meta_version: 0,
             last_picked_branch: Rc::new(RefCell::new(None)),
             root: None,
             items: Vec::new(),
             pending_rows: false,
+            pending_selection: None,
             max_lanes: 1,
             selected: None,
             state: LoadState::Loading { total: None },
             generation: 0,
+            meta_generation: 0,
             task: None,
             count_task: None,
             init_task: None,
@@ -1330,6 +1585,9 @@ impl HistoryView {
             summary_width: summary_width(1200., columns),
             clock_task: None,
             graph_width,
+            author_width,
+            date_width,
+            hash_width,
             idle_lanes: IdleLanes::new(),
             geometry: Rc::new(IdleLanes::new().geometry(collapse)),
             collapse,
@@ -1374,6 +1632,9 @@ impl HistoryView {
         self.stop_tasks();
         self.generation += 1;
         let generation = self.generation;
+        // A fresh walk reads HEAD and the refs again: an older refs-only
+        // refresh must not overwrite that answer.
+        self.meta_generation = self.meta_generation.wrapping_add(1);
         self.state = LoadState::Loading { total: None };
         // The graph starts over with the load, so its geometry does too.
         self.idle_lanes = IdleLanes::new();
@@ -1441,16 +1702,18 @@ impl HistoryView {
 
         // HEAD and the refs feed the toolbar and the sidebar; read them in the
         // background so the log is not held back.
+        let meta_generation = this
+            .update(cx, |view, _cx| view.next_meta_generation())
+            .unwrap_or(0);
         let meta_repo = repo.clone();
         let meta_root = root.clone();
         let meta_this = this.clone();
         cx.spawn(async move |cx| {
-            let (head, refs) = cx
-                .background_executor()
-                .spawn(async move { (meta_repo.head(), meta_repo.refs()) })
-                .await;
+            let (head, refs) = Self::read_meta(meta_repo, cx).await;
             meta_this
-                .update(cx, |view, cx| view.set_meta(meta_root, head, refs, cx))
+                .update(cx, |view, cx| {
+                    view.set_meta(meta_generation, meta_root, head, refs, cx)
+                })
                 .ok();
         })
         .detach();
@@ -1568,6 +1831,11 @@ impl HistoryView {
             self.max_lanes = 1;
             self.idle_lanes = IdleLanes::new();
             self.pending_rows = false;
+            // The old rows are gone; the selected commit is selected again by
+            // oid once its new row arrives.
+            if self.pending_selection.is_some() {
+                self.selected = None;
+            }
         }
         let start = self.items.len();
         for (commit, row) in page {
@@ -1579,6 +1847,15 @@ impl HistoryView {
             });
         }
         self.refresh_geometry();
+        // A reload keeps the selection on the commit it was on, by oid: the
+        // row number may have moved. Pages land in order, so a commit below
+        // the first page is restored by a later append.
+        if let Some(oid) = self.pending_selection {
+            if let Some(index) = self.items.iter().position(|item| item.commit.id == oid) {
+                self.selected = Some(index);
+                self.pending_selection = None;
+            }
+        }
         // The HEAD row may only arrive now; the initial selection follows it
         // until the user picks a row.
         self.settle_initial_selection(cx);
@@ -1929,6 +2206,9 @@ impl HistoryView {
     /// Selects `index`, scrolls it minimally into view and repaints. Any pick
     /// stops the initial selection from following the load.
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+        // A pick, a search jump or a reveal is newer than the reload's kept
+        // selection, so the reload must not put the old row back.
+        self.pending_selection = None;
         if index >= self.rows().len() || self.selected == Some(index) {
             self.user_selected = true;
             return;
@@ -2052,7 +2332,9 @@ impl HistoryView {
     }
 
     /// Double-click: switch to the row's first local branch that is not HEAD,
-    /// or check the commit out detached when the row has no such branch.
+    /// check out the row's first remote branch as a local tracking branch, or
+    /// check the commit out detached when the row has no branch at all (only
+    /// tags or a bare commit).
     fn checkout_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.rows().get(index) else {
             return;
@@ -2076,7 +2358,27 @@ impl HistoryView {
                 // The row's only local branch is the one already checked out.
                 return;
             }
-            None => RefAction::CheckoutCommit(card),
+            None => {
+                // No local branch: a remote branch is downloaded locally
+                // through the sidebar's remote-checkout path, not detached.
+                let remote = self
+                    .refs()
+                    .unwrap_or(&[])
+                    .iter()
+                    .find(|reference| {
+                        reference.kind == git_core::RefKind::RemoteBranch
+                            && reference.target == card.oid
+                            && !reference.name.ends_with("/HEAD")
+                    })
+                    .map(|reference| reference.name.clone());
+                if let (Some(remote), Some(handler)) = (remote, self.sidebar_action.clone()) {
+                    window.defer(cx, move |window, cx| {
+                        handler(SidebarAction::CheckoutRemoteBranch(remote), window, cx);
+                    });
+                    return;
+                }
+                RefAction::CheckoutCommit(card)
+            }
         };
         (self.on_action)(action, window, cx);
     }
@@ -2090,6 +2392,44 @@ impl HistoryView {
     /// Installs what a click on a pull request badge does.
     pub(crate) fn set_pr_click_handler(&mut self, handler: PrClickHandler) {
         self.pr_click = Some(handler);
+    }
+
+    /// Starts the short wait that lets a fast scroll pass before its rows are
+    /// reported. A wait already running picks up the latest range.
+    fn schedule_visible_rows(&mut self, cx: &mut Context<Self>) {
+        if self.visible_debounce.is_some() {
+            return;
+        }
+        self.visible_debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CI_VISIBLE_DEBOUNCE).await;
+            this.update(cx, |view, cx| view.report_visible_rows(cx))
+                .ok();
+        }));
+    }
+
+    /// Tells the shell the current visible set unless it is the one it has.
+    /// An event, not a callback: the shell reads this view from its handler,
+    /// which is only safe once this update has finished.
+    fn report_visible_rows(&mut self, cx: &mut Context<Self>) {
+        self.visible_debounce = None;
+        if self.visible_oids == self.visible_reported {
+            return;
+        }
+        self.visible_reported = self.visible_oids.clone();
+        cx.emit(HistoryEvent::VisibleRowsChanged(
+            self.visible_reported.clone(),
+        ));
+    }
+
+    /// The commits of the rows in `range`, plus [`CI_VISIBLE_MARGIN`] rows on
+    /// each side, in row order.
+    fn visible_commits(&self, items: &[Item], range: std::ops::Range<usize>) -> Vec<Oid> {
+        let start = range.start.saturating_sub(CI_VISIBLE_MARGIN);
+        let end = range.end.saturating_add(CI_VISIBLE_MARGIN).min(items.len());
+        items[start.min(end)..end]
+            .iter()
+            .map(|item| item.commit.id)
+            .collect()
     }
 
     /// Replaces the pull request badges and CI dots the rows draw.
@@ -2125,6 +2465,11 @@ impl HistoryView {
     /// offer "Open on <host>".
     pub(crate) fn set_remote_targets(&mut self, targets: Vec<RemoteTargets>) {
         self.remote_targets = targets;
+    }
+
+    /// Tells the History which operation the repository is stopped in.
+    pub(crate) fn set_operation(&mut self, operation: Operation) {
+        self.operation = operation;
     }
 
     /// The hosts the repository's remotes point at, the current branch's
@@ -2203,13 +2548,22 @@ impl HistoryView {
             remote_targets: self.remote_targets.clone(),
             ..SidebarExtras::default()
         };
+        let operation = self.operation;
         Rc::new(move |key| {
-            sidebar_menu_with_links(key, head.as_ref(), Some(&extras), Some(&refs), &links)
+            sidebar_menu_with_links(
+                key,
+                head.as_ref(),
+                Some(&extras),
+                Some(&refs),
+                &links,
+                operation,
+            )
         })
     }
 
     /// Right-clicking a branch, tag or remote badge opens that ref's own
-    /// sidebar menu in place of the row menu.
+    /// sidebar menu in place of the row menu. A merged local/remote badge lists
+    /// both refs' menus, separated by a rule.
     fn open_badge_menu(
         &mut self,
         spec: &BadgeSpec,
@@ -2217,11 +2571,22 @@ impl HistoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(key) = badge_menu_key(spec) else {
+        let keys = badge_menu_keys(spec);
+        if keys.is_empty() {
             return;
-        };
+        }
         let source = self.ref_menu_source(self.host_links(cx));
-        let entries = sidebar_menu_entries(source(&key), self.sidebar_action.clone());
+        let mut entries: Vec<MenuEntry> = Vec::new();
+        for key in keys {
+            let menu = sidebar_menu_entries(source(&key), self.sidebar_action.clone());
+            if menu.is_empty() {
+                continue;
+            }
+            if !entries.is_empty() {
+                entries.push(MenuEntry::Separator);
+            }
+            entries.extend(menu);
+        }
         if !entries.is_empty() {
             menu::open_context_menu(position, entries, window, cx);
         }
@@ -2272,6 +2637,50 @@ impl HistoryView {
         cx.notify();
     }
 
+    /// The current width of a resizable column.
+    fn column_width(&self, column: ResizeColumn) -> f32 {
+        match column {
+            ResizeColumn::Graph => self.graph_width,
+            ResizeColumn::Author => self.author_width,
+            ResizeColumn::Date => self.date_width,
+            ResizeColumn::Hash => self.hash_width,
+        }
+    }
+
+    /// Sets a resizable column's live width without persisting it; the grip
+    /// drag persists on release.
+    fn set_column_width(&mut self, column: ResizeColumn, width: f32) {
+        match column {
+            ResizeColumn::Graph => self.graph_width = width,
+            ResizeColumn::Author => self.author_width = width,
+            ResizeColumn::Date => self.date_width = width,
+            ResizeColumn::Hash => self.hash_width = width,
+        }
+    }
+
+    /// Persists one column's width in the settings.
+    fn persist_column_width(&mut self, column: ResizeColumn, width: f32, cx: &mut Context<Self>) {
+        crate::update_settings(cx, move |settings| match column {
+            ResizeColumn::Graph => settings.graph_width = width,
+            ResizeColumn::Author => settings.author_width = width,
+            ResizeColumn::Date => settings.date_width = width,
+            ResizeColumn::Hash => settings.hash_width = width,
+        });
+    }
+
+    /// Restores a column's default width on a grip double-click. The graph
+    /// keeps its own content-fitting behaviour.
+    fn reset_column_width(&mut self, column: ResizeColumn, cx: &mut Context<Self>) {
+        if column == ResizeColumn::Graph {
+            self.fit_graph(cx);
+            return;
+        }
+        let width = column.default_width();
+        self.set_column_width(column, width);
+        self.persist_column_width(column, width, cx);
+        cx.notify();
+    }
+
     /// Ends a grip drag: only a drag that actually moved is persisted, so a
     /// plain click on the grip does not write the settings.
     fn finish_grip_drag(&mut self, cx: &mut Context<Self>) {
@@ -2281,8 +2690,8 @@ impl HistoryView {
         if !drag.dragging {
             return;
         }
-        let width = self.graph_width;
-        crate::update_settings(cx, move |settings| settings.graph_width = width);
+        let width = self.column_width(drag.column);
+        self.persist_column_width(drag.column, width, cx);
         cx.notify();
     }
 
@@ -2334,13 +2743,52 @@ impl HistoryView {
         }
     }
 
+    /// Reads HEAD and the refs off the UI thread: the first load and the
+    /// refs-only refresh must read them the same way.
+    async fn read_meta(
+        repo: Repo,
+        cx: &mut AsyncApp,
+    ) -> (Result<Head, Error>, Result<Vec<Ref>, Error>) {
+        cx.background_executor()
+            .spawn(async move { (repo.head(), repo.refs()) })
+            .await
+    }
+
+    /// Bumps and returns the HEAD/refs read generation.
+    fn next_meta_generation(&mut self) -> u64 {
+        self.meta_generation = self.meta_generation.wrapping_add(1);
+        self.meta_generation
+    }
+
     fn set_meta(
         &mut self,
+        generation: u64,
         root: PathBuf,
         head: Result<Head, Error>,
         refs: Result<Vec<Ref>, Error>,
         cx: &mut Context<Self>,
     ) {
+        if !self.apply_meta(generation, root, head, refs) {
+            return;
+        }
+        // HEAD may have arrived after the first rows: the initial selection
+        // can now move to its row.
+        self.settle_initial_selection(cx);
+        cx.notify();
+    }
+
+    /// Stores a HEAD/refs answer and rebuilds the badges. Returns whether the
+    /// answer was still current.
+    fn apply_meta(
+        &mut self,
+        generation: u64,
+        root: PathBuf,
+        head: Result<Head, Error>,
+        refs: Result<Vec<Ref>, Error>,
+    ) -> bool {
+        if generation != self.meta_generation {
+            return false;
+        }
         self.root = Some(root);
         match head {
             Ok(head) => self.head = Some(Ok(head)),
@@ -2364,10 +2812,59 @@ impl HistoryView {
         };
         self.badges = build_badges(head, refs);
         self.meta_version = self.meta_version.wrapping_add(1);
-        // HEAD may have arrived after the first rows: the initial selection
-        // can now move to its row.
-        self.settle_initial_selection(cx);
-        cx.notify();
+        true
+    }
+
+    /// Re-reads HEAD and the refs without touching the rows, the selection,
+    /// the scroll offset, the hover or the search. A checkout moves HEAD and a
+    /// branch ref but cannot change the set of commits reachable from `--all`,
+    /// so the walking load is left alone; only the badges and the HEAD ring
+    /// change.
+    pub(crate) fn refresh_refs(&mut self, cx: &mut Context<Self>) {
+        let Ok(git) = self.git.clone() else {
+            return;
+        };
+        // The old refs stay on screen while the read runs: no Loading flash.
+        let generation = self.next_meta_generation();
+        let path = self.path.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &path)?;
+                    let root = repo.root().to_path_buf();
+                    Ok::<_, Error>((root, repo))
+                })
+                .await;
+            let (root, repo) = match result {
+                Ok(opened) => opened,
+                Err(error) => {
+                    log::warn!("could not read HEAD and the refs: {error}");
+                    return;
+                }
+            };
+            let (head, refs) = Self::read_meta(repo, cx).await;
+            this.update(cx, |view, cx| {
+                view.refresh_meta(generation, root, head, refs, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Applies a [`Self::refresh_refs`] answer: the badges, HEAD and meta
+    /// version, and nothing the list draws.
+    fn refresh_meta(
+        &mut self,
+        generation: u64,
+        root: PathBuf,
+        head: Result<Head, Error>,
+        refs: Result<Vec<Ref>, Error>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_meta(generation, root, head, refs) {
+            cx.notify();
+        }
     }
 
     /// The search field's text changed. The actual search waits for the
@@ -2458,6 +2955,31 @@ impl HistoryView {
     #[cfg(test)]
     pub(crate) fn selected_row(&self) -> Option<usize> {
         self.selected
+    }
+
+    /// The selected commit, for the shell's checkout test.
+    #[cfg(test)]
+    pub(crate) fn selected_oid(&self) -> Option<Oid> {
+        self.selected
+            .and_then(|index| self.rows().get(index))
+            .map(|item| item.commit.id)
+    }
+
+    /// The load generation, for the shell's checkout test: an unchanged value
+    /// proves the log was not walked again.
+    #[cfg(test)]
+    pub(crate) fn load_generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The HEAD badge's label on `oid`, for the shell's checkout test.
+    #[cfg(test)]
+    pub(crate) fn head_badge(&self, oid: Oid) -> Option<&str> {
+        self.badges
+            .get(&oid)?
+            .iter()
+            .find(|badge| badge.kind == RefKind::Head)
+            .map(|badge| badge.label.as_ref())
     }
 
     /// Enter / F3 (next) and Shift+Enter / Shift+F3 (previous), both wrapping.
@@ -2586,6 +3108,17 @@ impl HistoryView {
         if let Some(oid) = self.pending_reveal.take() {
             log::info!("the commit {oid} is not in the loaded history");
         }
+        // A selection kept across the reload whose commit is gone falls back
+        // to the top and the HEAD (or first) row, as a fresh load would.
+        if self.pending_selection.take().is_some() {
+            self.selected = None;
+            self.user_selected = false;
+            self.scroll.0.borrow().base_handle.set_offset(Point {
+                x: px(0.),
+                y: px(0.),
+            });
+            self.settle_initial_selection(cx);
+        }
         cx.notify();
     }
 
@@ -2599,6 +3132,11 @@ impl HistoryView {
         // must not touch the view any more.
         self.generation += 1;
         self.state = LoadState::Cancelled;
+        // The rows of the abandoned walk may not contain the kept commit.
+        if self.pending_selection.take().is_some() {
+            self.user_selected = false;
+            self.settle_initial_selection(cx);
+        }
         cx.notify();
     }
 
@@ -2609,16 +3147,34 @@ impl HistoryView {
 
     /// Start over: load again, keeping the rows until the first new page lands.
     fn retry(&mut self, cx: &mut Context<Self>) {
+        // Rows that are already shown keep their selection and scroll offset
+        // when the selected commit survives the walk (the commit count is
+        // usually unchanged on a reload). The very first load and an empty
+        // list start at the top again.
+        let restoring = !self.items.is_empty()
+            && self.day_rows.is_none()
+            && self.branch_rows.is_none()
+            && self.selected.is_some();
+        self.pending_selection = if restoring {
+            self.selected
+                .and_then(|index| self.items.get(index))
+                .map(|item| item.commit.id)
+        } else {
+            None
+        };
         self.pending_rows = !self.items.is_empty();
-        self.selected = None;
-        self.user_selected = false;
+        if self.pending_selection.is_none() {
+            self.selected = None;
+            self.user_selected = false;
+            // The new load starts at the top, so the HEAD selection that
+            // settles later is visible instead of being left below the old
+            // scroll offset.
+            self.scroll.0.borrow().base_handle.set_offset(Point {
+                x: px(0.),
+                y: px(0.),
+            });
+        }
         self.hovered = None;
-        // The new load starts at the top, so the HEAD selection that settles
-        // later is visible instead of being left below the old scroll offset.
-        self.scroll.0.borrow().base_handle.set_offset(Point {
-            x: px(0.),
-            y: px(0.),
-        });
         // The query stays in the field; its matches belong to the old rows.
         self.restart_search(cx);
         self.start(cx);
@@ -2631,38 +3187,6 @@ impl HistoryView {
             self.set_branch_filter(Some(branch), cx);
         }
         cx.notify();
-    }
-
-    /// Re-reads HEAD and the refs without re-walking the commit log. A
-    /// checkout only moves HEAD (the `--all` commit set is unchanged), so this
-    /// refreshes the badges and the HEAD ring while the scroll position and
-    /// the selected row stay exactly where the user left them.
-    pub fn refresh_meta(&mut self, cx: &mut Context<Self>) {
-        let git = match &self.git {
-            Ok(git) => git.clone(),
-            Err(_) => return,
-        };
-        let path = self.path.clone();
-        cx.spawn(async move |this, cx| {
-            let meta = cx
-                .background_executor()
-                .spawn(async move {
-                    let repo = Repo::open(git, &path)?;
-                    let root = repo.root().to_path_buf();
-                    Ok::<_, Error>((root, repo.head(), repo.refs()))
-                })
-                .await;
-            match meta {
-                Ok((root, head, refs)) => {
-                    this.update(cx, |view, cx| view.set_meta(root, head, refs, cx))
-                        .ok();
-                }
-                Err(e) => {
-                    log::warn!("could not refresh HEAD and refs after a checkout: {e}")
-                }
-            }
-        })
-        .detach();
     }
 
     /// `git init` the folder, then load the new repository.
@@ -2760,11 +3284,15 @@ impl HistoryView {
 
     /// The graph header cell: the label, the "+N" clipped-lanes pill, the
     /// resize grip and the right-click menu.
-    fn render_graph_header(&self, columns: Columns, cx: &Context<Self>) -> impl IntoElement {
+    fn render_graph_header(
+        &self,
+        columns: Columns,
+        pane_width: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let colors = cx.theme().colors;
         let accent = colors.accent;
         let clipped = clipped_lanes(self.geometry(), columns.graph);
-        let dragging = self.grip_drag.as_ref().is_some_and(|drag| drag.dragging);
 
         let mut cell = div()
             .id("history-graph-header")
@@ -2805,15 +3333,36 @@ impl HistoryView {
             );
         }
 
-        let grip = div()
-            .id("history-graph-grip")
+        cell.child(self.render_grip(ResizeColumn::Graph, pane_width, cx))
+    }
+
+    /// One column boundary's resize grip. The graph's grip sits on its right
+    /// edge; every other column's grip sits on its left edge and resizes that
+    /// column.
+    fn render_grip(
+        &self,
+        column: ResizeColumn,
+        pane_width: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let accent = colors.accent;
+        let dragging = self
+            .grip_drag
+            .as_ref()
+            .is_some_and(|drag| drag.dragging && drag.column == column);
+        let left_edge = column != ResizeColumn::Graph;
+
+        div()
+            .id(column.id())
             .absolute()
-            .right(px(-8.))
+            .when(left_edge, |this| this.left(px(-8.)))
+            .when(!left_edge, |this| this.right(px(-8.)))
             .top(px(3.))
             .bottom(px(3.))
             .w(px(7.))
             .rounded(px(2.))
-            .cursor_col_resize()
+            .cursor_ew_resize()
             .hover(move |style| style.bg(accent.opacity(0.7)))
             .when(dragging, |this| this.bg(accent.opacity(0.7)))
             // A resting 1px divider, so the grip is visible before hover.
@@ -2831,13 +3380,15 @@ impl HistoryView {
             .tooltip(Tooltip::text(ui::t!("history.header.grip_tooltip")))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|view, event: &MouseDownEvent, _, cx| {
+                cx.listener(move |view, event: &MouseDownEvent, _, cx| {
                     if event.click_count >= 2 {
-                        view.fit_graph(cx);
+                        view.reset_column_width(column, cx);
                     } else {
                         view.grip_drag = Some(GripDrag {
+                            column,
                             start_x: f32::from(event.position.x),
-                            start_width: view.graph_width,
+                            start_width: view.column_width(column),
+                            pane_width,
                             dragging: false,
                         });
                     }
@@ -2846,14 +3397,19 @@ impl HistoryView {
             .on_drag(GripDragPayload, |_, _, _, cx| cx.new(|_| EmptyView))
             .on_drag_move(
                 cx.listener(|view, event: &DragMoveEvent<GripDragPayload>, _, cx| {
-                    let Some(drag) = &mut view.grip_drag else {
+                    let Some(drag) = &view.grip_drag else {
                         return;
                     };
-                    let dx = f32::from(event.event.position.x) - drag.start_x;
-                    drag.dragging = true;
-                    let width = (drag.start_width + dx).clamp(GRAPH_MIN, GRAPH_MAX_WIDE);
-                    if view.graph_width != width {
-                        view.graph_width = width;
+                    let (column, start_x, start_width, pane_width) =
+                        (drag.column, drag.start_x, drag.start_width, drag.pane_width);
+                    let dx = f32::from(event.event.position.x) - start_x;
+                    if let Some(drag) = &mut view.grip_drag {
+                        drag.dragging = true;
+                    }
+                    let requested = start_width + column.drag_sign() * dx;
+                    let width = clamp_column_width(column, requested, pane_width, view.columns);
+                    if view.column_width(column) != width {
+                        view.set_column_width(column, width);
                         cx.notify();
                     }
                 }),
@@ -2865,12 +3421,15 @@ impl HistoryView {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|view, _: &MouseUpEvent, _, cx| view.finish_grip_drag(cx)),
-            );
-
-        cell.child(grip)
+            )
     }
 
-    fn render_header(&self, columns: Columns, cx: &Context<Self>) -> impl IntoElement {
+    fn render_header(
+        &self,
+        columns: Columns,
+        pane_width: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let colors = cx.theme().colors;
         // A 6px gutter around the header, so it lines up with the rows.
         let mut head = div()
@@ -2887,7 +3446,7 @@ impl HistoryView {
             .text_size(FS_SM)
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(colors.muted)
-            .child(self.render_graph_header(columns, cx))
+            .child(self.render_graph_header(columns, pane_width, cx))
             .child(
                 div()
                     .flex_1()
@@ -2898,23 +3457,29 @@ impl HistoryView {
         if let Some(author) = columns.author {
             head = head.child(
                 div()
+                    .relative()
                     .w(px(author))
                     .flex_none()
-                    .child(ui::t!("history.header.author")),
+                    .child(ui::t!("history.header.author"))
+                    .child(self.render_grip(ResizeColumn::Author, pane_width, cx)),
             );
         }
         head = head.child(
             div()
+                .relative()
                 .w(px(columns.date))
                 .flex_none()
-                .child(ui::t!("history.header.date")),
+                .child(ui::t!("history.header.date"))
+                .child(self.render_grip(ResizeColumn::Date, pane_width, cx)),
         );
         if let Some(hash) = columns.hash {
             head = head.child(
                 div()
+                    .relative()
                     .w(px(hash))
                     .flex_none()
-                    .child(ui::t!("history.header.hash")),
+                    .child(ui::t!("history.header.hash"))
+                    .child(self.render_grip(ResizeColumn::Hash, pane_width, cx)),
             );
         }
         div().w_full().px(px(SIDE_MARGIN)).child(head)
@@ -3169,6 +3734,13 @@ impl HistoryView {
             .branch_rows
             .as_ref()
             .filter(|_| self.day_rows.is_none());
+        // The shell asks for the checks of what is actually on screen; a fast
+        // scroll only reports where it stopped.
+        let visible = self.visible_commits(items, range.clone());
+        if visible != self.visible_oids {
+            self.visible_oids = visible;
+            cx.defer_in(window, |view, _, cx| view.schedule_visible_rows(cx));
+        }
         let badges = &self.badges;
         let hosting = self.hosting.clone();
         let badge_widths = &mut self.badge_widths;
@@ -3313,10 +3885,12 @@ impl HistoryView {
                     let widths: Vec<f32> = specs
                         .iter()
                         .map(|spec| {
+                            let suffix = remote_suffix(&spec.remotes);
                             let width = f32::from(measure_badge(
                                 window,
                                 &spec.label,
                                 spec.kind,
+                                suffix.as_ref(),
                                 badge_widths,
                             ));
                             // A branch with a pull request also carries its badge.
@@ -3332,14 +3906,20 @@ impl HistoryView {
                         window,
                         &plus,
                         RefKind::Overflow,
+                        None,
                         badge_widths,
                     ));
                     // The "from {x}" chip is not a ref of the row but takes
                     // room beside the badges.
                     let chip_width = merged_from.map_or(0., |name| {
                         let label = ui::t!("history.badge.from", name = name);
-                        f32::from(measure_badge(window, &label, RefKind::Local, badge_widths))
-                            + BADGE_GAP
+                        f32::from(measure_badge(
+                            window,
+                            &label,
+                            RefKind::Local,
+                            None,
+                            badge_widths,
+                        )) + BADGE_GAP
                     });
                     badge_overflow(&widths, summary_width - chip_width, BADGE_GAP, plus_width)
                 };
@@ -3365,7 +3945,7 @@ impl HistoryView {
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-                                    if badge_menu_key(&menu_spec).is_none() {
+                                    if badge_menu_keys(&menu_spec).is_empty() {
                                         return;
                                     }
                                     cx.stop_propagation();
@@ -3377,15 +3957,19 @@ impl HistoryView {
                                     window.prevent_default();
                                 }),
                             )
-                            .child(
-                                RefBadge::new(
+                            .child({
+                                let mut badge = RefBadge::new(
                                     format!("history-badge-{ix}-{index}"),
                                     spec.label.clone(),
                                 )
                                 .kind(spec.kind)
                                 .max_label_width(px(BADGE_LABEL_MAX))
-                                .tooltip(spec.tooltip.clone()),
-                            ),
+                                .tooltip(spec.tooltip.clone());
+                                if let Some(suffix) = remote_suffix(&spec.remotes) {
+                                    badge = badge.remote_suffix(suffix);
+                                }
+                                badge
+                            }),
                     );
                     if let Some((branch, badge)) = pr_badge_of(&hosting, spec) {
                         let branch = branch.to_owned();
@@ -4107,7 +4691,10 @@ impl HistoryView {
             .text_size(FS_SM)
             .text_color(colors.muted)
             .child(Icon::new(icon).size(px(14.)).color(color))
-            .child(text)
+            .child(SelectableText::new(
+                gpui::ElementId::Name("history-strip-text".into()),
+                text,
+            ))
             .child(div().flex_1())
             .child(
                 Button::new("history-strip-retry")
@@ -4138,7 +4725,13 @@ impl HistoryView {
     /// current state. Called with the width the pane was actually assigned.
     fn render_at(&mut self, pane_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
-        let columns = columns(pane_width, self.graph_width);
+        let columns = columns(
+            pane_width,
+            self.graph_width,
+            self.author_width,
+            self.date_width,
+            self.hash_width,
+        );
         // The virtualized rows are painted after this and must agree with the
         // header.
         self.columns = columns;
@@ -4163,7 +4756,7 @@ impl HistoryView {
                     cx.propagate();
                 }
             }))
-            .child(self.render_header(columns, cx))
+            .child(self.render_header(columns, pane_width, cx))
             .children(self.render_branch_bar(cx))
             .child(body)
             .into_any_element()
@@ -4633,7 +5226,13 @@ mod tests {
             on_sidebar: None,
             on_filter: Rc::new(|_, _| {}),
             branch_menu: Rc::new(move |key| {
-                sidebar_menu(key, head_for_menu.as_ref(), None, Some(&refs))
+                sidebar_menu(
+                    key,
+                    head_for_menu.as_ref(),
+                    None,
+                    Some(&refs),
+                    Operation::None,
+                )
             }),
             open_links: Vec::new(),
         }
@@ -4921,8 +5520,9 @@ mod tests {
         let view = open(&menu.entries(), "Branch feat");
 
         assert!(!find(&view, "Checkout").disabled);
-        // Merge is not wired yet in the sidebar either.
-        assert!(find(&view, "Merge feat into main").disabled);
+        // Merge follows the sidebar: enabled for another branch, rebase not wired yet.
+        assert!(!find(&view, "Merge feat into main…").disabled);
+        assert!(find(&view, "Rebase main onto feat").disabled);
     }
 
     #[test]
@@ -4931,6 +5531,7 @@ mod tests {
             kind,
             label: label.to_owned().into(),
             tooltip: "".into(),
+            remotes: Vec::new(),
         };
         assert_eq!(
             badge_menu_key(&spec(RefKind::Head, "main")).as_deref(),
@@ -4950,6 +5551,21 @@ mod tests {
             Some("tag:v1.0")
         );
         assert_eq!(badge_menu_key(&spec(RefKind::Overflow, "+3")), None);
+        // A merged badge's menu covers the local branch and every remote.
+        let merged = BadgeSpec {
+            kind: RefKind::Local,
+            label: "main".into(),
+            tooltip: "refs/heads/main".into(),
+            remotes: vec![SharedString::from("origin"), SharedString::from("upstream")],
+        };
+        assert_eq!(
+            badge_menu_keys(&merged),
+            [
+                "local:main".to_owned(),
+                "rbranch:origin/main".to_owned(),
+                "rbranch:upstream/main".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -5012,15 +5628,182 @@ mod tests {
                 (&RefKind::Head, "main"),
                 (&RefKind::Local, "alpha"),
                 (&RefKind::Local, "zeta"),
-                (&RefKind::Remote, "origin/main"),
                 (&RefKind::Tag, "v1"),
             ]
         );
+        // HEAD's branch and `origin/main` are the same commit: one badge.
+        assert_eq!(row[0].remotes, vec![SharedString::from("origin")]);
         // The HEAD badge names its branch's full ref.
         assert_eq!(row[0].tooltip.as_ref(), "refs/heads/main");
         // Every other badge points at its own full ref name.
         assert_eq!(row[2].tooltip.as_ref(), "refs/heads/zeta");
-        assert_eq!(row[3].tooltip.as_ref(), "refs/remotes/origin/main");
+        assert_eq!(row[3].tooltip.as_ref(), "refs/tags/v1");
+    }
+
+    #[test]
+    fn a_local_branch_and_its_remote_on_the_same_commit_merge_into_one_badge() {
+        let commit = oid(1);
+        let refs = vec![
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/main",
+                "main",
+                oid(9),
+            ),
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/feat",
+                "feat",
+                commit,
+            ),
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/origin/feat",
+                "origin/feat",
+                commit,
+            ),
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/origin/HEAD",
+                "origin/HEAD",
+                commit,
+            ),
+        ];
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: Some(oid(9)),
+        };
+
+        let badges = build_badges(Some(&head), &refs);
+
+        assert_eq!(
+            badges[&commit],
+            vec![BadgeSpec {
+                kind: RefKind::Local,
+                label: "feat".into(),
+                tooltip: "refs/heads/feat".into(),
+                remotes: vec![SharedString::from("origin")],
+            }]
+        );
+        assert_eq!(
+            remote_suffix(&badges[&commit][0].remotes).as_deref(),
+            Some("+origin")
+        );
+    }
+
+    #[test]
+    fn a_head_badge_merges_its_remote_on_the_same_commit() {
+        let commit = oid(1);
+        let refs = vec![
+            local("main", commit),
+            remote("origin/main", commit),
+            remote("origin/HEAD", commit),
+        ];
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: Some(commit),
+        };
+
+        let badges = build_badges(Some(&head), &refs);
+
+        assert_eq!(
+            badges[&commit],
+            vec![BadgeSpec {
+                kind: RefKind::Head,
+                label: "main".into(),
+                tooltip: "refs/heads/main".into(),
+                remotes: vec![SharedString::from("origin")],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_symbolic_remote_head_is_never_a_badge() {
+        let commit = oid(1);
+        let refs = vec![remote("origin/HEAD", commit)];
+
+        let badges = build_badges(None, &refs);
+
+        assert!(badges.is_empty(), "{badges:?}");
+    }
+
+    #[test]
+    fn a_remote_on_another_commit_stays_its_own_badge() {
+        let local_commit = oid(1);
+        let remote_commit = oid(2);
+        let refs = vec![
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/feat",
+                "feat",
+                local_commit,
+            ),
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/origin/feat",
+                "origin/feat",
+                remote_commit,
+            ),
+        ];
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: Some(oid(9)),
+        };
+
+        let badges = build_badges(Some(&head), &refs);
+
+        assert_eq!(badges[&local_commit].len(), 1);
+        assert!(badges[&local_commit][0].remotes.is_empty());
+        assert_eq!(
+            badges[&remote_commit],
+            vec![BadgeSpec {
+                kind: RefKind::Remote,
+                label: "origin/feat".into(),
+                tooltip: "refs/remotes/origin/feat".into(),
+                remotes: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn several_remotes_on_the_same_commit_merge_into_one_badge() {
+        let commit = oid(1);
+        let refs = vec![
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/feat",
+                "feat",
+                commit,
+            ),
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/upstream/feat",
+                "upstream/feat",
+                commit,
+            ),
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/origin/feat",
+                "origin/feat",
+                commit,
+            ),
+        ];
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: Some(oid(9)),
+        };
+
+        let badges = build_badges(Some(&head), &refs);
+
+        assert_eq!(badges[&commit].len(), 1);
+        assert_eq!(
+            badges[&commit][0].remotes,
+            vec![SharedString::from("origin"), SharedString::from("upstream")]
+        );
+        assert_eq!(
+            remote_suffix(&badges[&commit][0].remotes).as_deref(),
+            Some("+2")
+        );
     }
 
     #[test]
@@ -5040,6 +5823,7 @@ mod tests {
                 kind: RefKind::Head,
                 label: "HEAD".into(),
                 tooltip: "HEAD".into(),
+                remotes: Vec::new(),
             }]
         );
         assert_eq!(badges[&branch][0].kind, RefKind::Local);
@@ -5117,11 +5901,22 @@ mod tests {
         );
     }
 
+    /// The table for `pane_width` with every column at its default width.
+    fn default_columns(pane_width: f32) -> Columns {
+        columns(
+            pane_width,
+            GRAPH_WIDTH_DEFAULT,
+            AUTHOR_WIDTH_DEFAULT,
+            DATE_WIDTH_DEFAULT,
+            HASH_WIDTH_DEFAULT,
+        )
+    }
+
     #[test]
     fn summary_width_subtracts_the_fixed_columns_and_gaps() {
-        let wide = columns(1200., GRAPH_WIDTH_DEFAULT);
+        let wide = default_columns(1200.);
         assert_eq!(summary_width(1200., wide), 674.);
-        let medium = columns(560., GRAPH_WIDTH_DEFAULT);
+        let medium = default_columns(560.);
         assert_eq!(
             summary_width(560., medium),
             560. - 2. * SIDE_MARGIN
@@ -5139,46 +5934,110 @@ mod tests {
 
     #[test]
     fn columns_drop_the_wide_columns_at_the_container_queries() {
-        // 560 px is the design's first breakpoint: Hash goes, Author and Date
-        // take their narrow widths; the default graph width still fits.
-        let medium = columns(560., GRAPH_WIDTH_DEFAULT);
+        // 560 px is the design's first breakpoint: Hash goes; the saved Author
+        // and Date widths stay.
+        let medium = default_columns(560.);
         assert_eq!(medium.hash, None);
-        assert_eq!(medium.author, Some(COL_AUTHOR_NARROW));
-        assert_eq!(medium.date, COL_DATE_NARROW);
+        assert_eq!(medium.author, Some(AUTHOR_WIDTH_DEFAULT));
+        assert_eq!(medium.date, DATE_WIDTH_DEFAULT);
         assert_eq!(medium.graph, GRAPH_WIDTH_DEFAULT);
 
         // 460 px is the second: Author goes too.
-        let narrow = columns(460., GRAPH_WIDTH_DEFAULT);
+        let narrow = default_columns(460.);
         assert_eq!(narrow.hash, None);
         assert_eq!(narrow.author, None);
-        assert_eq!(narrow.date, COL_DATE_NARROW);
+        assert_eq!(narrow.date, DATE_WIDTH_DEFAULT);
         assert_eq!(narrow.graph, GRAPH_WIDTH_DEFAULT);
 
         // A wide pane keeps all five columns.
-        let wide = columns(1200., GRAPH_WIDTH_DEFAULT);
-        assert_eq!(wide.author, Some(COL_AUTHOR));
-        assert_eq!(wide.date, COL_DATE);
-        assert_eq!(wide.hash, Some(COL_HASH));
+        let wide = default_columns(1200.);
+        assert_eq!(wide.author, Some(AUTHOR_WIDTH_DEFAULT));
+        assert_eq!(wide.date, DATE_WIDTH_DEFAULT);
+        assert_eq!(wide.hash, Some(HASH_WIDTH_DEFAULT));
     }
 
     #[test]
-    fn columns_use_the_user_graph_width_at_the_three_pane_widths() {
-        // The user width is the column width while it fits the pane's share.
-        assert_eq!(columns(1200., 400.).graph, 400.);
-        // A 300 px user width still fits the 40 % share at 560 px.
-        assert_eq!(columns(560., 200.).graph, 200.);
-        assert_eq!(columns(460., 150.).graph, 150.);
-
-        // Above 560 px the 40 % share and the 480 cap bound it.
-        assert_eq!(columns(800., 400.).graph, 320.);
-        assert_eq!(columns(1200., 9999.).graph, GRAPH_MAX_WIDE);
-        // At and below 560 / 460 the pane's share narrows it further.
-        assert_eq!(columns(560., 480.).graph, GRAPH_SHARE_MEDIUM * 560.);
-        assert_eq!(columns(460., 480.).graph, GRAPH_SHARE_NARROW * 460.);
+    fn columns_have_no_fixed_graph_max_only_the_summary_minimum() {
+        // A 400 px graph fits the pane and is used as saved.
+        assert_eq!(
+            columns(
+                1200.,
+                400.,
+                AUTHOR_WIDTH_DEFAULT,
+                DATE_WIDTH_DEFAULT,
+                HASH_WIDTH_DEFAULT
+            )
+            .graph,
+            400.
+        );
+        // 306 px is the room a 800 px pane leaves after the other columns,
+        // the gaps and the 80 px summary minimum.
+        assert_eq!(columns(800., 400., 130., 104., 64.).graph, 306.);
+        // No 480 px cap: the pane's room alone bounds the graph.
+        let huge = columns(1200., 9999., 130., 104., 64.);
+        assert_eq!(huge.graph, 706.);
+        assert!(huge.graph > 480.);
+        assert_eq!(summary_width(1200., huge), SUMMARY_MIN);
+        // At 560 / 460 the saved graph is narrowed to keep the summary room.
+        assert_eq!(columns(560., 480., 130., 104., 64.).graph, 148.);
+        assert_eq!(columns(460., 480., 130., 104., 64.).graph, 196.);
         // The 40 px floor holds whatever the file or the pane says.
-        assert_eq!(columns(1200., 1.).graph, GRAPH_MIN);
-        assert_eq!(columns(300., 480.).graph, GRAPH_SHARE_NARROW * 300.);
-        assert_eq!(columns(100., 480.).graph, GRAPH_MIN);
+        assert_eq!(columns(1200., 1., 130., 104., 64.).graph, GRAPH_MIN);
+        assert_eq!(columns(300., 480., 130., 104., 64.).graph, GRAPH_MIN);
+        // A saved width that no longer fits a shrunk window is narrowed so the
+        // summary keeps its minimum.
+        assert_eq!(
+            summary_width(600., columns(600., 112., 900., 104., 64.)),
+            SUMMARY_MIN
+        );
+    }
+
+    #[test]
+    fn every_column_respects_its_minimum() {
+        let tiny = columns(1200., 1., 1., 1., 1.);
+        assert_eq!(tiny.graph, GRAPH_MIN);
+        assert_eq!(tiny.author, Some(AUTHOR_WIDTH_MIN));
+        assert_eq!(tiny.date, DATE_WIDTH_MIN);
+        assert_eq!(tiny.hash, Some(HASH_WIDTH_MIN));
+    }
+
+    #[test]
+    fn a_dragged_column_may_not_squeeze_the_summary_below_its_minimum() {
+        let wide = default_columns(1200.);
+        // Each column may grow until only the 80 px summary minimum is left.
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Graph, 9999., 1200., wide),
+            706.
+        );
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Author, 9999., 1200., wide),
+            724.
+        );
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Date, 9999., 1200., wide),
+            698.
+        );
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Hash, 9999., 1200., wide),
+            658.
+        );
+        // Each column also stops at its own minimum.
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Graph, 0., 1200., wide),
+            GRAPH_MIN
+        );
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Author, 0., 1200., wide),
+            AUTHOR_WIDTH_MIN
+        );
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Date, 0., 1200., wide),
+            DATE_WIDTH_MIN
+        );
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Hash, 0., 1200., wide),
+            HASH_WIDTH_MIN
+        );
     }
 
     #[test]
@@ -5193,23 +6052,23 @@ mod tests {
     #[test]
     fn clipped_lanes_count_the_centres_past_the_column_edge() {
         let geometry = ColumnGeometry {
-            xs: vec![7., 21., 35., 49.],
+            xs: vec![8., 24., 40., 56.],
             folded: vec![false; 4],
-            width: 56.,
+            width: 64.,
             folded_count: 0,
         };
         // A centre exactly on the edge is not clipped.
-        // (the painted centres are 9, 23, 37, 51 with the 2 px inset).
-        assert_eq!(clipped_lanes(&geometry, 56.), 0);
-        assert_eq!(clipped_lanes(&geometry, 51.), 0);
-        assert_eq!(clipped_lanes(&geometry, 28.), 2);
-        assert_eq!(clipped_lanes(&geometry, 23.), 2);
-        assert_eq!(clipped_lanes(&geometry, 9.), 3);
+        // (the painted centres are 10, 26, 42, 58 with the 2 px inset).
+        assert_eq!(clipped_lanes(&geometry, 64.), 0);
+        assert_eq!(clipped_lanes(&geometry, 58.), 0);
+        assert_eq!(clipped_lanes(&geometry, 32.), 2);
+        assert_eq!(clipped_lanes(&geometry, 26.), 2);
+        assert_eq!(clipped_lanes(&geometry, 10.), 3);
     }
 
     #[test]
     fn skeleton_widths_are_cell_percentages() {
-        let wide = columns(1200., GRAPH_WIDTH_DEFAULT);
+        let wide = default_columns(1200.);
         assert_eq!(skeleton_width(SkeletonColumn::Summary, 0, wide), px(144.));
         assert_eq!(
             skeleton_width(SkeletonColumn::Summary, 1, wide),
@@ -5218,11 +6077,11 @@ mod tests {
         assert_eq!(skeleton_width(SkeletonColumn::Author, 0, wide), px(65.));
         assert_eq!(skeleton_width(SkeletonColumn::Date, 4, wide), px(62.4));
         assert_eq!(skeleton_width(SkeletonColumn::Hash, 4, wide), px(51.2));
-        // The narrow table uses the narrow date column.
-        let narrow = columns(460., GRAPH_WIDTH_DEFAULT);
+        // The narrow table uses the saved date column without an author.
+        let narrow = default_columns(460.);
         assert_eq!(
             skeleton_width(SkeletonColumn::Date, 4, narrow),
-            px(COL_DATE_NARROW * (skeleton_percent(SkeletonColumn::Date, 4) / 100.))
+            px(DATE_WIDTH_DEFAULT * (skeleton_percent(SkeletonColumn::Date, 4) / 100.))
         );
     }
 
@@ -5285,7 +6144,7 @@ mod tests {
     fn body_runs_use_the_mono_font_for_code_only() {
         let body = BodyText::new()
             .plain("The command ")
-            .code("git log --all --topo-order")
+            .code("git log --all --date-order")
             .plain(" failed with exit code 128.");
         let style = body_style(ui::Theme::light().colors);
         let runs = body.runs(&style);
@@ -5294,7 +6153,7 @@ mod tests {
             (runs[0].len, runs[1].len, runs[2].len),
             (
                 "The command ".len(),
-                "git log --all --topo-order".len(),
+                "git log --all --date-order".len(),
                 " failed with exit code 128.".len(),
             )
         );
@@ -5680,6 +6539,30 @@ mod tests {
             [SidebarAction::ShowBranchCommits(branch)],
             "the badge menu is not the branch's sidebar menu"
         );
+    }
+
+    /// The badge and row menus read the operation the shell hands the History:
+    /// Merge is offered while idle and disabled while one is stopped.
+    #[gpui::test]
+    fn badge_menus_disable_merge_while_an_operation_is_stopped(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-badge-merge");
+        commit(repo.path(), "a.txt", "A");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, _| {
+            let merge_enabled = |view: &HistoryView| {
+                let model = view.ref_menu_source(Vec::new())("local:side");
+                model.iter().find_map(|entry| match entry {
+                    SidebarMenuEntry::Item(item) if item.label.starts_with("Merge ") => {
+                        Some(item.enabled)
+                    }
+                    _ => None,
+                })
+            };
+            assert_eq!(merge_enabled(view), Some(true));
+            view.set_operation(Operation::Merge);
+            assert_eq!(merge_enabled(view), Some(false));
+        });
     }
 
     /// The status only says "No matches" once the whole history was scanned; a

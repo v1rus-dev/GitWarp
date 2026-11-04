@@ -8,11 +8,12 @@ use std::fs;
 use std::io::Write;
 use std::process::Stdio;
 
+use crate::conflict::IndexStage;
 use crate::diff::{parse_name_status, parse_numstat};
 use crate::{check_output, ChangeKind, Error, FileDiff, Oid, Repo, Result};
 
 /// Largest untracked file whose lines are counted for the `+N` column.
-const UNTRACKED_COUNT_CAP: u64 = 2 * 1024 * 1024;
+pub(crate) const UNTRACKED_COUNT_CAP: u64 = 2 * 1024 * 1024;
 
 /// One file with local changes, on one side of the index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,8 +57,13 @@ pub struct WorkingStatus {
     /// Changes between HEAD and the index, in path order.
     pub staged: Vec<WorkingFile>,
     /// Changes between the index and the work tree, in path order. Untracked
-    /// files and conflicts are here too.
+    /// files are here too; conflicts are not (see [`Self::conflicted`]).
     pub unstaged: Vec<WorkingFile>,
+    /// Unmerged paths of a merge/rebase/cherry-pick in progress, in path
+    /// order. Each path is listed here only: `git diff` and `git diff
+    /// --cached` also report an unmerged path (as `U` and as `M`), so those
+    /// entries are dropped from `staged` and `unstaged`.
+    pub conflicted: Vec<WorkingFile>,
 }
 
 impl WorkingStatus {
@@ -67,6 +73,10 @@ impl WorkingStatus {
 
     pub fn unstaged_count(&self) -> usize {
         self.unstaged.len()
+    }
+
+    pub fn conflicted_count(&self) -> usize {
+        self.conflicted.len()
     }
 
     /// The amend hint: `e4f2a91 · feat: …`, or the short id alone.
@@ -196,17 +206,22 @@ pub(crate) fn status(repo: &Repo) -> Result<WorkingStatus> {
     let mut staged = side(repo, true)?;
     let mut unstaged = side(repo, false)?;
 
+    // An unmerged path shows up in both diffs too (`U` unstaged, `U`/`M`
+    // staged); the porcelain's `u` records are the only source for conflicts.
+    let conflicted_set: std::collections::HashSet<&str> =
+        porcelain.conflicted.iter().map(String::as_str).collect();
+    staged.retain(|file| !conflicted_set.contains(file.path.as_str()));
+    unstaged.retain(|file| !conflicted_set.contains(file.path.as_str()));
     for path in porcelain.untracked {
         if unstaged.iter().any(|file| file.path == path) {
             continue;
         }
         unstaged.push(untracked_file(repo, path));
     }
-    for path in porcelain.conflicted {
-        if unstaged.iter().any(|file| file.path == path) {
-            continue;
-        }
-        unstaged.push(WorkingFile {
+    let mut conflicted: Vec<WorkingFile> = porcelain
+        .conflicted
+        .into_iter()
+        .map(|path| WorkingFile {
             kind: ChangeKind::Other('U'),
             old_path: None,
             path,
@@ -214,16 +229,18 @@ pub(crate) fn status(repo: &Repo) -> Result<WorkingStatus> {
             deleted: 0,
             binary: false,
             untracked: false,
-        });
-    }
+        })
+        .collect();
     sort_files(&mut staged);
     sort_files(&mut unstaged);
+    sort_files(&mut conflicted);
 
     Ok(WorkingStatus {
         branch: porcelain.branch,
         head: head_commit(repo)?,
         staged,
         unstaged,
+        conflicted,
     })
 }
 
@@ -254,16 +271,101 @@ pub(crate) fn head_commit(repo: &Repo) -> Result<Option<HeadCommit>> {
     }))
 }
 
+/// A git command whose pathspecs are all literal: user paths such as
+/// `a[1].txt` must not glob onto other files (`a1.txt`).
+pub(crate) fn literal_command(repo: &Repo) -> std::process::Command {
+    let mut command = repo.command();
+    command.env("GIT_LITERAL_PATHSPECS", "1");
+    command
+}
+
 /// Adds `paths` to the index, including deletions and new files.
 pub(crate) fn stage(repo: &Repo, paths: &[String]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
-    let mut command = repo.command();
+    let mut command = literal_command(repo);
     command.args(["add", "-A", "--"]);
     command.args(paths);
     let out = command.output().map_err(Error::Spawn)?;
     check_output(out, "add").map(drop)
+}
+
+/// Which side of a merge wins when a conflicted file is resolved wholesale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictSide {
+    /// The branch being merged into (HEAD): index stage 2.
+    Ours,
+    /// The branch being merged in: index stage 3.
+    Theirs,
+}
+
+/// The unmerged index entries (stage 1 base, 2 ours, 3 theirs) of `path`,
+/// from `git ls-files -u -z`; empty when the path is not conflicted.
+pub(crate) fn unmerged(repo: &Repo, path: &str) -> Result<Vec<IndexStage>> {
+    let out = literal_command(repo)
+        .args(["ls-files", "-u", "-z", "--"])
+        .arg(path)
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "ls-files -u")?;
+    let mut entries = Vec::new();
+    // `<mode> SP <oid> SP <stage> TAB <path> NUL`
+    for record in out.stdout.split(|&byte| byte == 0) {
+        let Some(tab) = record.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        if &record[tab + 1..] != path.as_bytes() {
+            continue;
+        }
+        let head = String::from_utf8_lossy(&record[..tab]);
+        let mut fields = head.split(' ');
+        let (Some(mode), Some(oid), Some(stage)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(Error::Parse("ls-files -u entry"));
+        };
+        let stage = match stage {
+            "1" => 1,
+            "2" => 2,
+            "3" => 3,
+            _ => return Err(Error::Parse("ls-files -u stage")),
+        };
+        entries.push(IndexStage {
+            stage,
+            mode: mode.to_string(),
+            oid: oid.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+/// Resolves a conflicted `path` by taking one side as is.
+///
+/// If the chosen side does not have the file (it deleted it: a modify/delete
+/// conflict), the resolution is the deletion, `git rm`; otherwise
+/// `checkout --ours|--theirs` followed by `git add`.
+pub(crate) fn resolve_take(repo: &Repo, path: &str, side: ConflictSide) -> Result<()> {
+    let (side_stage, flag) = match side {
+        ConflictSide::Ours => (2, "--ours"),
+        ConflictSide::Theirs => (3, "--theirs"),
+    };
+    let has_side = unmerged(repo, path)?
+        .iter()
+        .any(|entry| entry.stage == side_stage);
+    if has_side {
+        let out = literal_command(repo)
+            .args(["checkout", flag, "--", path])
+            .output()
+            .map_err(Error::Spawn)?;
+        check_output(out, "checkout")?;
+        stage(repo, &[path.to_string()])
+    } else {
+        let out = literal_command(repo)
+            .args(["rm", "-q", "--", path])
+            .output()
+            .map_err(Error::Spawn)?;
+        check_output(out, "rm").map(drop)
+    }
 }
 
 /// Removes `paths` from the index (the work tree is left alone).
@@ -278,7 +380,7 @@ pub(crate) fn unstage(repo: &Repo, paths: &[String]) -> Result<()> {
         .map_err(Error::Spawn)?
         .status
         .success();
-    let mut command = repo.command();
+    let mut command = literal_command(repo);
     if has_head {
         command.args(["restore", "--staged", "--"]);
     } else {
@@ -325,14 +427,14 @@ pub(crate) fn discard_all(repo: &Repo) -> Result<()> {
 /// Restores tracked files from the index and removes untracked ones.
 pub(crate) fn discard(repo: &Repo, tracked: &[String], untracked: &[String]) -> Result<()> {
     if !tracked.is_empty() {
-        let mut command = repo.command();
+        let mut command = literal_command(repo);
         command.args(["restore", "--worktree", "--"]);
         command.args(tracked);
         let out = command.output().map_err(Error::Spawn)?;
         check_output(out, "restore --worktree")?;
     }
     if !untracked.is_empty() {
-        let mut command = repo.command();
+        let mut command = literal_command(repo);
         command.args(["clean", "-f", "-q", "--"]);
         command.args(untracked);
         let out = command.output().map_err(Error::Spawn)?;
@@ -399,39 +501,79 @@ pub(crate) fn unstaged_diff(repo: &Repo, path: &str, old_path: Option<&str>) -> 
     file_patch(repo, path, old_path, false, crate::DiffOptions::default())
 }
 
-/// A patch-shaped view of an untracked file: every line is an addition, so
-/// the same diff model and the same hunk controls work on it.
-pub(crate) fn untracked_diff(repo: &Repo, path: &str) -> Result<FileDiff> {
-    let bytes = fs::read(repo.root().join(path)).map_err(Error::Io)?;
-    if bytes.len() as u64 > UNTRACKED_COUNT_CAP {
+/// A work-tree file read for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeFile {
+    /// Contains a NUL byte.
+    Binary,
+    Text(WorktreeText),
+}
+
+/// The lines of a text work-tree file: `\n` and `\r\n` endings are stripped,
+/// invalid UTF-8 is replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeText {
+    pub lines: Vec<String>,
+    /// The last line ended with a newline (true for an empty file).
+    pub ends_with_newline: bool,
+}
+
+/// Reads the work-tree file `path` (repo-relative). A missing file is an
+/// [`Error::Io`] of kind `NotFound`; one over the display cap is
+/// [`Error::TooLarge`].
+pub(crate) fn worktree_file(repo: &Repo, path: &str) -> Result<WorktreeFile> {
+    let full = repo.root().join(path);
+    if fs::metadata(&full).map_err(Error::Io)?.len() > UNTRACKED_COUNT_CAP {
         return Err(Error::TooLarge { what: "diff" });
     }
+    let bytes = fs::read(&full).map_err(Error::Io)?;
     if bytes.contains(&0) {
-        return Ok(FileDiff {
-            path: path.to_string(),
-            binary: true,
-            ..FileDiff::default()
-        });
+        return Ok(WorktreeFile::Binary);
     }
     let text = String::from_utf8_lossy(&bytes);
     let mut lines = Vec::new();
-    let mut ended_with_newline = true;
+    let mut ends_with_newline = true;
     for line in text.split_inclusive('\n') {
         let (content, newline) = match line.strip_suffix('\n') {
             Some(content) => (content.strip_suffix('\r').unwrap_or(content), true),
             None => (line, false),
         };
-        ended_with_newline = newline;
-        lines.push(crate::DiffLine {
+        ends_with_newline = newline;
+        lines.push(content.to_string());
+    }
+    Ok(WorktreeFile::Text(WorktreeText {
+        lines,
+        ends_with_newline,
+    }))
+}
+
+/// A patch-shaped view of an untracked file: every line is an addition, so
+/// the same diff model and the same hunk controls work on it.
+pub(crate) fn untracked_diff(repo: &Repo, path: &str) -> Result<FileDiff> {
+    let text = match worktree_file(repo, path)? {
+        WorktreeFile::Binary => {
+            return Ok(FileDiff {
+                path: path.to_string(),
+                binary: true,
+                ..FileDiff::default()
+            })
+        }
+        WorktreeFile::Text(text) => text,
+    };
+    let mut lines: Vec<crate::DiffLine> = text
+        .lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, content)| crate::DiffLine {
             kind: crate::LineKind::Added,
             old_line: None,
-            new_line: Some(lines.len() as u32 + 1),
-            text: content.to_string(),
+            new_line: Some(index as u32 + 1),
+            text: content,
             no_newline: false,
-        });
-    }
+        })
+        .collect();
     if let Some(last) = lines.last_mut() {
-        last.no_newline = !ended_with_newline;
+        last.no_newline = !text.ends_with_newline;
     }
     let count = lines.len() as u32;
     Ok(FileDiff {
@@ -483,7 +625,7 @@ fn file_patch(
     cached: bool,
     options: crate::DiffOptions,
 ) -> Result<FileDiff> {
-    let mut command = repo.command();
+    let mut command = literal_command(repo);
     command.arg("diff");
     if cached {
         command.arg("--cached");
@@ -609,6 +751,11 @@ fn parse_porcelain(raw: &[u8]) -> Result<Porcelain> {
         }
     }
     Ok(out)
+}
+
+/// Repo-relative paths with unresolved conflicts, in git's order.
+pub(crate) fn conflicted_paths(repo: &Repo) -> Result<Vec<String>> {
+    Ok(porcelain(repo)?.conflicted)
 }
 
 /// Reads the status porcelain and returns only its parsed facts.

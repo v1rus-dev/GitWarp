@@ -12,7 +12,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use forge::ServiceKind;
-use git_core::{Git, Head, Oid, Ref, RefKind, Repo, Stash, Submodule, SubmoduleState, Worktree};
+use git_core::{
+    Git, Head, Oid, Operation, Ref, RefKind, Repo, Stash, Submodule, SubmoduleState, Worktree,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, App, ElementId, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton,
@@ -231,6 +233,9 @@ pub enum SidebarAction {
     CheckoutRemoteBranch(String),
     /// Checks out a tag with a detached HEAD.
     CheckoutTag(String),
+    /// Opens the Merge dialog for a local branch or a remote-tracking ref
+    /// (`origin/feat/x`), merging it into the current branch.
+    Merge(String),
     /// Opens "Create branch here" at `oid`.
     CreateBranchAt(Oid),
     /// Opens "Create pull request" for a local branch.
@@ -376,14 +381,16 @@ impl SidebarMenuEntry {
 ///
 /// `head` is the current branch name (`Head::Branch`), or `HEAD` when detached
 /// or still loading; `extras` supplies the worktree's lock state; `refs`
-/// resolves a tag's commit for "Create branch here…".
+/// resolves a tag's commit for "Create branch here…"; `operation` is the one
+/// the repository is stopped in (Merge is disabled while there is one).
 pub fn sidebar_menu(
     key: &str,
     head: Option<&Head>,
     extras: Option<&SidebarExtras>,
     refs: Option<&[Ref]>,
+    operation: Operation,
 ) -> Vec<SidebarMenuEntry> {
-    sidebar_menu_with_links(key, head, extras, refs, &[])
+    sidebar_menu_with_links(key, head, extras, refs, &[], operation)
 }
 
 /// "Open on <Service>" for `target` on the host of `link`; `None` when the
@@ -410,6 +417,7 @@ pub fn sidebar_menu_with_links(
     extras: Option<&SidebarExtras>,
     refs: Option<&[Ref]>,
     links: &[HostLink],
+    operation: Operation,
 ) -> Vec<SidebarMenuEntry> {
     let targets: &[RemoteTargets] = extras.map_or(&[], |e| &e.remote_targets);
     // The branch's own page on its host; hidden without a host, and for a
@@ -418,6 +426,9 @@ pub fn sidebar_menu_with_links(
         let (link, target) = web_links::branch_target(links, targets, refs.unwrap_or(&[]), key)?;
         open_item(link, &target)
     };
+    // Merging needs a branch to merge into: not on a detached or unread HEAD.
+    // ... and not while another operation is stopped (git refuses to start one).
+    let can_merge = matches!(head, Some(Head::Branch { .. })) && operation == Operation::None;
     let head = match head {
         Some(Head::Branch { name, .. }) => name.as_str(),
         Some(Head::Detached(_)) | None => "HEAD",
@@ -438,8 +449,9 @@ pub fn sidebar_menu_with_links(
             .action(SidebarAction::ShowBranchCommits(name.to_owned())),
             item(
                 &ui::t!("sidebar.menu.merge_into", name = name, head = head),
-                IconName::Branch,
-            ),
+                IconName::Merge,
+            )
+            .maybe_action((can_merge && !current).then(|| SidebarAction::Merge(name.to_owned()))),
             item(
                 &ui::t!("sidebar.menu.rebase_onto", name = name, head = head),
                 IconName::Branch,
@@ -481,8 +493,9 @@ pub fn sidebar_menu_with_links(
             .action(SidebarAction::ShowBranchCommits(name.to_owned())),
             item(
                 &ui::t!("sidebar.menu.merge_into", name = name, head = head),
-                IconName::Branch,
-            ),
+                IconName::Merge,
+            )
+            .maybe_action(can_merge.then(|| SidebarAction::Merge(name.to_owned()))),
             SidebarMenuEntry::Separator,
             item(
                 &ui::t!("sidebar.menu.delete_remote_branch"),
@@ -692,8 +705,9 @@ pub fn shortcut_action(
     head: Option<&Head>,
     extras: Option<&SidebarExtras>,
     refs: Option<&[Ref]>,
+    operation: Operation,
 ) -> Option<SidebarAction> {
-    sidebar_menu(key, head, extras, refs)
+    sidebar_menu(key, head, extras, refs, operation)
         .into_iter()
         .find_map(|entry| match entry {
             SidebarMenuEntry::Item(item)
@@ -2894,6 +2908,7 @@ mod tests {
             Some(&extras),
             Some(&refs),
             &links,
+            Operation::None,
         );
         with_create_pull_request(&mut with_open, "main", forge::ServiceKind::GitHub);
         let labels = menu_labels(&with_open);
@@ -2908,6 +2923,7 @@ mod tests {
             Some(&extras),
             Some(&refs),
             &links,
+            Operation::None,
         );
         with_create_pull_request(&mut without, "loose", forge::ServiceKind::GitLab);
         let labels = menu_labels(&without);
@@ -2940,7 +2956,14 @@ mod tests {
         ];
         let links = web_links::host_links(&[], &extras.remote_targets, None);
         let menu = |key: &str| {
-            sidebar_menu_with_links(key, Some(&head), Some(&extras), Some(&refs), &links)
+            sidebar_menu_with_links(
+                key,
+                Some(&head),
+                Some(&extras),
+                Some(&refs),
+                &links,
+                Operation::None,
+            )
         };
         let labels = |key: &str| {
             menu(key)
@@ -3048,9 +3071,16 @@ mod tests {
                     Some(&head),
                     Some(&extras),
                     Some(&refs),
-                    &links
+                    &links,
+                    Operation::None
                 )),
-                menu_labels(&sidebar_menu(key, Some(&head), Some(&extras), Some(&refs))),
+                menu_labels(&sidebar_menu(
+                    key,
+                    Some(&head),
+                    Some(&extras),
+                    Some(&refs),
+                    Operation::None
+                )),
                 "{key}"
             );
         }
@@ -3073,7 +3103,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let ready = sidebar_menu("sub:vendor/a", None, Some(&extras), None);
+        let ready = sidebar_menu("sub:vendor/a", None, Some(&extras), None, Operation::None);
         assert_eq!(
             menu_item(&ready, "Update submodule").action,
             SidebarAction::UpdateSubmodule("vendor/a".to_owned())
@@ -3082,7 +3112,7 @@ mod tests {
             menu_item(&ready, "Open in new window").action,
             SidebarAction::OpenSubmodule("vendor/a".to_owned())
         );
-        let missing = sidebar_menu("sub:vendor/b", None, Some(&extras), None);
+        let missing = sidebar_menu("sub:vendor/b", None, Some(&extras), None, Operation::None);
         assert!(menu_item(&missing, "Update submodule").enabled);
         assert!(!menu_item(&missing, "Open in new window").enabled);
     }
@@ -3116,12 +3146,13 @@ mod tests {
                 "local:feat/idle-lanes",
                 Some(&head),
                 Some(&extras),
-                None
+                None,
+                Operation::None
             )),
             vec![
                 "Checkout",
                 "Show all commits of feat/idle-lanes",
-                "Merge feat/idle-lanes into main",
+                "Merge feat/idle-lanes into main…",
                 "Rebase main onto feat/idle-lanes",
                 "—",
                 "Rename…",
@@ -3136,19 +3167,26 @@ mod tests {
                 "rbranch:origin/feat/idle-lanes",
                 Some(&head),
                 Some(&extras),
-                None
+                None,
+                Operation::None
             )),
             vec![
                 "Checkout as local branch",
                 "Show all commits of origin/feat/idle-lanes",
-                "Merge origin/feat/idle-lanes into main",
+                "Merge origin/feat/idle-lanes into main…",
                 "—",
                 "Delete remote branch…",
                 "Copy branch name",
             ]
         );
         assert_eq!(
-            menu_labels(&sidebar_menu("tag:v1", Some(&head), Some(&extras), None)),
+            menu_labels(&sidebar_menu(
+                "tag:v1",
+                Some(&head),
+                Some(&extras),
+                None,
+                Operation::None
+            )),
             vec![
                 "Checkout",
                 "Create branch here…",
@@ -3159,7 +3197,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            menu_labels(&sidebar_menu("stash:0", Some(&head), Some(&extras), None)),
+            menu_labels(&sidebar_menu(
+                "stash:0",
+                Some(&head),
+                Some(&extras),
+                None,
+                Operation::None
+            )),
             vec![
                 "Apply stash",
                 "Pop stash",
@@ -3173,7 +3217,8 @@ mod tests {
                 "remote:origin",
                 Some(&head),
                 Some(&extras),
-                None
+                None,
+                Operation::None
             )),
             vec![
                 "Fetch",
@@ -3189,7 +3234,8 @@ mod tests {
                 "wt:/tmp/plain",
                 Some(&head),
                 Some(&extras),
-                None
+                None,
+                Operation::None
             )),
             vec![
                 "Open in new window",
@@ -3206,7 +3252,8 @@ mod tests {
                 "wt:/tmp/locked",
                 Some(&head),
                 Some(&extras),
-                None
+                None,
+                Operation::None
             )),
             vec![
                 "Open in new window",
@@ -3223,7 +3270,8 @@ mod tests {
                 "sub:vendor/a",
                 Some(&head),
                 Some(&extras),
-                None
+                None,
+                Operation::None
             )),
             vec!["Update submodule", "Open in new window"]
         );
@@ -3232,7 +3280,8 @@ mod tests {
                 "section:remotes",
                 Some(&head),
                 Some(&extras),
-                None
+                None,
+                Operation::None
             )),
             vec![
                 "Add remote…",
@@ -3246,7 +3295,8 @@ mod tests {
                 "section:tags",
                 Some(&head),
                 Some(&extras),
-                None
+                None,
+                Operation::None
             )),
             vec![
                 "Create tag…",
@@ -3260,7 +3310,8 @@ mod tests {
                 "section:worktrees",
                 Some(&head),
                 Some(&extras),
-                None
+                None,
+                Operation::None
             )),
             vec![
                 "Manage worktrees…",
@@ -3271,22 +3322,138 @@ mod tests {
             ]
         );
         // The other sections, folders and unknown keys have no menu.
-        assert!(sidebar_menu("section:local", Some(&head), Some(&extras), None).is_empty());
-        assert!(sidebar_menu("section:stashes", Some(&head), Some(&extras), None).is_empty());
-        assert!(sidebar_menu("section:submodules", Some(&head), Some(&extras), None).is_empty());
-        assert!(sidebar_menu("folder:feat", Some(&head), Some(&extras), None).is_empty());
-        assert!(sidebar_menu("unknown", Some(&head), Some(&extras), None).is_empty());
+        assert!(sidebar_menu(
+            "section:local",
+            Some(&head),
+            Some(&extras),
+            None,
+            Operation::None
+        )
+        .is_empty());
+        assert!(sidebar_menu(
+            "section:stashes",
+            Some(&head),
+            Some(&extras),
+            None,
+            Operation::None
+        )
+        .is_empty());
+        assert!(sidebar_menu(
+            "section:submodules",
+            Some(&head),
+            Some(&extras),
+            None,
+            Operation::None
+        )
+        .is_empty());
+        assert!(sidebar_menu(
+            "folder:feat",
+            Some(&head),
+            Some(&extras),
+            None,
+            Operation::None
+        )
+        .is_empty());
+        assert!(
+            sidebar_menu("unknown", Some(&head), Some(&extras), None, Operation::None).is_empty()
+        );
+    }
+
+    #[test]
+    fn merge_is_enabled_for_another_local_branch() {
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        let menu = sidebar_menu("local:feat/x", Some(&head), None, None, Operation::None);
+        let merge = menu_item(&menu, "Merge feat/x into main…");
+        assert!(merge.enabled);
+        assert_eq!(merge.action, SidebarAction::Merge("feat/x".to_owned()));
+        // Rebase stays disabled until its own stage.
+        assert!(!menu_item(&menu, "Rebase main onto feat/x").enabled);
+    }
+
+    #[test]
+    fn merge_is_disabled_for_the_current_branch() {
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        let menu = sidebar_menu("local:main", Some(&head), None, None, Operation::None);
+        let merge = menu_item(&menu, "Merge main into main…");
+        assert!(!merge.enabled);
+        assert_eq!(merge.action, SidebarAction::None);
+    }
+
+    #[test]
+    fn merge_is_disabled_while_an_operation_is_stopped() {
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        for operation in [Operation::Merge, Operation::Squash, Operation::CherryPick] {
+            let local = sidebar_menu("local:feat/x", Some(&head), None, None, operation);
+            assert!(!menu_item(&local, "Merge feat/x into main…").enabled);
+            let remote = sidebar_menu("rbranch:origin/feat/x", Some(&head), None, None, operation);
+            assert!(!menu_item(&remote, "Merge origin/feat/x into main…").enabled);
+        }
+        let local = sidebar_menu("local:feat/x", Some(&head), None, None, Operation::None);
+        assert!(menu_item(&local, "Merge feat/x into main…").enabled);
+    }
+
+    #[test]
+    fn merge_is_disabled_on_a_detached_head() {
+        let detached = Head::Detached(oid());
+        let local = sidebar_menu("local:feat/x", Some(&detached), None, None, Operation::None);
+        assert!(!menu_item(&local, "Merge feat/x into HEAD…").enabled);
+        let remote = sidebar_menu(
+            "rbranch:origin/feat/x",
+            Some(&detached),
+            None,
+            None,
+            Operation::None,
+        );
+        assert!(!menu_item(&remote, "Merge origin/feat/x into HEAD…").enabled);
+        let unread = sidebar_menu("local:feat/x", None, None, None, Operation::None);
+        assert!(!menu_item(&unread, "Merge feat/x into HEAD…").enabled);
+    }
+
+    #[test]
+    fn merge_is_enabled_for_a_remote_branch() {
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        let menu = sidebar_menu(
+            "rbranch:origin/feat/x",
+            Some(&head),
+            None,
+            None,
+            Operation::None,
+        );
+        let merge = menu_item(&menu, "Merge origin/feat/x into main…");
+        assert!(merge.enabled);
+        assert_eq!(
+            merge.action,
+            SidebarAction::Merge("origin/feat/x".to_owned())
+        );
     }
 
     #[test]
     fn a_detached_head_says_head_in_the_branch_menus() {
         let detached = Head::Detached(oid());
         assert_eq!(
-            menu_labels(&sidebar_menu("local:feat/x", Some(&detached), None, None)),
+            menu_labels(&sidebar_menu(
+                "local:feat/x",
+                Some(&detached),
+                None,
+                None,
+                Operation::None
+            )),
             vec![
                 "Checkout",
                 "Show all commits of feat/x",
-                "Merge feat/x into HEAD",
+                "Merge feat/x into HEAD…",
                 "Rebase HEAD onto feat/x",
                 "—",
                 "Rename…",
@@ -3301,12 +3468,13 @@ mod tests {
                 "rbranch:origin/feat/x",
                 Some(&detached),
                 None,
-                None
+                None,
+                Operation::None
             )),
             vec![
                 "Checkout as local branch",
                 "Show all commits of origin/feat/x",
-                "Merge origin/feat/x into HEAD",
+                "Merge origin/feat/x into HEAD…",
                 "—",
                 "Delete remote branch…",
                 "Copy branch name",
@@ -3314,8 +3482,14 @@ mod tests {
         );
         // HEAD not read yet is named the same way.
         assert_eq!(
-            menu_labels(&sidebar_menu("local:feat/x", None, None, None))[2],
-            "Merge feat/x into HEAD"
+            menu_labels(&sidebar_menu(
+                "local:feat/x",
+                None,
+                None,
+                None,
+                Operation::None
+            ))[2],
+            "Merge feat/x into HEAD…"
         );
     }
 
@@ -3343,7 +3517,7 @@ mod tests {
             "section:worktrees",
         ];
         for key in keys {
-            let entries = sidebar_menu(key, Some(&head), Some(&extras), None);
+            let entries = sidebar_menu(key, Some(&head), Some(&extras), None, Operation::None);
             let enabled: Vec<&str> = entries
                 .iter()
                 .filter_map(|entry| match entry {
@@ -3355,6 +3529,7 @@ mod tests {
                 "local:feat/idle-lanes" => &[
                     "Checkout",
                     "Show all commits of feat/idle-lanes",
+                    "Merge feat/idle-lanes into main…",
                     "Rename…",
                     "Set upstream",
                     "Delete branch",
@@ -3363,6 +3538,7 @@ mod tests {
                 "rbranch:origin/feat/idle-lanes" => &[
                     "Checkout as local branch",
                     "Show all commits of origin/feat/idle-lanes",
+                    "Merge origin/feat/idle-lanes into main…",
                     "Delete remote branch…",
                     "Copy branch name",
                 ],
@@ -3407,7 +3583,13 @@ mod tests {
         }
 
         // The local branch copies its full name.
-        let local_menu = sidebar_menu("local:feat/idle-lanes", Some(&head), Some(&extras), None);
+        let local_menu = sidebar_menu(
+            "local:feat/idle-lanes",
+            Some(&head),
+            Some(&extras),
+            None,
+            Operation::None,
+        );
         assert_eq!(
             menu_item(&local_menu, "Copy branch name").action,
             SidebarAction::CopyText("feat/idle-lanes".to_owned())
@@ -3418,13 +3600,20 @@ mod tests {
             Some(&head),
             Some(&extras),
             None,
+            Operation::None,
         );
         assert_eq!(
             menu_item(&remote_menu, "Copy branch name").action,
             SidebarAction::CopyText("origin/feat/idle-lanes".to_owned())
         );
         // Refresh list reloads the sidebar's lists.
-        let worktrees_menu = sidebar_menu("section:worktrees", Some(&head), Some(&extras), None);
+        let worktrees_menu = sidebar_menu(
+            "section:worktrees",
+            Some(&head),
+            Some(&extras),
+            None,
+            Operation::None,
+        );
         assert_eq!(
             menu_item(&worktrees_menu, "Refresh list").action,
             SidebarAction::Refresh
@@ -3440,13 +3629,25 @@ mod tests {
             behind: 0,
             upstream_gone: false,
         }];
-        let tag_menu = sidebar_menu("tag:v1", Some(&head), Some(&extras), Some(&refs));
+        let tag_menu = sidebar_menu(
+            "tag:v1",
+            Some(&head),
+            Some(&extras),
+            Some(&refs),
+            Operation::None,
+        );
         assert_eq!(
             menu_item(&tag_menu, "Create branch here…").action,
             SidebarAction::CreateBranchAt(oid())
         );
         // The current branch is neither checked out nor deleted.
-        let current = sidebar_menu("local:main", Some(&head), Some(&extras), None);
+        let current = sidebar_menu(
+            "local:main",
+            Some(&head),
+            Some(&extras),
+            None,
+            Operation::None,
+        );
         assert_eq!(menu_item(&current, "Checkout").action, SidebarAction::None);
         assert_eq!(
             menu_item(&current, "Delete branch").action,
@@ -3461,7 +3662,7 @@ mod tests {
             menu_item(&tag_menu, "Push tag to origin").action,
             SidebarAction::PushTag("v1".to_owned())
         );
-        let stash_menu = sidebar_menu("stash:0", Some(&head), Some(&extras), None);
+        let stash_menu = sidebar_menu("stash:0", Some(&head), Some(&extras), None, Operation::None);
         assert_eq!(
             menu_item(&stash_menu, "View changes").action,
             SidebarAction::ViewStash(0)
@@ -3480,7 +3681,13 @@ mod tests {
             Some("Del")
         );
         assert!(menu_item(&local_menu, "Delete branch").danger);
-        let remotes_menu = sidebar_menu("section:remotes", Some(&head), Some(&extras), None);
+        let remotes_menu = sidebar_menu(
+            "section:remotes",
+            Some(&head),
+            Some(&extras),
+            None,
+            Operation::None,
+        );
         assert_eq!(
             menu_item(&remotes_menu, "Fetch all remotes")
                 .shortcut
@@ -3495,7 +3702,9 @@ mod tests {
             name: "main".into(),
             target: None,
         };
-        let run = |key: &str, hint: &str| shortcut_action(key, hint, Some(&head), None, None);
+        let run = |key: &str, hint: &str| {
+            shortcut_action(key, hint, Some(&head), None, None, Operation::None)
+        };
         assert_eq!(
             run("local:feat", "Enter"),
             Some(SidebarAction::CheckoutBranch("feat".into()))
@@ -3685,7 +3894,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let plain = sidebar_menu("remote:origin", None, Some(&extras), None);
+        let plain = sidebar_menu("remote:origin", None, Some(&extras), None, Operation::None);
         assert_eq!(
             menu_labels(&plain),
             vec![
@@ -3701,7 +3910,7 @@ mod tests {
             menu_item(&plain, "Account…").action,
             SidebarAction::RemoteAccount("origin".into())
         );
-        let multi = sidebar_menu("remote:publish", None, Some(&extras), None);
+        let multi = sidebar_menu("remote:publish", None, Some(&extras), None, Operation::None);
         assert_eq!(
             menu_labels(&multi),
             vec![

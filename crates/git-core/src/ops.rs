@@ -1,13 +1,14 @@
-//! Ref and history operations: checkout, branches, tags, remotes, cherry-pick,
-//! revert, reset and the stash.
+//! Ref and history operations: checkout, branches, tags, remotes, merge (with a
+//! conflict preview), cherry-pick, revert, reset and the stash.
 //!
 //! All of them run the `git` CLI, like the read paths, so hooks, signing
 //! configuration and credential helpers keep working. The UI only sees plain
 //! [`Result`]s and turns git's own message into the error banner.
 
-use std::process::Output;
+use std::io::Write;
+use std::process::{Output, Stdio};
 
-use crate::{check_output, Error, Oid, Repo, Result};
+use crate::{check_output, Error, GitVersion, Oid, Repo, Result};
 
 /// How much of the work tree and index `git reset` rewrites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,19 +42,91 @@ pub(crate) fn checkout_detached(repo: &Repo, oid: Oid) -> Result<()> {
     run(repo, &["switch", "--detach", &oid], "switch --detach")
 }
 
-/// Checks out a remote branch as a local tracking branch.
+/// Checks out a remote branch as its local counterpart.
 ///
-/// When a local branch with the remote's leaf name already exists, that branch
-/// is checked out instead: creating it again would fail. The leaf name is the
-/// part after the remote's first `/`, so `origin/feat/x` becomes `feat/x`.
+/// A missing local branch is created with `git switch --track`. An existing
+/// one is switched to, fast-forwarded to the remote when it is strictly behind,
+/// and gets an upstream only when it has none: an existing upstream and any
+/// local commits are never overwritten.
+///
+/// The local name is the remote ref without its remote prefix. Remotes can be
+/// named anything (`upstream`, …) and branch names may contain `/`, so the
+/// prefix is matched against the configured remotes rather than the first `/`.
 pub(crate) fn checkout_remote(repo: &Repo, remote_ref: &str) -> Result<()> {
-    let local = remote_ref
-        .split_once('/')
-        .map_or(remote_ref, |(_, leaf)| leaf);
-    if has_local_branch(repo, local)? {
-        return checkout_branch(repo, local);
+    let local = remote_branch_leaf(repo, remote_ref)?;
+    if !has_local_branch(repo, &local)? {
+        return run(repo, &["switch", "--track", remote_ref], "switch --track");
     }
-    run(repo, &["switch", "--track", remote_ref], "switch --track")
+    // A branch checked out in another worktree makes git itself fail here; the
+    // shell's "open that worktree" dialog handles the error.
+    checkout_branch(repo, &local)?;
+    let local_ref = format!("refs/heads/{local}");
+    let remote = format!("refs/remotes/{remote_ref}");
+    if is_ancestor(repo, &local_ref, &remote)? && !is_ancestor(repo, &remote, &local_ref)? {
+        run(repo, &["merge", "--ff-only", &remote], "merge --ff-only")?;
+    }
+    if !has_upstream(repo, &local)? {
+        run(
+            repo,
+            &["branch", "--set-upstream-to", &remote, &local],
+            "branch --set-upstream-to",
+        )?;
+    }
+    Ok(())
+}
+
+/// The local branch name of a remote ref: `origin/fix/x` becomes `fix/x`.
+///
+/// The remote prefix is the longest configured remote that matches, so a
+/// remote called `upstream` and branches with `/` in their names both work.
+fn remote_branch_leaf(repo: &Repo, remote_ref: &str) -> Result<String> {
+    let remotes = repo.remotes()?;
+    let remote = remotes
+        .iter()
+        .filter(|remote| {
+            remote_ref
+                .strip_prefix(remote.as_str())
+                .is_some_and(|rest| rest.len() > 1 && rest.starts_with('/'))
+        })
+        .max_by_key(|remote| remote.len());
+    Ok(match remote {
+        Some(remote) => remote_ref[remote.len() + 1..].to_owned(),
+        // Not a configured remote (or still loading): keep the old first-`/`
+        // split so a stale tracking ref still checks out somewhere sensible.
+        None => remote_ref
+            .split_once('/')
+            .map_or(remote_ref, |(_, leaf)| leaf)
+            .to_owned(),
+    })
+}
+
+/// Whether `ancestor` is an ancestor of `descendant` (`git merge-base`).
+fn is_ancestor(repo: &Repo, ancestor: &str, descendant: &str) -> Result<bool> {
+    let out = repo
+        .command()
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .map_err(Error::Spawn)?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(failure("merge-base --is-ancestor", out)),
+    }
+}
+
+/// Whether a local branch has any upstream configured.
+fn has_upstream(repo: &Repo, branch: &str) -> Result<bool> {
+    let out = repo
+        .command()
+        .args([
+            "for-each-ref",
+            "--format=%(upstream)",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "for-each-ref")?;
+    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
 fn has_local_branch(repo: &Repo, name: &str) -> Result<bool> {
@@ -197,6 +270,359 @@ pub(crate) fn remote_push_urls(repo: &Repo, name: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// How `git merge` joins the branch into HEAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MergeType {
+    /// `--ff`: fast-forward when possible, a merge commit otherwise.
+    #[default]
+    FastForwardIfPossible,
+    /// `--no-ff`: always create a merge commit.
+    NoFastForward,
+    /// `--ff-only`: fail instead of creating a merge commit.
+    FastForwardOnly,
+    /// `--squash`: stage the combined changes without committing.
+    Squash,
+}
+
+impl MergeType {
+    fn flag(self) -> &'static str {
+        match self {
+            MergeType::FastForwardIfPossible => "--ff",
+            MergeType::NoFastForward => "--no-ff",
+            MergeType::FastForwardOnly => "--ff-only",
+            MergeType::Squash => "--squash",
+        }
+    }
+}
+
+/// What a [`merge`] did. Conflicts are an outcome, not an error: the merge is
+/// left in progress for the conflict editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// A merge commit was created.
+    Merged,
+    FastForwarded,
+    /// The changes are staged and nothing is committed (`--squash`).
+    Squashed,
+    /// There was nothing to merge.
+    UpToDate,
+    /// This call left a merge in progress (`--squash` leaves none, but its
+    /// conflicts still stop it). `conflicts` are the repo-relative conflicted
+    /// paths; it is empty when the merge stopped for another reason (`--no-commit`
+    /// in `branch.<name>.mergeOptions`, a rejecting `pre-merge-commit` hook) and
+    /// only waits for a commit.
+    Stopped {
+        conflicts: Vec<String>,
+    },
+}
+
+/// What merging a branch into HEAD would do, computed without touching the
+/// work tree or the index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergePreview {
+    /// HEAD already contains the branch.
+    UpToDate,
+    /// HEAD is an ancestor of the branch.
+    FastForward,
+    /// Diverged and mergeable without conflicts; `commits` is the number of
+    /// commits only the branch has.
+    Clean {
+        commits: usize,
+    },
+    Conflicts {
+        commits: usize,
+        paths: Vec<String>,
+    },
+    /// The outcome cannot be predicted; the app words the reason.
+    Unavailable(PreviewUnavailable),
+}
+
+/// Why a [`MergePreview`] could not be computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewUnavailable {
+    /// `git merge-tree --write-tree` needs `need`; the installed git is `have`.
+    GitTooOld { have: GitVersion, need: GitVersion },
+}
+
+/// The multi-step operation a repository is stopped in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Operation {
+    #[default]
+    None,
+    Merge,
+    /// `git merge --squash` staged the changes (`SQUASH_MSG`, no `MERGE_HEAD`)
+    /// and waits for a commit.
+    Squash,
+    /// `progress` is `(current step, total steps)` when git recorded it
+    /// (`rebase-merge/msgnum` and `end`); the apply backend has none here.
+    Rebase {
+        progress: Option<(usize, usize)>,
+    },
+    CherryPick,
+    Revert,
+}
+
+/// `git merge-tree --write-tree` needs 2.38; the app's floor is lower, so the
+/// conflict preview degrades to [`MergePreview::Unavailable`] instead.
+pub(crate) const MERGE_TREE_MIN: GitVersion = GitVersion {
+    major: 2,
+    minor: 38,
+    patch: 0,
+};
+
+/// Merges `branch` into HEAD with `git merge --no-edit`.
+///
+/// A merge this call left stopped is [`MergeOutcome::Stopped`]: a failure with
+/// `MERGE_HEAD` (or, for `--squash`, unmerged paths) behind it, or a success
+/// that still left `MERGE_HEAD` (`--no-commit` from config). A stop that
+/// already existed before the call is not this merge's: git refuses to start
+/// and its message is returned as the error. The outcome is told apart by HEAD
+/// and the resolved branch tip, not by git's message (the runner forces
+/// `LC_ALL=C`, but the text is still not a contract).
+pub(crate) fn merge(repo: &Repo, branch: &str, ty: MergeType) -> Result<MergeOutcome> {
+    let before = resolve_commit(repo, "HEAD")?;
+    let tip = resolve_commit(repo, branch)?;
+    // Every multi-step stop leaves a marker file or dir, so they decide this.
+    let was_stopped = operation(repo)? != Operation::None;
+    let squash = ty == MergeType::Squash;
+    // `--squash` leaves no `MERGE_HEAD`, so its conflicts are told from ones
+    // that were already there (a conflicting stash pop) by comparing before/after.
+    let old_conflicts = if squash && !was_stopped {
+        crate::status::conflicted_paths(repo)?
+    } else {
+        Vec::new()
+    };
+    let out = repo
+        .command()
+        .args(["merge", "--no-edit", ty.flag(), "--end-of-options", branch])
+        .output()
+        .map_err(Error::Spawn)?;
+    let merge_head = repo.git_dir().join("MERGE_HEAD").exists();
+    if !was_stopped && (merge_head || squash) {
+        let conflicts = crate::status::conflicted_paths(repo)?;
+        if merge_head || (old_conflicts.is_empty() && !conflicts.is_empty()) {
+            return Ok(MergeOutcome::Stopped { conflicts });
+        }
+    }
+    if !out.status.success() {
+        return Err(failure("merge", out));
+    }
+    if squash {
+        // A squash never moves HEAD, so "up to date" cannot be read from it.
+        return Ok(if is_ancestor(repo, branch, "HEAD")? {
+            MergeOutcome::UpToDate
+        } else {
+            MergeOutcome::Squashed
+        });
+    }
+    let after = resolve_commit(repo, "HEAD")?;
+    Ok(if after == before {
+        MergeOutcome::UpToDate
+    } else if after == tip {
+        // HEAD became the branch tip: a fast-forward, even when that tip is
+        // itself a merge commit.
+        MergeOutcome::FastForwarded
+    } else {
+        MergeOutcome::Merged
+    })
+}
+
+/// The commit id `rev` names; a bad ref is an error.
+fn resolve_commit(repo: &Repo, rev: &str) -> Result<String> {
+    let out = repo
+        .command()
+        .args(["rev-parse", "--verify", "--end-of-options"])
+        .arg(format!("{rev}^{{commit}}"))
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "rev-parse")?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// Predicts `git merge branch` without touching the work tree or the index.
+///
+/// Ahead/behind counts decide up-to-date and fast-forward; otherwise `git merge-tree
+/// --write-tree` merges in memory (it only writes objects). The branch is
+/// resolved to a commit id first, so a bad ref is an error rather than a
+/// guess, and a name that looks like an option cannot be misread.
+pub(crate) fn merge_preview(repo: &Repo, branch: &str) -> Result<MergePreview> {
+    let target = resolve_commit(repo, branch)?;
+
+    // `ahead` is what only the branch has, `behind` what only HEAD has.
+    let (commits, head_only) = ahead_behind(repo, "HEAD", &target)?;
+    if commits == 0 {
+        return Ok(MergePreview::UpToDate);
+    }
+    if head_only == 0 {
+        return Ok(MergePreview::FastForward);
+    }
+    let version = repo.git_version();
+    if version < MERGE_TREE_MIN {
+        return Ok(MergePreview::Unavailable(PreviewUnavailable::GitTooOld {
+            have: version,
+            need: MERGE_TREE_MIN,
+        }));
+    }
+    let out = repo
+        .command()
+        .args(["merge-tree", "--write-tree", "--name-only", "-z", "HEAD"])
+        .arg(&target)
+        .output()
+        .map_err(Error::Spawn)?;
+    match out.status.code() {
+        Some(0) => Ok(MergePreview::Clean { commits }),
+        // Exit 1 is also what a bad ref gives (empty stdout), so conflicts
+        // only count when stdout starts with the result tree's hex id.
+        Some(1) if starts_with_oid(&out.stdout) => {
+            // `<tree>\0<path>\0…\0\0<messages>`: paths end at the empty field.
+            let mut paths: Vec<String> = Vec::new();
+            for field in out.stdout.split(|b| *b == 0).skip(1) {
+                if field.is_empty() {
+                    break;
+                }
+                let path = String::from_utf8_lossy(field).into_owned();
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            Ok(MergePreview::Conflicts { commits, paths })
+        }
+        _ => Err(failure("merge-tree", out)),
+    }
+}
+
+fn starts_with_oid(stdout: &[u8]) -> bool {
+    let first = stdout.split(|b| *b == 0).next().unwrap_or_default();
+    first.len() >= 40 && first.iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Abandons the merge or squash in progress. `git merge --abort` needs
+/// `MERGE_HEAD`, which a squash never has, so a squash is undone with
+/// `git reset --merge` and its `SQUASH_MSG` removed.
+pub(crate) fn merge_abort(repo: &Repo) -> Result<()> {
+    if operation(repo)? == Operation::Squash {
+        run(repo, &["reset", "--merge"], "reset --merge")?;
+        return remove_git_file(repo, "SQUASH_MSG");
+    }
+    run(repo, &["merge", "--abort"], "merge --abort")
+}
+
+/// The operation the repository is stopped in, read from the per-worktree git
+/// dir. A rebase wins over the others: it replays commits through
+/// cherry-pick, so `CHERRY_PICK_HEAD` can exist inside it.
+pub(crate) fn operation(repo: &Repo) -> Result<Operation> {
+    let dir = repo.git_dir();
+    let merge_dir = dir.join("rebase-merge");
+    if merge_dir.is_dir() {
+        let number = |name: &str| {
+            std::fs::read_to_string(merge_dir.join(name))
+                .ok()
+                .and_then(|text| text.trim().parse::<usize>().ok())
+        };
+        let progress = number("msgnum").zip(number("end"));
+        return Ok(Operation::Rebase { progress });
+    }
+    if dir.join("rebase-apply").is_dir() {
+        return Ok(Operation::Rebase { progress: None });
+    }
+    Ok(if dir.join("MERGE_HEAD").exists() {
+        Operation::Merge
+    } else if dir.join("SQUASH_MSG").exists() {
+        Operation::Squash
+    } else if dir.join("CHERRY_PICK_HEAD").exists() {
+        Operation::CherryPick
+    } else if dir.join("REVERT_HEAD").exists() {
+        Operation::Revert
+    } else {
+        Operation::None
+    })
+}
+
+/// The bytes of `name` in the per-worktree git dir; `None` when absent.
+fn read_git_file(repo: &Repo, name: &str) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(repo.git_dir().join(name)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(Error::Io(err)),
+    }
+}
+
+/// Removes `name` from the per-worktree git dir; already absent is fine.
+fn remove_git_file(repo: &Repo, name: &str) -> Result<()> {
+    match std::fs::remove_file(repo.git_dir().join(name)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(Error::Io(err)),
+    }
+}
+
+/// See [`Repo::merge_heading`].
+pub(crate) fn merge_heading(repo: &Repo) -> Result<Option<String>> {
+    Ok(read_git_file(repo, "MERGE_MSG")?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .as_deref()
+        .and_then(|text| text.lines().next())
+        .and_then(parse_merge_heading))
+}
+
+fn parse_merge_heading(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix("Merge branch '")
+        .or_else(|| line.strip_prefix("Merge remote-tracking branch '"))?;
+    let end = rest.find('\'')?;
+    let name = &rest[..end];
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// See [`Repo::prepared_message`].
+pub(crate) fn prepared_message(repo: &Repo, operation: Operation) -> Result<Option<String>> {
+    Ok(merge_info(repo, operation)?.1)
+}
+
+/// See [`Repo::merge_info`].
+pub(crate) fn merge_info(
+    repo: &Repo,
+    operation: Operation,
+) -> Result<(Option<String>, Option<String>)> {
+    // Cherry-pick and revert also leave a `MERGE_MSG`; add them here when the
+    // app starts stopping in those operations.
+    let name = match operation {
+        Operation::Merge => "MERGE_MSG",
+        Operation::Squash => "SQUASH_MSG",
+        _ => return Ok((None, None)),
+    };
+    let Some(text) = read_git_file(repo, name)? else {
+        return Ok((None, None));
+    };
+    let heading = (operation == Operation::Merge)
+        .then(|| {
+            String::from_utf8_lossy(&text)
+                .lines()
+                .next()
+                .and_then(parse_merge_heading)
+        })
+        .flatten();
+    // `git commit -F` keeps comment lines (it does not strip them like the
+    // editor flow), and git appends a `# Conflicts:` block; stripspace drops
+    // them using the configured `core.commentChar`.
+    let mut child = repo
+        .command()
+        .args(["stripspace", "--strip-comments"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(Error::Spawn)?;
+    let mut stdin = child.stdin.take().ok_or(Error::Parse("stripspace stdin"))?;
+    // Feed stdin from a thread so a large message cannot deadlock on the pipe.
+    let writer = std::thread::spawn(move || stdin.write_all(&text));
+    let out = child.wait_with_output().map_err(Error::Spawn)?;
+    let _ = writer.join();
+    let out = check_output(out, "stripspace")?;
+    let message = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+    Ok((heading, Some(message)))
+}
+
 /// Applies one commit on top of HEAD as a new commit.
 ///
 /// A conflict is aborted before it reaches the UI: there is no conflict editor
@@ -250,7 +676,7 @@ pub(crate) fn reset(repo: &Repo, oid: Oid, mode: ResetMode) -> Result<()> {
 /// was nothing to stash, so the caller can say so instead of toasting success.
 pub(crate) fn stash_save(repo: &Repo, message: Option<&str>) -> Result<bool> {
     let status = crate::status::status(repo)?;
-    if status.staged.is_empty() && status.unstaged.is_empty() {
+    if status.staged.is_empty() && status.unstaged.is_empty() && status.conflicted.is_empty() {
         return Ok(false);
     }
     let mut args = vec!["stash", "push", "--include-untracked"];
@@ -269,6 +695,38 @@ pub(crate) fn stash_apply(repo: &Repo, index: usize) -> Result<()> {
 pub(crate) fn stash_pop(repo: &Repo, index: usize) -> Result<()> {
     let reference = format!("stash@{{{index}}}");
     run(repo, &["stash", "pop", &reference], "stash pop")
+}
+
+/// Whether `git stash pop --index` failed only because it could not rebuild
+/// the index (a conflicting index, or an index with its own changes). Git
+/// says so outright and keeps the stash entry; a plain pop can still apply it.
+fn index_restore_failed(error: &Error) -> bool {
+    let Error::Git { stderr, .. } = error else {
+        return false;
+    };
+    let stderr = stderr.to_lowercase();
+    stderr.contains("conflicts in index")
+        || stderr.contains("try without --index")
+        || stderr.contains("your index contains uncommitted changes")
+}
+
+/// Pops a stash and restores which changes were staged. When the index cannot
+/// be restored, falls back to a plain pop: the changes come back unstaged but
+/// are not lost.
+pub(crate) fn stash_pop_keep_index(repo: &Repo, index: usize) -> Result<()> {
+    let reference = format!("stash@{{{index}}}");
+    let out = repo
+        .command()
+        .args(["stash", "pop", "--index", &reference])
+        .output()
+        .map_err(Error::Spawn)?;
+    match check_output(out, "stash pop") {
+        Ok(_) => Ok(()),
+        Err(error) if index_restore_failed(&error) => {
+            run(repo, &["stash", "pop", &reference], "stash pop")
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn stash_drop(repo: &Repo, index: usize) -> Result<()> {

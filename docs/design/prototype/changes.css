@@ -58,3 +58,13 @@
 .notes { max-width: 1200px; margin: 20px auto 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px 24px; }
 .notes .n { font-size: var(--fs-sm); color: var(--muted); }
 .notes .n b { color: var(--text); display: block; margin-bottom: 2px; font-weight: 600; }
+/* merge / rebase in progress: full-width banner under the toolbar, Conflicts group, conflict markers in the diff */
+.banner.chg-op { border-radius: 0; border-width: 0 0 1px; align-items: center; flex: none; }
+.chg-op .opacts { margin-left: auto; display: flex; gap: 8px; align-items: center; flex: none; }
+.chg-op .hash { color: var(--muted); }
+.grp.grp-c { flex: none; }
+.grp.grp-c .flist { flex: none; }
+.cnote { padding: 6px 16px; font-size: var(--fs-sm); color: var(--muted); border-bottom: 1px solid var(--border); background: var(--surface); flex: none; }
+.chg-wrap .dl.cf-m > span { background: color-mix(in srgb, var(--warning) 18%, transparent); color: var(--warning); font-weight: 600; }
+.chg-wrap .dl.cf-a > span.c { background: var(--diff-del-bg); }
+.chg-wrap .dl.cf-b > span.c { background: var(--diff-add-bg); }

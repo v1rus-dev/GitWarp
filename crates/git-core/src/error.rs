@@ -306,13 +306,13 @@ mod tests {
     #[test]
     fn display_names_the_exit_code() {
         let err = Error::Git {
-            command: "log --all --topo-order",
+            command: "log --all --date-order",
             code: Some(128),
             stderr: "fatal: bad object\n".into(),
         };
         assert_eq!(
             err.to_string(),
-            "git log --all --topo-order failed (exit 128): fatal: bad object"
+            "git log --all --date-order failed (exit 128): fatal: bad object"
         );
     }
 }

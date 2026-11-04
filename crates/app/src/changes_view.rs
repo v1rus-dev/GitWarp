@@ -5,29 +5,35 @@
 //! the answer: the status snapshot, the selected file's diff and the picks the
 //! user made for line-level staging.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, div, px, uniform_list, AnyElement, App, AppContext, Context, Div, Entity,
-    EventEmitter, FocusHandle, FontWeight, Hsla, InteractiveElement, IntoElement,
-    ListHorizontalSizingBehavior, ParentElement, Pixels, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, StyledText, Subscription, TextRun, UniformListScrollHandle,
-    Window,
+    actions, canvas, div, px, uniform_list, AnyElement, App, AppContext, Bounds, Context, Div,
+    Entity, EventEmitter, FocusHandle, FontWeight, Hsla, InteractiveElement, IntoElement,
+    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, ParentElement, Pixels, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, StyledText, Subscription,
+    TextRun, UniformListScrollHandle, Window,
 };
 
-use git_core::{ChangeKind, Error, FileDiff, Git, HunkPick, Repo, WorkingFile, WorkingStatus};
-use ui::actions::{key_binding, SelectNext, SelectPrev};
+use git_core::{
+    ChangeKind, ConflictSide, Error, FileDiff, Git, HunkPick, Operation, Repo, WorkingFile,
+    WorkingStatus, WorktreeFile,
+};
+use ui::actions::{key_binding, Cancel, SelectNext, SelectPrev};
 use ui::components::toast::{self, ToastKind};
 use ui::metrics::{FONT_MONO, FS_SM, FS_XS, MONO};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    Button, ButtonSize, CountPill, FileRow, IconName, ScrollArea, Scrollbar, SegmentItem,
-    Segmented, Skeleton, Switch, TextArea, TextAreaEvent,
+    Banner, BannerKind, Button, ButtonSize, CountPill, FileRow, IconName, ScrollArea, Scrollbar,
+    SegmentItem, Segmented, SelectableText, Skeleton, Switch, TextArea, TextAreaEvent,
 };
 
+use crate::conflict_editor::{self, ConflictEditor, EditorEvent};
 use crate::diff_model::{
     build_rows_with, build_split_rows, max_columns, DiffRow, RowKind, SplitCell, SplitCellKind,
     SplitRow,
@@ -50,11 +56,16 @@ pub enum ChangesEvent {
     Committed,
     /// A commit the user asked to push succeeded; the shell starts the push.
     PushAfterCommit,
+    /// The merge in progress was aborted. `merge --abort` does not move HEAD,
+    /// but the index, the work tree and the sidebar state changed.
+    MergeAborted,
 }
 
 /// Which side of the index a file row belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
+    /// Unmerged paths of a merge in progress.
+    Conflicted,
     Unstaged,
     Staged,
 }
@@ -73,12 +84,15 @@ pub struct Selection {
 }
 
 /// What the view knows about the work tree.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub enum StatusState {
-    #[default]
-    Loading,
+    /// A read is running; carries the last loaded status so counts and the
+    /// banner keep their values instead of flashing to zero during a reload.
+    Loading(Option<Arc<WorkingStatus>>),
     Loaded(Arc<WorkingStatus>),
-    Failed(String),
+    /// The read failed; keeps the last loaded status (as `Loading` does) so a
+    /// merge's conflict count and banner do not reset to "all resolved".
+    Failed(String, Option<Arc<WorkingStatus>>),
 }
 
 /// One file's diff, flattened into the rows the two layouts paint.
@@ -97,7 +111,105 @@ pub enum DiffState {
     Empty,
     Loading,
     Loaded(Arc<ChangesDiff>),
+    /// The work-tree file of a conflicted path, markers and all.
+    Conflict(Arc<ConflictFile>),
     Failed(String),
+}
+
+/// How a line of a conflicted file is painted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictKind {
+    Plain,
+    /// `<<<<<<<`, `|||||||`, `=======` or `>>>>>>>`.
+    Marker,
+    /// Between `<<<<<<<` and `=======` (the checked-out side).
+    Ours,
+    /// Between `=======` and `>>>>>>>` (the merged side).
+    Theirs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConflictLine {
+    pub text: SharedString,
+    pub kind: ConflictKind,
+}
+
+/// The work-tree content of a conflicted path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConflictFile {
+    pub lines: Vec<ConflictLine>,
+    /// Longest line, in characters, for the pane width.
+    pub columns: usize,
+    pub binary: bool,
+    /// The path is not in the work tree (both sides deleted it).
+    pub missing: bool,
+}
+
+/// What a stopped merge adds to the view.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MergeInfo {
+    /// The branch being merged, from the merge message (a squash has none).
+    pub branch: Option<String>,
+    /// The prepared commit message (`MERGE_MSG` or `SQUASH_MSG`).
+    pub message: Option<String>,
+}
+
+/// Whether the box still holds the untouched prefill text, so it can be
+/// cleared when the merge ended without a commit. A prefill only goes into an
+/// empty box, so "undo" is always "empty it".
+fn prefill_untouched(current: &str, prefill: &str) -> bool {
+    current.trim_end() == prefill.trim_end()
+}
+
+/// Where the conflict menu opens.
+#[derive(Clone, Copy)]
+enum MenuAnchor {
+    /// At the pointer (right click).
+    Pointer(gpui::Point<Pixels>),
+    /// Under a control or row (keyboard, the "…" button).
+    Bounds(Bounds<Pixels>),
+}
+
+/// Anchors a menu to `bounds`; before the first paint there are none, and the
+/// pointer is the fallback.
+fn anchor_or_pointer(bounds: Option<Bounds<Pixels>>, window: &Window) -> MenuAnchor {
+    bounds.map_or_else(
+        || MenuAnchor::Pointer(window.mouse_position()),
+        MenuAnchor::Bounds,
+    )
+}
+
+/// An invisible canvas filling its parent that records the parent's painted
+/// bounds in `slot` under `index`.
+fn bounds_probe(
+    slot: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    index: usize,
+) -> impl IntoElement {
+    canvas(
+        |bounds, _, _| bounds,
+        move |_, bounds, _, _| {
+            slot.borrow_mut().insert(index, bounds);
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// One consistent read of the work tree.
+#[derive(Debug)]
+pub struct Snapshot {
+    pub status: WorkingStatus,
+    /// `Some` while a merge or squash is in progress.
+    pub merge: Option<MergeInfo>,
+    /// Whatever operation the repository is stopped in.
+    pub operation: Operation,
+}
+
+/// How a conflicted path is resolved from the row menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Resolve {
+    Take(ConflictSide),
+    MarkResolved,
 }
 
 pub struct ChangesView {
@@ -119,7 +231,28 @@ pub struct ChangesView {
     /// The message the user typed before amend replaced it.
     draft: Option<String>,
     busy: bool,
+    /// The merge in progress, if any; read with every status.
+    merge: Option<MergeInfo>,
+    /// The operation the repository is stopped in, read with every status.
+    operation: Operation,
+    /// What the merge prefill put in the box, to take it out again if the
+    /// merge ends without a commit.
+    prefill: Option<String>,
+    /// The banner asks to confirm the abort.
+    confirming_abort: bool,
+    /// "Keep merging" of the abort confirm: focused when the confirm opens.
+    keep_focus: FocusHandle,
+    /// Painted bounds of the conflicted rows (by index) and of their "…"
+    /// buttons, to anchor the resolve menu.
+    conflict_row_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    conflict_button_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    /// The conflict editor, while it replaces the lists and the diff.
+    editor: Option<(Entity<ConflictEditor>, Subscription)>,
+    /// The editor went away without a window at hand: focus the view on the
+    /// next paint so its keys keep working.
+    refocus: bool,
     focus: FocusHandle,
+    conflicts_scroll: ScrollHandle,
     unstaged_scroll: ScrollHandle,
     staged_scroll: ScrollHandle,
     diff_scroll: UniformListScrollHandle,
@@ -163,7 +296,7 @@ impl ChangesView {
         let mut view = Self {
             path,
             git,
-            state: StatusState::Loading,
+            state: StatusState::Loading(None),
             generation: 0,
             selection: None,
             diff: DiffState::Empty,
@@ -176,7 +309,17 @@ impl ChangesView {
             amend: false,
             draft: None,
             busy: false,
+            merge: None,
+            operation: Operation::None,
+            prefill: None,
+            confirming_abort: false,
+            keep_focus: cx.focus_handle().tab_stop(true),
+            conflict_row_bounds: Rc::default(),
+            conflict_button_bounds: Rc::default(),
+            editor: None,
+            refocus: false,
             focus: cx.focus_handle().tab_stop(false),
+            conflicts_scroll: ScrollHandle::new(),
             unstaged_scroll: ScrollHandle::new(),
             staged_scroll: ScrollHandle::new(),
             diff_scroll: UniformListScrollHandle::new(),
@@ -191,6 +334,8 @@ impl ChangesView {
         self.focus.clone()
     }
 
+    /// The status once loaded; `None` while loading or after a failure, so the
+    /// lists, the diff selection and the commit box show their empty state.
     pub fn status(&self) -> Option<&WorkingStatus> {
         match &self.state {
             StatusState::Loaded(status) => Some(status),
@@ -198,21 +343,58 @@ impl ChangesView {
         }
     }
 
+    fn last_arc(&self) -> Option<Arc<WorkingStatus>> {
+        match &self.state {
+            StatusState::Loaded(status)
+            | StatusState::Loading(Some(status))
+            | StatusState::Failed(_, Some(status)) => Some(status.clone()),
+            _ => None,
+        }
+    }
+
+    /// The last loaded status, kept through a reload or a failed read. Only the
+    /// data accessors (counts, the banner and commit rules) go by it, never
+    /// what is rendered.
+    fn last_status(&self) -> Option<&WorkingStatus> {
+        match &self.state {
+            StatusState::Loaded(status)
+            | StatusState::Loading(Some(status))
+            | StatusState::Failed(_, Some(status)) => Some(status),
+            _ => None,
+        }
+    }
+
+    /// Unstaged paths, conflicted ones not included (see [`Self::conflicted_count`]).
     pub fn unstaged_count(&self) -> usize {
-        self.status().map_or(0, WorkingStatus::unstaged_count)
+        self.last_status().map_or(0, WorkingStatus::unstaged_count)
     }
 
     pub fn staged_count(&self) -> usize {
-        self.status().map_or(0, WorkingStatus::staged_count)
+        self.last_status().map_or(0, WorkingStatus::staged_count)
+    }
+
+    pub fn conflicted_count(&self) -> usize {
+        self.last_status()
+            .map_or(0, WorkingStatus::conflicted_count)
+    }
+
+    /// Every path with local work: staged, unstaged and conflicted.
+    pub fn dirty_count(&self) -> usize {
+        self.staged_count() + self.unstaged_count() + self.conflicted_count()
+    }
+
+    /// The operation the repository is stopped in, as of the last status.
+    pub fn operation(&self) -> Operation {
+        self.operation
     }
 
     pub fn is_loading(&self) -> bool {
-        matches!(self.state, StatusState::Loading)
+        matches!(self.state, StatusState::Loading(_))
     }
 
     pub fn failure(&self) -> Option<&str> {
         match &self.state {
-            StatusState::Failed(error) => Some(error),
+            StatusState::Failed(error, _) => Some(error),
             _ => None,
         }
     }
@@ -220,15 +402,13 @@ impl ChangesView {
     /// Reloads the status, e.g. when the view becomes visible or the work tree
     /// changed outside the app.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        // The view becoming visible again drops a half-answered abort confirm.
+        self.confirming_abort = false;
         self.start_status(cx);
     }
 
     fn file(&self, selection: Selection) -> Option<&WorkingFile> {
-        let status = self.status()?;
-        match selection.side {
-            Side::Unstaged => status.unstaged.get(selection.index),
-            Side::Staged => status.staged.get(selection.index),
-        }
+        files_of(self.status()?, selection.side).get(selection.index)
     }
 
     fn selection_path(&self) -> Option<(Side, String)> {
@@ -241,22 +421,23 @@ impl ChangesView {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let previous = self.selection_path();
-        self.state = StatusState::Loading;
+        self.state = StatusState::Loading(self.last_arc());
         let git = match &self.git {
             Ok(git) => git.clone(),
             Err(error) => {
-                self.state = StatusState::Failed(error.to_string());
+                self.state = StatusState::Failed(error.to_string(), None);
                 cx.notify();
                 return;
             }
         };
         let path = self.path.clone();
+        let need_message = self.merge.is_none();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let repo = Repo::open(git, &path).map_err(|error| error.to_string())?;
-                    repo.working_status().map_err(|error| error.to_string())
+                    read_snapshot(&repo, need_message)
                 })
                 .await;
             this.update(cx, |view, cx| {
@@ -272,83 +453,105 @@ impl ChangesView {
         &mut self,
         generation: u64,
         previous: Option<(Side, String)>,
-        result: Result<WorkingStatus, String>,
+        result: Result<Snapshot, String>,
         cx: &mut Context<Self>,
     ) {
         if generation != self.generation {
             return;
         }
-        let status = match result {
-            Ok(status) => Arc::new(status),
+        let (status, merge, operation) = match result {
+            Ok(snapshot) => (
+                Arc::new(snapshot.status),
+                snapshot.merge,
+                snapshot.operation,
+            ),
             Err(error) => {
-                self.state = StatusState::Failed(error);
+                self.state = StatusState::Failed(error, self.last_arc());
                 self.diff = DiffState::Empty;
+                // An editor waiting for the status of its save must not wait
+                // for ever.
+                if let Some((editor, _)) = &self.editor {
+                    editor.update(cx, |editor, cx| editor.status_failed(cx));
+                }
                 cx.notify();
                 return;
             }
         };
         let selection = previous
             .and_then(|(side, path)| {
-                let files = match side {
-                    Side::Unstaged => &status.unstaged,
-                    Side::Staged => &status.staged,
-                };
-                files
-                    .iter()
-                    .position(|file| file.path == path)
-                    .map(|index| Selection { side, index })
-                    .or_else(|| {
-                        // The file may have moved to the other side.
-                        let other = if side == Side::Unstaged {
-                            Side::Staged
-                        } else {
-                            Side::Unstaged
-                        };
-                        let files = match other {
-                            Side::Unstaged => &status.unstaged,
-                            Side::Staged => &status.staged,
-                        };
-                        files
-                            .iter()
-                            .position(|file| file.path == path)
-                            .map(|index| Selection { side: other, index })
-                    })
-            })
-            .or_else(|| {
-                (!status.unstaged.is_empty()).then_some(Selection {
-                    side: Side::Unstaged,
-                    index: 0,
+                // The file may have moved to another list (resolved, staged).
+                let others = SIDES.into_iter().filter(|other| *other != side);
+                std::iter::once(side).chain(others).find_map(|side| {
+                    files_of(&status, side)
+                        .iter()
+                        .position(|file| file.path == path)
+                        .map(|index| Selection { side, index })
                 })
             })
             .or_else(|| {
-                (!status.staged.is_empty()).then_some(Selection {
-                    side: Side::Staged,
-                    index: 0,
+                SIDES.into_iter().find_map(|side| {
+                    (!files_of(&status, side).is_empty()).then_some(Selection { side, index: 0 })
                 })
             });
         self.selection = selection;
         self.picked.clear();
         self.pick_anchor = None;
         self.confirming_discard = None;
+        self.operation = operation;
         self.state = StatusState::Loaded(status);
+        self.apply_merge(merge, cx);
         self.start_diff(cx);
+        self.sync_editor(cx);
         cx.notify();
+    }
+
+    /// Takes the merge state of a fresh status: a stopped merge pre-fills the
+    /// commit box once and rules amend out.
+    fn apply_merge(&mut self, merge: Option<MergeInfo>, cx: &mut Context<Self>) {
+        match &merge {
+            Some(info) => {
+                if self.amend {
+                    self.set_amend(false, cx);
+                }
+                let current = self.message.read(cx).text().to_string();
+                // Only the first status of a merge prefills (`self.merge` is
+                // still `None` then); later reloads leave the box alone.
+                if self.merge.is_none() && current.trim().is_empty() {
+                    if let Some(message) = info.message.clone().filter(|text| !text.is_empty()) {
+                        self.prefill = Some(message.clone());
+                        self.message
+                            .update(cx, |input, cx| input.set_text(message, cx));
+                    }
+                }
+            }
+            None => {
+                // The merge ended: after a commit the box is already empty; after
+                // an abort (here or outside the app) an untouched prefill goes.
+                if let Some(prefill) = self.prefill.take() {
+                    let current = self.message.read(cx).text().to_string();
+                    if prefill_untouched(&current, &prefill) {
+                        self.message.update(cx, |input, cx| input.set_text("", cx));
+                    }
+                }
+                self.confirming_abort = false;
+            }
+        }
+        self.merge = merge;
     }
 
     /// Moves the file selection through both lists with the arrow keys.
     fn step_selection(&mut self, step: isize, cx: &mut Context<Self>) {
+        // The lists are hidden behind the conflict editor.
+        if self.editor.is_some() {
+            return;
+        }
         let Some(status) = self.status() else {
             return;
         };
-        let mut rows = Vec::with_capacity(status.unstaged.len() + status.staged.len());
-        rows.extend((0..status.unstaged.len()).map(|index| Selection {
-            side: Side::Unstaged,
-            index,
-        }));
-        rows.extend((0..status.staged.len()).map(|index| Selection {
-            side: Side::Staged,
-            index,
-        }));
+        let mut rows = Vec::new();
+        for side in SIDES {
+            rows.extend((0..files_of(status, side).len()).map(|index| Selection { side, index }));
+        }
         if rows.is_empty() {
             return;
         }
@@ -373,11 +576,17 @@ impl ChangesView {
         self.picked.clear();
         self.pick_anchor = None;
         self.confirming_discard = None;
+        self.confirming_abort = false;
         self.start_diff(cx);
         cx.notify();
     }
 
     fn start_diff(&mut self, cx: &mut Context<Self>) {
+        // The conflict editor covers the diff pane: leave the hidden pane alone
+        // (the editor's close reloads it).
+        if self.editor.is_some() {
+            return;
+        }
         self.diff_generation = self.diff_generation.wrapping_add(1);
         let generation = self.diff_generation;
         self.diff_scroll = UniformListScrollHandle::new();
@@ -399,6 +608,19 @@ impl ChangesView {
         };
         self.diff = DiffState::Loading;
         let path = self.path.clone();
+        if selection.side == Side::Conflicted {
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { read_conflict(git, &path, &file.path) })
+                    .await;
+                this.update(cx, |view, cx| view.set_conflict(generation, result, cx))
+                    .ok();
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
         let staged = selection.side.staged();
         let settings = cx
             .try_global::<crate::AppSettings>()
@@ -434,6 +656,22 @@ impl ChangesView {
         cx.notify();
     }
 
+    fn set_conflict(
+        &mut self,
+        generation: u64,
+        result: Result<ConflictFile, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.diff_generation {
+            return;
+        }
+        self.diff = match result {
+            Ok(data) => DiffState::Conflict(Arc::new(data)),
+            Err(error) => DiffState::Failed(error),
+        };
+        cx.notify();
+    }
+
     fn diff_data(&self) -> Option<Arc<ChangesDiff>> {
         match &self.diff {
             DiffState::Loaded(data) => Some(data.clone()),
@@ -458,7 +696,7 @@ impl ChangesView {
     }
 
     fn set_amend(&mut self, amend: bool, cx: &mut Context<Self>) {
-        if self.amend == amend {
+        if self.amend == amend || (amend && self.merge.is_some()) {
             return;
         }
         self.amend = amend;
@@ -607,12 +845,14 @@ impl ChangesView {
     }
 
     fn stage_file(&mut self, side: Side, index: usize, cx: &mut Context<Self>) {
+        // A conflicted path is only resolved on purpose, from its menu: Space
+        // must not mark it resolved with the markers still in it.
+        if side == Side::Conflicted {
+            return;
+        }
         let Some(file) = self
             .status()
-            .and_then(|status| match side {
-                Side::Unstaged => status.unstaged.get(index),
-                Side::Staged => status.staged.get(index),
-            })
+            .and_then(|status| files_of(status, side).get(index))
             .cloned()
         else {
             return;
@@ -639,14 +879,13 @@ impl ChangesView {
         let Some(status) = self.status() else {
             return;
         };
-        let paths: Vec<String> = match side {
-            Side::Unstaged => status
-                .unstaged
-                .iter()
-                .map(|file| file.path.clone())
-                .collect(),
-            Side::Staged => status.staged.iter().map(|file| file.path.clone()).collect(),
-        };
+        if side == Side::Conflicted {
+            return;
+        }
+        let paths: Vec<String> = files_of(status, side)
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
         if paths.is_empty() {
             return;
         }
@@ -668,12 +907,12 @@ impl ChangesView {
     }
 
     fn discard(&mut self, side: Side, index: usize, cx: &mut Context<Self>) {
+        if side == Side::Conflicted {
+            return;
+        }
         let Some(file) = self
             .status()
-            .and_then(|status| match side {
-                Side::Unstaged => status.unstaged.get(index),
-                Side::Staged => status.staged.get(index),
-            })
+            .and_then(|status| files_of(status, side).get(index))
             .cloned()
         else {
             return;
@@ -697,6 +936,19 @@ impl ChangesView {
     where
         F: FnOnce(&Repo) -> git_core::Result<String> + Send + 'static,
     {
+        self.start_action_emitting(None, cx, action);
+    }
+
+    /// [`Self::start_action`] that also tells the shell what happened once the
+    /// action succeeded.
+    fn start_action_emitting<F>(
+        &mut self,
+        event: Option<ChangesEvent>,
+        cx: &mut Context<Self>,
+        action: F,
+    ) where
+        F: FnOnce(&Repo) -> git_core::Result<String> + Send + 'static,
+    {
         if self.busy {
             return;
         }
@@ -709,18 +961,19 @@ impl ChangesView {
         };
         self.busy = true;
         let path = self.path.clone();
+        let need_message = self.merge.is_none();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let repo = Repo::open(git, &path).map_err(|error| error.to_string())?;
                     let notice = action(&repo).map_err(|error| error.to_string())?;
-                    let status = repo.working_status().map_err(|error| error.to_string())?;
-                    Ok::<_, String>((notice, status))
+                    let snapshot = read_snapshot(&repo, need_message)?;
+                    Ok::<_, String>((notice, snapshot))
                 })
                 .await;
             this.update_in(cx, |view, window, cx| {
-                view.finish_action(result, window, cx)
+                view.finish_action(result, event, window, cx)
             })
             .ok();
         })
@@ -730,16 +983,20 @@ impl ChangesView {
 
     fn finish_action(
         &mut self,
-        result: Result<(String, WorkingStatus), String>,
+        result: Result<(String, Snapshot), String>,
+        event: Option<ChangesEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.busy = false;
         match result {
-            Ok((notice, status)) => {
+            Ok((notice, snapshot)) => {
                 toast::show(ToastKind::Ok, notice, window, cx);
                 let previous = self.selection_path();
-                self.apply_status(status, previous, cx);
+                self.apply_status(snapshot, previous, cx);
+                if let Some(event) = event {
+                    cx.emit(event);
+                }
             }
             Err(error) => {
                 toast::show(ToastKind::Error, error, window, cx);
@@ -750,13 +1007,377 @@ impl ChangesView {
 
     fn apply_status(
         &mut self,
-        status: WorkingStatus,
+        status: Snapshot,
         previous: Option<(Side, String)>,
         cx: &mut Context<Self>,
     ) {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.set_status(generation, previous, Ok(status), cx);
+    }
+
+    /// The label of the checked-out branch, or `HEAD` while detached.
+    fn head_label(&self) -> String {
+        self.status()
+            .and_then(|status| status.branch.clone())
+            .unwrap_or_else(|| "HEAD".to_string())
+    }
+
+    /// The name of the merged side: the branch from the merge message, or a
+    /// neutral phrase when git's message has an unknown shape.
+    fn incoming_label(&self) -> String {
+        self.merge
+            .as_ref()
+            .and_then(|merge| merge.branch.clone())
+            .unwrap_or_else(|| ui::t!("changes.conflict.incoming").to_string())
+    }
+
+    /// The name of one side of a conflict: the checked-out branch for ours,
+    /// the merged one for theirs.
+    fn side_label(&self, side: ConflictSide) -> String {
+        match side {
+            ConflictSide::Ours => self.head_label(),
+            ConflictSide::Theirs => self.incoming_label(),
+        }
+    }
+
+    /// Opens the conflict editor on the conflicted `path`. Only while an
+    /// operation is stopped with conflicts.
+    fn open_conflict_editor(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(git) = &self.git else {
+            return;
+        };
+        let git = git.clone();
+        let Some(status) = self.status() else {
+            return;
+        };
+        if self.operation == Operation::None
+            || !status.conflicted.iter().any(|file| file.path == path)
+        {
+            return;
+        }
+        let files = status
+            .conflicted
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        let root = self.path.clone();
+        let (ours, theirs) = (
+            self.side_label(ConflictSide::Ours),
+            self.side_label(ConflictSide::Theirs),
+        );
+        let editor = cx.new(|cx| ConflictEditor::new(git, root, files, path, ours, theirs, cx));
+        let subscription = cx.subscribe_in(
+            &editor,
+            window,
+            |view, _, event: &EditorEvent, window, cx| {
+                match event {
+                    EditorEvent::Close => {
+                        view.editor = None;
+                        // The diff pane was not following the status while the
+                        // editor covered it: catch up.
+                        view.start_diff(cx);
+                        window.focus(&view.focus, cx);
+                        cx.notify();
+                    }
+                    // The status read that follows tells the editor what is
+                    // left (see `sync_editor`).
+                    EditorEvent::Saved | EditorEvent::Refresh => view.start_status(cx),
+                }
+            },
+        );
+        self.editor = Some((editor, subscription));
+        cx.notify();
+    }
+
+    fn open_selected_conflict_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((Side::Conflicted, path)) = self.selection_path() {
+            self.open_conflict_editor(path, window, cx);
+        }
+    }
+
+    /// Hands a fresh status to the open editor: it moves to the next
+    /// conflicted file when its own was resolved, and the view takes the
+    /// lists back when nothing is left.
+    fn sync_editor(&mut self, cx: &mut Context<Self>) {
+        let Some((editor, _)) = &self.editor else {
+            return;
+        };
+        let editor = editor.clone();
+        let files = self
+            .status()
+            .map(|status| status.conflicted.iter().map(|f| f.path.clone()).collect())
+            .unwrap_or_default();
+        let (ours, theirs) = (
+            self.side_label(ConflictSide::Ours),
+            self.side_label(ConflictSide::Theirs),
+        );
+        let keep = self.operation != Operation::None
+            && editor.update(cx, |editor, cx| editor.sync(files, ours, theirs, cx));
+        if !keep {
+            self.editor = None;
+            self.refocus = true;
+            self.start_diff(cx);
+        }
+    }
+
+    /// Resolves the conflicted `path` (see the row menu). The menu captures the
+    /// path, not the row index: the list may have changed while the menu was
+    /// open, and then the path is simply no longer conflicted.
+    fn resolve_conflict(&mut self, path: String, how: Resolve, cx: &mut Context<Self>) {
+        let still_conflicted = self
+            .status()
+            .is_some_and(|status| status.conflicted.iter().any(|file| file.path == path));
+        if !still_conflicted {
+            self.start_status(cx);
+            return;
+        }
+        let notice = match how {
+            Resolve::Take(side) => {
+                ui::t!(
+                    "changes.notice.took",
+                    branch = self.side_label(side),
+                    path = path
+                )
+            }
+            Resolve::MarkResolved => ui::t!("changes.notice.marked_resolved", path = path),
+        }
+        .to_string();
+        self.start_action(cx, move |repo| {
+            match how {
+                Resolve::Take(side) => repo.resolve_take(&path, side)?,
+                Resolve::MarkResolved => repo.stage(std::slice::from_ref(&path))?,
+            }
+            Ok(notice)
+        });
+    }
+
+    /// Abandons the merge (after the banner's inline confirm).
+    fn abort_merge(&mut self, cx: &mut Context<Self>) {
+        self.confirming_abort = false;
+        let notice = if self.squashing() {
+            ui::t!("changes.notice.squash_aborted")
+        } else {
+            ui::t!("changes.notice.merge_aborted")
+        }
+        .to_string();
+        self.start_action_emitting(Some(ChangesEvent::MergeAborted), cx, move |repo| {
+            repo.merge_abort()?;
+            Ok(notice)
+        });
+        cx.notify();
+    }
+
+    /// Opens the menu of the selected conflicted row from the keyboard
+    /// (Enter, Menu, Shift+F10), anchored under the row.
+    fn open_selected_conflict_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selection) = self.selection.filter(|s| s.side == Side::Conflicted) else {
+            return;
+        };
+        let Some(path) = self.file(selection).map(|file| file.path.clone()) else {
+            return;
+        };
+        let bounds = self
+            .conflict_row_bounds
+            .borrow()
+            .get(&selection.index)
+            .copied();
+        let anchor = anchor_or_pointer(bounds, window);
+        self.open_conflict_menu(path, anchor, window, cx);
+    }
+
+    /// The menu of the conflicted `path`: take a side, or mark it resolved.
+    fn open_conflict_menu(
+        &mut self,
+        path: String,
+        anchor: MenuAnchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use ui::components::menu::{self, MenuEntry, MenuItem};
+
+        let busy = self.busy;
+        let view = cx.entity();
+        let item =
+            |label: SharedString, icon: IconName, how: Resolve| {
+                let view = view.clone();
+                let path = path.clone();
+                MenuEntry::Item(MenuItem::new(label).icon(icon).disabled(busy).action(
+                    move |_, cx| {
+                        view.update(cx, |view, cx| view.resolve_conflict(path.clone(), how, cx));
+                    },
+                ))
+            };
+        let mut entries = Vec::new();
+        if self.operation != Operation::None {
+            let editor_view = view.clone();
+            let editor_path = path.clone();
+            entries.push(MenuEntry::Item(
+                MenuItem::new(ui::t!("changes.editor.open_menu"))
+                    .icon(IconName::Merge)
+                    .disabled(busy)
+                    .action(move |window, cx| {
+                        editor_view.update(cx, |view, cx| {
+                            view.open_conflict_editor(editor_path.clone(), window, cx);
+                        });
+                    }),
+            ));
+            entries.push(MenuEntry::Separator);
+        }
+        entries.extend(vec![
+            item(
+                ui::t!(
+                    "changes.conflict.take",
+                    branch = self.side_label(ConflictSide::Ours)
+                ),
+                IconName::Check,
+                Resolve::Take(ConflictSide::Ours),
+            ),
+            item(
+                ui::t!(
+                    "changes.conflict.take",
+                    branch = self.side_label(ConflictSide::Theirs)
+                ),
+                IconName::Check,
+                Resolve::Take(ConflictSide::Theirs),
+            ),
+            MenuEntry::Separator,
+            item(
+                ui::t!("changes.conflict.mark_resolved"),
+                IconName::Plus,
+                Resolve::MarkResolved,
+            ),
+        ]);
+        match anchor {
+            MenuAnchor::Pointer(position) => menu::open_context_menu(position, entries, window, cx),
+            MenuAnchor::Bounds(bounds) => menu::open_dropdown(bounds, entries, window, cx),
+        };
+    }
+
+    /// The operation banner of a merge or squash in progress.
+    fn render_merge_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let merge = self.merge.as_ref()?;
+        let squash = self.squashing();
+        let left = self.conflicted_count();
+        let head = self.head_label();
+        let busy = self.busy;
+        let view = cx.entity();
+        // A squash message does not name the branch, so it has no branch title.
+        let title = match &merge.branch {
+            _ if squash => ui::t!("changes.squash.title_unknown", head = head),
+            Some(branch) => ui::t!("changes.merge.title", branch = branch, head = head),
+            None => ui::t!("changes.merge.title_unknown", head = head),
+        };
+        let abort_label = if squash {
+            ui::t!("changes.squash.abort")
+        } else {
+            ui::t!("changes.merge.abort")
+        };
+        let commit_label = if squash {
+            ui::t!("changes.squash.commit")
+        } else {
+            ui::t!("changes.merge.commit")
+        };
+        let kind = merge_banner_kind(left);
+        let actions = if self.confirming_abort {
+            let keep_view = view.clone();
+            div()
+                .flex()
+                .gap(px(8.))
+                .child(
+                    Button::danger("merge-abort-confirm")
+                        .size(ButtonSize::Small)
+                        .label(abort_label.clone())
+                        .disabled(busy)
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |view, cx| view.abort_merge(cx));
+                        }),
+                )
+                .child(
+                    Button::new("merge-abort-keep")
+                        .size(ButtonSize::Small)
+                        .label(ui::t!("changes.merge.keep"))
+                        .focus_handle(self.keep_focus.clone())
+                        .on_click(move |_, _, cx| {
+                            keep_view.update(cx, |view, cx| {
+                                view.confirming_abort = false;
+                                cx.notify();
+                            });
+                        }),
+                )
+        } else {
+            let abort_view = view.clone();
+            let can = can_commit(!squash, false, self.staged_count(), left) && !busy;
+            let mut commit = Button::primary("merge-commit")
+                .size(ButtonSize::Small)
+                .label(commit_label)
+                .disabled(!can);
+            if left > 0 {
+                commit = commit.tooltip(ui::t!("changes.merge.resolve_first"));
+            }
+            div()
+                .flex()
+                .gap(px(8.))
+                .child(
+                    Button::danger("merge-abort")
+                        .size(ButtonSize::Small)
+                        .label(abort_label)
+                        .disabled(busy)
+                        .on_click(move |_, window, cx| {
+                            abort_view.update(cx, |view, cx| {
+                                view.confirming_abort = true;
+                                // Safe choice first: Enter / Space keep merging.
+                                window.focus(&view.keep_focus, cx);
+                                cx.notify();
+                            });
+                        }),
+                )
+                .child(commit.on_click(move |_, window, cx| {
+                    view.update(cx, |view, cx| view.commit(window, cx));
+                }))
+        };
+        let detail = if self.confirming_abort {
+            match &merge.branch {
+                _ if squash => ui::t!("changes.squash.abort_confirm", head = head),
+                Some(branch) => {
+                    ui::t!("changes.merge.abort_confirm", branch = branch, head = head)
+                }
+                None => ui::t!("changes.merge.abort_confirm_unknown", head = head),
+            }
+        } else if left == 0 {
+            if squash {
+                ui::t!("changes.squash.resolved")
+            } else {
+                ui::t!("changes.merge.resolved")
+            }
+        } else {
+            ui::i18n::t_count("changes.merge.left", left as u64, &[])
+        };
+        Some(
+            div()
+                .w_full()
+                .flex_none()
+                .debug_selector(|| "merge-banner".to_string())
+                .child(
+                    Banner::new(kind, title)
+                        .body(detail)
+                        .flat()
+                        .trailing(actions),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// A merge (not a squash) is stopped: its commit needs nothing newly staged.
+    /// A squash commits like a plain commit, from what the squash staged.
+    fn merging(&self) -> bool {
+        self.merge.is_some() && !self.squashing()
+    }
+
+    /// A `--squash` merge is stopped: the changes are staged, there is no
+    /// `MERGE_HEAD` and the commit has a single parent.
+    fn squashing(&self) -> bool {
+        self.operation == Operation::Squash
     }
 
     /// Commits the index, or amends HEAD, from the commit box.
@@ -785,14 +1406,18 @@ impl ChangesView {
         }
         let staged = self.staged_count();
         let amend = self.amend;
-        if !amend && staged == 0 {
+        if !can_commit(self.merging(), amend, staged, self.conflicted_count()) {
             return;
         }
-        let branch = self
-            .status()
-            .and_then(|status| status.branch.clone())
-            .unwrap_or_else(|| "HEAD".to_string());
-        let notice = if amend {
+        let branch = self.head_label();
+        let notice = if let Some(merge) = self.merge.as_ref().filter(|_| !self.squashing()) {
+            match &merge.branch {
+                Some(merged) => {
+                    ui::t!("changes.notice.merged", branch = merged, head = branch).to_string()
+                }
+                None => ui::t!("changes.notice.merge_finished").to_string(),
+            }
+        } else if amend {
             ui::t!("changes.notice.amended").to_string()
         } else {
             ui::i18n::t_count(
@@ -811,6 +1436,7 @@ impl ChangesView {
         };
         self.busy = true;
         let path = self.path.clone();
+        let need_message = self.merge.is_none();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -818,8 +1444,8 @@ impl ChangesView {
                     let repo = Repo::open(git, &path).map_err(|error| error.to_string())?;
                     repo.commit(&message, amend)
                         .map_err(|error| error.to_string())?;
-                    let status = repo.working_status().map_err(|error| error.to_string())?;
-                    Ok::<_, String>((notice, status))
+                    let snapshot = read_snapshot(&repo, need_message)?;
+                    Ok::<_, String>((notice, snapshot))
                 })
                 .await;
             this.update_in(cx, |view, window, cx| {
@@ -833,20 +1459,20 @@ impl ChangesView {
 
     fn finish_commit(
         &mut self,
-        result: Result<(String, WorkingStatus), String>,
+        result: Result<(String, Snapshot), String>,
         push: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.busy = false;
         match result {
-            Ok((notice, status)) => {
+            Ok((notice, snapshot)) => {
                 toast::show(ToastKind::Ok, notice, window, cx);
                 self.message.update(cx, |input, cx| input.set_text("", cx));
                 self.amend = false;
                 self.draft = None;
                 let previous = self.selection_path();
-                self.apply_status(status, previous, cx);
+                self.apply_status(snapshot, previous, cx);
                 cx.emit(ChangesEvent::Committed);
                 if push {
                     cx.emit(ChangesEvent::PushAfterCommit);
@@ -861,6 +1487,10 @@ impl ChangesView {
 
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
+        if self.refocus {
+            self.refocus = false;
+            window.focus(&self.focus, cx);
+        }
         let pane_width = (f32::from(window.viewport_size().width) - FILES_WIDTH - 560.).max(320.);
         div()
             .size_full()
@@ -869,14 +1499,35 @@ impl ChangesView {
             .debug_selector(|| "changes-view".to_string())
             .key_context("changes")
             .track_focus(&self.focus)
+            // While the conflict editor covers the lists, their keys do nothing.
             .on_action(cx.listener(|view, _: &CommitChanges, window, cx| {
-                view.commit(window, cx);
+                if view.editor.is_none() {
+                    view.commit(window, cx);
+                }
             }))
             .on_action(cx.listener(|view, _: &StageSelected, _, cx| {
-                view.stage_selected(cx);
+                if view.editor.is_none() {
+                    view.stage_selected(cx);
+                }
             }))
             .on_action(cx.listener(|view, _: &DiscardSelected, _, cx| {
-                view.ask_discard_selected(cx);
+                if view.editor.is_none() {
+                    view.ask_discard_selected(cx);
+                }
+            }))
+            .on_action(cx.listener(|view, _: &OpenConflictMenu, window, cx| {
+                if view.editor.is_none() {
+                    view.open_selected_conflict_menu(window, cx);
+                }
+            }))
+            // Esc in the abort confirm is "Keep merging"; otherwise it goes on.
+            .on_action(cx.listener(|view, _: &Cancel, _, cx| {
+                if view.confirming_abort {
+                    view.confirming_abort = false;
+                    cx.notify();
+                } else {
+                    cx.propagate();
+                }
             }))
             .on_action(cx.listener(|view, _: &SelectNext, _, cx| {
                 view.step_selection(1, cx);
@@ -884,16 +1535,45 @@ impl ChangesView {
             .on_action(cx.listener(|view, _: &SelectPrev, _, cx| {
                 view.step_selection(-1, cx);
             }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .flex()
-                    .child(self.render_files(cx))
-                    .child(self.render_diff(pane_width, colors, cx)),
+            .children(self.render_merge_banner(cx))
+            .map(
+                |this| match self.editor.as_ref().map(|(editor, _)| editor.clone()) {
+                    // The editor takes the whole centre area, commit box included.
+                    Some(editor) => this.child(div().flex_1().min_h_0().w_full().child(editor)),
+                    None => this
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .flex()
+                                .child(self.render_files(cx))
+                                .child(self.render_diff(pane_width, colors, cx)),
+                        )
+                        .child(self.render_commit_box(cx)),
+                },
             )
-            .child(self.render_commit_box(cx))
+    }
+
+    /// The primary "Resolve…" button of a conflicted file's diff pane.
+    fn resolve_button(&self, cx: &mut Context<Self>) -> Option<Button> {
+        let conflicted = self
+            .selection
+            .is_some_and(|selection| selection.side == Side::Conflicted);
+        if !conflicted || self.operation == Operation::None || self.git.is_err() {
+            return None;
+        }
+        let view = cx.entity();
+        Some(
+            Button::primary("resolve-conflict")
+                .size(ButtonSize::Small)
+                .label(ui::t!("changes.editor.open_button"))
+                .on_click(move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.open_selected_conflict_editor(window, cx);
+                    });
+                }),
+        )
     }
 
     fn render_files(&mut self, cx: &mut Context<Self>) -> Div {
@@ -959,15 +1639,28 @@ impl ChangesView {
             );
         }
 
-        let (unstaged, staged) = match self.status() {
-            Some(status) => (status.unstaged.clone(), status.staged.clone()),
-            None => (Vec::new(), Vec::new()),
+        // Empty lists while loading or failed; one refcount bump when loaded.
+        let status = match &self.state {
+            StatusState::Loaded(status) => status.clone(),
+            _ => Arc::default(),
         };
+        let (conflicted, unstaged, staged) = (&status.conflicted, &status.unstaged, &status.staged);
+        if !conflicted.is_empty() {
+            panel = panel.child(self.render_group(
+                Side::Conflicted,
+                ui::t!("changes.group.conflicts"),
+                conflicted,
+                SharedString::default(),
+                self.conflicts_scroll.clone(),
+                view.clone(),
+                cx,
+            ));
+        }
         panel
             .child(self.render_group(
                 Side::Unstaged,
                 ui::t!("changes.group.unstaged"),
-                &unstaged,
+                unstaged,
                 ui::t!("changes.group.unstaged_empty"),
                 self.unstaged_scroll.clone(),
                 view.clone(),
@@ -976,7 +1669,7 @@ impl ChangesView {
             .child(self.render_group(
                 Side::Staged,
                 ui::t!("changes.group.staged"),
-                &staged,
+                staged,
                 ui::t!("changes.group.staged_empty"),
                 self.staged_scroll.clone(),
                 view,
@@ -997,31 +1690,24 @@ impl ChangesView {
     ) -> Div {
         let colors = cx.theme().colors;
         let busy = self.busy;
+        let has_conflicts = self.conflicted_count() > 0;
+        let conflict_row_bounds = self.conflict_row_bounds.clone();
+        let conflict_button_bounds = self.conflict_button_bounds.clone();
         let all_view = view.clone();
         let all_label = match side {
-            Side::Unstaged => ui::t!("changes.group.stage_all"),
+            Side::Unstaged | Side::Conflicted => ui::t!("changes.group.stage_all"),
             Side::Staged => ui::t!("changes.group.unstage_all"),
         };
+        let side_name = side_id(side);
         let mut rows = Vec::with_capacity(files.len());
         for (index, file) in files.iter().enumerate() {
             let selected = self.selection == Some(Selection { side, index });
             let status = status_letter(file);
             let path = file.path.clone();
-            let mut row = FileRow::new(
-                format!(
-                    "changes-{}-{index}",
-                    if side == Side::Unstaged {
-                        "unstaged"
-                    } else {
-                        "staged"
-                    }
-                ),
-                status,
-                path,
-            )
-            .added(file.added)
-            .deleted(file.deleted)
-            .selected(selected);
+            let mut row = FileRow::new(format!("changes-{side_name}-{index}"), status, path)
+                .added(file.added)
+                .deleted(file.deleted)
+                .selected(selected);
             let select_view = view.clone();
             let stage_view = view.clone();
             let discard_view = view.clone();
@@ -1039,16 +1725,45 @@ impl ChangesView {
                 (true, None) => ui::t!("changes.row.stage"),
                 (false, None) => ui::t!("changes.row.unstage"),
             };
-            row = row.action(
-                Button::ghost(format!("stage-{side:?}-{index}"))
-                    .size(ButtonSize::Xs)
-                    .icon_only(stage_icon)
-                    .tooltip(stage_tip)
-                    .disabled(busy)
-                    .on_click(move |_, _, cx| {
-                        stage_view.update(cx, |view, cx| view.stage_file(side, index, cx));
-                    }),
-            );
+            if side == Side::Conflicted {
+                let menu_view = view.clone();
+                let path = file.path.clone();
+                let button_bounds = conflict_button_bounds.clone();
+                let slot = conflict_button_bounds.clone();
+                row = row.action(
+                    div()
+                        .relative()
+                        .child(
+                            Button::ghost(format!("resolve-{index}"))
+                                .size(ButtonSize::Xs)
+                                // No tooltip: it would stay on top of the menu this opens.
+                                .label("…")
+                                .disabled(busy)
+                                .on_click(move |_, window, cx| {
+                                    let path = path.clone();
+                                    // Anchored to the button itself, not the mouse.
+                                    let anchor = button_bounds.borrow().get(&index).copied();
+                                    menu_view.update(cx, |view, cx| {
+                                        view.select(Side::Conflicted, index, cx);
+                                        let anchor = anchor_or_pointer(anchor, window);
+                                        view.open_conflict_menu(path, anchor, window, cx);
+                                    });
+                                }),
+                        )
+                        .child(bounds_probe(slot, index)),
+                );
+            } else {
+                row = row.action(
+                    Button::ghost(format!("stage-{side:?}-{index}"))
+                        .size(ButtonSize::Xs)
+                        .icon_only(stage_icon)
+                        .tooltip(stage_tip)
+                        .disabled(busy)
+                        .on_click(move |_, _, cx| {
+                            stage_view.update(cx, |view, cx| view.stage_file(side, index, cx));
+                        }),
+                );
+            }
             if side == Side::Unstaged {
                 row = row.action(
                     Button::ghost(format!("discard-{side:?}-{index}"))
@@ -1080,18 +1795,40 @@ impl ChangesView {
                         }),
                 );
             }
-            let debug_id = format!(
-                "changes-{}-{index}",
-                if side == Side::Unstaged {
-                    "unstaged"
-                } else {
-                    "staged"
-                }
-            );
+            let debug_id = format!("changes-{side_name}-{index}");
+            let menu_view = view.clone();
+            let menu_path = file.path.clone();
+            let row_slot = conflict_row_bounds.clone();
             rows.push(
                 div()
                     .debug_selector(move || debug_id.clone())
-                    .key_context("changes-file")
+                    // A conflicted row also gets `changes-conflict`, for the
+                    // keys that open its resolve menu.
+                    .key_context(if side == Side::Conflicted {
+                        "changes-file changes-conflict"
+                    } else {
+                        "changes-file"
+                    })
+                    .when(side == Side::Conflicted, |this| {
+                        this.relative()
+                            .child(bounds_probe(row_slot, index))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                move |event: &MouseDownEvent, window, cx| {
+                                    let position = event.position;
+                                    let path = menu_path.clone();
+                                    menu_view.update(cx, |view, cx| {
+                                        view.select(Side::Conflicted, index, cx);
+                                        view.open_conflict_menu(
+                                            path,
+                                            MenuAnchor::Pointer(position),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                },
+                            )
+                    })
                     .child(row.on_click(move |_, _, cx| {
                         select_view.update(cx, |view, cx| view.select(side, index, cx));
                     })),
@@ -1115,6 +1852,7 @@ impl ChangesView {
                 .into_any_element()
         };
         let count = files.len();
+        let conflicts = side == Side::Conflicted;
         let stage_all = Button::new(format!("stage-all-{side:?}"))
             .size(ButtonSize::Small)
             .label(all_label)
@@ -1122,15 +1860,19 @@ impl ChangesView {
             .on_click(move |_, _, cx| {
                 all_view.update(cx, |view, cx| view.stage_all(side, cx));
             });
+        // The conflicts group keeps its natural height (up to a few rows, then
+        // it scrolls) so the two lists below stay visible.
+        let conflicts_height = px(34. + count.min(6) as f32 * f32::from(cx.theme().row_height));
         div()
             .w_full()
-            .flex_1()
-            .min_h_0()
+            .when(conflicts, |this| this.flex_none().h(conflicts_height))
+            .when(!conflicts, |this| this.flex_1().min_h_0())
             .flex()
             .flex_col()
-            .when(side == Side::Staged, |this| {
-                this.border_t_1().border_color(colors.border)
-            })
+            .when(
+                side == Side::Staged || (side == Side::Unstaged && has_conflicts),
+                |this| this.border_t_1().border_color(colors.border),
+            )
             .child(
                 div()
                     .w_full()
@@ -1147,7 +1889,7 @@ impl ChangesView {
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
                     .child(CountPill::new(count.to_string()))
                     .child(div().flex_1())
-                    .child(stage_all),
+                    .when(!conflicts, |this| this.child(stage_all)),
             )
             .child(ScrollArea::new(format!("changes-scroll-{side:?}"), scroll).child(list))
     }
@@ -1187,20 +1929,22 @@ impl ChangesView {
                 .child(path.unwrap_or_default()),
         );
         if let Some(selection) = selection {
-            let side = match selection.side {
-                Side::Unstaged => ui::t!("changes.side.unstaged"),
-                Side::Staged => ui::t!("changes.side.staged"),
+            let label = match selection.side {
+                Side::Conflicted => ui::t!("changes.conflict.label"),
+                side => {
+                    let side = match side {
+                        Side::Unstaged => ui::t!("changes.side.unstaged"),
+                        _ => ui::t!("changes.side.staged"),
+                    };
+                    ui::i18n::t_count("changes.diff.side_hunks", hunks as u64, &[("side", &side)])
+                }
             };
             toolbar = toolbar.child(
                 div()
                     .flex_none()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child(ui::i18n::t_count(
-                        "changes.diff.side_hunks",
-                        hunks as u64,
-                        &[("side", &side)],
-                    )),
+                    .child(label),
             );
         }
         toolbar = toolbar.child(
@@ -1244,7 +1988,67 @@ impl ChangesView {
                 .min_h_0()
                 .p(px(12.))
                 .text_color(colors.error)
-                .child(message.clone()),
+                .child(SelectableText::new(
+                    gpui::ElementId::Name("changes-diff-error".into()),
+                    message.clone(),
+                )),
+            DiffState::Conflict(data) => {
+                let resolve = self.resolve_button(cx);
+                if data.binary {
+                    diff_note(ui::t!("changes.diff.binary"), colors)
+                        .flex_col()
+                        .gap(px(12.))
+                        .children(resolve)
+                } else if data.missing {
+                    diff_note(ui::t!("changes.conflict.no_file"), colors)
+                        .flex_col()
+                        .gap(px(12.))
+                        .children(resolve)
+                } else {
+                    let row_width = conflict_width(self.mono_cell, data.columns, pane_width);
+                    let data = data.clone();
+                    let list = uniform_list(
+                        "changes-conflict",
+                        data.lines.len(),
+                        cx.processor(move |view, range, window, cx| {
+                            view.render_conflict_rows(data.clone(), range, row_width, window, cx)
+                        }),
+                    )
+                    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                    .track_scroll(&self.diff_scroll)
+                    .flex_1()
+                    .min_h_0()
+                    .w_full();
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(16.))
+                                .py(px(6.))
+                                .flex()
+                                .items_center()
+                                .gap(px(12.))
+                                .text_size(FS_SM)
+                                .text_color(colors.muted)
+                                .border_b_1()
+                                .border_color(colors.border)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(ui::t!("changes.conflict.note")),
+                                )
+                                .children(resolve),
+                        )
+                        .child(div().flex_1().min_h_0().flex().child(list).child(
+                            Scrollbar::uniform("changes-diff-bar", self.diff_scroll.clone()),
+                        ))
+                }
+            }
             DiffState::Loaded(data) => {
                 if data.diff.binary {
                     diff_note(ui::t!("changes.diff.binary"), colors)
@@ -1493,6 +2297,63 @@ impl ChangesView {
             .collect()
     }
 
+    /// Rows of a conflicted file: line number, then the text, with the marker
+    /// lines tinted as a warning and the two sides like removed / added lines.
+    fn render_conflict_rows(
+        &mut self,
+        data: Arc<ConflictFile>,
+        range: std::ops::Range<usize>,
+        row_width: Pixels,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let colors = cx.theme().colors;
+        range
+            .filter_map(|index| {
+                let line = data.lines.get(index)?;
+                let (background, color, weight) = match line.kind {
+                    ConflictKind::Marker => (
+                        Some(colors.warning.opacity(0.18)),
+                        colors.warning,
+                        FontWeight::SEMIBOLD,
+                    ),
+                    ConflictKind::Ours => {
+                        (Some(colors.diff_del_bg), colors.text, FontWeight::NORMAL)
+                    }
+                    ConflictKind::Theirs => {
+                        (Some(colors.diff_add_bg), colors.text, FontWeight::NORMAL)
+                    }
+                    ConflictKind::Plain => (None, colors.text, FontWeight::NORMAL),
+                };
+                Some(
+                    div()
+                        .id(SharedString::from(format!("changes-conflict-row-{index}")))
+                        .h(px(DIFF_ROW))
+                        .w(row_width)
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .whitespace_nowrap()
+                        .child(diff_gutter(Some(index as u32 + 1), None, colors))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .px(px(6.))
+                                .when_some(background, |this, background| this.bg(background))
+                                .text_color(color)
+                                .font_weight(weight)
+                                .child(line.text.clone()),
+                        )
+                        .into_any_element(),
+                )
+            })
+            .collect()
+    }
+
     fn render_split_rows(
         &mut self,
         data: Arc<ChangesDiff>,
@@ -1521,13 +2382,13 @@ impl ChangesView {
         let text = self.message.read(cx).text().to_string();
         let (subject, longest_body) = message_counters(&text);
         let head = self.status().and_then(|status| status.head.clone());
-        let branch = self
-            .status()
-            .and_then(|status| status.branch.clone())
-            .unwrap_or_else(|| "HEAD".to_string());
+        let branch = self.head_label();
         let staged = self.staged_count();
         let busy = self.busy;
-        let commit_label = if self.amend {
+        let merging = self.merging();
+        let commit_label = if merging {
+            ui::t!("changes.merge.commit")
+        } else if self.amend {
             ui::t!("changes.commit.amend")
         } else {
             ui::i18n::t_count(
@@ -1536,13 +2397,15 @@ impl ChangesView {
                 &[("branch", &branch)],
             )
         };
-        let can_commit = !busy && (!commit_label.is_empty()) && (self.amend || staged > 0);
+        let can_commit = !busy
+            && !commit_label.is_empty()
+            && can_commit(merging, self.amend, staged, self.conflicted_count());
         let commit_view = cx.entity();
         let amend_view = cx.entity();
         let switch = Switch::new("amend-switch")
             .label(ui::t!("changes.commit.amend_switch"))
             .checked(self.amend)
-            .disabled(busy || head.is_none())
+            .disabled(busy || head.is_none() || self.merge.is_some())
             .on_toggle(move |checked, _, cx| {
                 amend_view.update(cx, |view, cx| view.set_amend(checked, cx));
             });
@@ -1719,9 +2582,26 @@ pub fn bind_keys(cx: &mut App, settings: &crate::settings::Settings) {
             file,
         ),
     ]);
+    // A conflicted row has no stage/discard keys; its resolve menu opens on
+    // Enter, the Menu key and Shift+F10 (not on a focused button inside it).
+    let conflict = Some("changes-conflict && !ui-button");
+    cx.bind_keys([
+        key_binding(cx, "enter", OpenConflictMenu, conflict),
+        key_binding(cx, "menu", OpenConflictMenu, conflict),
+        key_binding(cx, "shift-f10", OpenConflictMenu, conflict),
+    ]);
+    conflict_editor::bind_keys(cx);
 }
 
-actions!(gitwarp, [CommitChanges, StageSelected, DiscardSelected]);
+actions!(
+    gitwarp,
+    [
+        CommitChanges,
+        StageSelected,
+        DiscardSelected,
+        OpenConflictMenu
+    ]
+);
 
 /// Reads one file's diff and flattens it into rows off the UI thread.
 fn read_diff(
@@ -1754,6 +2634,157 @@ fn read_diff(
     })
 }
 
+/// The lists top to bottom, as the arrow keys walk them.
+const SIDES: [Side; 3] = [Side::Conflicted, Side::Unstaged, Side::Staged];
+
+fn files_of(status: &WorkingStatus, side: Side) -> &[WorkingFile] {
+    match side {
+        Side::Conflicted => &status.conflicted,
+        Side::Unstaged => &status.unstaged,
+        Side::Staged => &status.staged,
+    }
+}
+
+fn side_id(side: Side) -> &'static str {
+    match side {
+        Side::Conflicted => "conflicted",
+        Side::Unstaged => "unstaged",
+        Side::Staged => "staged",
+    }
+}
+
+/// Whether the commit button is live. A merge commit is valid with nothing
+/// newly staged (the merge result is in the index already) but never while a
+/// path is unmerged, and a merge cannot be amended into.
+fn can_commit(merging: bool, amend: bool, staged: usize, conflicts: usize) -> bool {
+    if conflicts > 0 {
+        return false;
+    }
+    if merging {
+        return !amend;
+    }
+    amend || staged > 0
+}
+
+/// A merge banner is a warning while conflicts remain, plain info after.
+fn merge_banner_kind(conflicts: usize) -> BannerKind {
+    if conflicts > 0 {
+        BannerKind::Warn
+    } else {
+        BannerKind::Info
+    }
+}
+
+/// Reads the status and, while a merge is stopped, its branch and (only when
+/// `need_message`) its prepared message, which only the first status of a
+/// merge puts into the commit box.
+fn read_snapshot(repo: &Repo, need_message: bool) -> Result<Snapshot, String> {
+    let status = repo.working_status().map_err(|error| error.to_string())?;
+    let operation = repo.operation().map_err(|error| error.to_string())?;
+    let merge = match operation {
+        Operation::Merge | Operation::Squash => {
+            // A missing or odd message only costs the branch name / the prefill.
+            let (branch, message) = if need_message {
+                repo.merge_info(operation).unwrap_or_default()
+            } else if operation == Operation::Merge {
+                (repo.merge_heading().ok().flatten(), None)
+            } else {
+                (None, None)
+            };
+            Some(MergeInfo { branch, message })
+        }
+        _ => None,
+    };
+    Ok(Snapshot {
+        status,
+        merge,
+        operation,
+    })
+}
+
+/// Reads the work-tree file of a conflicted path off the UI thread.
+fn read_conflict(git: Arc<Git>, root: &Path, path: &str) -> Result<ConflictFile, String> {
+    let repo = Repo::open(git, root).map_err(|error| error.to_string())?;
+    let text = match repo.worktree_file(path) {
+        Ok(WorktreeFile::Text(text)) => text,
+        Ok(WorktreeFile::Binary) => {
+            return Ok(ConflictFile {
+                binary: true,
+                ..ConflictFile::default()
+            })
+        }
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConflictFile {
+                missing: true,
+                ..ConflictFile::default()
+            })
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let lines = conflict_lines(text.lines.iter().map(String::as_str));
+    let columns = lines
+        .iter()
+        .map(|line| line.text.chars().count())
+        .max()
+        .unwrap_or(0);
+    Ok(ConflictFile {
+        lines,
+        columns,
+        ..ConflictFile::default()
+    })
+}
+
+/// Classifies the lines of a file with conflict markers. A `=======` outside
+/// a `<<<<<<<` block is ordinary text; the diff3 base block (`|||||||` to
+/// `=======`) is left plain.
+fn conflict_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<ConflictLine> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Outside,
+        Ours,
+        Base,
+        Theirs,
+    }
+    let is_marker = |line: &str, marker: &str| {
+        line.strip_prefix(marker)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    };
+    let mut state = State::Outside;
+    lines
+        .into_iter()
+        .map(|line| {
+            let kind = if is_marker(line, "<<<<<<<") && state == State::Outside {
+                state = State::Ours;
+                ConflictKind::Marker
+            } else if is_marker(line, "|||||||") && state == State::Ours {
+                state = State::Base;
+                ConflictKind::Marker
+            } else if is_marker(line, "=======") && matches!(state, State::Ours | State::Base) {
+                state = State::Theirs;
+                ConflictKind::Marker
+            } else if is_marker(line, ">>>>>>>") && state == State::Theirs {
+                state = State::Outside;
+                ConflictKind::Marker
+            } else {
+                match state {
+                    State::Ours => ConflictKind::Ours,
+                    State::Theirs => ConflictKind::Theirs,
+                    State::Outside | State::Base => ConflictKind::Plain,
+                }
+            };
+            ConflictLine {
+                text: line.to_string().into(),
+                kind,
+            }
+        })
+        .collect()
+}
+
+fn conflict_width(cell: Pixels, columns: usize, pane: f32) -> Pixels {
+    let text = columns as f32 * f32::from(cell) + 24.;
+    px((DIFF_GUTTER + text).max(pane))
+}
+
 /// The glyph a working-tree file shows: untracked and conflicted files keep
 /// git's own letters instead of the change kind.
 fn status_letter(file: &WorkingFile) -> char {
@@ -1762,6 +2793,54 @@ fn status_letter(file: &WorkingFile) -> char {
     } else {
         file.kind.letter()
     }
+}
+
+/// Changed paths of the work tree, grouped the way the sidebar's view nav
+/// shows them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChangeCounts {
+    /// Added and untracked paths.
+    pub added: usize,
+    /// Modified, renamed, copied, type-changed and conflicted paths.
+    pub modified: usize,
+    pub deleted: usize,
+}
+
+impl ChangeCounts {
+    pub fn is_empty(self) -> bool {
+        self.added == 0 && self.modified == 0 && self.deleted == 0
+    }
+}
+
+/// Counts the unique changed paths in `status`: a path on both sides of the
+/// index counts once, with the unstaged kind when the two differ. `None`
+/// (status loading or failed) counts nothing.
+pub fn change_counts(status: Option<&WorkingStatus>) -> ChangeCounts {
+    let Some(status) = status else {
+        return ChangeCounts::default();
+    };
+    // The index is the older state of a path; the work tree overrides it.
+    let mut files: HashMap<&str, &WorkingFile> = HashMap::new();
+    for file in &status.staged {
+        files.insert(file.path.as_str(), file);
+    }
+    for file in &status.unstaged {
+        files.insert(file.path.as_str(), file);
+    }
+    for file in &status.conflicted {
+        files.insert(file.path.as_str(), file);
+    }
+    let mut counts = ChangeCounts::default();
+    for file in files.values() {
+        if file.untracked || file.kind == ChangeKind::Added {
+            counts.added += 1;
+        } else if file.kind == ChangeKind::Deleted {
+            counts.deleted += 1;
+        } else {
+            counts.modified += 1;
+        }
+    }
+    counts
 }
 
 /// The subject length and the longest body line, for the counters.
@@ -1993,9 +3072,137 @@ mod tests {
     }
 
     #[test]
+    fn change_counts_are_empty_without_a_status() {
+        assert_eq!(change_counts(None), ChangeCounts::default());
+        assert!(change_counts(Some(&WorkingStatus::default())).is_empty());
+    }
+
+    #[test]
+    fn change_counts_group_paths_by_kind() {
+        let status = WorkingStatus {
+            staged: vec![
+                working_file("a.txt", ChangeKind::Added, false),
+                working_file("b.txt", ChangeKind::Deleted, false),
+            ],
+            unstaged: vec![
+                working_file("c.txt", ChangeKind::Added, true),
+                working_file("d.txt", ChangeKind::Modified, false),
+                working_file("e.txt", ChangeKind::Renamed, false),
+                working_file("f.txt", ChangeKind::Other('U'), false),
+            ],
+            ..WorkingStatus::default()
+        };
+        assert_eq!(
+            change_counts(Some(&status)),
+            ChangeCounts {
+                added: 2,
+                modified: 3,
+                deleted: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn change_counts_count_a_path_on_both_sides_once() {
+        let status = WorkingStatus {
+            staged: vec![
+                working_file("a.txt", ChangeKind::Added, false),
+                working_file("b.txt", ChangeKind::Deleted, false),
+            ],
+            unstaged: vec![
+                working_file("a.txt", ChangeKind::Modified, false),
+                working_file("b.txt", ChangeKind::Modified, false),
+            ],
+            ..WorkingStatus::default()
+        };
+        // The work tree's kind wins: both paths count as modified, once each.
+        assert_eq!(
+            change_counts(Some(&status)),
+            ChangeCounts {
+                added: 0,
+                modified: 2,
+                deleted: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn conflicted_paths_count_once_as_modified() {
+        let status = WorkingStatus {
+            conflicted: vec![working_file("c.txt", ChangeKind::Other('U'), false)],
+            ..WorkingStatus::default()
+        };
+        assert_eq!(
+            change_counts(Some(&status)),
+            ChangeCounts {
+                added: 0,
+                modified: 1,
+                deleted: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn the_merge_banner_warns_until_the_last_conflict_is_gone() {
+        assert_eq!(merge_banner_kind(2), BannerKind::Warn);
+        assert_eq!(merge_banner_kind(1), BannerKind::Warn);
+        assert_eq!(merge_banner_kind(0), BannerKind::Info);
+    }
+
+    #[test]
+    fn an_untouched_prefill_is_cleared_but_an_edited_one_is_kept() {
+        let prefill = "Merge branch 'side'";
+        assert!(prefill_untouched("Merge branch 'side'\n", prefill));
+        assert!(!prefill_untouched("Merge branch 'side' + notes", prefill));
+        assert!(!prefill_untouched("", prefill));
+    }
+
+    #[test]
+    fn commit_rules_for_plain_amend_and_merge() {
+        // Plain: needs something staged, or an amend.
+        assert!(!can_commit(false, false, 0, 0));
+        assert!(can_commit(false, false, 2, 0));
+        assert!(can_commit(false, true, 0, 0));
+        // A merge commits with nothing newly staged, but not amended.
+        assert!(can_commit(true, false, 0, 0));
+        assert!(!can_commit(true, true, 0, 0));
+        // Unmerged paths block everything.
+        assert!(!can_commit(true, false, 3, 1));
+        assert!(!can_commit(false, false, 3, 1));
+    }
+
+    #[test]
+    fn conflict_markers_and_both_sides_are_classified() {
+        use ConflictKind::*;
+        let text = "top\n<<<<<<< HEAD\nours\n||||||| base\nold\n=======\ntheirs\n>>>>>>> side\nbottom\n=======\n";
+        let kinds: Vec<_> = conflict_lines(text.lines())
+            .into_iter()
+            .map(|l| l.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [Plain, Marker, Ours, Marker, Plain, Marker, Theirs, Marker, Plain, Plain]
+        );
+        assert!(conflict_lines("".lines()).is_empty());
+    }
+
+    #[test]
     fn a_single_line_diff_is_never_narrower_than_the_pane() {
         assert!(diff_width(px(7.), 4, 400.) >= px(400.));
         assert!(split_width(400.) >= px(400.));
+    }
+
+    /// A changed file of `path`, for the counter tests.
+    fn working_file(path: &str, kind: ChangeKind, untracked: bool) -> WorkingFile {
+        WorkingFile {
+            kind,
+            old_path: None,
+            path: path.into(),
+            added: 1,
+            deleted: 0,
+            binary: false,
+            untracked,
+        }
     }
 
     /// Writes `content` to `file` under `dir`, creating parent directories.
@@ -2073,6 +3280,50 @@ mod tests {
             .update(|window, _| window.root::<ChangesView>().flatten())
             .expect("the changes view is the window root");
         (cx, view)
+    }
+
+    /// While a reload runs the last loaded status stays readable, so counts and
+    /// the merge banner do not flash to zero ("all resolved").
+    #[gpui::test]
+    fn counts_survive_a_reload(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-reload");
+        write(repo.path(), "a.txt", "one\n");
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "one"]);
+        write(repo.path(), "a.txt", "two\n");
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.read_with(&cx, |view, _| assert_eq!(view.unstaged_count(), 1));
+        view.update(&mut cx, |view, cx| view.start_status(cx));
+        view.read_with(&cx, |view, _| {
+            assert!(view.is_loading());
+            assert_eq!(view.unstaged_count(), 1);
+            assert_eq!(view.dirty_count(), 1);
+            // Rendered lists and selection stay empty while loading.
+            assert!(view.status().is_none());
+        });
+        cx.update(|window, _| window.refresh());
+        assert!(
+            cx.debug_bounds("changes-unstaged-0").is_none(),
+            "the file list showed rows while loading"
+        );
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert!(!view.is_loading()));
+
+        // A failed reload keeps the last snapshot too.
+        view.update(&mut cx, |view, cx| {
+            view.set_status(view.generation, None, Err("boom".into()), cx)
+        });
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.failure(), Some("boom"));
+            assert_eq!(view.unstaged_count(), 1);
+            assert!(view.status().is_none());
+        });
+        cx.update(|window, _| window.refresh());
+        assert!(
+            cx.debug_bounds("changes-unstaged-0").is_none(),
+            "the file list showed rows after a failed read"
+        );
     }
 
     /// Space on a focused file row stages the selected file; Ctrl+Shift+Z asks
@@ -2177,6 +3428,587 @@ mod tests {
         view.read_with(&cx, |view, _| {
             assert_eq!(view.staged_count(), 0);
             assert_eq!(view.unstaged_count(), 2);
+        });
+    }
+
+    /// A stopped merge: each conflicted path is listed once in its own group,
+    /// the merge message fills the commit box, resolving every path lets the
+    /// merge commit through, and the banner is gone afterwards.
+    #[gpui::test]
+    fn a_stopped_merge_lists_conflicts_once_and_commits_after_resolving(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = crate::test_support::TempRepo::new("changes-merge");
+        let dir = repo.path();
+        write(dir, "a.txt", "base\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        write(dir, "a.txt", "main\n");
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", "side\n");
+        write(dir, "new.txt", "new\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        let outcome = Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::FastForwardIfPossible)
+            .unwrap();
+        assert!(matches!(outcome, git_core::MergeOutcome::Stopped { .. }));
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.read_with(&cx, |view, cx| {
+            let status = view.status().expect("loaded");
+            let conflicted: Vec<_> = status.conflicted.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(conflicted, ["a.txt"]);
+            assert!(status.unstaged.is_empty(), "{:?}", status.unstaged);
+            let staged: Vec<_> = status.staged.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(staged, ["new.txt"]);
+            assert_eq!(
+                view.selection,
+                Some(Selection {
+                    side: Side::Conflicted,
+                    index: 0
+                })
+            );
+            assert_eq!(
+                view.merge.as_ref().and_then(|m| m.branch.as_deref()),
+                Some("side")
+            );
+            assert!(view
+                .message
+                .read(cx)
+                .text()
+                .starts_with("Merge branch 'side'"));
+            let DiffState::Conflict(file) = &view.diff else {
+                panic!("the conflicted file did not load: {:?}", view.diff);
+            };
+            assert!(file
+                .lines
+                .iter()
+                .any(|line| line.kind == ConflictKind::Marker));
+        });
+        assert!(cx.debug_bounds("merge-banner").is_some(), "no banner");
+        assert!(cx.debug_bounds("changes-conflicted-0").is_some());
+
+        // A menu opened on a row that is gone by click time must not act on
+        // whatever now sits at that index: a stale path does nothing.
+        view.update(&mut cx, |view, cx| {
+            view.resolve_conflict("gone.txt".into(), Resolve::MarkResolved, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.conflicted_count(), 1);
+            assert_eq!(view.staged_count(), 1, "the stale path staged something");
+        });
+
+        // Space must not mark a conflicted path resolved.
+        view.update(&mut cx, |view, cx| view.stage_selected(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert_eq!(view.conflicted_count(), 1));
+
+        view.update(&mut cx, |view, cx| {
+            view.resolve_conflict("a.txt".into(), Resolve::Take(ConflictSide::Theirs), cx)
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.conflicted_count(), 0);
+            assert!(view.merge.is_some());
+            assert!(can_commit(true, false, view.staged_count(), 0));
+        });
+        view.update_in(&mut cx, |view, window, cx| view.commit(window, cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(view.merge.is_none());
+            assert_eq!(view.staged_count(), 0);
+        });
+        assert!(cx.debug_bounds("merge-banner").is_none());
+        let repo = Repo::open(crate::test_support::git(), dir).unwrap();
+        assert_eq!(repo.operation().unwrap(), Operation::None);
+    }
+
+    /// While the conflict editor covers the lists, the hidden lists do not
+    /// react: a status refresh loads no diff, the arrow-key selection does not
+    /// move; closing the editor catches the diff pane up with the selection.
+    #[gpui::test]
+    fn the_hidden_lists_stay_still_while_the_conflict_editor_is_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = crate::test_support::TempRepo::new("changes-editor-hidden");
+        let dir = repo.path();
+        write(dir, "a.txt", "1\n2\n3\n");
+        write(dir, "z.txt", "z\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        write(dir, "a.txt", "1\nmain\n3\n");
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", "1\nside\n3\n");
+        git(dir, &["commit", "-q", "-am", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        let outcome = Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::FastForwardIfPossible)
+            .unwrap();
+        assert!(matches!(outcome, git_core::MergeOutcome::Stopped { .. }));
+        // An unstaged change gives the lists a second row to move to.
+        write(dir, "z.txt", "z2\n");
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_conflict_editor("a.txt".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let (selection, generation) =
+            view.read_with(&cx, |view, _| (view.selection, view.diff_generation));
+        assert_eq!(selection.map(|s| s.side), Some(Side::Conflicted));
+
+        view.update(&mut cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| view.step_selection(1, cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(view.editor.is_some());
+            assert_eq!(view.diff_generation, generation, "no diff while hidden");
+            assert_eq!(view.selection, selection, "the selection did not move");
+        });
+
+        // Closing the editor loads the diff of the (unchanged) selection.
+        let editor = view.read_with(&cx, |view, _| view.editor.as_ref().unwrap().0.clone());
+        editor.update(&mut cx, |editor, cx| editor.cancel(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(view.editor.is_none());
+            assert_eq!(view.selection, selection);
+            assert_ne!(view.diff_generation, generation, "the diff pane caught up");
+        });
+    }
+
+    /// A merge of `a.txt` (`one` on main, `two` on side) that stops with a conflict.
+    fn conflicted_a_txt(name: &str) -> crate::test_support::TempRepo {
+        let repo = crate::test_support::TempRepo::new(name);
+        let dir = repo.path();
+        git(dir, &["config", "core.autocrlf", "false"]);
+        write(dir, "a.txt", "1\nbase\n3\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        write(dir, "a.txt", "1\none\n3\n");
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", "1\ntwo\n3\n");
+        git(dir, &["commit", "-q", "-am", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        let outcome = Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::FastForwardIfPossible)
+            .unwrap();
+        assert!(matches!(outcome, git_core::MergeOutcome::Stopped { .. }));
+        repo
+    }
+
+    /// Work done outside the editor is not overwritten silently: a file that
+    /// changed after the merge warns at load and asks before saving; one that
+    /// changed while the editor was open is not written and is reloaded; one
+    /// whose merge was aborted is not written either.
+    #[gpui::test]
+    fn the_conflict_editor_protects_work_done_elsewhere(cx: &mut gpui::TestAppContext) {
+        let repo = conflicted_a_txt("changes-editor-outside");
+        let dir = repo.path();
+        let ours = git_core::ConflictResolution::Picked(vec![ConflictSide::Ours]);
+
+        // rerere / an IDE changed the file after the merge, before the editor.
+        write(dir, "a.txt", "1\nresolved by rerere\n3\n");
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_conflict_editor("a.txt".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let editor = view.read_with(&cx, |view, _| view.editor.as_ref().unwrap().0.clone());
+        editor.read_with(&cx, |editor, _| assert!(editor.changed_after_merge()));
+        cx.simulate_keystrokes("alt-1");
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.resolution(0), Some(&ours))
+        });
+        // Save asks first and writes nothing yet.
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+        editor.read_with(&cx, |editor, _| assert!(editor.confirming()));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "1\nresolved by rerere\n3\n"
+        );
+        editor.update(&mut cx, |editor, cx| editor.accept_confirm(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "1\none\n3\n"
+        );
+        view.read_with(&cx, |view, _| assert!(view.editor.is_none()));
+    }
+
+    #[gpui::test]
+    fn a_file_changed_while_the_editor_is_open_is_not_overwritten(cx: &mut gpui::TestAppContext) {
+        let repo = conflicted_a_txt("changes-editor-changed-open");
+        let dir = repo.path();
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_conflict_editor("a.txt".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let editor = view.read_with(&cx, |view, _| view.editor.as_ref().unwrap().0.clone());
+        editor.read_with(&cx, |editor, _| assert!(!editor.changed_after_merge()));
+        cx.simulate_keystrokes("alt-1");
+        write(dir, "a.txt", "1\nedited meanwhile\n3\n");
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+        // Nothing was written; the editor is open again on the file as it is.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "1\nedited meanwhile\n3\n"
+        );
+        view.read_with(&cx, |view, _| {
+            assert!(view.editor.is_some());
+            assert_eq!(view.conflicted_count(), 1);
+        });
+        editor.read_with(&cx, |editor, _| {
+            assert!(editor.changed_after_merge(), "reloaded: now it warns");
+            assert!(!editor.can_save(), "the picks were dropped by the reload");
+        });
+    }
+
+    #[gpui::test]
+    fn saving_after_the_merge_was_aborted_writes_nothing(cx: &mut gpui::TestAppContext) {
+        let repo = conflicted_a_txt("changes-editor-aborted");
+        let dir = repo.path();
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_conflict_editor("a.txt".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let editor = view.read_with(&cx, |view, _| view.editor.as_ref().unwrap().0.clone());
+        cx.simulate_keystrokes("alt-2");
+        git(dir, &["merge", "--abort"]);
+        let after_abort = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            after_abort
+        );
+        // No merge left: the status read closes the editor.
+        view.read_with(&cx, |view, _| assert!(view.editor.is_none()));
+        drop(editor);
+    }
+
+    /// The conflict editor end to end on a real merge: two conflicts in
+    /// `a.txt`, one in `b.txt`. Picks rebuild the file, save writes and stages
+    /// it and moves to the next conflicted file, Esc with picks asks first, and
+    /// resolving the last file hands the view back.
+    #[gpui::test]
+    fn the_conflict_editor_resolves_files_in_turn(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-editor");
+        let dir = repo.path();
+        let base = "a1\none\na2\na3\na4\na5\na6\ntwo\na7\n";
+        write(dir, "a.txt", base);
+        write(dir, "b.txt", "x\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        let edit = |one: &str, two: &str| base.replace("one", one).replace("two", two);
+        write(dir, "a.txt", edit("one-main", "two-main"));
+        write(dir, "b.txt", "x-main\n");
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", edit("one-side", "two-side"));
+        write(dir, "b.txt", "x-side\n");
+        git(dir, &["commit", "-q", "-am", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        let outcome = Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::FastForwardIfPossible)
+            .unwrap();
+        assert!(matches!(outcome, git_core::MergeOutcome::Stopped { .. }));
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_conflict_editor("a.txt".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let editor = view.read_with(&cx, |view, _| {
+            view.editor.as_ref().expect("the editor opened").0.clone()
+        });
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.path(), "a.txt");
+            assert_eq!(editor.counts(), Some((2, 2)));
+            assert!(!editor.can_save(), "save must wait for every conflict");
+        });
+
+        // Save is a no-op while a conflict is open.
+        editor.update(&mut cx, |editor, cx| editor.save(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert_eq!(view.conflicted_count(), 2));
+
+        // Alt+1 toggles ours on the focused (first) conflict.
+        cx.simulate_keystrokes("alt-1");
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.focused(), Some(0));
+            assert_eq!(
+                editor.resolution(0),
+                Some(&git_core::ConflictResolution::Picked(vec![
+                    ConflictSide::Ours
+                ]))
+            );
+        });
+        // Second conflict: theirs ticked first, then ours.
+        editor.update(&mut cx, |editor, cx| {
+            editor.toggle_pick(1, ConflictSide::Theirs, cx);
+            editor.toggle_pick(1, ConflictSide::Ours, cx);
+        });
+        editor.read_with(&cx, |editor, _| assert!(editor.can_save()));
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+
+        let saved = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        assert_eq!(
+            saved,
+            "a1\none-main\na2\na3\na4\na5\na6\ntwo-side\ntwo-main\na7\n"
+        );
+        view.read_with(&cx, |view, _| {
+            let status = view.status().expect("loaded");
+            let conflicted: Vec<_> = status.conflicted.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(conflicted, ["b.txt"]);
+            assert!(status.staged.iter().any(|f| f.path == "a.txt"));
+        });
+        // The editor moved on to the next conflicted file by itself.
+        let editor = view.read_with(&cx, |view, _| {
+            view.editor.as_ref().expect("still open").0.clone()
+        });
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.path(), "b.txt");
+            assert_eq!(editor.counts(), Some((1, 1)));
+        });
+
+        // Esc without picks would leave at once; with a pick it asks first.
+        editor.update(&mut cx, |editor, cx| {
+            editor.toggle_pick(0, ConflictSide::Theirs, cx)
+        });
+        cx.simulate_keystrokes("escape");
+        editor.read_with(&cx, |editor, _| assert!(editor.confirming()));
+        view.read_with(&cx, |view, _| assert!(view.editor.is_some()));
+        // A second Esc is "Keep editing".
+        cx.simulate_keystrokes("escape");
+        editor.read_with(&cx, |editor, _| assert!(!editor.confirming()));
+
+        editor.update(&mut cx, |editor, cx| editor.save(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(view.editor.is_none(), "the last file closes the editor");
+            assert_eq!(view.conflicted_count(), 0);
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+            "x-side\n"
+        );
+    }
+
+    /// Hand-editing the result: F2 opens the text area (untouched, the region
+    /// stays a pick), typing makes it a hand edit that locks the picks, Esc
+    /// stops editing without leaving the editor, Reset restores the picks,
+    /// take-all asks before replacing an edit, and save writes the edit with
+    /// the file's own line endings.
+    #[gpui::test]
+    fn the_conflict_editor_edits_the_result_by_hand(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-editor-custom");
+        let dir = repo.path();
+        git(dir, &["config", "core.autocrlf", "false"]);
+        let file = |middle: &str| format!("a\r\n{middle}\r\nb\r\n");
+        write(dir, "a.txt", file("one"));
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        write(dir, "a.txt", file("one-main"));
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", file("one-side"));
+        git(dir, &["commit", "-q", "-am", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        let outcome = Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::FastForwardIfPossible)
+            .unwrap();
+        assert!(matches!(outcome, git_core::MergeOutcome::Stopped { .. }));
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_conflict_editor("a.txt".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let editor = view.read_with(&cx, |view, _| {
+            view.editor.as_ref().expect("the editor opened").0.clone()
+        });
+        let ours = git_core::ConflictResolution::Picked(vec![ConflictSide::Ours]);
+        let custom = |text: &str| git_core::ConflictResolution::Custom(text.to_owned());
+
+        // Alt+1, then F2: the text area opens on the picked lines; opening it
+        // does not make the region a hand edit.
+        cx.simulate_keystrokes("alt-1");
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        editor.read_with(&cx, |editor, cx| {
+            assert_eq!(editor.editing(), Some(0));
+            assert_eq!(editor.resolution(0), Some(&ours));
+            assert_eq!(editor.edit_area().unwrap().read(cx).text(), "one-main");
+        });
+
+        // The editor's Alt keys are not for the text area: pressing one while
+        // typing neither toggles a pick nor leaves the text area.
+        cx.simulate_keystrokes("alt-2 alt-down alt-up");
+        cx.run_until_parked();
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.editing(), Some(0));
+            assert_eq!(editor.resolution(0), Some(&ours));
+        });
+
+        // Typing makes the region a hand edit: resolved, picks locked.
+        let area = editor.read_with(&cx, |editor, _| editor.edit_area().unwrap());
+        area.update(&mut cx, |area, cx| area.set_text("first\nsecond", cx));
+        cx.run_until_parked();
+        editor.update(&mut cx, |editor, cx| {
+            editor.toggle_pick(0, ConflictSide::Theirs, cx)
+        });
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.resolution(0), Some(&custom("first\nsecond")));
+            assert!(editor.can_save());
+        });
+
+        // Esc in the text area only stops editing: the editor stays open and
+        // nothing asks for a confirmation.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.editing(), None);
+            assert!(!editor.confirming());
+            assert_eq!(editor.resolution(0), Some(&custom("first\nsecond")));
+        });
+        view.read_with(&cx, |view, _| assert!(view.editor.is_some()));
+
+        // Reset to picks brings the tick back.
+        editor.update(&mut cx, |editor, cx| editor.reset_picks(0, cx));
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.resolution(0), Some(&ours));
+        });
+
+        // Edit again; "take theirs for all" must ask before replacing it.
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        let area = editor.read_with(&cx, |editor, _| editor.edit_area().unwrap());
+        area.update(&mut cx, |area, cx| area.set_text("hand edit", cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        editor.update(&mut cx, |editor, cx| {
+            editor.request_take_all(ConflictSide::Theirs, cx)
+        });
+        editor.read_with(&cx, |editor, _| {
+            assert!(editor.confirming());
+            assert_eq!(editor.resolution(0), Some(&custom("hand edit")));
+        });
+        // Esc is "Keep editing".
+        cx.simulate_keystrokes("escape");
+        editor.read_with(&cx, |editor, _| {
+            assert!(!editor.confirming());
+            assert_eq!(editor.resolution(0), Some(&custom("hand edit")));
+        });
+
+        // Ctrl+S saves the edit with the file's CRLF endings.
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "a\r\nhand edit\r\nb\r\n"
+        );
+        view.read_with(&cx, |view, _| {
+            assert!(view.editor.is_none(), "the last file closes the editor");
+            assert_eq!(view.conflicted_count(), 0);
+        });
+    }
+
+    /// A conflicted squash has no `MERGE_HEAD`: it still gets the banner, the
+    /// squash message prefill and an abort that works.
+    #[gpui::test]
+    fn a_conflicted_squash_shows_the_banner_and_aborts(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-squash");
+        let dir = repo.path();
+        write(dir, "a.txt", "base\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        write(dir, "a.txt", "main\n");
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", "side\n");
+        git(dir, &["commit", "-q", "-am", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::Squash)
+            .unwrap();
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(view.operation(), Operation::Squash);
+            assert!(view.merge.is_some() && view.squashing());
+            assert!(view
+                .message
+                .read(cx)
+                .text()
+                .starts_with("Squashed commit of the following"));
+            // A squash commits like a plain commit, not like a merge.
+            assert!(!view.merging());
+        });
+        assert!(cx.debug_bounds("merge-banner").is_some(), "no banner");
+        view.update(&mut cx, |view, cx| view.abort_merge(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert!(view.merge.is_none());
+            assert_eq!(view.operation(), Operation::None);
+            assert_eq!(view.message.read(cx).text(), "");
+        });
+        assert!(!dir.join(".git/SQUASH_MSG").exists());
+    }
+
+    /// Aborting a merge removes the untouched prefilled message again.
+    #[gpui::test]
+    fn aborting_a_merge_clears_the_prefilled_message(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-abort");
+        let dir = repo.path();
+        write(dir, "a.txt", "base\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        write(dir, "a.txt", "main\n");
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", "side\n");
+        git(dir, &["commit", "-q", "-am", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::FastForwardIfPossible)
+            .unwrap();
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.read_with(&cx, |view, cx| {
+            assert!(view.message.read(cx).text().starts_with("Merge branch"));
+        });
+        view.update(&mut cx, |view, cx| view.abort_merge(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert!(view.merge.is_none());
+            assert_eq!(view.message.read(cx).text().to_string(), "");
         });
     }
 

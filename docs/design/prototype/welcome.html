@@ -11,6 +11,7 @@
   .wl aside { padding: 28px 24px; border-right: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; gap: 8px; }
   .logo { display: flex; align-items: center; gap: 10px; font-size: var(--fs-xl); font-weight: 700; margin-bottom: 4px; }
   .act { display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--bg); cursor: default; width: 100%; text-align: left; }
+  .wl aside > .od-fill { flex: 1 1 0; }
   .act:hover { background: var(--hover); } .act .kbd { margin-left: auto; }
   .wl main { padding: 20px 24px; display: flex; flex-direction: column; min-height: 0; gap: 12px; }
   .recent { overflow: auto; flex: 1; min-height: 0; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); outline: none; }
@@ -38,11 +39,13 @@
     <div class="wl"><aside><div class="logo">${G.logo(26)}GitWarp</div><div class="muted" style="margin-bottom:16px">A fast, keyboard-first git client.</div>
       <button class="act" id="open" data-tip="Open an existing repository">${ic('folder', 16)}Open repository…<span class="kbd">Ctrl O</span></button>
       <button class="act" id="clone" data-tip="Clone a repository from a URL">${ic('clone', 16)}Clone repository…<span class="kbd">Ctrl Shift O</span></button>
-      <button class="act" id="init" data-tip="Create a new repository">${ic('init', 16)}Init new repository…<span class="kbd">Ctrl N</span></button></aside>
+      <button class="act" id="init" data-tip="Create a new repository">${ic('init', 16)}Init new repository…<span class="kbd">Ctrl N</span></button>
+      <span class="od-fill"></span>
+      <button class="act" id="settings" data-tip="Open Settings">${ic('gear', 16)}Settings<span class="kbd">Ctrl ,</span></button></aside>
     <main><div class="od-row"><h2 style="margin:0;font-size:var(--fs-lg)" class="od-fill">Recent repositories</h2><label class="input-wrap" style="width:240px">${ic('search', 14)}<input class="input" id="flt" placeholder="Filter recent…" aria-label="Filter recent repositories"></label></div>
       <div class="recent" id="recent" role="listbox" tabindex="0" aria-label="Recent repositories"></div>
       <div class="muted" style="font-size:12px"><span class="kbd">↑</span> <span class="kbd">↓</span> select · <span class="kbd">Enter</span> open · <span class="kbd">Del</span> remove from list</div></main></div>
-    <footer class="statusbar"><span class="od-fill"></span><span class="sb-btn" id="gitlabel"></span></footer></div>`);
+    <footer class="statusbar"><span class="sb-btn" id="appver" data-tip="GitWarp version">GitWarp v0.3.0</span><span class="od-fill"></span><span class="sb-btn" id="gitlabel"></span></footer></div>`);
   stage.firstChild.appendChild(win);
   G.initTips(win);
   const list = win.querySelector('#recent'); let sel_ = 0, rec = R.slice();
@@ -74,6 +77,10 @@
   document.getElementById('scn').addEventListener('change', scn);
   win.querySelector('#clone').onclick = () => D.repo(win, { tab: 'clone' });
   win.querySelector('#init').onclick = () => D.initRepo(win, {});
+  /* Settings lives on its own design page; the main window opens it as a modal, the welcome screen navigates to it */
+  const openSettings = () => { location.href = 'settings-general.html'; };
+  win.querySelector('#settings').onclick = openSettings;
+  addEventListener('keydown', (e) => { if (e.ctrlKey && !e.shiftKey && e.key === ',') { e.preventDefault(); openSettings(); } });
   win.querySelector('#open').onclick = () => D.repo(win, { tab: 'open' });
   addEventListener('keydown', (e) => { if (!e.ctrlKey || e.shiftKey) return; if (e.key.toLowerCase() === 'n') { e.preventDefault(); D.initRepo(win, {}); } });
   draw(); gl();

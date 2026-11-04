@@ -33,6 +33,9 @@
         S.row('Fetch remotes automatically', 'Keeps ahead/behind counts and the graph current without touching your working tree.', S.sw('fetch-auto', fetchOn, 'Fetch remotes automatically')),
         S.row('Interval', fetchOn ? 'Fetch pauses while the window is in the background.' : 'Automatic fetch is off.', S.sel('fetch-int', S.get('fetch-int', '5'), EVERY, 'Fetch interval', !fetchOn), '', !fetchOn)
       ])}
+      ${S.group('Commit activity', [
+        S.row('Show activity statistics', 'The commit heatmap on the Welcome screen and above History. Hiding it does not delete any data.', S.sw('show-activity', S.get('show-activity', true), 'Show activity statistics'))
+      ])}
       ${S.group('Ask before…', [
         S.row('Force push', 'Rewrites remote history; always shows which commits will be lost.', S.chk('cf-force', S.get('cf-force', true), 'Confirm')),
         S.row('Discarding changes', 'Discarded edits cannot be recovered.', S.chk('cf-discard', S.get('cf-discard', true), 'Confirm')),

@@ -612,7 +612,7 @@ fn strip_ab_prefix(path: &str) -> String {
 }
 
 /// `@@ -a,b +c,d @@ section` → the four numbers.
-fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32, u32)> {
+pub(crate) fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32, u32)> {
     let rest = header.strip_prefix("@@ ")?;
     let (ranges, _) = rest.split_once(" @@")?;
     let mut parts = ranges.split(' ');
