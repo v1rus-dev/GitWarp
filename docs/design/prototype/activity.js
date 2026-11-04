@@ -198,7 +198,12 @@
     pageHost.innerHTML = '<div class="winwrap"></div>';
     document.getElementById('act-cap').innerHTML = S.variant === 'A' ? CAP_A : CAP_B;
     (S.variant === 'A' ? variantA : variantB)(pageHost.firstChild);
+    /* Settings → Appearance → "Show activity statistics" (stored by settings.js as gl-set-show-activity; default on).
+       Off hides the Welcome card / History strip; the data and the Placement/State controls of this page stay. */
+    let on = true; try { on = JSON.parse(localStorage.getItem('gl-set-show-activity') ?? 'true') !== false; } catch (e) {}
+    if (!on) pageHost.querySelectorAll('.act-strip, .wact-sec, .dayfilter').forEach((n) => { n.hidden = true; n.style.display = 'none'; });
   }
+  addEventListener('storage', (e) => { if (e.key === 'gl-set-show-activity') render(); });
 
   /* ---------- the strip/card body shared by A and B per state ---------- */
   function body(o) {

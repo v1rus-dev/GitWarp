@@ -187,7 +187,7 @@
     const f = st.failed;
     return { title: 'Clone repository', icon: 'clone', width: 560, body: `<div class="od-stack" style="--od-gap:12px">
       ${D.f('Repository URL', 'url', D.in('url', st.url, 'https://host/user/repo.git', { err: urlErr, mono: 1 }) + (urlErr ? `<div class="field-error" id="url-e">${ic('err', 12)}<span>${esc(urlErr)}</span></div>` : ''), { req: 1, help: proto ? `<span class="od-row" style="gap:6px;color:var(--muted)">${ic(proto[0], 12)}${proto[1]}</span>` : '' })}
-      <div class="od-row" style="align-items:flex-start;gap:12px"><div style="flex:1;min-width:0">${D.f('Folder', 'dest', D.in('dest', st.dest, '~/develop', { mono: 1 }), { req: 1 })}</div><div style="width:200px">${D.f('Folder name', 'name', D.in('name', name, 'repo', { err: nameErr, mono: 1 }), { req: 1, err: nameErr })}</div></div>
+      <div class="od-row" style="align-items:flex-start;gap:12px"><div style="flex:1;min-width:0">${D.f('Folder', 'dest', `<div class="od-row">${D.in('dest', st.dest, '~/develop', { mono: 1 })}${D.btn('Browse…', { act: 'browse', icon: 'folder' })}</div>`, { req: 1 })}</div><div style="width:200px">${D.f('Folder name', 'name', D.in('name', name, 'repo', { err: nameErr, mono: 1 }), { req: 1, err: nameErr })}</div></div>
       <div class="od-row" style="align-items:flex-start;gap:12px"><div style="flex:1;min-width:0">${D.f('Branch (optional)', 'branch', D.in('branch', st.branch, 'Default branch'))}</div><div style="width:96px">${D.f('Depth', 'depth', D.in('depth', st.depth, '1', { err: depthBad, mono: 1 }), { err: depthBad ? 'Use a number above 0.' : '' })}</div></div>
       <div class="od-stack" style="--od-gap:6px">${D.chk('recurse', st.recurse, 'Clone submodules recursively')}${D.chk('shallow', st.shallow, 'Shallow clone — only recent history')}</div></div>
       ${f ? D.banner(f.cancelled ? 'info' : 'error', f.cancelled ? 'Clone cancelled' : 'Clone failed', esc(f.text).replace(/\n/g, '<br>')) : ''}`,
@@ -251,6 +251,7 @@
       st, width: 560, view: cloneView, busy: (s) => s.phase === 'cloning',
       onInput: (s, k) => { if (k === 'name') s.nameEdited = true; },
       actions: {
+        browse: (s, api) => { api.toast('Native-style folder picker opens here (custom-drawn dialog in GPUI)', 'info'); return false; },
         clone: (s, api) => { s.phase = 'cloning'; s.pct = null; s.failed = null; startClone(api); },
         cancelClone: (s, api) => { s.cancelling = true; startClone(api); },
         clearFail: (s) => { s.failed = null; },
