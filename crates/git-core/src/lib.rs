@@ -53,7 +53,10 @@ pub use ops::{MergeOutcome, MergePreview, MergeType, Operation, PreviewUnavailab
 pub use refs::{Head, Ref, RefKind};
 pub use runner::{DiscoveredRepo, GitRunner};
 pub use stash::Stash;
-pub use status::{ChangedEntry, ConflictSide, HeadCommit, HunkPick, WorkingFile, WorkingStatus};
+pub use status::{
+    ChangedEntry, ConflictSide, HeadCommit, HunkPick, WorkingFile, WorkingStatus, WorktreeFile,
+    WorktreeText,
+};
 pub use submodule::{Submodule, SubmoduleState};
 pub use worktree::Worktree;
 
@@ -463,6 +466,12 @@ impl Repo {
         status::untracked_diff(self, path)
     }
 
+    /// A work-tree file (repo-relative `path`) read for display, with the same
+    /// size cap and binary check as [`Self::untracked_diff`].
+    pub fn worktree_file(&self, path: &str) -> Result<WorktreeFile> {
+        status::worktree_file(self, path)
+    }
+
     /// Stages the picked hunks/lines of one unstaged file.
     pub fn stage_selection(
         &self,
@@ -606,9 +615,16 @@ impl Repo {
 
     /// The prepared commit message of the operation in progress: `MERGE_MSG`
     /// for a merge, `SQUASH_MSG` for a squash, without comment lines (per
-    /// `core.commentChar`). `None` for any other state.
-    pub fn prepared_message(&self) -> Result<Option<String>> {
-        ops::prepared_message(self)
+    /// `core.commentChar`). `None` for any other state. `operation` is the
+    /// already-known [`Repo::operation`].
+    pub fn prepared_message(&self, operation: Operation) -> Result<Option<String>> {
+        ops::prepared_message(self, operation)
+    }
+
+    /// `(merge_heading, prepared_message)` for the known `operation`, reading
+    /// the message file once. The heading is only set for a merge.
+    pub fn merge_info(&self, operation: Operation) -> Result<(Option<String>, Option<String>)> {
+        ops::merge_info(self, operation)
     }
 
     /// Applies `oid` on top of HEAD; a conflict is aborted and returned.

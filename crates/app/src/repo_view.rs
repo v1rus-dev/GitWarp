@@ -849,10 +849,19 @@ impl RepositoryView {
                 ChangesEvent::PushAfterCommit => this.push_branch(window, cx),
                 // `merge --abort` does not move HEAD: the sidebar, the worktree
                 // status and the badges are enough, not a history walk.
-                ChangesEvent::MergeAborted => this.after_ref_change(RefChange::RefsOnly, cx),
+                // `abort_merge` already applied a fresh status, so Changes is not re-read.
+                ChangesEvent::MergeAborted => {
+                    this.after_ref_change_with(RefChange::RefsOnly, false, cx)
+                }
             },
         );
-        let changes_redraw = cx.observe(&changes, |_, _, cx| cx.notify());
+        let changes_redraw = cx.observe(&changes, |this, changes, cx| {
+            // The History's menus need the operation the Changes view read.
+            let operation = changes.read(cx).operation();
+            this.history
+                .update(cx, |history, _| history.set_operation(operation));
+            cx.notify();
+        });
         let worktrees_model =
             cx.new(|cx| WorktreesModel::new(path.clone(), git.clone(), workspace.clone(), cx));
         let worktrees = cx.new(|cx| WorktreesView::new(worktrees_model.clone(), window, cx));
@@ -1434,6 +1443,7 @@ impl RepositoryView {
                 history.head(),
                 self.sidebar_extras.as_ref(),
                 history.refs(),
+                self.changes.read(cx).operation(),
             )
         };
         match action {
@@ -1455,13 +1465,17 @@ impl RepositoryView {
         cx: &mut Context<Self>,
     ) {
         let links = self.host_links(cx);
-        let extras = SidebarExtras {
-            operation: self.changes.read(cx).operation(),
-            ..self.sidebar_extras.clone().unwrap_or_default()
-        };
+        let operation = self.changes.read(cx).operation();
         let mut model = {
             let history = self.history.read(cx);
-            sidebar_menu_with_links(key, history.head(), Some(&extras), history.refs(), &links)
+            sidebar_menu_with_links(
+                key,
+                history.head(),
+                self.sidebar_extras.as_ref(),
+                history.refs(),
+                &links,
+                operation,
+            )
         };
         // "Create pull request…" for a local branch when a remote can take one.
         if let Some(branch) = key.strip_prefix("local:") {
@@ -2416,12 +2430,9 @@ impl RepositoryView {
             // The menu disables Merge without a branch checked out.
             _ => return,
         };
-        // Git refuses a merge while another operation is stopped. The sidebar
-        // menu is disabled then; the History badge menus (history_view.rs) do
-        // not know the operation, so this entry point sends the user to the
-        // Changes banner instead of opening a dialog that can only fail.
+        // Git refuses a merge while another operation is stopped; the menus
+        // disable Merge then, so this is only a guard.
         if self.changes.read(cx).operation() != git_core::Operation::None {
-            self.show_changes(window, cx);
             return;
         }
         let changes = self.changes.read(cx);
@@ -2444,7 +2455,10 @@ impl RepositoryView {
                     } else {
                         RefChange::RefsOnly
                     };
-                    view.after_ref_change(change, cx);
+                    // Switching to Changes reads its status itself; when the view
+                    // is already there, `after_ref_change` has to.
+                    let switching = done.show_changes && view.view != ViewMode::Changes;
+                    view.after_ref_change_with(change, !switching, cx);
                     if done.show_changes {
                         view.show_changes(window, cx);
                     }
@@ -2602,6 +2616,17 @@ impl RepositoryView {
     /// operation (a checkout, branch/tag creation, rename, upstream) leaves
     /// the rows in place; only a walk-changing one reloads the history.
     fn after_ref_change(&mut self, change: RefChange, cx: &mut Context<Self>) {
+        self.after_ref_change_with(change, true, cx);
+    }
+
+    /// [`Self::after_ref_change`] that can skip re-reading the Changes status,
+    /// for callers that have just applied a fresh one.
+    fn after_ref_change_with(
+        &mut self,
+        change: RefChange,
+        refresh_changes: bool,
+        cx: &mut Context<Self>,
+    ) {
         match change {
             RefChange::RefsOnly => {
                 self.history
@@ -2609,7 +2634,9 @@ impl RepositoryView {
             }
             RefChange::History => self.reload_history(cx),
         }
-        self.changes.update(cx, |changes, cx| changes.refresh(cx));
+        if refresh_changes {
+            self.changes.update(cx, |changes, cx| changes.refresh(cx));
+        }
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.refresh(cx));
         self.refresh_with(hosting_status::INTERNAL_RELOAD, cx);

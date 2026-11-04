@@ -33,7 +33,7 @@ const VISIBLE_PATHS: usize = 5;
 type Done = Rc<dyn Fn(MergeDone, &mut Window, &mut App)>;
 
 /// What the shell needs to know once a merge call returned.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MergeDone {
     /// Switch to the Changes tab (the merge stopped, or a squash is staged).
     pub show_changes: bool,
@@ -116,8 +116,14 @@ pub(crate) enum HintKind {
 pub(crate) struct Status {
     pub kind: StatusKind,
     pub primary: PrimaryLabel,
-    pub enabled: bool,
     pub hint: Option<HintKind>,
+}
+
+impl Status {
+    /// The primary button runs unless a hint explains why it cannot.
+    pub(crate) fn enabled(&self) -> bool {
+        self.hint.is_none()
+    }
 }
 
 /// Preview x merge type -> what the dialog shows and whether it can run.
@@ -127,7 +133,6 @@ pub(crate) fn derive_status(preview: &PreviewState, ty: MergeType) -> Status {
     let ok = |kind, primary| Status {
         kind,
         primary,
-        enabled: true,
         hint: None,
     };
     let plain = if squash {
@@ -138,7 +143,6 @@ pub(crate) fn derive_status(preview: &PreviewState, ty: MergeType) -> Status {
     let blocked = |kind, hint| Status {
         kind,
         primary: plain,
-        enabled: false,
         hint: Some(hint),
     };
     let ready = match preview {
@@ -190,9 +194,7 @@ pub(crate) fn derive_status(preview: &PreviewState, ty: MergeType) -> Status {
 pub(crate) struct Notice {
     pub kind: ToastKind,
     pub message: String,
-    pub show_changes: bool,
-    /// HEAD moved (see [`MergeDone::head_moved`]).
-    pub head_moved: bool,
+    pub done: MergeDone,
 }
 
 /// The toast for `outcome` of merging `branch` into `head`.
@@ -201,8 +203,10 @@ pub(crate) fn outcome_notice(outcome: &MergeOutcome, branch: &str, head: &str) -
         MergeOutcome::Merged => Notice {
             kind: ToastKind::Ok,
             message: ui::t!("dialogs.merge.toast.merged", branch = branch, head = head).to_string(),
-            show_changes: false,
-            head_moved: true,
+            done: MergeDone {
+                show_changes: false,
+                head_moved: true,
+            },
         },
         MergeOutcome::FastForwarded => Notice {
             kind: ToastKind::Ok,
@@ -212,14 +216,18 @@ pub(crate) fn outcome_notice(outcome: &MergeOutcome, branch: &str, head: &str) -
                 head = head
             )
             .to_string(),
-            show_changes: false,
-            head_moved: true,
+            done: MergeDone {
+                show_changes: false,
+                head_moved: true,
+            },
         },
         MergeOutcome::Squashed => Notice {
             kind: ToastKind::Ok,
             message: ui::t!("dialogs.merge.toast.squashed", branch = branch).to_string(),
-            show_changes: true,
-            head_moved: false,
+            done: MergeDone {
+                show_changes: true,
+                head_moved: false,
+            },
         },
         MergeOutcome::UpToDate => Notice {
             kind: ToastKind::Info,
@@ -229,16 +237,20 @@ pub(crate) fn outcome_notice(outcome: &MergeOutcome, branch: &str, head: &str) -
                 head = head
             )
             .to_string(),
-            show_changes: false,
-            head_moved: false,
+            done: MergeDone {
+                show_changes: false,
+                head_moved: false,
+            },
         },
         // Stopped without conflicts (`--no-commit`, a rejecting hook): only a
         // commit is left to make.
         MergeOutcome::Stopped { conflicts } if conflicts.is_empty() => Notice {
             kind: ToastKind::Info,
             message: ui::t!("dialogs.merge.toast.waiting", branch = branch).to_string(),
-            show_changes: true,
-            head_moved: false,
+            done: MergeDone {
+                show_changes: true,
+                head_moved: false,
+            },
         },
         MergeOutcome::Stopped { conflicts } => Notice {
             kind: ToastKind::Warn,
@@ -248,8 +260,10 @@ pub(crate) fn outcome_notice(outcome: &MergeOutcome, branch: &str, head: &str) -
                 &[],
             )
             .to_string(),
-            show_changes: true,
-            head_moved: false,
+            done: MergeDone {
+                show_changes: true,
+                head_moved: false,
+            },
         },
     }
 }
@@ -329,7 +343,7 @@ impl MergeDialog {
 
     /// Runs the merge off the main thread.
     fn start(&mut self, cx: &mut Context<Self>) {
-        if self.running || !self.status().enabled {
+        if self.running || !self.status().enabled() {
             return;
         }
         let git = match &self.git {
@@ -366,20 +380,12 @@ impl MergeDialog {
         cx: &mut Context<Self>,
     ) {
         self.running = false;
-        match result {
+        let done = match result {
             Ok(outcome) => {
                 let notice = outcome_notice(&outcome, &self.branch, &self.head);
                 self.close(window, cx);
                 toast::show(notice.kind, notice.message, window, cx);
-                let on_done = self.on_done.clone();
-                on_done(
-                    MergeDone {
-                        show_changes: notice.show_changes,
-                        head_moved: notice.head_moved,
-                    },
-                    window,
-                    cx,
-                );
+                notice.done
             }
             Err(error) => {
                 self.error = Some(error.to_string());
@@ -387,17 +393,11 @@ impl MergeDialog {
                 cx.notify();
                 // Git may have changed state even though it failed (a hook
                 // that ran, a half-applied merge): let the shell re-read it.
-                let on_done = self.on_done.clone();
-                on_done(
-                    MergeDone {
-                        show_changes: false,
-                        head_moved: false,
-                    },
-                    window,
-                    cx,
-                );
+                MergeDone::default()
             }
-        }
+        };
+        let on_done = self.on_done.clone();
+        on_done(done, window, cx);
     }
 }
 
@@ -627,7 +627,7 @@ fn build(state: &Entity<MergeDialog>, cx: &App) -> Dialog {
             Button::primary("merge-primary")
                 .label(primary_text(status.primary))
                 .min_width(px(72.))
-                .disabled(!status.enabled || dialog.running)
+                .disabled(!status.enabled() || dialog.running)
                 .focus_handle(dialog.primary_focus.clone())
                 .on_click(primary),
         );
@@ -827,7 +827,7 @@ mod tests {
         for ty in TYPES {
             let status = derive_status(&PreviewState::Pending, ty);
             assert_eq!(status.kind, StatusKind::Pending);
-            assert!(status.enabled);
+            assert!(status.enabled());
             assert_eq!(status.hint, None);
         }
         assert_eq!(
@@ -844,7 +844,7 @@ mod tests {
     fn a_failed_or_unavailable_preview_keeps_the_primary_enabled() {
         let failed = derive_status(&PreviewState::Failed("boom".into()), FF);
         assert_eq!(failed.kind, StatusKind::Unavailable("boom".into()));
-        assert!(failed.enabled);
+        assert!(failed.enabled());
         let unavailable = derive_status(
             &ready(MergePreview::Unavailable(PreviewUnavailable::GitTooOld {
                 have: git_core::GitVersion {
@@ -867,7 +867,7 @@ mod tests {
                 need: "2.38.0".into()
             }
         );
-        assert!(unavailable.enabled);
+        assert!(unavailable.enabled());
     }
 
     #[test]
@@ -875,7 +875,7 @@ mod tests {
         for ty in [FF, NO_FF, SQUASH] {
             let status = derive_status(&ready(MergePreview::Clean { commits: 3 }), ty);
             assert_eq!(status.kind, StatusKind::Clean { commits: Some(3) });
-            assert!(status.enabled);
+            assert!(status.enabled());
             assert_eq!(status.hint, None);
         }
         assert_eq!(
@@ -889,14 +889,14 @@ mod tests {
         for ty in [FF, FF_ONLY] {
             let status = derive_status(&ready(MergePreview::FastForward), ty);
             assert_eq!(status.kind, StatusKind::FastForward);
-            assert!(status.enabled);
+            assert!(status.enabled());
         }
         let no_ff = derive_status(&ready(MergePreview::FastForward), NO_FF);
         assert_eq!(no_ff.kind, StatusKind::MergeCommitDespiteFastForward);
-        assert!(no_ff.enabled);
+        assert!(no_ff.enabled());
         let squash = derive_status(&ready(MergePreview::FastForward), SQUASH);
         assert_eq!(squash.kind, StatusKind::Clean { commits: None });
-        assert!(squash.enabled);
+        assert!(squash.enabled());
         assert_eq!(squash.primary, PrimaryLabel::Squash);
     }
 
@@ -905,7 +905,7 @@ mod tests {
         for ty in TYPES {
             let status = derive_status(&ready(MergePreview::UpToDate), ty);
             assert_eq!(status.kind, StatusKind::UpToDate);
-            assert!(!status.enabled);
+            assert!(!status.enabled());
             assert_eq!(status.hint, Some(HintKind::NothingToMerge));
         }
     }
@@ -915,7 +915,7 @@ mod tests {
         for preview in [MergePreview::Clean { commits: 1 }, conflicts(2)] {
             let status = derive_status(&ready(preview), FF_ONLY);
             assert_eq!(status.kind, StatusKind::CannotFastForward);
-            assert!(!status.enabled);
+            assert!(!status.enabled());
             assert_eq!(status.hint, Some(HintKind::PickAnotherType));
         }
     }
@@ -930,11 +930,11 @@ mod tests {
                     paths: vec!["src/f0.rs".into(), "src/f1.rs".into()]
                 }
             );
-            assert!(status.enabled);
+            assert!(status.enabled());
             assert_eq!(status.primary, PrimaryLabel::MergeWithConflicts);
         }
         let squash = derive_status(&ready(conflicts(2)), SQUASH);
-        assert!(squash.enabled);
+        assert!(squash.enabled());
         assert_eq!(squash.primary, PrimaryLabel::Squash);
     }
 
@@ -943,18 +943,18 @@ mod tests {
         let merged = outcome_notice(&MergeOutcome::Merged, "feat/x", "main");
         assert_eq!(merged.kind, ToastKind::Ok);
         assert_eq!(merged.message, "Merged feat/x into main");
-        assert!(!merged.show_changes);
+        assert!(!merged.done.show_changes);
 
         let ff = outcome_notice(&MergeOutcome::FastForwarded, "feat/x", "main");
         assert_eq!(ff.message, "Fast-forwarded main to feat/x");
-        assert!(!ff.show_changes);
+        assert!(!ff.done.show_changes);
 
         let squashed = outcome_notice(&MergeOutcome::Squashed, "feat/x", "main");
         assert_eq!(
             squashed.message,
             "Squashed feat/x into the index — commit it from Changes"
         );
-        assert!(squashed.show_changes);
+        assert!(squashed.done.show_changes);
 
         let up_to_date = outcome_notice(&MergeOutcome::UpToDate, "feat/x", "main");
         assert_eq!(up_to_date.kind, ToastKind::Info);
@@ -969,7 +969,7 @@ mod tests {
         );
         assert_eq!(one.kind, ToastKind::Warn);
         assert_eq!(one.message, "Merge stopped: 1 file has conflicts");
-        assert!(one.show_changes);
+        assert!(one.done.show_changes);
         let two = outcome_notice(
             &MergeOutcome::Stopped {
                 conflicts: vec!["a".into(), "b".into()],
@@ -988,9 +988,11 @@ mod tests {
         );
         assert_eq!(waiting.kind, ToastKind::Info);
         assert_eq!(waiting.message, "Merge of feat/x is waiting for a commit");
-        assert!(waiting.show_changes);
+        assert!(waiting.done.show_changes);
         // Only a merge or fast-forward moves HEAD.
-        assert!(merged.head_moved && ff.head_moved);
-        assert!(!squashed.head_moved && !up_to_date.head_moved && !waiting.head_moved);
+        assert!(merged.done.head_moved && ff.done.head_moved);
+        assert!(
+            !squashed.done.head_moved && !up_to_date.done.head_moved && !waiting.done.head_moved
+        );
     }
 }

@@ -371,7 +371,10 @@ fn status_lists_each_conflicted_path_once() {
 fn merge_heading_reads_the_branch_name() {
     let (_tmp, repo) = stopped_merge();
     assert_eq!(repo.merge_heading().unwrap().as_deref(), Some("side"));
-    let message = repo.prepared_message().unwrap().unwrap();
+    let message = repo
+        .prepared_message(repo.operation().unwrap())
+        .unwrap()
+        .unwrap();
     assert!(message.starts_with("Merge branch 'side'"));
     assert!(!message.contains('#'), "{message}");
 }
@@ -380,7 +383,10 @@ fn merge_heading_reads_the_branch_name() {
 fn merge_heading_formats() {
     let (tmp, repo) = base();
     assert_eq!(repo.merge_heading().unwrap(), None);
-    assert_eq!(repo.prepared_message().unwrap(), None);
+    assert_eq!(
+        repo.prepared_message(repo.operation().unwrap()).unwrap(),
+        None
+    );
     let msg = repo.git_dir().join("MERGE_MSG");
     for (text, want) in [
         ("Merge branch 'feature/x'\n", Some("feature/x")),
@@ -421,7 +427,10 @@ fn resolve_take_ours_and_theirs_then_commit_finishes_the_merge() {
     // graph.rs took our side, so it no longer differs from HEAD.
     assert_eq!(status.staged.len(), 2);
     assert_eq!(repo.operation().unwrap(), Operation::Merge);
-    let message = repo.prepared_message().unwrap().unwrap();
+    let message = repo
+        .prepared_message(repo.operation().unwrap())
+        .unwrap()
+        .unwrap();
     repo.commit(&message, false).unwrap();
     assert_eq!(repo.operation().unwrap(), Operation::None);
     assert_eq!(
@@ -558,7 +567,10 @@ fn squash_prefills_the_squash_message() {
     let (_tmp, repo) = diverged();
     repo.merge("side", MergeType::Squash).unwrap();
     assert_eq!(repo.operation().unwrap(), Operation::Squash);
-    let message = repo.prepared_message().unwrap().unwrap();
+    let message = repo
+        .prepared_message(repo.operation().unwrap())
+        .unwrap()
+        .unwrap();
     assert!(
         message.contains("Squashed commit of the following"),
         "{message}"
@@ -575,7 +587,10 @@ fn prepared_message_respects_a_custom_comment_char() {
         "Merge branch 'side'\n\n# keep me\n; drop me\n",
     )
     .unwrap();
-    let message = repo.prepared_message().unwrap().unwrap();
+    let message = repo
+        .prepared_message(repo.operation().unwrap())
+        .unwrap()
+        .unwrap();
     assert_eq!(message, "Merge branch 'side'\n\n# keep me");
 }
 
@@ -632,5 +647,32 @@ fn stash_save_with_only_conflicts_surfaces_gits_error() {
     assert!(repo.working_status().unwrap().staged.is_empty());
     // `Ok(false)` ("nothing to stash") would hide the stopped merge.
     let result = repo.stash_save(None);
+    assert!(result.is_err(), "{result:?}");
+}
+
+#[test]
+fn squash_over_preexisting_unmerged_paths_is_gits_error_not_stopped() {
+    let (tmp, repo) = base();
+    let dir = tmp.path();
+    git(dir, &["switch", "-q", "side"]);
+    commit_file(dir, "side.txt", "s\n", "S");
+    git(dir, &["switch", "-q", "main"]);
+    // A conflicting `stash pop` leaves unmerged paths with no MERGE_HEAD.
+    fs::write(dir.join("a.txt"), "stashed\n").unwrap();
+    git(dir, &["stash", "push", "-q"]);
+    commit_file(dir, "a.txt", "other\n", "other");
+    let pop = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["stash", "pop"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(!pop.status.success());
+    assert_eq!(repo.working_status().unwrap().conflicted.len(), 1);
+    assert_eq!(repo.operation().unwrap(), Operation::None);
+
+    let result = repo.merge("side", MergeType::Squash);
     assert!(result.is_err(), "{result:?}");
 }

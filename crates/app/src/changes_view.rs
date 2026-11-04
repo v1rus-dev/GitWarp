@@ -22,7 +22,7 @@ use gpui::{
 
 use git_core::{
     ChangeKind, ConflictSide, Error, FileDiff, Git, HunkPick, Operation, Repo, WorkingFile,
-    WorkingStatus,
+    WorkingStatus, WorktreeFile,
 };
 use ui::actions::{key_binding, Cancel, SelectNext, SelectPrev};
 use ui::components::toast::{self, ToastKind};
@@ -83,12 +83,15 @@ pub struct Selection {
 }
 
 /// What the view knows about the work tree.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub enum StatusState {
-    #[default]
-    Loading,
+    /// A read is running; carries the last loaded status so counts and the
+    /// banner keep their values instead of flashing to zero during a reload.
+    Loading(Option<Arc<WorkingStatus>>),
     Loaded(Arc<WorkingStatus>),
-    Failed(String),
+    /// The read failed; keeps the last loaded status (as `Loading` does) so a
+    /// merge's conflict count and banner do not reset to "all resolved".
+    Failed(String, Option<Arc<WorkingStatus>>),
 }
 
 /// One file's diff, flattened into the rows the two layouts paint.
@@ -126,7 +129,7 @@ pub enum ConflictKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConflictLine {
-    pub text: String,
+    pub text: SharedString,
     pub kind: ConflictKind,
 }
 
@@ -148,30 +151,13 @@ pub struct MergeInfo {
     pub branch: Option<String>,
     /// The prepared commit message (`MERGE_MSG` or `SQUASH_MSG`).
     pub message: Option<String>,
-    /// A `--squash` merge: the changes are staged, there is no `MERGE_HEAD`
-    /// and the commit has a single parent.
-    pub squash: bool,
 }
 
-/// A commit-box prefill from the merge message.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Prefill {
-    /// The text the box was given.
-    text: String,
-}
-
-/// Whether the box still holds the untouched prefill, so it can be cleared
-/// when the merge ended without a commit. A prefill only goes into an empty
-/// box, so "undo" is always "empty it".
-fn prefill_untouched(current: &str, prefill: &Prefill) -> bool {
-    current.trim_end() == prefill.text.trim_end()
-}
-
-/// The conflicts the banner and the commit button go by: the loaded status's
-/// count, or the last loaded one while a reload is running. Without it a
-/// reload reads as "0 conflicts left" and the banner flips to "all resolved".
-fn conflicts_left(loaded: Option<usize>, last: usize) -> usize {
-    loaded.unwrap_or(last)
+/// Whether the box still holds the untouched prefill text, so it can be
+/// cleared when the merge ended without a commit. A prefill only goes into an
+/// empty box, so "undo" is always "empty it".
+fn prefill_untouched(current: &str, prefill: &str) -> bool {
+    current.trim_end() == prefill.trim_end()
 }
 
 /// Where the conflict menu opens.
@@ -181,6 +167,31 @@ enum MenuAnchor {
     Pointer(gpui::Point<Pixels>),
     /// Under a control or row (keyboard, the "…" button).
     Bounds(Bounds<Pixels>),
+}
+
+/// Anchors a menu to `bounds`; before the first paint there are none, and the
+/// pointer is the fallback.
+fn anchor_or_pointer(bounds: Option<Bounds<Pixels>>, window: &Window) -> MenuAnchor {
+    bounds.map_or_else(
+        || MenuAnchor::Pointer(window.mouse_position()),
+        MenuAnchor::Bounds,
+    )
+}
+
+/// An invisible canvas filling its parent that records the parent's painted
+/// bounds in `slot` under `index`.
+fn bounds_probe(
+    slot: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    index: usize,
+) -> impl IntoElement {
+    canvas(
+        |bounds, _, _| bounds,
+        move |_, bounds, _, _| {
+            slot.borrow_mut().insert(index, bounds);
+        },
+    )
+    .absolute()
+    .inset_0()
 }
 
 /// One consistent read of the work tree.
@@ -223,13 +234,9 @@ pub struct ChangesView {
     merge: Option<MergeInfo>,
     /// The operation the repository is stopped in, read with every status.
     operation: Operation,
-    /// Conflicted paths in the last loaded status, kept through a reload.
-    last_conflicts: usize,
-    /// The merge message was put in the commit box for this merge.
-    merge_prefilled: bool,
-    /// What the prefill put in the box, to take it out again if the merge ends
-    /// without a commit.
-    prefill: Option<Prefill>,
+    /// What the merge prefill put in the box, to take it out again if the
+    /// merge ends without a commit.
+    prefill: Option<String>,
     /// The banner asks to confirm the abort.
     confirming_abort: bool,
     /// "Keep merging" of the abort confirm: focused when the confirm opens.
@@ -283,7 +290,7 @@ impl ChangesView {
         let mut view = Self {
             path,
             git,
-            state: StatusState::Loading,
+            state: StatusState::Loading(None),
             generation: 0,
             selection: None,
             diff: DiffState::Empty,
@@ -298,8 +305,6 @@ impl ChangesView {
             busy: false,
             merge: None,
             operation: Operation::None,
-            last_conflicts: 0,
-            merge_prefilled: false,
             prefill: None,
             confirming_abort: false,
             keep_focus: cx.focus_handle().tab_stop(true),
@@ -321,6 +326,8 @@ impl ChangesView {
         self.focus.clone()
     }
 
+    /// The status once loaded; `None` while loading or after a failure, so the
+    /// lists, the diff selection and the commit box show their empty state.
     pub fn status(&self) -> Option<&WorkingStatus> {
         match &self.state {
             StatusState::Loaded(status) => Some(status),
@@ -328,17 +335,39 @@ impl ChangesView {
         }
     }
 
+    fn last_arc(&self) -> Option<Arc<WorkingStatus>> {
+        match &self.state {
+            StatusState::Loaded(status)
+            | StatusState::Loading(Some(status))
+            | StatusState::Failed(_, Some(status)) => Some(status.clone()),
+            _ => None,
+        }
+    }
+
+    /// The last loaded status, kept through a reload or a failed read. Only the
+    /// data accessors (counts, the banner and commit rules) go by it, never
+    /// what is rendered.
+    fn last_status(&self) -> Option<&WorkingStatus> {
+        match &self.state {
+            StatusState::Loaded(status)
+            | StatusState::Loading(Some(status))
+            | StatusState::Failed(_, Some(status)) => Some(status),
+            _ => None,
+        }
+    }
+
     /// Unstaged paths, conflicted ones not included (see [`Self::conflicted_count`]).
     pub fn unstaged_count(&self) -> usize {
-        self.status().map_or(0, WorkingStatus::unstaged_count)
+        self.last_status().map_or(0, WorkingStatus::unstaged_count)
     }
 
     pub fn staged_count(&self) -> usize {
-        self.status().map_or(0, WorkingStatus::staged_count)
+        self.last_status().map_or(0, WorkingStatus::staged_count)
     }
 
     pub fn conflicted_count(&self) -> usize {
-        self.status().map_or(0, WorkingStatus::conflicted_count)
+        self.last_status()
+            .map_or(0, WorkingStatus::conflicted_count)
     }
 
     /// Every path with local work: staged, unstaged and conflicted.
@@ -351,21 +380,13 @@ impl ChangesView {
         self.operation
     }
 
-    /// Conflicts for the banner and the commit rules; survives a reload.
-    fn conflicts_left(&self) -> usize {
-        conflicts_left(
-            self.status().map(WorkingStatus::conflicted_count),
-            self.last_conflicts,
-        )
-    }
-
     pub fn is_loading(&self) -> bool {
-        matches!(self.state, StatusState::Loading)
+        matches!(self.state, StatusState::Loading(_))
     }
 
     pub fn failure(&self) -> Option<&str> {
         match &self.state {
-            StatusState::Failed(error) => Some(error),
+            StatusState::Failed(error, _) => Some(error),
             _ => None,
         }
     }
@@ -392,22 +413,23 @@ impl ChangesView {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let previous = self.selection_path();
-        self.state = StatusState::Loading;
+        self.state = StatusState::Loading(self.last_arc());
         let git = match &self.git {
             Ok(git) => git.clone(),
             Err(error) => {
-                self.state = StatusState::Failed(error.to_string());
+                self.state = StatusState::Failed(error.to_string(), None);
                 cx.notify();
                 return;
             }
         };
         let path = self.path.clone();
+        let need_message = self.merge.is_none();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let repo = Repo::open(git, &path).map_err(|error| error.to_string())?;
-                    read_snapshot(&repo)
+                    read_snapshot(&repo, need_message)
                 })
                 .await;
             this.update(cx, |view, cx| {
@@ -436,7 +458,7 @@ impl ChangesView {
                 snapshot.operation,
             ),
             Err(error) => {
-                self.state = StatusState::Failed(error);
+                self.state = StatusState::Failed(error, self.last_arc());
                 self.diff = DiffState::Empty;
                 cx.notify();
                 return;
@@ -462,7 +484,6 @@ impl ChangesView {
         self.picked.clear();
         self.pick_anchor = None;
         self.confirming_discard = None;
-        self.last_conflicts = status.conflicted_count();
         self.operation = operation;
         self.state = StatusState::Loaded(status);
         self.apply_merge(merge, cx);
@@ -479,16 +500,15 @@ impl ChangesView {
                     self.set_amend(false, cx);
                 }
                 let current = self.message.read(cx).text().to_string();
-                if !self.merge_prefilled && current.trim().is_empty() {
+                // Only the first status of a merge prefills (`self.merge` is
+                // still `None` then); later reloads leave the box alone.
+                if self.merge.is_none() && current.trim().is_empty() {
                     if let Some(message) = info.message.clone().filter(|text| !text.is_empty()) {
-                        self.prefill = Some(Prefill {
-                            text: message.clone(),
-                        });
+                        self.prefill = Some(message.clone());
                         self.message
                             .update(cx, |input, cx| input.set_text(message, cx));
                     }
                 }
-                self.merge_prefilled = true;
             }
             None => {
                 // The merge ended: after a commit the box is already empty; after
@@ -499,7 +519,6 @@ impl ChangesView {
                         self.message.update(cx, |input, cx| input.set_text("", cx));
                     }
                 }
-                self.merge_prefilled = false;
                 self.confirming_abort = false;
             }
         }
@@ -919,13 +938,14 @@ impl ChangesView {
         };
         self.busy = true;
         let path = self.path.clone();
+        let need_message = self.merge.is_none();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let repo = Repo::open(git, &path).map_err(|error| error.to_string())?;
                     let notice = action(&repo).map_err(|error| error.to_string())?;
-                    let snapshot = read_snapshot(&repo)?;
+                    let snapshot = read_snapshot(&repo, need_message)?;
                     Ok::<_, String>((notice, snapshot))
                 })
                 .await;
@@ -989,6 +1009,15 @@ impl ChangesView {
             .unwrap_or_else(|| ui::t!("changes.conflict.incoming").to_string())
     }
 
+    /// The name of one side of a conflict: the checked-out branch for ours,
+    /// the merged one for theirs.
+    fn side_label(&self, side: ConflictSide) -> String {
+        match side {
+            ConflictSide::Ours => self.head_label(),
+            ConflictSide::Theirs => self.incoming_label(),
+        }
+    }
+
     /// Resolves the conflicted `path` (see the row menu). The menu captures the
     /// path, not the row index: the list may have changed while the menu was
     /// open, and then the path is simply no longer conflicted.
@@ -1001,17 +1030,10 @@ impl ChangesView {
             return;
         }
         let notice = match how {
-            Resolve::Take(ConflictSide::Ours) => {
+            Resolve::Take(side) => {
                 ui::t!(
                     "changes.notice.took",
-                    branch = self.head_label(),
-                    path = path
-                )
-            }
-            Resolve::Take(ConflictSide::Theirs) => {
-                ui::t!(
-                    "changes.notice.took",
-                    branch = self.incoming_label(),
+                    branch = self.side_label(side),
                     path = path
                 )
             }
@@ -1030,7 +1052,7 @@ impl ChangesView {
     /// Abandons the merge (after the banner's inline confirm).
     fn abort_merge(&mut self, cx: &mut Context<Self>) {
         self.confirming_abort = false;
-        let notice = if self.merge.as_ref().is_some_and(|merge| merge.squash) {
+        let notice = if self.squashing() {
             ui::t!("changes.notice.squash_aborted")
         } else {
             ui::t!("changes.notice.merge_aborted")
@@ -1057,11 +1079,7 @@ impl ChangesView {
             .borrow()
             .get(&selection.index)
             .copied();
-        // Before the first paint there are no bounds: fall back to the pointer.
-        let anchor = bounds.map_or_else(
-            || MenuAnchor::Pointer(window.mouse_position()),
-            MenuAnchor::Bounds,
-        );
+        let anchor = anchor_or_pointer(bounds, window);
         self.open_conflict_menu(path, anchor, window, cx);
     }
 
@@ -1089,12 +1107,18 @@ impl ChangesView {
             };
         let entries = vec![
             item(
-                ui::t!("changes.conflict.take", branch = self.head_label()),
+                ui::t!(
+                    "changes.conflict.take",
+                    branch = self.side_label(ConflictSide::Ours)
+                ),
                 IconName::Check,
                 Resolve::Take(ConflictSide::Ours),
             ),
             item(
-                ui::t!("changes.conflict.take", branch = self.incoming_label()),
+                ui::t!(
+                    "changes.conflict.take",
+                    branch = self.side_label(ConflictSide::Theirs)
+                ),
                 IconName::Check,
                 Resolve::Take(ConflictSide::Theirs),
             ),
@@ -1114,8 +1138,8 @@ impl ChangesView {
     /// The operation banner of a merge or squash in progress.
     fn render_merge_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let merge = self.merge.as_ref()?;
-        let squash = merge.squash;
-        let left = self.conflicts_left();
+        let squash = self.squashing();
+        let left = self.conflicted_count();
         let head = self.head_label();
         let busy = self.busy;
         let view = cx.entity();
@@ -1228,7 +1252,13 @@ impl ChangesView {
     /// A merge (not a squash) is stopped: its commit needs nothing newly staged.
     /// A squash commits like a plain commit, from what the squash staged.
     fn merging(&self) -> bool {
-        self.merge.as_ref().is_some_and(|merge| !merge.squash)
+        self.merge.is_some() && !self.squashing()
+    }
+
+    /// A `--squash` merge is stopped: the changes are staged, there is no
+    /// `MERGE_HEAD` and the commit has a single parent.
+    fn squashing(&self) -> bool {
+        self.operation == Operation::Squash
     }
 
     /// Commits the index, or amends HEAD, from the commit box.
@@ -1257,14 +1287,11 @@ impl ChangesView {
         }
         let staged = self.staged_count();
         let amend = self.amend;
-        if !can_commit(self.merging(), amend, staged, self.conflicts_left()) {
+        if !can_commit(self.merging(), amend, staged, self.conflicted_count()) {
             return;
         }
-        let branch = self
-            .status()
-            .and_then(|status| status.branch.clone())
-            .unwrap_or_else(|| "HEAD".to_string());
-        let notice = if let Some(merge) = self.merge.as_ref().filter(|merge| !merge.squash) {
+        let branch = self.head_label();
+        let notice = if let Some(merge) = self.merge.as_ref().filter(|_| !self.squashing()) {
             match &merge.branch {
                 Some(merged) => {
                     ui::t!("changes.notice.merged", branch = merged, head = branch).to_string()
@@ -1290,6 +1317,7 @@ impl ChangesView {
         };
         self.busy = true;
         let path = self.path.clone();
+        let need_message = self.merge.is_none();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -1297,7 +1325,7 @@ impl ChangesView {
                     let repo = Repo::open(git, &path).map_err(|error| error.to_string())?;
                     repo.commit(&message, amend)
                         .map_err(|error| error.to_string())?;
-                    let snapshot = read_snapshot(&repo)?;
+                    let snapshot = read_snapshot(&repo, need_message)?;
                     Ok::<_, String>((notice, snapshot))
                 })
                 .await;
@@ -1451,19 +1479,17 @@ impl ChangesView {
             );
         }
 
-        let (conflicted, unstaged, staged) = match self.status() {
-            Some(status) => (
-                status.conflicted.clone(),
-                status.unstaged.clone(),
-                status.staged.clone(),
-            ),
-            None => (Vec::new(), Vec::new(), Vec::new()),
+        // Empty lists while loading or failed; one refcount bump when loaded.
+        let status = match &self.state {
+            StatusState::Loaded(status) => status.clone(),
+            _ => Arc::default(),
         };
+        let (conflicted, unstaged, staged) = (&status.conflicted, &status.unstaged, &status.staged);
         if !conflicted.is_empty() {
             panel = panel.child(self.render_group(
                 Side::Conflicted,
                 ui::t!("changes.group.conflicts"),
-                &conflicted,
+                conflicted,
                 SharedString::default(),
                 self.conflicts_scroll.clone(),
                 view.clone(),
@@ -1474,7 +1500,7 @@ impl ChangesView {
             .child(self.render_group(
                 Side::Unstaged,
                 ui::t!("changes.group.unstaged"),
-                &unstaged,
+                unstaged,
                 ui::t!("changes.group.unstaged_empty"),
                 self.unstaged_scroll.clone(),
                 view.clone(),
@@ -1483,7 +1509,7 @@ impl ChangesView {
             .child(self.render_group(
                 Side::Staged,
                 ui::t!("changes.group.staged"),
-                &staged,
+                staged,
                 ui::t!("changes.group.staged_empty"),
                 self.staged_scroll.clone(),
                 view,
@@ -1559,24 +1585,12 @@ impl ChangesView {
                                     let anchor = button_bounds.borrow().get(&index).copied();
                                     menu_view.update(cx, |view, cx| {
                                         view.select(Side::Conflicted, index, cx);
-                                        let anchor = anchor.map_or_else(
-                                            || MenuAnchor::Pointer(window.mouse_position()),
-                                            MenuAnchor::Bounds,
-                                        );
+                                        let anchor = anchor_or_pointer(anchor, window);
                                         view.open_conflict_menu(path, anchor, window, cx);
                                     });
                                 }),
                         )
-                        .child(
-                            canvas(
-                                |bounds, _, _| bounds,
-                                move |_, bounds, _, _| {
-                                    slot.borrow_mut().insert(index, bounds);
-                                },
-                            )
-                            .absolute()
-                            .inset_0(),
-                        ),
+                        .child(bounds_probe(slot, index)),
                 );
             } else {
                 row = row.action(
@@ -1637,16 +1651,7 @@ impl ChangesView {
                     })
                     .when(side == Side::Conflicted, |this| {
                         this.relative()
-                            .child(
-                                canvas(
-                                    |bounds, _, _| bounds,
-                                    move |_, bounds, _, _| {
-                                        row_slot.borrow_mut().insert(index, bounds);
-                                    },
-                                )
-                                .absolute()
-                                .inset_0(),
-                            )
+                            .child(bounds_probe(row_slot, index))
                             .on_mouse_down(
                                 MouseButton::Right,
                                 move |event: &MouseDownEvent, window, cx| {
@@ -2165,7 +2170,7 @@ impl ChangesView {
                                 .when_some(background, |this, background| this.bg(background))
                                 .text_color(color)
                                 .font_weight(weight)
-                                .child(SharedString::from(line.text.clone())),
+                                .child(line.text.clone()),
                         )
                         .into_any_element(),
                 )
@@ -2201,10 +2206,7 @@ impl ChangesView {
         let text = self.message.read(cx).text().to_string();
         let (subject, longest_body) = message_counters(&text);
         let head = self.status().and_then(|status| status.head.clone());
-        let branch = self
-            .status()
-            .and_then(|status| status.branch.clone())
-            .unwrap_or_else(|| "HEAD".to_string());
+        let branch = self.head_label();
         let staged = self.staged_count();
         let busy = self.busy;
         let merging = self.merging();
@@ -2221,7 +2223,7 @@ impl ChangesView {
         };
         let can_commit = !busy
             && !commit_label.is_empty()
-            && can_commit(merging, self.amend, staged, self.conflicts_left());
+            && can_commit(merging, self.amend, staged, self.conflicted_count());
         let commit_view = cx.entity();
         let amend_view = cx.entity();
         let switch = Switch::new("amend-switch")
@@ -2496,22 +2498,24 @@ fn merge_banner_kind(conflicts: usize) -> BannerKind {
     }
 }
 
-/// Reads the status and, while a merge is stopped, its branch and message.
-fn read_snapshot(repo: &Repo) -> Result<Snapshot, String> {
+/// Reads the status and, while a merge is stopped, its branch and (only when
+/// `need_message`) its prepared message, which only the first status of a
+/// merge puts into the commit box.
+fn read_snapshot(repo: &Repo, need_message: bool) -> Result<Snapshot, String> {
     let status = repo.working_status().map_err(|error| error.to_string())?;
     let operation = repo.operation().map_err(|error| error.to_string())?;
     let merge = match operation {
-        Operation::Merge => Some(MergeInfo {
-            // A missing or odd message only costs the branch name.
-            branch: repo.merge_heading().ok().flatten(),
-            message: repo.prepared_message().ok().flatten(),
-            squash: false,
-        }),
-        Operation::Squash => Some(MergeInfo {
-            branch: None,
-            message: repo.prepared_message().ok().flatten(),
-            squash: true,
-        }),
+        Operation::Merge | Operation::Squash => {
+            // A missing or odd message only costs the branch name / the prefill.
+            let (branch, message) = if need_message {
+                repo.merge_info(operation).unwrap_or_default()
+            } else if operation == Operation::Merge {
+                (repo.merge_heading().ok().flatten(), None)
+            } else {
+                (None, None)
+            };
+            Some(MergeInfo { branch, message })
+        }
         _ => None,
     };
     Ok(Snapshot {
@@ -2521,16 +2525,18 @@ fn read_snapshot(repo: &Repo) -> Result<Snapshot, String> {
     })
 }
 
-/// Largest conflicted file shown (as for an untracked file's diff).
-const CONFLICT_FILE_CAP: u64 = 2 * 1024 * 1024;
-
 /// Reads the work-tree file of a conflicted path off the UI thread.
 fn read_conflict(git: Arc<Git>, root: &Path, path: &str) -> Result<ConflictFile, String> {
     let repo = Repo::open(git, root).map_err(|error| error.to_string())?;
-    let full = repo.root().join(path);
-    let meta = match std::fs::metadata(&full) {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let text = match repo.worktree_file(path) {
+        Ok(WorktreeFile::Text(text)) => text,
+        Ok(WorktreeFile::Binary) => {
+            return Ok(ConflictFile {
+                binary: true,
+                ..ConflictFile::default()
+            })
+        }
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(ConflictFile {
                 missing: true,
                 ..ConflictFile::default()
@@ -2538,17 +2544,7 @@ fn read_conflict(git: Arc<Git>, root: &Path, path: &str) -> Result<ConflictFile,
         }
         Err(error) => return Err(error.to_string()),
     };
-    if meta.len() > CONFLICT_FILE_CAP {
-        return Err(Error::TooLarge { what: "diff" }.to_string());
-    }
-    let bytes = std::fs::read(&full).map_err(|error| error.to_string())?;
-    if bytes.contains(&0) {
-        return Ok(ConflictFile {
-            binary: true,
-            ..ConflictFile::default()
-        });
-    }
-    let lines = conflict_lines(&String::from_utf8_lossy(&bytes));
+    let lines = conflict_lines(text.lines.iter().map(String::as_str));
     let columns = lines
         .iter()
         .map(|line| line.text.chars().count())
@@ -2564,7 +2560,7 @@ fn read_conflict(git: Arc<Git>, root: &Path, path: &str) -> Result<ConflictFile,
 /// Classifies the lines of a file with conflict markers. A `=======` outside
 /// a `<<<<<<<` block is ordinary text; the diff3 base block (`|||||||` to
 /// `=======`) is left plain.
-fn conflict_lines(text: &str) -> Vec<ConflictLine> {
+fn conflict_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<ConflictLine> {
     #[derive(Clone, Copy, PartialEq)]
     enum State {
         Outside,
@@ -2577,7 +2573,8 @@ fn conflict_lines(text: &str) -> Vec<ConflictLine> {
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
     };
     let mut state = State::Outside;
-    text.lines()
+    lines
+        .into_iter()
         .map(|line| {
             let kind = if is_marker(line, "<<<<<<<") && state == State::Outside {
                 state = State::Ours;
@@ -2599,7 +2596,7 @@ fn conflict_lines(text: &str) -> Vec<ConflictLine> {
                 }
             };
             ConflictLine {
-                text: line.to_string(),
+                text: line.to_string().into(),
                 kind,
             }
         })
@@ -2977,23 +2974,10 @@ mod tests {
 
     #[test]
     fn an_untouched_prefill_is_cleared_but_an_edited_one_is_kept() {
-        let prefill = Prefill {
-            text: "Merge branch 'side'".into(),
-        };
-        assert!(prefill_untouched("Merge branch 'side'\n", &prefill));
-        assert!(!prefill_untouched("Merge branch 'side' + notes", &prefill));
-        assert!(!prefill_untouched("", &prefill));
-    }
-
-    #[test]
-    fn a_reload_keeps_the_last_conflict_count() {
-        // Loaded: the fresh count wins, even when it is 0.
-        assert_eq!(conflicts_left(Some(0), 3), 0);
-        assert_eq!(conflicts_left(Some(2), 3), 2);
-        // Loading or failed: the banner keeps the last loaded count instead of
-        // reading 0 ("all resolved") and enabling Commit merge.
-        assert_eq!(conflicts_left(None, 3), 3);
-        assert_eq!(conflicts_left(None, 0), 0);
+        let prefill = "Merge branch 'side'";
+        assert!(prefill_untouched("Merge branch 'side'\n", prefill));
+        assert!(!prefill_untouched("Merge branch 'side' + notes", prefill));
+        assert!(!prefill_untouched("", prefill));
     }
 
     #[test]
@@ -3014,12 +2998,15 @@ mod tests {
     fn conflict_markers_and_both_sides_are_classified() {
         use ConflictKind::*;
         let text = "top\n<<<<<<< HEAD\nours\n||||||| base\nold\n=======\ntheirs\n>>>>>>> side\nbottom\n=======\n";
-        let kinds: Vec<_> = conflict_lines(text).into_iter().map(|l| l.kind).collect();
+        let kinds: Vec<_> = conflict_lines(text.lines())
+            .into_iter()
+            .map(|l| l.kind)
+            .collect();
         assert_eq!(
             kinds,
             [Plain, Marker, Ours, Marker, Plain, Marker, Theirs, Marker, Plain, Plain]
         );
-        assert!(conflict_lines("").is_empty());
+        assert!(conflict_lines("".lines()).is_empty());
     }
 
     #[test]
@@ -3116,6 +3103,50 @@ mod tests {
             .update(|window, _| window.root::<ChangesView>().flatten())
             .expect("the changes view is the window root");
         (cx, view)
+    }
+
+    /// While a reload runs the last loaded status stays readable, so counts and
+    /// the merge banner do not flash to zero ("all resolved").
+    #[gpui::test]
+    fn counts_survive_a_reload(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-reload");
+        write(repo.path(), "a.txt", "one\n");
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "one"]);
+        write(repo.path(), "a.txt", "two\n");
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.read_with(&cx, |view, _| assert_eq!(view.unstaged_count(), 1));
+        view.update(&mut cx, |view, cx| view.start_status(cx));
+        view.read_with(&cx, |view, _| {
+            assert!(view.is_loading());
+            assert_eq!(view.unstaged_count(), 1);
+            assert_eq!(view.dirty_count(), 1);
+            // Rendered lists and selection stay empty while loading.
+            assert!(view.status().is_none());
+        });
+        cx.update(|window, _| window.refresh());
+        assert!(
+            cx.debug_bounds("changes-unstaged-0").is_none(),
+            "the file list showed rows while loading"
+        );
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert!(!view.is_loading()));
+
+        // A failed reload keeps the last snapshot too.
+        view.update(&mut cx, |view, cx| {
+            view.set_status(view.generation, None, Err("boom".into()), cx)
+        });
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.failure(), Some("boom"));
+            assert_eq!(view.unstaged_count(), 1);
+            assert!(view.status().is_none());
+        });
+        cx.update(|window, _| window.refresh());
+        assert!(
+            cx.debug_bounds("changes-unstaged-0").is_none(),
+            "the file list showed rows after a failed read"
+        );
     }
 
     /// Space on a focused file row stages the selected file; Ctrl+Shift+Z asks
@@ -3345,7 +3376,7 @@ mod tests {
         let (mut cx, view) = open_changes(&repo, cx);
         view.read_with(&cx, |view, cx| {
             assert_eq!(view.operation(), Operation::Squash);
-            assert!(view.merge.as_ref().is_some_and(|merge| merge.squash));
+            assert!(view.merge.is_some() && view.squashing());
             assert!(view
                 .message
                 .read(cx)

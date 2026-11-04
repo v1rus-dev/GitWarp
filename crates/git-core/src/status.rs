@@ -207,8 +207,10 @@ pub(crate) fn status(repo: &Repo) -> Result<WorkingStatus> {
 
     // An unmerged path shows up in both diffs too (`U` unstaged, `U`/`M`
     // staged); the porcelain's `u` records are the only source for conflicts.
-    staged.retain(|file| !porcelain.conflicted.contains(&file.path));
-    unstaged.retain(|file| !porcelain.conflicted.contains(&file.path));
+    let conflicted_set: std::collections::HashSet<&str> =
+        porcelain.conflicted.iter().map(String::as_str).collect();
+    staged.retain(|file| !conflicted_set.contains(file.path.as_str()));
+    unstaged.retain(|file| !conflicted_set.contains(file.path.as_str()));
     for path in porcelain.untracked {
         if unstaged.iter().any(|file| file.path == path) {
             continue;
@@ -303,13 +305,11 @@ pub enum ConflictSide {
 /// conflict), the resolution is the deletion, `git rm`; otherwise
 /// `checkout --ours|--theirs` followed by `git add`.
 pub(crate) fn resolve_take(repo: &Repo, path: &str, side: ConflictSide) -> Result<()> {
-    let (stage, flag) = match side {
+    let (side_stage, flag) = match side {
         ConflictSide::Ours => (b'2', "--ours"),
         ConflictSide::Theirs => (b'3', "--theirs"),
     };
-    let out = repo
-        .command()
-        .env("GIT_LITERAL_PATHSPECS", "1")
+    let out = literal_command(repo)
         .args(["ls-files", "-u", "-z", "--"])
         .arg(path)
         .output()
@@ -320,31 +320,22 @@ pub(crate) fn resolve_take(repo: &Repo, path: &str, side: ConflictSide) -> Resul
         record
             .iter()
             .position(|&b| b == b'\t')
-            .is_some_and(|tab| record[..tab].last() == Some(&stage))
+            .is_some_and(|tab| record[..tab].last() == Some(&side_stage))
     });
     if has_side {
-        let out = repo
-            .command()
-            .env("GIT_LITERAL_PATHSPECS", "1")
+        let out = literal_command(repo)
             .args(["checkout", flag, "--", path])
             .output()
             .map_err(Error::Spawn)?;
         check_output(out, "checkout")?;
-        stage_paths(repo, path, "add")
+        stage(repo, &[path.to_string()])
     } else {
-        stage_paths(repo, path, "rm")
+        let out = literal_command(repo)
+            .args(["rm", "-q", "--", path])
+            .output()
+            .map_err(Error::Spawn)?;
+        check_output(out, "rm").map(drop)
     }
-}
-
-fn stage_paths(repo: &Repo, path: &str, verb: &'static str) -> Result<()> {
-    let mut command = literal_command(repo);
-    command.arg(verb);
-    if verb == "rm" {
-        command.arg("-q");
-    }
-    command.args(["--", path]);
-    let out = command.output().map_err(Error::Spawn)?;
-    check_output(out, verb).map(drop)
 }
 
 /// Removes `paths` from the index (the work tree is left alone).
@@ -480,39 +471,79 @@ pub(crate) fn unstaged_diff(repo: &Repo, path: &str, old_path: Option<&str>) -> 
     file_patch(repo, path, old_path, false, crate::DiffOptions::default())
 }
 
-/// A patch-shaped view of an untracked file: every line is an addition, so
-/// the same diff model and the same hunk controls work on it.
-pub(crate) fn untracked_diff(repo: &Repo, path: &str) -> Result<FileDiff> {
-    let bytes = fs::read(repo.root().join(path)).map_err(Error::Io)?;
-    if bytes.len() as u64 > UNTRACKED_COUNT_CAP {
+/// A work-tree file read for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeFile {
+    /// Contains a NUL byte.
+    Binary,
+    Text(WorktreeText),
+}
+
+/// The lines of a text work-tree file: `\n` and `\r\n` endings are stripped,
+/// invalid UTF-8 is replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeText {
+    pub lines: Vec<String>,
+    /// The last line ended with a newline (true for an empty file).
+    pub ends_with_newline: bool,
+}
+
+/// Reads the work-tree file `path` (repo-relative). A missing file is an
+/// [`Error::Io`] of kind `NotFound`; one over the display cap is
+/// [`Error::TooLarge`].
+pub(crate) fn worktree_file(repo: &Repo, path: &str) -> Result<WorktreeFile> {
+    let full = repo.root().join(path);
+    if fs::metadata(&full).map_err(Error::Io)?.len() > UNTRACKED_COUNT_CAP {
         return Err(Error::TooLarge { what: "diff" });
     }
+    let bytes = fs::read(&full).map_err(Error::Io)?;
     if bytes.contains(&0) {
-        return Ok(FileDiff {
-            path: path.to_string(),
-            binary: true,
-            ..FileDiff::default()
-        });
+        return Ok(WorktreeFile::Binary);
     }
     let text = String::from_utf8_lossy(&bytes);
     let mut lines = Vec::new();
-    let mut ended_with_newline = true;
+    let mut ends_with_newline = true;
     for line in text.split_inclusive('\n') {
         let (content, newline) = match line.strip_suffix('\n') {
             Some(content) => (content.strip_suffix('\r').unwrap_or(content), true),
             None => (line, false),
         };
-        ended_with_newline = newline;
-        lines.push(crate::DiffLine {
+        ends_with_newline = newline;
+        lines.push(content.to_string());
+    }
+    Ok(WorktreeFile::Text(WorktreeText {
+        lines,
+        ends_with_newline,
+    }))
+}
+
+/// A patch-shaped view of an untracked file: every line is an addition, so
+/// the same diff model and the same hunk controls work on it.
+pub(crate) fn untracked_diff(repo: &Repo, path: &str) -> Result<FileDiff> {
+    let text = match worktree_file(repo, path)? {
+        WorktreeFile::Binary => {
+            return Ok(FileDiff {
+                path: path.to_string(),
+                binary: true,
+                ..FileDiff::default()
+            })
+        }
+        WorktreeFile::Text(text) => text,
+    };
+    let mut lines: Vec<crate::DiffLine> = text
+        .lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, content)| crate::DiffLine {
             kind: crate::LineKind::Added,
             old_line: None,
-            new_line: Some(lines.len() as u32 + 1),
-            text: content.to_string(),
+            new_line: Some(index as u32 + 1),
+            text: content,
             no_newline: false,
-        });
-    }
+        })
+        .collect();
     if let Some(last) = lines.last_mut() {
-        last.no_newline = !ended_with_newline;
+        last.no_newline = !text.ends_with_newline;
     }
     let count = lines.len() as u32;
     Ok(FileDiff {
@@ -690,6 +721,11 @@ fn parse_porcelain(raw: &[u8]) -> Result<Porcelain> {
         }
     }
     Ok(out)
+}
+
+/// Repo-relative paths with unresolved conflicts, in git's order.
+pub(crate) fn conflicted_paths(repo: &Repo) -> Result<Vec<String>> {
+    Ok(porcelain(repo)?.conflicted)
 }
 
 /// Reads the status porcelain and returns only its parsed facts.

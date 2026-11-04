@@ -21,7 +21,8 @@ use gpui::{
 };
 
 use git_core::{
-    BranchLog, CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Ref, Repo,
+    BranchLog, CommitInfo, Error, Git, Head, LogKiller, LogOptions, LogStream, Oid, Operation, Ref,
+    Repo,
 };
 use git_graph::{ColumnGeometry, GraphBuilder, IdleLanes, Row};
 use ui::actions::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrev};
@@ -862,6 +863,9 @@ pub struct HistoryView {
     /// The repository's remotes, for the "Open on <host>" menu items; set by
     /// the shell whenever it reloads them.
     remote_targets: Vec<RemoteTargets>,
+    /// The operation the repository is stopped in, for the badge and row
+    /// menus (Merge is disabled while there is one). The shell keeps it current.
+    operation: Operation,
     /// The pull request badges and CI dots, pushed by the shell.
     hosting: Arc<HostingView>,
     /// What a click on a pull request badge does; installed by the shell.
@@ -1551,6 +1555,7 @@ impl HistoryView {
             on_action,
             sidebar_action: None,
             remote_targets: Vec::new(),
+            operation: Operation::None,
             hosting: Arc::default(),
             pr_click: None,
             visible_oids: Vec::new(),
@@ -2462,6 +2467,11 @@ impl HistoryView {
         self.remote_targets = targets;
     }
 
+    /// Tells the History which operation the repository is stopped in.
+    pub(crate) fn set_operation(&mut self, operation: Operation) {
+        self.operation = operation;
+    }
+
     /// The hosts the repository's remotes point at, the current branch's
     /// upstream first. Pure: reads the configured accounts, nothing else.
     fn host_links(&self, cx: &App) -> Vec<HostLink> {
@@ -2538,8 +2548,16 @@ impl HistoryView {
             remote_targets: self.remote_targets.clone(),
             ..SidebarExtras::default()
         };
+        let operation = self.operation;
         Rc::new(move |key| {
-            sidebar_menu_with_links(key, head.as_ref(), Some(&extras), Some(&refs), &links)
+            sidebar_menu_with_links(
+                key,
+                head.as_ref(),
+                Some(&extras),
+                Some(&refs),
+                &links,
+                operation,
+            )
         })
     }
 
@@ -5208,7 +5226,13 @@ mod tests {
             on_sidebar: None,
             on_filter: Rc::new(|_, _| {}),
             branch_menu: Rc::new(move |key| {
-                sidebar_menu(key, head_for_menu.as_ref(), None, Some(&refs))
+                sidebar_menu(
+                    key,
+                    head_for_menu.as_ref(),
+                    None,
+                    Some(&refs),
+                    Operation::None,
+                )
             }),
             open_links: Vec::new(),
         }
@@ -6515,6 +6539,30 @@ mod tests {
             [SidebarAction::ShowBranchCommits(branch)],
             "the badge menu is not the branch's sidebar menu"
         );
+    }
+
+    /// The badge and row menus read the operation the shell hands the History:
+    /// Merge is offered while idle and disabled while one is stopped.
+    #[gpui::test]
+    fn badge_menus_disable_merge_while_an_operation_is_stopped(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-badge-merge");
+        commit(repo.path(), "a.txt", "A");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update(&mut cx, |view, _| {
+            let merge_enabled = |view: &HistoryView| {
+                let model = view.ref_menu_source(Vec::new())("local:side");
+                model.iter().find_map(|entry| match entry {
+                    SidebarMenuEntry::Item(item) if item.label.starts_with("Merge ") => {
+                        Some(item.enabled)
+                    }
+                    _ => None,
+                })
+            };
+            assert_eq!(merge_enabled(view), Some(true));
+            view.set_operation(Operation::Merge);
+            assert_eq!(merge_enabled(view), Some(false));
+        });
     }
 
     /// The status only says "No matches" once the whole history was scanned; a
