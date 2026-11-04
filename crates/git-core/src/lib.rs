@@ -49,7 +49,7 @@ pub use error::{Error, ErrorClass, Result};
 pub use git::{Git, GitChoice, GitEngine, GitSource, GitVersion, Resolution};
 pub use log::{commits_on_day, CommitCount, CommitInfo, LogKiller, LogOptions, LogStream};
 pub use oid::Oid;
-pub use ops::ResetMode;
+pub use ops::{MergeOutcome, MergePreview, MergeType, Operation, ResetMode};
 pub use refs::{Head, Ref, RefKind};
 pub use runner::{DiscoveredRepo, GitRunner};
 pub use stash::Stash;
@@ -182,6 +182,11 @@ impl Repo {
 
     pub fn git_dir(&self) -> &Path {
         &self.git_dir
+    }
+
+    /// The version of the resolved `git` executable.
+    pub(crate) fn git_version(&self) -> GitVersion {
+        self.git.version()
     }
 
     /// A `git` command already pointed at this repository.
@@ -561,6 +566,28 @@ impl Repo {
     /// Empty when no such remote is configured.
     pub fn remote_push_urls(&self, name: &str) -> Result<Vec<String>> {
         ops::remote_push_urls(self, name)
+    }
+
+    /// Merges `branch` into HEAD. Conflicts are an outcome
+    /// ([`MergeOutcome::Conflicts`]) and leave the merge in progress.
+    pub fn merge(&self, branch: &str, ty: MergeType) -> Result<MergeOutcome> {
+        ops::merge(self, branch, ty)
+    }
+
+    /// Predicts merging `branch` into HEAD without touching the work tree or
+    /// the index.
+    pub fn merge_preview(&self, branch: &str) -> Result<MergePreview> {
+        ops::merge_preview(self, branch)
+    }
+
+    /// Abandons a merge in progress (`git merge --abort`).
+    pub fn merge_abort(&self) -> Result<()> {
+        ops::merge_abort(self)
+    }
+
+    /// The merge / rebase / cherry-pick / revert the repository is stopped in.
+    pub fn operation(&self) -> Result<Operation> {
+        ops::operation(self)
     }
 
     /// Applies `oid` on top of HEAD; a conflict is aborted and returned.

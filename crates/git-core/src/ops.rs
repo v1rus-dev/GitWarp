@@ -1,5 +1,5 @@
-//! Ref and history operations: checkout, branches, tags, remotes, cherry-pick,
-//! revert, reset and the stash.
+//! Ref and history operations: checkout, branches, tags, remotes, merge (with a
+//! conflict preview), cherry-pick, revert, reset and the stash.
 //!
 //! All of them run the `git` CLI, like the read paths, so hooks, signing
 //! configuration and credential helpers keep working. The UI only sees plain
@@ -7,7 +7,7 @@
 
 use std::process::Output;
 
-use crate::{check_output, Error, Oid, Repo, Result};
+use crate::{check_output, Error, GitVersion, Oid, Repo, Result};
 
 /// How much of the work tree and index `git reset` rewrites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +267,280 @@ pub(crate) fn remote_push_urls(repo: &Repo, name: &str) -> Result<Vec<String>> {
         .filter(|url| !url.is_empty())
         .map(str::to_owned)
         .collect())
+}
+
+/// How `git merge` joins the branch into HEAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MergeType {
+    /// `--ff`: fast-forward when possible, a merge commit otherwise.
+    #[default]
+    FastForwardIfPossible,
+    /// `--no-ff`: always create a merge commit.
+    NoFastForward,
+    /// `--ff-only`: fail instead of creating a merge commit.
+    FastForwardOnly,
+    /// `--squash`: stage the combined changes without committing.
+    Squash,
+}
+
+impl MergeType {
+    fn flag(self) -> &'static str {
+        match self {
+            MergeType::FastForwardIfPossible => "--ff",
+            MergeType::NoFastForward => "--no-ff",
+            MergeType::FastForwardOnly => "--ff-only",
+            MergeType::Squash => "--squash",
+        }
+    }
+}
+
+/// What a [`merge`] did. Conflicts are an outcome, not an error: the merge is
+/// left in progress for the conflict editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// A merge commit was created.
+    Merged,
+    FastForwarded,
+    /// The changes are staged and nothing is committed (`--squash`).
+    Squashed,
+    /// There was nothing to merge.
+    UpToDate,
+    /// The merge stopped; these repo-relative paths are conflicted.
+    Conflicts(Vec<String>),
+}
+
+/// What merging a branch into HEAD would do, computed without touching the
+/// work tree or the index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergePreview {
+    /// HEAD already contains the branch.
+    UpToDate,
+    /// HEAD is an ancestor of the branch.
+    FastForward,
+    /// Diverged and mergeable without conflicts; `commits` is the number of
+    /// commits only the branch has.
+    Clean {
+        commits: usize,
+    },
+    Conflicts {
+        commits: usize,
+        paths: Vec<String>,
+    },
+    /// The outcome cannot be predicted (git too old, …); the reason is
+    /// human-readable.
+    Unavailable(String),
+}
+
+/// The multi-step operation a repository is stopped in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+    None,
+    Merge,
+    /// `progress` is `(current step, total steps)` when git recorded it
+    /// (`rebase-merge/msgnum` and `end`); the apply backend has none here.
+    Rebase {
+        progress: Option<(usize, usize)>,
+    },
+    CherryPick,
+    Revert,
+}
+
+/// `git merge-tree --write-tree` needs 2.38; the app's floor is lower, so the
+/// conflict preview degrades to [`MergePreview::Unavailable`] instead.
+pub(crate) const MERGE_TREE_MIN: GitVersion = GitVersion {
+    major: 2,
+    minor: 38,
+    patch: 0,
+};
+
+/// Merges `branch` into HEAD with `git merge --no-edit`.
+///
+/// A failed merge that left unmerged paths behind is [`MergeOutcome::Conflicts`]
+/// (with `--squash` git writes no `MERGE_HEAD`, so the paths alone decide);
+/// every other failure is git's own error. The outcome is told apart by HEAD
+/// and its parent count, not by git's message (the runner forces `LC_ALL=C`,
+/// but the text is still not a contract).
+pub(crate) fn merge(repo: &Repo, branch: &str, ty: MergeType) -> Result<MergeOutcome> {
+    let before = head_oid(repo)?;
+    let out = repo
+        .command()
+        .args(["merge", "--no-edit", ty.flag(), "--end-of-options", branch])
+        .output()
+        .map_err(Error::Spawn)?;
+    if !out.status.success() {
+        let merging = ty == MergeType::Squash || repo.git_dir().join("MERGE_HEAD").exists();
+        if merging {
+            let paths = unmerged_paths(repo)?;
+            if !paths.is_empty() {
+                return Ok(MergeOutcome::Conflicts(paths));
+            }
+        }
+        return Err(failure("merge", out));
+    }
+    if ty == MergeType::Squash {
+        // A squash never moves HEAD, so "up to date" cannot be read from it.
+        return Ok(if is_ancestor(repo, branch, "HEAD")? {
+            MergeOutcome::UpToDate
+        } else {
+            MergeOutcome::Squashed
+        });
+    }
+    let after = head_oid(repo)?;
+    if after == before {
+        return Ok(MergeOutcome::UpToDate);
+    }
+    // `rev-list --parents -n 1` prints the commit followed by its parents.
+    let out = repo
+        .command()
+        .args(["rev-list", "--parents", "-n", "1", "HEAD", "--"])
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "rev-list")?;
+    let fields = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .count();
+    Ok(if fields > 2 {
+        MergeOutcome::Merged
+    } else {
+        MergeOutcome::FastForwarded
+    })
+}
+
+fn head_oid(repo: &Repo) -> Result<String> {
+    let out = repo
+        .command()
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "rev-parse")?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// Repo-relative paths with unresolved conflicts, in git's order.
+fn unmerged_paths(repo: &Repo) -> Result<Vec<String>> {
+    let out = repo
+        .command()
+        .args(["diff", "--name-only", "--diff-filter=U", "-z"])
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "diff --diff-filter=U")?;
+    Ok(split_nul(&out.stdout))
+}
+
+fn split_nul(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect()
+}
+
+/// Predicts `git merge branch` without touching the work tree or the index.
+///
+/// Ancestry decides up-to-date and fast-forward; otherwise `git merge-tree
+/// --write-tree` merges in memory (it only writes objects). The branch is
+/// resolved to a commit id first, so a bad ref is an error rather than a
+/// guess, and a name that looks like an option cannot be misread.
+pub(crate) fn merge_preview(repo: &Repo, branch: &str) -> Result<MergePreview> {
+    let out = repo
+        .command()
+        .args(["rev-parse", "--verify", "--end-of-options"])
+        .arg(format!("{branch}^{{commit}}"))
+        .output()
+        .map_err(Error::Spawn)?;
+    let target = check_output(out, "rev-parse")?;
+    let target = String::from_utf8_lossy(&target.stdout).trim().to_owned();
+
+    if is_ancestor(repo, &target, "HEAD")? {
+        return Ok(MergePreview::UpToDate);
+    }
+    if is_ancestor(repo, "HEAD", &target)? {
+        return Ok(MergePreview::FastForward);
+    }
+    let out = repo
+        .command()
+        .args(["rev-list", "--count"])
+        .arg(format!("HEAD..{target}"))
+        .arg("--")
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "rev-list")?;
+    let commits = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| Error::Parse("rev-list --count"))?;
+
+    let version = repo.git_version();
+    if version < MERGE_TREE_MIN {
+        return Ok(MergePreview::Unavailable(format!(
+            "git {version} is too old for a conflict preview (needs {MERGE_TREE_MIN})"
+        )));
+    }
+    let out = repo
+        .command()
+        .args(["merge-tree", "--write-tree", "--name-only", "-z", "HEAD"])
+        .arg(&target)
+        .output()
+        .map_err(Error::Spawn)?;
+    match out.status.code() {
+        Some(0) => Ok(MergePreview::Clean { commits }),
+        // Exit 1 is also what a bad ref gives (empty stdout), so conflicts
+        // only count when stdout starts with the result tree's hex id.
+        Some(1) if starts_with_oid(&out.stdout) => {
+            // `<tree>\0<path>\0…\0\0<messages>`: paths end at the empty field.
+            let mut paths: Vec<String> = Vec::new();
+            for field in out.stdout.split(|b| *b == 0).skip(1) {
+                if field.is_empty() {
+                    break;
+                }
+                let path = String::from_utf8_lossy(field).into_owned();
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            Ok(MergePreview::Conflicts { commits, paths })
+        }
+        _ => Err(failure("merge-tree", out)),
+    }
+}
+
+fn starts_with_oid(stdout: &[u8]) -> bool {
+    let first = stdout.split(|b| *b == 0).next().unwrap_or_default();
+    first.len() >= 40 && first.iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Abandons a merge in progress (`git merge --abort`).
+pub(crate) fn merge_abort(repo: &Repo) -> Result<()> {
+    run(repo, &["merge", "--abort"], "merge --abort")
+}
+
+/// The operation the repository is stopped in, read from the per-worktree git
+/// dir. A rebase wins over the others: it replays commits through
+/// cherry-pick, so `CHERRY_PICK_HEAD` can exist inside it.
+pub(crate) fn operation(repo: &Repo) -> Result<Operation> {
+    let dir = repo.git_dir();
+    let merge_dir = dir.join("rebase-merge");
+    if merge_dir.is_dir() {
+        let number = |name: &str| {
+            std::fs::read_to_string(merge_dir.join(name))
+                .ok()
+                .and_then(|text| text.trim().parse::<usize>().ok())
+        };
+        let progress = number("msgnum").zip(number("end"));
+        return Ok(Operation::Rebase { progress });
+    }
+    if dir.join("rebase-apply").is_dir() {
+        return Ok(Operation::Rebase { progress: None });
+    }
+    Ok(if dir.join("MERGE_HEAD").exists() {
+        Operation::Merge
+    } else if dir.join("CHERRY_PICK_HEAD").exists() {
+        Operation::CherryPick
+    } else if dir.join("REVERT_HEAD").exists() {
+        Operation::Revert
+    } else {
+        Operation::None
+    })
 }
 
 /// Applies one commit on top of HEAD as a new commit.
