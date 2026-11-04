@@ -251,6 +251,7 @@
   "dialogs.merge.help.squash": "Добавляет объединённые изменения в индекс без коммита. Изменения откроются с заполненным сообщением коммита.",
   "dialogs.merge.checking": "Проверка конфликтов…",
   "dialogs.merge.unavailable": "Не удалось проверить конфликты: {reason}",
+  "dialogs.merge.unavailable_old_git": "Не удалось проверить конфликты: git {have} старее требуемой версии {need}",
   "dialogs.merge.clean.title": "Слияние пройдёт без конфликтов",
   "dialogs.merge.clean.body.one": "Будет влит {n} коммит из {branch}.",
   "dialogs.merge.clean.body.few": "Будет влито {n} коммита из {branch}.",
@@ -281,8 +282,9 @@
   "dialogs.merge.dirty_note": "Git остановится, прежде чем тронуть файл с локальными изменениями.",
   "dialogs.merge.toast.merged": "{branch} влита в {head}",
   "dialogs.merge.toast.fast_forwarded": "{head} перемотана до {branch}",
-  "dialogs.merge.toast.squashed": "{branch} объединена в индекс — закоммитьте её из «Изменений»",
+  "dialogs.merge.toast.squashed": "Изменения из {branch} добавлены в индекс — закоммитьте их в «Изменениях»",
   "dialogs.merge.toast.up_to_date": "{head} уже содержит всё из {branch}",
+  "dialogs.merge.toast.waiting": "Слияние {branch} ждёт коммита",
   "dialogs.merge.toast.conflicts.one": "Слияние остановлено: конфликты в {n} файле",
   "dialogs.merge.toast.conflicts.few": "Слияние остановлено: конфликты в {n} файлах",
   "dialogs.merge.toast.conflicts.many": "Слияние остановлено: конфликты в {n} файлах"

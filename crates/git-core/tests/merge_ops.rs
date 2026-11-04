@@ -60,6 +60,11 @@ fn base() -> (tempfile::TempDir, Repo) {
     let dir = tmp.path();
     git(dir, &["init", "-q"]);
     git(dir, &["config", "core.autocrlf", "false"]);
+    // Repo commands run the real git (global config included), so the identity
+    // and signing must be local, as in tests/ref_ops.rs.
+    git(dir, &["config", "user.name", "Test"]);
+    git(dir, &["config", "user.email", "test@example.com"]);
+    git(dir, &["config", "commit.gpgsign", "false"]);
     commit_file(dir, "a.txt", "one\n", "A");
     git(dir, &["branch", "side"]);
     let repo = open(dir);
@@ -247,7 +252,9 @@ fn merge_squash_with_conflicts_reports_paths() {
     let (_tmp, repo) = conflicting();
     assert_eq!(
         repo.merge("side", MergeType::Squash).unwrap(),
-        MergeOutcome::Conflicts(vec!["a.txt".to_owned()])
+        MergeOutcome::Stopped {
+            conflicts: vec!["a.txt".to_owned()]
+        }
     );
 }
 
@@ -258,7 +265,12 @@ fn merge_conflicts_are_an_outcome_and_abort_restores_head() {
     let outcome = repo
         .merge("side", MergeType::FastForwardIfPossible)
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::Conflicts(vec!["a.txt".to_owned()]));
+    assert_eq!(
+        outcome,
+        MergeOutcome::Stopped {
+            conflicts: vec!["a.txt".to_owned()]
+        }
+    );
     assert_eq!(repo.operation().unwrap(), Operation::Merge);
 
     repo.merge_abort().unwrap();
@@ -340,7 +352,7 @@ fn stopped_merge() -> (tempfile::TempDir, Repo) {
     let outcome = repo
         .merge("side", MergeType::FastForwardIfPossible)
         .unwrap();
-    assert!(matches!(outcome, MergeOutcome::Conflicts { .. }));
+    assert!(matches!(outcome, MergeOutcome::Stopped { .. }));
     (tmp, repo)
 }
 
@@ -359,7 +371,7 @@ fn status_lists_each_conflicted_path_once() {
 fn merge_heading_reads_the_branch_name() {
     let (_tmp, repo) = stopped_merge();
     assert_eq!(repo.merge_heading().unwrap().as_deref(), Some("side"));
-    let message = repo.merge_message().unwrap().unwrap();
+    let message = repo.prepared_message().unwrap().unwrap();
     assert!(message.starts_with("Merge branch 'side'"));
     assert!(!message.contains('#'), "{message}");
 }
@@ -368,7 +380,7 @@ fn merge_heading_reads_the_branch_name() {
 fn merge_heading_formats() {
     let (tmp, repo) = base();
     assert_eq!(repo.merge_heading().unwrap(), None);
-    assert_eq!(repo.merge_message().unwrap(), None);
+    assert_eq!(repo.prepared_message().unwrap(), None);
     let msg = repo.git_dir().join("MERGE_MSG");
     for (text, want) in [
         ("Merge branch 'feature/x'\n", Some("feature/x")),
@@ -409,7 +421,7 @@ fn resolve_take_ours_and_theirs_then_commit_finishes_the_merge() {
     // graph.rs took our side, so it no longer differs from HEAD.
     assert_eq!(status.staged.len(), 2);
     assert_eq!(repo.operation().unwrap(), Operation::Merge);
-    let message = repo.merge_message().unwrap().unwrap();
+    let message = repo.prepared_message().unwrap().unwrap();
     repo.commit(&message, false).unwrap();
     assert_eq!(repo.operation().unwrap(), Operation::None);
     assert_eq!(
@@ -433,7 +445,7 @@ fn resolve_take_deletion_side_removes_the_file() {
     assert!(matches!(
         repo.merge("side", MergeType::FastForwardIfPossible)
             .unwrap(),
-        MergeOutcome::Conflicts { .. }
+        MergeOutcome::Stopped { .. }
     ));
     assert_eq!(repo.working_status().unwrap().conflicted.len(), 1);
     repo.resolve_take("a.txt", ConflictSide::Theirs).unwrap();
@@ -456,4 +468,169 @@ fn resolve_take_keeps_a_file_the_chosen_side_still_has() {
         .unwrap();
     repo.resolve_take("a.txt", ConflictSide::Ours).unwrap();
     assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "main\n");
+}
+
+#[test]
+fn merge_during_a_stopped_merge_is_an_error_not_conflicts() {
+    let (tmp, repo) = stopped_merge();
+    git(tmp.path(), &["branch", "other", "side"]);
+    let err = repo
+        .merge("other", MergeType::FastForwardIfPossible)
+        .unwrap_err();
+    assert!(matches!(err, git_core::Error::Git { .. }), "{err:?}");
+    assert_eq!(repo.operation().unwrap(), Operation::Merge);
+}
+
+#[test]
+fn fast_forward_to_a_merge_commit_is_a_fast_forward() {
+    let (tmp, repo) = diverged();
+    let dir = tmp.path();
+    // `merged` = main + side joined by a merge commit; main then sits behind it.
+    git(dir, &["switch", "-q", "-c", "merged"]);
+    git(dir, &["merge", "-q", "--no-edit", "side"]);
+    git(dir, &["switch", "-q", "main"]);
+    let tip = git_out(dir, &["rev-parse", "merged"]);
+    assert_eq!(
+        repo.merge("merged", MergeType::FastForwardIfPossible)
+            .unwrap(),
+        MergeOutcome::FastForwarded
+    );
+    assert_eq!(git_out(dir, &["rev-parse", "HEAD"]), tip);
+}
+
+#[test]
+fn merge_no_commit_from_config_is_a_stopped_merge() {
+    let (tmp, repo) = diverged();
+    let dir = tmp.path();
+    git(dir, &["config", "branch.main.mergeOptions", "--no-commit"]);
+    let head = git_out(dir, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        repo.merge("side", MergeType::NoFastForward).unwrap(),
+        MergeOutcome::Stopped {
+            conflicts: Vec::new()
+        }
+    );
+    assert_eq!(git_out(dir, &["rev-parse", "HEAD"]), head);
+    assert_eq!(repo.operation().unwrap(), Operation::Merge);
+}
+
+#[cfg(unix)]
+#[test]
+fn rejecting_pre_merge_commit_hook_is_a_stopped_merge() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, repo) = diverged();
+    let hook = repo.git_dir().join("hooks").join("pre-merge-commit");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        repo.merge("side", MergeType::NoFastForward).unwrap(),
+        MergeOutcome::Stopped {
+            conflicts: Vec::new()
+        }
+    );
+    assert_eq!(repo.operation().unwrap(), Operation::Merge);
+    drop(tmp);
+}
+
+#[test]
+fn conflicted_squash_is_a_squash_operation_and_abort_cleans_up() {
+    let (tmp, repo) = conflicting();
+    let dir = tmp.path();
+    let head = git_out(dir, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        repo.merge("side", MergeType::Squash).unwrap(),
+        MergeOutcome::Stopped {
+            conflicts: vec!["a.txt".to_owned()]
+        }
+    );
+    assert_eq!(repo.operation().unwrap(), Operation::Squash);
+    repo.merge_abort().unwrap();
+    assert_eq!(repo.operation().unwrap(), Operation::None);
+    assert!(!repo.git_dir().join("SQUASH_MSG").exists());
+    assert_eq!(git_out(dir, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git_out(dir, &["status", "--porcelain"]), "");
+    assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "main\n");
+}
+
+#[test]
+fn squash_prefills_the_squash_message() {
+    let (_tmp, repo) = diverged();
+    repo.merge("side", MergeType::Squash).unwrap();
+    assert_eq!(repo.operation().unwrap(), Operation::Squash);
+    let message = repo.prepared_message().unwrap().unwrap();
+    assert!(
+        message.contains("Squashed commit of the following"),
+        "{message}"
+    );
+    assert!(message.contains("S2"), "{message}");
+}
+
+#[test]
+fn prepared_message_respects_a_custom_comment_char() {
+    let (tmp, repo) = stopped_merge();
+    git(tmp.path(), &["config", "core.commentChar", ";"]);
+    fs::write(
+        repo.git_dir().join("MERGE_MSG"),
+        "Merge branch 'side'\n\n# keep me\n; drop me\n",
+    )
+    .unwrap();
+    let message = repo.prepared_message().unwrap().unwrap();
+    assert_eq!(message, "Merge branch 'side'\n\n# keep me");
+}
+
+#[test]
+fn resolve_take_treats_paths_literally() {
+    let (tmp, repo) = base();
+    let dir = tmp.path();
+    commit_file(dir, "a[1].txt", "base\n", "br");
+    commit_file(dir, "a1.txt", "base\n", "plain");
+    git(dir, &["branch", "-f", "side"]);
+    commit_file(dir, "a[1].txt", "main\n", "M");
+    git(dir, &["switch", "-q", "side"]);
+    commit_file(dir, "a[1].txt", "side\n", "S");
+    git(dir, &["switch", "-q", "main"]);
+    assert!(matches!(
+        repo.merge("side", MergeType::FastForwardIfPossible)
+            .unwrap(),
+        MergeOutcome::Stopped { .. }
+    ));
+    fs::write(dir.join("a1.txt"), "local edit\n").unwrap();
+    repo.resolve_take("a[1].txt", ConflictSide::Theirs).unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.join("a1.txt")).unwrap(),
+        "local edit\n"
+    );
+    assert_eq!(fs::read_to_string(dir.join("a[1].txt")).unwrap(), "side\n");
+}
+
+#[test]
+fn stage_unstage_discard_treat_paths_literally() {
+    let (tmp, repo) = base();
+    let dir = tmp.path();
+    commit_file(dir, "a[1].txt", "base\n", "br");
+    commit_file(dir, "a1.txt", "base\n", "plain");
+    fs::write(dir.join("a[1].txt"), "x\n").unwrap();
+    fs::write(dir.join("a1.txt"), "y\n").unwrap();
+    repo.stage(&["a[1].txt".to_owned()]).unwrap();
+    assert_eq!(
+        git_out(dir, &["diff", "--cached", "--name-only"]),
+        "a[1].txt"
+    );
+    repo.unstage(&["a[1].txt".to_owned()]).unwrap();
+    assert_eq!(git_out(dir, &["diff", "--cached", "--name-only"]), "");
+    repo.discard(&["a[1].txt".to_owned()], &[]).unwrap();
+    assert_eq!(fs::read_to_string(dir.join("a1.txt")).unwrap(), "y\n");
+    assert_eq!(fs::read_to_string(dir.join("a[1].txt")).unwrap(), "base\n");
+}
+
+#[test]
+fn stash_save_with_only_conflicts_surfaces_gits_error() {
+    let (_tmp, repo) = conflicting();
+    repo.merge("side", MergeType::FastForwardIfPossible)
+        .unwrap();
+    assert!(repo.working_status().unwrap().staged.is_empty());
+    // `Ok(false)` ("nothing to stash") would hide the stopped merge.
+    let result = repo.stash_save(None);
+    assert!(result.is_err(), "{result:?}");
 }

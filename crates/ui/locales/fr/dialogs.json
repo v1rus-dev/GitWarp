@@ -247,6 +247,7 @@
   "dialogs.merge.help.squash": "Indexe les changements combinés sans commit. Changements s’ouvre avec le message de commit prérempli.",
   "dialogs.merge.checking": "Recherche de conflits…",
   "dialogs.merge.unavailable": "Impossible de vérifier les conflits : {reason}",
+  "dialogs.merge.unavailable_old_git": "Impossible de vérifier les conflits : git {have} est plus ancien que la version requise {need}",
   "dialogs.merge.clean.title": "La fusion peut se faire sans conflit",
   "dialogs.merge.clean.body.one": "{n} commit de {branch} sera fusionné.",
   "dialogs.merge.clean.body.other": "{n} commits de {branch} seront fusionnés.",
@@ -276,6 +277,7 @@
   "dialogs.merge.toast.fast_forwarded": "{head} avancée rapidement jusqu’à {branch}",
   "dialogs.merge.toast.squashed": "{branch} écrasée dans l’index : validez-la depuis Changements",
   "dialogs.merge.toast.up_to_date": "{head} est déjà à jour avec {branch}",
+  "dialogs.merge.toast.waiting": "La fusion de {branch} attend une validation",
   "dialogs.merge.toast.conflicts.one": "Fusion arrêtée : {n} fichier a des conflits",
   "dialogs.merge.toast.conflicts.other": "Fusion arrêtée : {n} fichiers ont des conflits"
 }

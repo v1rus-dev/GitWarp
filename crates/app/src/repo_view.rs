@@ -847,8 +847,9 @@ impl RepositoryView {
                     this.reload_history(cx);
                 }
                 ChangesEvent::PushAfterCommit => this.push_branch(window, cx),
-                // The abort moved HEAD back: history, sidebar and worktrees follow.
-                ChangesEvent::MergeAborted => this.after_ref_change(RefChange::History, cx),
+                // `merge --abort` does not move HEAD: the sidebar, the worktree
+                // status and the badges are enough, not a history walk.
+                ChangesEvent::MergeAborted => this.after_ref_change(RefChange::RefsOnly, cx),
             },
         );
         let changes_redraw = cx.observe(&changes, |_, _, cx| cx.notify());
@@ -1454,15 +1455,13 @@ impl RepositoryView {
         cx: &mut Context<Self>,
     ) {
         let links = self.host_links(cx);
+        let extras = SidebarExtras {
+            operation: self.changes.read(cx).operation(),
+            ..self.sidebar_extras.clone().unwrap_or_default()
+        };
         let mut model = {
             let history = self.history.read(cx);
-            sidebar_menu_with_links(
-                key,
-                history.head(),
-                self.sidebar_extras.as_ref(),
-                history.refs(),
-                &links,
-            )
+            sidebar_menu_with_links(key, history.head(), Some(&extras), history.refs(), &links)
         };
         // "Create pull request…" for a local branch when a remote can take one.
         if let Some(branch) = key.strip_prefix("local:") {
@@ -2355,7 +2354,7 @@ impl RepositoryView {
             view.update(cx, |view, cx| view.start_network_job(job, window, cx));
         });
         let changes = self.changes.read(cx);
-        let dirty = changes.staged_count() + changes.unstaged_count();
+        let dirty = changes.dirty_count();
         RefDialogContext {
             root: self.root.clone(),
             git: self.git.clone(),
@@ -2417,22 +2416,36 @@ impl RepositoryView {
             // The menu disables Merge without a branch checked out.
             _ => return,
         };
+        // Git refuses a merge while another operation is stopped. The sidebar
+        // menu is disabled then; the History badge menus (history_view.rs) do
+        // not know the operation, so this entry point sends the user to the
+        // Changes banner instead of opening a dialog that can only fail.
+        if self.changes.read(cx).operation() != git_core::Operation::None {
+            self.show_changes(window, cx);
+            return;
+        }
         let changes = self.changes.read(cx);
         let context = crate::merge_dialog::MergeDialogContext {
             root: self.root.clone(),
             git: self.git.clone(),
             branch,
             head,
-            dirty: changes.staged_count() + changes.unstaged_count(),
+            dirty: changes.dirty_count(),
         };
         let view = cx.entity();
         let dialog = crate::merge_dialog::open(
             context,
-            move |show_changes, window, cx| {
+            move |done, window, cx| {
                 view.update(cx, |view, cx| {
-                    // A merge adds commits (or stops with conflicts): full reload.
-                    view.after_ref_change(RefChange::History, cx);
-                    if show_changes {
+                    // A merge or fast-forward adds commits; a stop, a squash or
+                    // a failure leaves HEAD where it was.
+                    let change = if done.head_moved {
+                        RefChange::History
+                    } else {
+                        RefChange::RefsOnly
+                    };
+                    view.after_ref_change(change, cx);
+                    if done.show_changes {
                         view.show_changes(window, cx);
                     }
                     window.refresh();
@@ -2480,7 +2493,7 @@ impl RepositoryView {
         }
         let dirty = {
             let changes = self.changes.read(cx);
-            changes.staged_count() + changes.unstaged_count()
+            changes.dirty_count()
         };
         if dirty == 0 {
             self.run_checkout_action(checkout, window, cx);
@@ -5938,7 +5951,8 @@ impl RepositoryView {
             bar = bar.child(div().flex_1());
             bar = bar.child(ui::t!(
                 "repo.status.unstaged_staged",
-                unstaged = changes.unstaged_count(),
+                // Conflicted paths are still unstaged work for the status bar.
+                unstaged = changes.unstaged_count() + changes.conflicted_count(),
                 staged = changes.staged_count()
             ));
         } else {

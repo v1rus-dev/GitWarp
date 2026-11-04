@@ -247,6 +247,7 @@
   "dialogs.merge.help.squash": "Stages the combined changes without committing. Changes opens with the commit message prefilled.",
   "dialogs.merge.checking": "Checking for conflicts…",
   "dialogs.merge.unavailable": "Could not check for conflicts: {reason}",
+  "dialogs.merge.unavailable_old_git": "Could not check for conflicts: git {have} is older than the required {need}",
   "dialogs.merge.clean.title": "Merge can be done without conflicts",
   "dialogs.merge.clean.body.one": "{n} commit from {branch} will be merged.",
   "dialogs.merge.clean.body.other": "{n} commits from {branch} will be merged.",
@@ -276,6 +277,7 @@
   "dialogs.merge.toast.fast_forwarded": "Fast-forwarded {head} to {branch}",
   "dialogs.merge.toast.squashed": "Squashed {branch} into the index — commit it from Changes",
   "dialogs.merge.toast.up_to_date": "{head} is already up to date with {branch}",
+  "dialogs.merge.toast.waiting": "Merge of {branch} is waiting for a commit",
   "dialogs.merge.toast.conflicts.one": "Merge stopped: {n} file has conflicts",
   "dialogs.merge.toast.conflicts.other": "Merge stopped: {n} files have conflicts"
 }

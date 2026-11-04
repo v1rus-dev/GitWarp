@@ -5,14 +5,16 @@
 //! the answer: the status snapshot, the selected file's diff and the picks the
 //! user made for line-level staging.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, div, px, uniform_list, AnyElement, App, AppContext, Context, Div, Entity,
-    EventEmitter, FocusHandle, FontWeight, Hsla, InteractiveElement, IntoElement,
+    actions, canvas, div, px, uniform_list, AnyElement, App, AppContext, Bounds, Context, Div,
+    Entity, EventEmitter, FocusHandle, FontWeight, Hsla, InteractiveElement, IntoElement,
     ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, ParentElement, Pixels, Render,
     ScrollHandle, SharedString, StatefulInteractiveElement, Styled, StyledText, Subscription,
     TextRun, UniformListScrollHandle, Window,
@@ -22,7 +24,7 @@ use git_core::{
     ChangeKind, ConflictSide, Error, FileDiff, Git, HunkPick, Operation, Repo, WorkingFile,
     WorkingStatus,
 };
-use ui::actions::{key_binding, SelectNext, SelectPrev};
+use ui::actions::{key_binding, Cancel, SelectNext, SelectPrev};
 use ui::components::toast::{self, ToastKind};
 use ui::metrics::{FONT_MONO, FS_SM, FS_XS, MONO};
 use ui::theme::{ActiveTheme, ThemeColors};
@@ -53,8 +55,8 @@ pub enum ChangesEvent {
     Committed,
     /// A commit the user asked to push succeeded; the shell starts the push.
     PushAfterCommit,
-    /// The merge in progress was aborted: HEAD, the history and the sidebar
-    /// moved back, so the shell reloads them.
+    /// The merge in progress was aborted. `merge --abort` does not move HEAD,
+    /// but the index, the work tree and the sidebar state changed.
     MergeAborted,
 }
 
@@ -142,10 +144,13 @@ pub struct ConflictFile {
 /// What a stopped merge adds to the view.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MergeInfo {
-    /// The branch being merged, from the merge message.
+    /// The branch being merged, from the merge message (a squash has none).
     pub branch: Option<String>,
-    /// The prepared merge commit message.
+    /// The prepared commit message (`MERGE_MSG` or `SQUASH_MSG`).
     pub message: Option<String>,
+    /// A `--squash` merge: the changes are staged, there is no `MERGE_HEAD`
+    /// and the commit has a single parent.
+    pub squash: bool,
 }
 
 /// A commit-box prefill from the merge message.
@@ -153,22 +158,39 @@ pub struct MergeInfo {
 struct Prefill {
     /// The text the box was given.
     text: String,
-    /// What the box held before (the user's draft; may be empty).
-    before: String,
 }
 
-/// The text to put back when the merge ended without a commit: the box content
-/// from before the prefill, unless the user edited the prefilled text.
-fn undo_prefill(current: &str, prefill: &Prefill) -> Option<String> {
-    (current.trim_end() == prefill.text.trim_end()).then(|| prefill.before.clone())
+/// Whether the box still holds the untouched prefill, so it can be cleared
+/// when the merge ended without a commit. A prefill only goes into an empty
+/// box, so "undo" is always "empty it".
+fn prefill_untouched(current: &str, prefill: &Prefill) -> bool {
+    current.trim_end() == prefill.text.trim_end()
+}
+
+/// The conflicts the banner and the commit button go by: the loaded status's
+/// count, or the last loaded one while a reload is running. Without it a
+/// reload reads as "0 conflicts left" and the banner flips to "all resolved".
+fn conflicts_left(loaded: Option<usize>, last: usize) -> usize {
+    loaded.unwrap_or(last)
+}
+
+/// Where the conflict menu opens.
+#[derive(Clone, Copy)]
+enum MenuAnchor {
+    /// At the pointer (right click).
+    Pointer(gpui::Point<Pixels>),
+    /// Under a control or row (keyboard, the "…" button).
+    Bounds(Bounds<Pixels>),
 }
 
 /// One consistent read of the work tree.
 #[derive(Debug)]
 pub struct Snapshot {
     pub status: WorkingStatus,
-    /// `Some` while a merge is in progress.
+    /// `Some` while a merge or squash is in progress.
     pub merge: Option<MergeInfo>,
+    /// Whatever operation the repository is stopped in.
+    pub operation: Operation,
 }
 
 /// How a conflicted path is resolved from the row menu.
@@ -199,6 +221,10 @@ pub struct ChangesView {
     busy: bool,
     /// The merge in progress, if any; read with every status.
     merge: Option<MergeInfo>,
+    /// The operation the repository is stopped in, read with every status.
+    operation: Operation,
+    /// Conflicted paths in the last loaded status, kept through a reload.
+    last_conflicts: usize,
     /// The merge message was put in the commit box for this merge.
     merge_prefilled: bool,
     /// What the prefill put in the box, to take it out again if the merge ends
@@ -206,6 +232,12 @@ pub struct ChangesView {
     prefill: Option<Prefill>,
     /// The banner asks to confirm the abort.
     confirming_abort: bool,
+    /// "Keep merging" of the abort confirm: focused when the confirm opens.
+    keep_focus: FocusHandle,
+    /// Painted bounds of the conflicted rows (by index) and of their "…"
+    /// buttons, to anchor the resolve menu.
+    conflict_row_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    conflict_button_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
     focus: FocusHandle,
     conflicts_scroll: ScrollHandle,
     unstaged_scroll: ScrollHandle,
@@ -265,9 +297,14 @@ impl ChangesView {
             draft: None,
             busy: false,
             merge: None,
+            operation: Operation::None,
+            last_conflicts: 0,
             merge_prefilled: false,
             prefill: None,
             confirming_abort: false,
+            keep_focus: cx.focus_handle().tab_stop(true),
+            conflict_row_bounds: Rc::default(),
+            conflict_button_bounds: Rc::default(),
             focus: cx.focus_handle().tab_stop(false),
             conflicts_scroll: ScrollHandle::new(),
             unstaged_scroll: ScrollHandle::new(),
@@ -291,20 +328,35 @@ impl ChangesView {
         }
     }
 
-    /// Unstaged and conflicted paths: everything the work tree still differs
-    /// by from the index.
+    /// Unstaged paths, conflicted ones not included (see [`Self::conflicted_count`]).
     pub fn unstaged_count(&self) -> usize {
-        self.status().map_or(0, |status| {
-            status.unstaged_count() + status.conflicted_count()
-        })
+        self.status().map_or(0, WorkingStatus::unstaged_count)
     }
 
     pub fn staged_count(&self) -> usize {
         self.status().map_or(0, WorkingStatus::staged_count)
     }
 
-    fn conflicted_count(&self) -> usize {
+    pub fn conflicted_count(&self) -> usize {
         self.status().map_or(0, WorkingStatus::conflicted_count)
+    }
+
+    /// Every path with local work: staged, unstaged and conflicted.
+    pub fn dirty_count(&self) -> usize {
+        self.staged_count() + self.unstaged_count() + self.conflicted_count()
+    }
+
+    /// The operation the repository is stopped in, as of the last status.
+    pub fn operation(&self) -> Operation {
+        self.operation
+    }
+
+    /// Conflicts for the banner and the commit rules; survives a reload.
+    fn conflicts_left(&self) -> usize {
+        conflicts_left(
+            self.status().map(WorkingStatus::conflicted_count),
+            self.last_conflicts,
+        )
     }
 
     pub fn is_loading(&self) -> bool {
@@ -321,6 +373,8 @@ impl ChangesView {
     /// Reloads the status, e.g. when the view becomes visible or the work tree
     /// changed outside the app.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        // The view becoming visible again drops a half-answered abort confirm.
+        self.confirming_abort = false;
         self.start_status(cx);
     }
 
@@ -375,8 +429,12 @@ impl ChangesView {
         if generation != self.generation {
             return;
         }
-        let (status, merge) = match result {
-            Ok(snapshot) => (Arc::new(snapshot.status), snapshot.merge),
+        let (status, merge, operation) = match result {
+            Ok(snapshot) => (
+                Arc::new(snapshot.status),
+                snapshot.merge,
+                snapshot.operation,
+            ),
             Err(error) => {
                 self.state = StatusState::Failed(error);
                 self.diff = DiffState::Empty;
@@ -404,6 +462,8 @@ impl ChangesView {
         self.picked.clear();
         self.pick_anchor = None;
         self.confirming_discard = None;
+        self.last_conflicts = status.conflicted_count();
+        self.operation = operation;
         self.state = StatusState::Loaded(status);
         self.apply_merge(merge, cx);
         self.start_diff(cx);
@@ -423,7 +483,6 @@ impl ChangesView {
                     if let Some(message) = info.message.clone().filter(|text| !text.is_empty()) {
                         self.prefill = Some(Prefill {
                             text: message.clone(),
-                            before: current,
                         });
                         self.message
                             .update(cx, |input, cx| input.set_text(message, cx));
@@ -436,9 +495,8 @@ impl ChangesView {
                 // an abort (here or outside the app) an untouched prefill goes.
                 if let Some(prefill) = self.prefill.take() {
                     let current = self.message.read(cx).text().to_string();
-                    if let Some(before) = undo_prefill(&current, &prefill) {
-                        self.message
-                            .update(cx, |input, cx| input.set_text(before, cx));
+                    if prefill_untouched(&current, &prefill) {
+                        self.message.update(cx, |input, cx| input.set_text("", cx));
                     }
                 }
                 self.merge_prefilled = false;
@@ -481,6 +539,7 @@ impl ChangesView {
         self.picked.clear();
         self.pick_anchor = None;
         self.confirming_discard = None;
+        self.confirming_abort = false;
         self.start_diff(cx);
         cx.notify();
     }
@@ -930,15 +989,17 @@ impl ChangesView {
             .unwrap_or_else(|| ui::t!("changes.conflict.incoming").to_string())
     }
 
-    /// Resolves the conflicted row `index` (see the row menu).
-    fn resolve_conflict(&mut self, index: usize, how: Resolve, cx: &mut Context<Self>) {
-        let Some(path) = self
+    /// Resolves the conflicted `path` (see the row menu). The menu captures the
+    /// path, not the row index: the list may have changed while the menu was
+    /// open, and then the path is simply no longer conflicted.
+    fn resolve_conflict(&mut self, path: String, how: Resolve, cx: &mut Context<Self>) {
+        let still_conflicted = self
             .status()
-            .and_then(|status| status.conflicted.get(index))
-            .map(|file| file.path.clone())
-        else {
+            .is_some_and(|status| status.conflicted.iter().any(|file| file.path == path));
+        if !still_conflicted {
+            self.start_status(cx);
             return;
-        };
+        }
         let notice = match how {
             Resolve::Take(ConflictSide::Ours) => {
                 ui::t!(
@@ -969,7 +1030,12 @@ impl ChangesView {
     /// Abandons the merge (after the banner's inline confirm).
     fn abort_merge(&mut self, cx: &mut Context<Self>) {
         self.confirming_abort = false;
-        let notice = ui::t!("changes.notice.merge_aborted").to_string();
+        let notice = if self.merge.as_ref().is_some_and(|merge| merge.squash) {
+            ui::t!("changes.notice.squash_aborted")
+        } else {
+            ui::t!("changes.notice.merge_aborted")
+        }
+        .to_string();
         self.start_action_emitting(Some(ChangesEvent::MergeAborted), cx, move |repo| {
             repo.merge_abort()?;
             Ok(notice)
@@ -977,11 +1043,33 @@ impl ChangesView {
         cx.notify();
     }
 
-    /// The menu of a conflicted row: take a side, or mark it resolved.
+    /// Opens the menu of the selected conflicted row from the keyboard
+    /// (Enter, Menu, Shift+F10), anchored under the row.
+    fn open_selected_conflict_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selection) = self.selection.filter(|s| s.side == Side::Conflicted) else {
+            return;
+        };
+        let Some(path) = self.file(selection).map(|file| file.path.clone()) else {
+            return;
+        };
+        let bounds = self
+            .conflict_row_bounds
+            .borrow()
+            .get(&selection.index)
+            .copied();
+        // Before the first paint there are no bounds: fall back to the pointer.
+        let anchor = bounds.map_or_else(
+            || MenuAnchor::Pointer(window.mouse_position()),
+            MenuAnchor::Bounds,
+        );
+        self.open_conflict_menu(path, anchor, window, cx);
+    }
+
+    /// The menu of the conflicted `path`: take a side, or mark it resolved.
     fn open_conflict_menu(
         &mut self,
-        index: usize,
-        position: gpui::Point<Pixels>,
+        path: String,
+        anchor: MenuAnchor,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -992,9 +1080,10 @@ impl ChangesView {
         let item =
             |label: SharedString, icon: IconName, how: Resolve| {
                 let view = view.clone();
+                let path = path.clone();
                 MenuEntry::Item(MenuItem::new(label).icon(icon).disabled(busy).action(
                     move |_, cx| {
-                        view.update(cx, |view, cx| view.resolve_conflict(index, how, cx));
+                        view.update(cx, |view, cx| view.resolve_conflict(path.clone(), how, cx));
                     },
                 ))
             };
@@ -1016,19 +1105,35 @@ impl ChangesView {
                 Resolve::MarkResolved,
             ),
         ];
-        menu::open_context_menu(position, entries, window, cx);
+        match anchor {
+            MenuAnchor::Pointer(position) => menu::open_context_menu(position, entries, window, cx),
+            MenuAnchor::Bounds(bounds) => menu::open_dropdown(bounds, entries, window, cx),
+        };
     }
 
-    /// The operation banner of a merge in progress.
+    /// The operation banner of a merge or squash in progress.
     fn render_merge_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let merge = self.merge.as_ref()?;
-        let left = self.conflicted_count();
+        let squash = merge.squash;
+        let left = self.conflicts_left();
         let head = self.head_label();
         let busy = self.busy;
         let view = cx.entity();
+        // A squash message does not name the branch, so it has no branch title.
         let title = match &merge.branch {
+            _ if squash => ui::t!("changes.squash.title_unknown", head = head),
             Some(branch) => ui::t!("changes.merge.title", branch = branch, head = head),
             None => ui::t!("changes.merge.title_unknown", head = head),
+        };
+        let abort_label = if squash {
+            ui::t!("changes.squash.abort")
+        } else {
+            ui::t!("changes.merge.abort")
+        };
+        let commit_label = if squash {
+            ui::t!("changes.squash.commit")
+        } else {
+            ui::t!("changes.merge.commit")
         };
         let kind = merge_banner_kind(left);
         let actions = if self.confirming_abort {
@@ -1039,7 +1144,7 @@ impl ChangesView {
                 .child(
                     Button::danger("merge-abort-confirm")
                         .size(ButtonSize::Small)
-                        .label(ui::t!("changes.merge.abort"))
+                        .label(abort_label.clone())
                         .disabled(busy)
                         .on_click(move |_, _, cx| {
                             view.update(cx, |view, cx| view.abort_merge(cx));
@@ -1049,6 +1154,7 @@ impl ChangesView {
                     Button::new("merge-abort-keep")
                         .size(ButtonSize::Small)
                         .label(ui::t!("changes.merge.keep"))
+                        .focus_handle(self.keep_focus.clone())
                         .on_click(move |_, _, cx| {
                             keep_view.update(cx, |view, cx| {
                                 view.confirming_abort = false;
@@ -1058,10 +1164,10 @@ impl ChangesView {
                 )
         } else {
             let abort_view = view.clone();
-            let can = can_commit(true, false, self.staged_count(), left) && !busy;
+            let can = can_commit(!squash, false, self.staged_count(), left) && !busy;
             let mut commit = Button::primary("merge-commit")
                 .size(ButtonSize::Small)
-                .label(ui::t!("changes.merge.commit"))
+                .label(commit_label)
                 .disabled(!can);
             if left > 0 {
                 commit = commit.tooltip(ui::t!("changes.merge.resolve_first"));
@@ -1072,11 +1178,13 @@ impl ChangesView {
                 .child(
                     Button::danger("merge-abort")
                         .size(ButtonSize::Small)
-                        .label(ui::t!("changes.merge.abort"))
+                        .label(abort_label)
                         .disabled(busy)
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             abort_view.update(cx, |view, cx| {
                                 view.confirming_abort = true;
+                                // Safe choice first: Enter / Space keep merging.
+                                window.focus(&view.keep_focus, cx);
                                 cx.notify();
                             });
                         }),
@@ -1087,13 +1195,18 @@ impl ChangesView {
         };
         let detail = if self.confirming_abort {
             match &merge.branch {
+                _ if squash => ui::t!("changes.squash.abort_confirm", head = head),
                 Some(branch) => {
                     ui::t!("changes.merge.abort_confirm", branch = branch, head = head)
                 }
                 None => ui::t!("changes.merge.abort_confirm_unknown", head = head),
             }
         } else if left == 0 {
-            ui::t!("changes.merge.resolved")
+            if squash {
+                ui::t!("changes.squash.resolved")
+            } else {
+                ui::t!("changes.merge.resolved")
+            }
         } else {
             ui::i18n::t_count("changes.merge.left", left as u64, &[])
         };
@@ -1110,6 +1223,12 @@ impl ChangesView {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// A merge (not a squash) is stopped: its commit needs nothing newly staged.
+    /// A squash commits like a plain commit, from what the squash staged.
+    fn merging(&self) -> bool {
+        self.merge.as_ref().is_some_and(|merge| !merge.squash)
     }
 
     /// Commits the index, or amends HEAD, from the commit box.
@@ -1138,14 +1257,14 @@ impl ChangesView {
         }
         let staged = self.staged_count();
         let amend = self.amend;
-        if !can_commit(self.merge.is_some(), amend, staged, self.conflicted_count()) {
+        if !can_commit(self.merging(), amend, staged, self.conflicts_left()) {
             return;
         }
         let branch = self
             .status()
             .and_then(|status| status.branch.clone())
             .unwrap_or_else(|| "HEAD".to_string());
-        let notice = if let Some(merge) = &self.merge {
+        let notice = if let Some(merge) = self.merge.as_ref().filter(|merge| !merge.squash) {
             match &merge.branch {
                 Some(merged) => {
                     ui::t!("changes.notice.merged", branch = merged, head = branch).to_string()
@@ -1237,6 +1356,18 @@ impl ChangesView {
             }))
             .on_action(cx.listener(|view, _: &DiscardSelected, _, cx| {
                 view.ask_discard_selected(cx);
+            }))
+            .on_action(cx.listener(|view, _: &OpenConflictMenu, window, cx| {
+                view.open_selected_conflict_menu(window, cx);
+            }))
+            // Esc in the abort confirm is "Keep merging"; otherwise it goes on.
+            .on_action(cx.listener(|view, _: &Cancel, _, cx| {
+                if view.confirming_abort {
+                    view.confirming_abort = false;
+                    cx.notify();
+                } else {
+                    cx.propagate();
+                }
             }))
             .on_action(cx.listener(|view, _: &SelectNext, _, cx| {
                 view.step_selection(1, cx);
@@ -1374,6 +1505,8 @@ impl ChangesView {
         let colors = cx.theme().colors;
         let busy = self.busy;
         let has_conflicts = self.conflicted_count() > 0;
+        let conflict_row_bounds = self.conflict_row_bounds.clone();
+        let conflict_button_bounds = self.conflict_button_bounds.clone();
         let all_view = view.clone();
         let all_label = match side {
             Side::Unstaged | Side::Conflicted => ui::t!("changes.group.stage_all"),
@@ -1408,19 +1541,42 @@ impl ChangesView {
             };
             if side == Side::Conflicted {
                 let menu_view = view.clone();
+                let path = file.path.clone();
+                let button_bounds = conflict_button_bounds.clone();
+                let slot = conflict_button_bounds.clone();
                 row = row.action(
-                    Button::ghost(format!("resolve-{index}"))
-                        .size(ButtonSize::Xs)
-                        // No tooltip: it would stay on top of the menu this opens.
-                        .label("…")
-                        .disabled(busy)
-                        .on_click(move |event, window, cx| {
-                            let position = event.position();
-                            menu_view.update(cx, |view, cx| {
-                                view.select(Side::Conflicted, index, cx);
-                                view.open_conflict_menu(index, position, window, cx);
-                            });
-                        }),
+                    div()
+                        .relative()
+                        .child(
+                            Button::ghost(format!("resolve-{index}"))
+                                .size(ButtonSize::Xs)
+                                // No tooltip: it would stay on top of the menu this opens.
+                                .label("…")
+                                .disabled(busy)
+                                .on_click(move |_, window, cx| {
+                                    let path = path.clone();
+                                    // Anchored to the button itself, not the mouse.
+                                    let anchor = button_bounds.borrow().get(&index).copied();
+                                    menu_view.update(cx, |view, cx| {
+                                        view.select(Side::Conflicted, index, cx);
+                                        let anchor = anchor.map_or_else(
+                                            || MenuAnchor::Pointer(window.mouse_position()),
+                                            MenuAnchor::Bounds,
+                                        );
+                                        view.open_conflict_menu(path, anchor, window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            canvas(
+                                |bounds, _, _| bounds,
+                                move |_, bounds, _, _| {
+                                    slot.borrow_mut().insert(index, bounds);
+                                },
+                            )
+                            .absolute()
+                            .inset_0(),
+                        ),
                 );
             } else {
                 row = row.action(
@@ -1467,21 +1623,46 @@ impl ChangesView {
             }
             let debug_id = format!("changes-{side_name}-{index}");
             let menu_view = view.clone();
+            let menu_path = file.path.clone();
+            let row_slot = conflict_row_bounds.clone();
             rows.push(
                 div()
                     .debug_selector(move || debug_id.clone())
-                    .key_context("changes-file")
+                    // A conflicted row also gets `changes-conflict`, for the
+                    // keys that open its resolve menu.
+                    .key_context(if side == Side::Conflicted {
+                        "changes-file changes-conflict"
+                    } else {
+                        "changes-file"
+                    })
                     .when(side == Side::Conflicted, |this| {
-                        this.on_mouse_down(
-                            MouseButton::Right,
-                            move |event: &MouseDownEvent, window, cx| {
-                                let position = event.position;
-                                menu_view.update(cx, |view, cx| {
-                                    view.select(Side::Conflicted, index, cx);
-                                    view.open_conflict_menu(index, position, window, cx);
-                                });
-                            },
-                        )
+                        this.relative()
+                            .child(
+                                canvas(
+                                    |bounds, _, _| bounds,
+                                    move |_, bounds, _, _| {
+                                        row_slot.borrow_mut().insert(index, bounds);
+                                    },
+                                )
+                                .absolute()
+                                .inset_0(),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                move |event: &MouseDownEvent, window, cx| {
+                                    let position = event.position;
+                                    let path = menu_path.clone();
+                                    menu_view.update(cx, |view, cx| {
+                                        view.select(Side::Conflicted, index, cx);
+                                        view.open_conflict_menu(
+                                            path,
+                                            MenuAnchor::Pointer(position),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                },
+                            )
                     })
                     .child(row.on_click(move |_, _, cx| {
                         select_view.update(cx, |view, cx| view.select(side, index, cx));
@@ -2026,7 +2207,7 @@ impl ChangesView {
             .unwrap_or_else(|| "HEAD".to_string());
         let staged = self.staged_count();
         let busy = self.busy;
-        let merging = self.merge.is_some();
+        let merging = self.merging();
         let commit_label = if merging {
             ui::t!("changes.merge.commit")
         } else if self.amend {
@@ -2040,13 +2221,13 @@ impl ChangesView {
         };
         let can_commit = !busy
             && !commit_label.is_empty()
-            && can_commit(merging, self.amend, staged, self.conflicted_count());
+            && can_commit(merging, self.amend, staged, self.conflicts_left());
         let commit_view = cx.entity();
         let amend_view = cx.entity();
         let switch = Switch::new("amend-switch")
             .label(ui::t!("changes.commit.amend_switch"))
             .checked(self.amend)
-            .disabled(busy || head.is_none() || merging)
+            .disabled(busy || head.is_none() || self.merge.is_some())
             .on_toggle(move |checked, _, cx| {
                 amend_view.update(cx, |view, cx| view.set_amend(checked, cx));
             });
@@ -2223,9 +2404,25 @@ pub fn bind_keys(cx: &mut App, settings: &crate::settings::Settings) {
             file,
         ),
     ]);
+    // A conflicted row has no stage/discard keys; its resolve menu opens on
+    // Enter, the Menu key and Shift+F10 (not on a focused button inside it).
+    let conflict = Some("changes-conflict && !ui-button");
+    cx.bind_keys([
+        key_binding(cx, "enter", OpenConflictMenu, conflict),
+        key_binding(cx, "menu", OpenConflictMenu, conflict),
+        key_binding(cx, "shift-f10", OpenConflictMenu, conflict),
+    ]);
 }
 
-actions!(gitwarp, [CommitChanges, StageSelected, DiscardSelected]);
+actions!(
+    gitwarp,
+    [
+        CommitChanges,
+        StageSelected,
+        DiscardSelected,
+        OpenConflictMenu
+    ]
+);
 
 /// Reads one file's diff and flattens it into rows off the UI thread.
 fn read_diff(
@@ -2302,15 +2499,26 @@ fn merge_banner_kind(conflicts: usize) -> BannerKind {
 /// Reads the status and, while a merge is stopped, its branch and message.
 fn read_snapshot(repo: &Repo) -> Result<Snapshot, String> {
     let status = repo.working_status().map_err(|error| error.to_string())?;
-    let merge = match repo.operation().map_err(|error| error.to_string())? {
+    let operation = repo.operation().map_err(|error| error.to_string())?;
+    let merge = match operation {
         Operation::Merge => Some(MergeInfo {
             // A missing or odd message only costs the branch name.
             branch: repo.merge_heading().ok().flatten(),
-            message: repo.merge_message().ok().flatten(),
+            message: repo.prepared_message().ok().flatten(),
+            squash: false,
+        }),
+        Operation::Squash => Some(MergeInfo {
+            branch: None,
+            message: repo.prepared_message().ok().flatten(),
+            squash: true,
         }),
         _ => None,
     };
-    Ok(Snapshot { status, merge })
+    Ok(Snapshot {
+        status,
+        merge,
+        operation,
+    })
 }
 
 /// Largest conflicted file shown (as for an untracked file's diff).
@@ -2768,17 +2976,24 @@ mod tests {
     }
 
     #[test]
-    fn an_untouched_prefill_is_undone_but_an_edited_one_is_kept() {
+    fn an_untouched_prefill_is_cleared_but_an_edited_one_is_kept() {
         let prefill = Prefill {
             text: "Merge branch 'side'".into(),
-            before: "draft".into(),
         };
-        assert_eq!(
-            undo_prefill("Merge branch 'side'\n", &prefill).as_deref(),
-            Some("draft")
-        );
-        assert_eq!(undo_prefill("Merge branch 'side' + notes", &prefill), None);
-        assert_eq!(undo_prefill("", &prefill), None);
+        assert!(prefill_untouched("Merge branch 'side'\n", &prefill));
+        assert!(!prefill_untouched("Merge branch 'side' + notes", &prefill));
+        assert!(!prefill_untouched("", &prefill));
+    }
+
+    #[test]
+    fn a_reload_keeps_the_last_conflict_count() {
+        // Loaded: the fresh count wins, even when it is 0.
+        assert_eq!(conflicts_left(Some(0), 3), 0);
+        assert_eq!(conflicts_left(Some(2), 3), 2);
+        // Loading or failed: the banner keeps the last loaded count instead of
+        // reading 0 ("all resolved") and enabling Commit merge.
+        assert_eq!(conflicts_left(None, 3), 3);
+        assert_eq!(conflicts_left(None, 0), 0);
     }
 
     #[test]
@@ -3033,7 +3248,7 @@ mod tests {
             .unwrap()
             .merge("side", git_core::MergeType::FastForwardIfPossible)
             .unwrap();
-        assert!(matches!(outcome, git_core::MergeOutcome::Conflicts { .. }));
+        assert!(matches!(outcome, git_core::MergeOutcome::Stopped { .. }));
 
         let (mut cx, view) = open_changes(&repo, cx);
         view.read_with(&cx, |view, cx| {
@@ -3070,13 +3285,24 @@ mod tests {
         assert!(cx.debug_bounds("merge-banner").is_some(), "no banner");
         assert!(cx.debug_bounds("changes-conflicted-0").is_some());
 
+        // A menu opened on a row that is gone by click time must not act on
+        // whatever now sits at that index: a stale path does nothing.
+        view.update(&mut cx, |view, cx| {
+            view.resolve_conflict("gone.txt".into(), Resolve::MarkResolved, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.conflicted_count(), 1);
+            assert_eq!(view.staged_count(), 1, "the stale path staged something");
+        });
+
         // Space must not mark a conflicted path resolved.
         view.update(&mut cx, |view, cx| view.stage_selected(cx));
         cx.run_until_parked();
         view.read_with(&cx, |view, _| assert_eq!(view.conflicted_count(), 1));
 
         view.update(&mut cx, |view, cx| {
-            view.resolve_conflict(0, Resolve::Take(ConflictSide::Theirs), cx)
+            view.resolve_conflict("a.txt".into(), Resolve::Take(ConflictSide::Theirs), cx)
         });
         cx.run_until_parked();
         view.read_with(&cx, |view, _| {
@@ -3093,6 +3319,50 @@ mod tests {
         assert!(cx.debug_bounds("merge-banner").is_none());
         let repo = Repo::open(crate::test_support::git(), dir).unwrap();
         assert_eq!(repo.operation().unwrap(), Operation::None);
+    }
+
+    /// A conflicted squash has no `MERGE_HEAD`: it still gets the banner, the
+    /// squash message prefill and an abort that works.
+    #[gpui::test]
+    fn a_conflicted_squash_shows_the_banner_and_aborts(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-squash");
+        let dir = repo.path();
+        write(dir, "a.txt", "base\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        write(dir, "a.txt", "main\n");
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", "side\n");
+        git(dir, &["commit", "-q", "-am", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::Squash)
+            .unwrap();
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(view.operation(), Operation::Squash);
+            assert!(view.merge.as_ref().is_some_and(|merge| merge.squash));
+            assert!(view
+                .message
+                .read(cx)
+                .text()
+                .starts_with("Squashed commit of the following"));
+            // A squash commits like a plain commit, not like a merge.
+            assert!(!view.merging());
+        });
+        assert!(cx.debug_bounds("merge-banner").is_some(), "no banner");
+        view.update(&mut cx, |view, cx| view.abort_merge(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert!(view.merge.is_none());
+            assert_eq!(view.operation(), Operation::None);
+            assert_eq!(view.message.read(cx).text(), "");
+        });
+        assert!(!dir.join(".git/SQUASH_MSG").exists());
     }
 
     /// Aborting a merge removes the untouched prefilled message again.

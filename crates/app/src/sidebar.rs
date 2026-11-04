@@ -12,7 +12,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use forge::ServiceKind;
-use git_core::{Git, Head, Oid, Ref, RefKind, Repo, Stash, Submodule, SubmoduleState, Worktree};
+use git_core::{
+    Git, Head, Oid, Operation, Ref, RefKind, Repo, Stash, Submodule, SubmoduleState, Worktree,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, App, ElementId, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton,
@@ -97,6 +99,10 @@ pub struct SidebarExtras {
     pub stashes: Vec<Stash>,
     pub worktrees: Vec<Worktree>,
     pub submodules: Vec<Submodule>,
+    /// The merge, rebase, … the repository is stopped in. Not read with the
+    /// lists: the shell fills it from the Changes view, which re-reads it with
+    /// every status. Merge and rebase items are disabled while one is stopped.
+    pub operation: Operation,
 }
 
 /// Reads the four sidebar lists off the UI thread. One failing list is logged
@@ -163,6 +169,7 @@ pub(crate) fn read_sidebar_extras(git: Arc<Git>, root: &Path) -> SidebarExtras {
         stashes,
         worktrees,
         submodules,
+        operation: Operation::None,
     }
 }
 
@@ -422,7 +429,9 @@ pub fn sidebar_menu_with_links(
         open_item(link, &target)
     };
     // Merging needs a branch to merge into: not on a detached or unread HEAD.
-    let on_branch = matches!(head, Some(Head::Branch { .. }));
+    // ... and not while another operation is stopped (git refuses to start one).
+    let idle = extras.is_none_or(|e| e.operation == Operation::None);
+    let on_branch = matches!(head, Some(Head::Branch { .. })) && idle;
     let head = match head {
         Some(Head::Branch { name, .. }) => name.as_str(),
         Some(Head::Detached(_)) | None => "HEAD",
@@ -3309,6 +3318,27 @@ mod tests {
         let merge = menu_item(&menu, "Merge main into main…");
         assert!(!merge.enabled);
         assert_eq!(merge.action, SidebarAction::None);
+    }
+
+    #[test]
+    fn merge_is_disabled_while_an_operation_is_stopped() {
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        for operation in [Operation::Merge, Operation::Squash, Operation::CherryPick] {
+            let extras = SidebarExtras {
+                operation,
+                ..SidebarExtras::default()
+            };
+            let local = sidebar_menu("local:feat/x", Some(&head), Some(&extras), None);
+            assert!(!menu_item(&local, "Merge feat/x into main…").enabled);
+            let remote = sidebar_menu("rbranch:origin/feat/x", Some(&head), Some(&extras), None);
+            assert!(!menu_item(&remote, "Merge origin/feat/x into main…").enabled);
+        }
+        let idle = SidebarExtras::default();
+        let local = sidebar_menu("local:feat/x", Some(&head), Some(&idle), None);
+        assert!(menu_item(&local, "Merge feat/x into main…").enabled);
     }
 
     #[test]

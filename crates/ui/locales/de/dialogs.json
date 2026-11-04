@@ -247,6 +247,7 @@
   "dialogs.merge.help.squash": "Stagt die zusammengefassten Änderungen ohne Commit. Änderungen öffnet sich mit vorbefüllter Commit-Nachricht.",
   "dialogs.merge.checking": "Prüfe auf Konflikte…",
   "dialogs.merge.unavailable": "Konflikte konnten nicht geprüft werden: {reason}",
+  "dialogs.merge.unavailable_old_git": "Konflikte konnten nicht geprüft werden: git {have} ist älter als das erforderliche {need}",
   "dialogs.merge.clean.title": "Merge ist ohne Konflikte möglich",
   "dialogs.merge.clean.body.one": "{n} Commit von {branch} wird übernommen.",
   "dialogs.merge.clean.body.other": "{n} Commits von {branch} werden übernommen.",
@@ -276,6 +277,7 @@
   "dialogs.merge.toast.fast_forwarded": "{head} per Fast-Forward auf {branch} gesetzt",
   "dialogs.merge.toast.squashed": "{branch} in den Index gesquasht — in Änderungen committen",
   "dialogs.merge.toast.up_to_date": "{head} ist bereits auf dem Stand von {branch}",
+  "dialogs.merge.toast.waiting": "Merge von {branch} wartet auf einen Commit",
   "dialogs.merge.toast.conflicts.one": "Merge gestoppt: {n} Datei hat Konflikte",
   "dialogs.merge.toast.conflicts.other": "Merge gestoppt: {n} Dateien haben Konflikte"
 }

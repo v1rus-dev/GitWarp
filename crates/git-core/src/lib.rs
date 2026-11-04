@@ -49,7 +49,7 @@ pub use error::{Error, ErrorClass, Result};
 pub use git::{Git, GitChoice, GitEngine, GitSource, GitVersion, Resolution};
 pub use log::{commits_on_day, CommitCount, CommitInfo, LogKiller, LogOptions, LogStream};
 pub use oid::Oid;
-pub use ops::{MergeOutcome, MergePreview, MergeType, Operation, ResetMode};
+pub use ops::{MergeOutcome, MergePreview, MergeType, Operation, PreviewUnavailable, ResetMode};
 pub use refs::{Head, Ref, RefKind};
 pub use runner::{DiscoveredRepo, GitRunner};
 pub use stash::Stash;
@@ -575,7 +575,7 @@ impl Repo {
     }
 
     /// Merges `branch` into HEAD. Conflicts are an outcome
-    /// ([`MergeOutcome::Conflicts`]) and leave the merge in progress.
+    /// ([`MergeOutcome::Stopped`]) and leave the merge in progress.
     pub fn merge(&self, branch: &str, ty: MergeType) -> Result<MergeOutcome> {
         ops::merge(self, branch, ty)
     }
@@ -586,7 +586,7 @@ impl Repo {
         ops::merge_preview(self, branch)
     }
 
-    /// Abandons a merge in progress (`git merge --abort`).
+    /// Abandons the merge or squash in progress.
     pub fn merge_abort(&self) -> Result<()> {
         ops::merge_abort(self)
     }
@@ -604,10 +604,11 @@ impl Repo {
         ops::merge_heading(self)
     }
 
-    /// The prepared merge commit message (`.git/MERGE_MSG` without its `#`
-    /// comment lines), if a merge is in progress.
-    pub fn merge_message(&self) -> Result<Option<String>> {
-        ops::merge_message(self)
+    /// The prepared commit message of the operation in progress: `MERGE_MSG`
+    /// for a merge, `SQUASH_MSG` for a squash, without comment lines (per
+    /// `core.commentChar`). `None` for any other state.
+    pub fn prepared_message(&self) -> Result<Option<String>> {
+        ops::prepared_message(self)
     }
 
     /// Applies `oid` on top of HEAD; a conflict is aborted and returned.

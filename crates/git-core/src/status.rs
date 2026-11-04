@@ -268,12 +268,20 @@ pub(crate) fn head_commit(repo: &Repo) -> Result<Option<HeadCommit>> {
     }))
 }
 
+/// A git command whose pathspecs are all literal: user paths such as
+/// `a[1].txt` must not glob onto other files (`a1.txt`).
+fn literal_command(repo: &Repo) -> std::process::Command {
+    let mut command = repo.command();
+    command.env("GIT_LITERAL_PATHSPECS", "1");
+    command
+}
+
 /// Adds `paths` to the index, including deletions and new files.
 pub(crate) fn stage(repo: &Repo, paths: &[String]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
-    let mut command = repo.command();
+    let mut command = literal_command(repo);
     command.args(["add", "-A", "--"]);
     command.args(paths);
     let out = command.output().map_err(Error::Spawn)?;
@@ -301,6 +309,7 @@ pub(crate) fn resolve_take(repo: &Repo, path: &str, side: ConflictSide) -> Resul
     };
     let out = repo
         .command()
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .args(["ls-files", "-u", "-z", "--"])
         .arg(path)
         .output()
@@ -316,6 +325,7 @@ pub(crate) fn resolve_take(repo: &Repo, path: &str, side: ConflictSide) -> Resul
     if has_side {
         let out = repo
             .command()
+            .env("GIT_LITERAL_PATHSPECS", "1")
             .args(["checkout", flag, "--", path])
             .output()
             .map_err(Error::Spawn)?;
@@ -327,7 +337,7 @@ pub(crate) fn resolve_take(repo: &Repo, path: &str, side: ConflictSide) -> Resul
 }
 
 fn stage_paths(repo: &Repo, path: &str, verb: &'static str) -> Result<()> {
-    let mut command = repo.command();
+    let mut command = literal_command(repo);
     command.arg(verb);
     if verb == "rm" {
         command.arg("-q");
@@ -349,7 +359,7 @@ pub(crate) fn unstage(repo: &Repo, paths: &[String]) -> Result<()> {
         .map_err(Error::Spawn)?
         .status
         .success();
-    let mut command = repo.command();
+    let mut command = literal_command(repo);
     if has_head {
         command.args(["restore", "--staged", "--"]);
     } else {
@@ -396,14 +406,14 @@ pub(crate) fn discard_all(repo: &Repo) -> Result<()> {
 /// Restores tracked files from the index and removes untracked ones.
 pub(crate) fn discard(repo: &Repo, tracked: &[String], untracked: &[String]) -> Result<()> {
     if !tracked.is_empty() {
-        let mut command = repo.command();
+        let mut command = literal_command(repo);
         command.args(["restore", "--worktree", "--"]);
         command.args(tracked);
         let out = command.output().map_err(Error::Spawn)?;
         check_output(out, "restore --worktree")?;
     }
     if !untracked.is_empty() {
-        let mut command = repo.command();
+        let mut command = literal_command(repo);
         command.args(["clean", "-f", "-q", "--"]);
         command.args(untracked);
         let out = command.output().map_err(Error::Spawn)?;
@@ -554,7 +564,7 @@ fn file_patch(
     cached: bool,
     options: crate::DiffOptions,
 ) -> Result<FileDiff> {
-    let mut command = repo.command();
+    let mut command = literal_command(repo);
     command.arg("diff");
     if cached {
         command.arg("--cached");

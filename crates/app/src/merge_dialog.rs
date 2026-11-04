@@ -12,16 +12,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    div, px, App, AppContext, ClickEvent, Context, Entity, FocusHandle, InteractiveElement,
-    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px, App, AppContext, ClickEvent, Context, Entity, FocusHandle, IntoElement, ParentElement,
+    SharedString, Styled, Window,
 };
 
-use git_core::{Error, Git, MergeOutcome, MergePreview, MergeType, Repo};
+use git_core::{Error, Git, MergeOutcome, MergePreview, MergeType, PreviewUnavailable, Repo};
 use ui::metrics::{FONT_MONO, FS_BASE, FS_SM};
 use ui::theme::ActiveTheme;
 use ui::{
-    dialog, overlay, toast, Banner, BannerKind, Button, Chip, ChipKind, Dialog, DialogFocus,
-    DialogHost, Icon, IconName, Select, Spinner, ToastKind,
+    dialog, overlay, toast, Banner, BannerKind, Button, ButtonSize, Chip, ChipKind, Dialog,
+    DialogFocus, DialogHost, Icon, IconName, Select, Spinner, ToastKind,
 };
 
 /// Width of the dialog, from the design.
@@ -29,9 +29,19 @@ const WIDTH: f32 = 520.;
 /// Conflicted paths listed before the "Show N more" toggle.
 const VISIBLE_PATHS: usize = 5;
 
-/// What the shell does after the dialog's merge finished (not after Cancel).
-/// The `bool` is `true` when the shell should switch to the Changes tab.
-type Done = Rc<dyn Fn(bool, &mut Window, &mut App)>;
+/// What the shell does after the dialog's merge ran (not after Cancel).
+type Done = Rc<dyn Fn(MergeDone, &mut Window, &mut App)>;
+
+/// What the shell needs to know once a merge call returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MergeDone {
+    /// Switch to the Changes tab (the merge stopped, or a squash is staged).
+    pub show_changes: bool,
+    /// HEAD moved, so the history has to be walked again; otherwise the refs,
+    /// the sidebar and the work-tree status are enough (git may still have
+    /// touched the index after a failure).
+    pub head_moved: bool,
+}
 
 /// What the shell hands the dialog when it opens.
 pub(crate) struct MergeDialogContext {
@@ -69,6 +79,8 @@ pub(crate) enum StatusKind {
     Pending,
     /// Muted error row: the preview could not be computed.
     Unavailable(String),
+    /// Muted error row: the installed git is too old for the preview.
+    GitTooOld { have: String, need: String },
     /// Ok banner. `commits` is `None` when the count is not known (a squash of
     /// a branch HEAD could fast-forward to).
     Clean { commits: Option<usize> },
@@ -137,7 +149,13 @@ pub(crate) fn derive_status(preview: &PreviewState, ty: MergeType) -> Status {
         PreviewState::Ready(preview) => preview,
     };
     match ready {
-        MergePreview::Unavailable(reason) => ok(StatusKind::Unavailable(reason.clone()), plain),
+        MergePreview::Unavailable(PreviewUnavailable::GitTooOld { have, need }) => ok(
+            StatusKind::GitTooOld {
+                have: have.to_string(),
+                need: need.to_string(),
+            },
+            plain,
+        ),
         MergePreview::UpToDate => blocked(StatusKind::UpToDate, HintKind::NothingToMerge),
         MergePreview::FastForward => match ty {
             MergeType::NoFastForward => ok(StatusKind::MergeCommitDespiteFastForward, plain),
@@ -173,6 +191,8 @@ pub(crate) struct Notice {
     pub kind: ToastKind,
     pub message: String,
     pub show_changes: bool,
+    /// HEAD moved (see [`MergeDone::head_moved`]).
+    pub head_moved: bool,
 }
 
 /// The toast for `outcome` of merging `branch` into `head`.
@@ -182,6 +202,7 @@ pub(crate) fn outcome_notice(outcome: &MergeOutcome, branch: &str, head: &str) -
             kind: ToastKind::Ok,
             message: ui::t!("dialogs.merge.toast.merged", branch = branch, head = head).to_string(),
             show_changes: false,
+            head_moved: true,
         },
         MergeOutcome::FastForwarded => Notice {
             kind: ToastKind::Ok,
@@ -192,11 +213,13 @@ pub(crate) fn outcome_notice(outcome: &MergeOutcome, branch: &str, head: &str) -
             )
             .to_string(),
             show_changes: false,
+            head_moved: true,
         },
         MergeOutcome::Squashed => Notice {
             kind: ToastKind::Ok,
             message: ui::t!("dialogs.merge.toast.squashed", branch = branch).to_string(),
             show_changes: true,
+            head_moved: false,
         },
         MergeOutcome::UpToDate => Notice {
             kind: ToastKind::Info,
@@ -207,12 +230,26 @@ pub(crate) fn outcome_notice(outcome: &MergeOutcome, branch: &str, head: &str) -
             )
             .to_string(),
             show_changes: false,
+            head_moved: false,
         },
-        MergeOutcome::Conflicts(paths) => Notice {
-            kind: ToastKind::Warn,
-            message: ui::i18n::t_count("dialogs.merge.toast.conflicts", count(paths.len()), &[])
-                .to_string(),
+        // Stopped without conflicts (`--no-commit`, a rejecting hook): only a
+        // commit is left to make.
+        MergeOutcome::Stopped { conflicts } if conflicts.is_empty() => Notice {
+            kind: ToastKind::Info,
+            message: ui::t!("dialogs.merge.toast.waiting", branch = branch).to_string(),
             show_changes: true,
+            head_moved: false,
+        },
+        MergeOutcome::Stopped { conflicts } => Notice {
+            kind: ToastKind::Warn,
+            message: ui::i18n::t_count(
+                "dialogs.merge.toast.conflicts",
+                count(conflicts.len()),
+                &[],
+            )
+            .to_string(),
+            show_changes: true,
+            head_moved: false,
         },
     }
 }
@@ -237,6 +274,8 @@ pub(crate) struct MergeDialog {
     /// git's own message after a failed merge.
     error: Option<String>,
     select_focus: FocusHandle,
+    /// The "Show N more" button of the conflicted-path list.
+    paths_focus: FocusHandle,
     cancel_focus: FocusHandle,
     primary_focus: FocusHandle,
     on_done: Done,
@@ -333,12 +372,30 @@ impl MergeDialog {
                 self.close(window, cx);
                 toast::show(notice.kind, notice.message, window, cx);
                 let on_done = self.on_done.clone();
-                on_done(notice.show_changes, window, cx);
+                on_done(
+                    MergeDone {
+                        show_changes: notice.show_changes,
+                        head_moved: notice.head_moved,
+                    },
+                    window,
+                    cx,
+                );
             }
             Err(error) => {
                 self.error = Some(error.to_string());
                 self.notify_host(cx);
                 cx.notify();
+                // Git may have changed state even though it failed (a hook
+                // that ran, a half-applied merge): let the shell re-read it.
+                let on_done = self.on_done.clone();
+                on_done(
+                    MergeDone {
+                        show_changes: false,
+                        head_moved: false,
+                    },
+                    window,
+                    cx,
+                );
             }
         }
     }
@@ -347,7 +404,7 @@ impl MergeDialog {
 /// Opens the dialog and keeps its state alive in the returned entity.
 pub(crate) fn open(
     context: MergeDialogContext,
-    on_done: impl Fn(bool, &mut Window, &mut App) + 'static,
+    on_done: impl Fn(MergeDone, &mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<MergeDialog> {
@@ -366,6 +423,7 @@ pub(crate) fn open(
             running: false,
             error: None,
             select_focus: cx.focus_handle().tab_stop(true),
+            paths_focus: cx.focus_handle().tab_stop(true),
             cancel_focus: cx.focus_handle().tab_stop(true),
             primary_focus: cx.focus_handle().tab_stop(true),
             on_done: Rc::new(on_done),
@@ -580,6 +638,13 @@ fn build(state: &Entity<MergeDialog>, cx: &App) -> Dialog {
         status.hint.map(hint_text)
     };
 
+    let mut focus_order = vec![DialogFocus::control(dialog.select_focus.clone())];
+    if matches!(&status.kind, StatusKind::Conflicts { paths } if paths.len() > VISIBLE_PATHS) {
+        focus_order.push(DialogFocus::control(dialog.paths_focus.clone()));
+    }
+    focus_order.push(DialogFocus::control(dialog.cancel_focus.clone()));
+    focus_order.push(DialogFocus::control(dialog.primary_focus.clone()));
+
     let mut panel = Dialog::new(ui::t!("dialogs.merge.title"))
         .icon(IconName::Merge)
         .width(px(WIDTH))
@@ -587,11 +652,7 @@ fn build(state: &Entity<MergeDialog>, cx: &App) -> Dialog {
         .body(body)
         .footer(footer)
         .busy(dialog.running)
-        .focus_order(vec![
-            DialogFocus::control(dialog.select_focus.clone()),
-            DialogFocus::control(dialog.cancel_focus.clone()),
-            DialogFocus::control(dialog.primary_focus.clone()),
-        ])
+        .focus_order(focus_order)
         .autofocus(dialog.select_focus.clone())
         .default_button(dialog.primary_focus.clone())
         .on_default(on_default);
@@ -632,6 +693,17 @@ fn status_area(
                 .color(colors.muted)
                 .into_any_element(),
             ui::t!("dialogs.merge.unavailable", reason = reason),
+        ),
+        StatusKind::GitTooOld { have, need } => muted_row(
+            Icon::new(IconName::Err)
+                .size(px(13.))
+                .color(colors.muted)
+                .into_any_element(),
+            ui::t!(
+                "dialogs.merge.unavailable_old_git",
+                have = have,
+                need = need
+            ),
         ),
         StatusKind::Clean { commits } => {
             let banner = Banner::new(BannerKind::Ok, ui::t!("dialogs.merge.clean.title"));
@@ -703,19 +775,19 @@ fn status_area(
                 };
                 let state = state.clone();
                 list = list.child(
-                    div()
-                        .id("merge-paths-toggle")
-                        .cursor_pointer()
-                        .text_size(FS_SM)
-                        .text_color(colors.accent)
-                        .child(label)
-                        .on_click(move |_, _, cx| {
-                            state.update(cx, |dialog, cx| {
-                                dialog.show_all_paths = !dialog.show_all_paths;
-                                dialog.notify_host(cx);
-                                cx.notify();
-                            });
-                        }),
+                    div().child(
+                        Button::ghost("merge-paths-toggle")
+                            .size(ButtonSize::Xs)
+                            .label(label)
+                            .focus_handle(dialog.paths_focus.clone())
+                            .on_click(move |_, _, cx| {
+                                state.update(cx, |dialog, cx| {
+                                    dialog.show_all_paths = !dialog.show_all_paths;
+                                    dialog.notify_host(cx);
+                                    cx.notify();
+                                });
+                            }),
+                    ),
                 );
             }
             // The list lives inside the banner's text column, as in the design.
@@ -773,9 +845,28 @@ mod tests {
         let failed = derive_status(&PreviewState::Failed("boom".into()), FF);
         assert_eq!(failed.kind, StatusKind::Unavailable("boom".into()));
         assert!(failed.enabled);
-        let unavailable =
-            derive_status(&ready(MergePreview::Unavailable("old git".into())), FF_ONLY);
-        assert_eq!(unavailable.kind, StatusKind::Unavailable("old git".into()));
+        let unavailable = derive_status(
+            &ready(MergePreview::Unavailable(PreviewUnavailable::GitTooOld {
+                have: git_core::GitVersion {
+                    major: 2,
+                    minor: 30,
+                    patch: 1,
+                },
+                need: git_core::GitVersion {
+                    major: 2,
+                    minor: 38,
+                    patch: 0,
+                },
+            })),
+            FF_ONLY,
+        );
+        assert_eq!(
+            unavailable.kind,
+            StatusKind::GitTooOld {
+                have: "2.30.1".into(),
+                need: "2.38.0".into()
+            }
+        );
         assert!(unavailable.enabled);
     }
 
@@ -869,15 +960,37 @@ mod tests {
         assert_eq!(up_to_date.kind, ToastKind::Info);
         assert_eq!(up_to_date.message, "main is already up to date with feat/x");
 
-        let one = outcome_notice(&MergeOutcome::Conflicts(vec!["a".into()]), "feat/x", "main");
+        let one = outcome_notice(
+            &MergeOutcome::Stopped {
+                conflicts: vec!["a".into()],
+            },
+            "feat/x",
+            "main",
+        );
         assert_eq!(one.kind, ToastKind::Warn);
         assert_eq!(one.message, "Merge stopped: 1 file has conflicts");
         assert!(one.show_changes);
         let two = outcome_notice(
-            &MergeOutcome::Conflicts(vec!["a".into(), "b".into()]),
+            &MergeOutcome::Stopped {
+                conflicts: vec!["a".into(), "b".into()],
+            },
             "feat/x",
             "main",
         );
         assert_eq!(two.message, "Merge stopped: 2 files have conflicts");
+
+        let waiting = outcome_notice(
+            &MergeOutcome::Stopped {
+                conflicts: Vec::new(),
+            },
+            "feat/x",
+            "main",
+        );
+        assert_eq!(waiting.kind, ToastKind::Info);
+        assert_eq!(waiting.message, "Merge of feat/x is waiting for a commit");
+        assert!(waiting.show_changes);
+        // Only a merge or fast-forward moves HEAD.
+        assert!(merged.head_moved && ff.head_moved);
+        assert!(!squashed.head_moved && !up_to_date.head_moved && !waiting.head_moved);
     }
 }

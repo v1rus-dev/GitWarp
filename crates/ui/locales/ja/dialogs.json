@@ -243,6 +243,7 @@
   "dialogs.merge.help.squash": "まとめた変更をコミットせずにステージします。変更タブはコミットメッセージが入力済みの状態で開きます。",
   "dialogs.merge.checking": "競合を確認しています…",
   "dialogs.merge.unavailable": "競合を確認できませんでした: {reason}",
+  "dialogs.merge.unavailable_old_git": "競合を確認できませんでした: git {have} は必要な {need} より古いです",
   "dialogs.merge.clean.title": "競合なしでマージできます",
   "dialogs.merge.clean.body.other": "{branch} の {n} 件のコミットがマージされます。",
   "dialogs.merge.ff.title": "{head} は {branch} にファストフォワードします",
@@ -269,5 +270,6 @@
   "dialogs.merge.toast.fast_forwarded": "{head} を {branch} にファストフォワードしました",
   "dialogs.merge.toast.squashed": "{branch} をインデックスにスカッシュしました。変更タブからコミットしてください",
   "dialogs.merge.toast.up_to_date": "{head} はすでに {branch} と同じ状態です",
+  "dialogs.merge.toast.waiting": "{branch} のマージはコミット待ちです",
   "dialogs.merge.toast.conflicts.other": "マージを中断しました: {n} 件のファイルに競合があります"
 }

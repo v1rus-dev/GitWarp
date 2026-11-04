@@ -247,6 +247,7 @@
   "dialogs.merge.help.squash": "Prepara los cambios combinados sin hacer commit. Cambios se abre con el mensaje de commit rellenado.",
   "dialogs.merge.checking": "Comprobando conflictos…",
   "dialogs.merge.unavailable": "No se pudieron comprobar los conflictos: {reason}",
+  "dialogs.merge.unavailable_old_git": "No se pudieron comprobar los conflictos: git {have} es anterior a la versión necesaria {need}",
   "dialogs.merge.clean.title": "La fusión se puede hacer sin conflictos",
   "dialogs.merge.clean.body.one": "Se fusionará {n} commit de {branch}.",
   "dialogs.merge.clean.body.other": "Se fusionarán {n} commits de {branch}.",
@@ -276,6 +277,7 @@
   "dialogs.merge.toast.fast_forwarded": "{head} avanzada rápido a {branch}",
   "dialogs.merge.toast.squashed": "{branch} aplastada en el índice: haz commit desde Cambios",
   "dialogs.merge.toast.up_to_date": "{head} ya está al día con {branch}",
+  "dialogs.merge.toast.waiting": "La fusión de {branch} espera un commit",
   "dialogs.merge.toast.conflicts.one": "Fusión detenida: {n} archivo tiene conflictos",
   "dialogs.merge.toast.conflicts.other": "Fusión detenida: {n} archivos tienen conflictos"
 }
