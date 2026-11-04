@@ -136,6 +136,7 @@
   "repo.toolbar.stash_tip": "Guardar cambios locales en stash",
   "repo.toolbar.switch_branch": "Cambiar de rama",
   "repo.toolbar.switch_repository": "Cambiar de repositorio",
+  "repo.toolbar.toggle_dock": "Mostrar u ocultar el panel de detalles",
   "repo.toolbar.toggle_sidebar": "Mostrar u ocultar la barra lateral",
   "repo.toolbar.view_changes": "Cambios",
   "repo.toolbar.view_history": "Historial",

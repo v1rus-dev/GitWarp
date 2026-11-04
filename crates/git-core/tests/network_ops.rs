@@ -93,6 +93,8 @@ fn clone_into(remote: &Path) -> (tempfile::TempDir, Repo) {
         |_| {},
     )
     .unwrap();
+    // Git for Windows enables `core.autocrlf` system-wide; files pulled later must keep LF.
+    git(&dest, &["config", "core.autocrlf", "false"]);
     let repo = open(&dest);
     (parent, repo)
 }
@@ -635,6 +637,7 @@ fn multi_push_gives_the_hooks_reason_for_a_declined_target() {
     let hook = declining.path().join("hooks/pre-receive");
     fs::create_dir_all(hook.parent().unwrap()).unwrap();
     fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();

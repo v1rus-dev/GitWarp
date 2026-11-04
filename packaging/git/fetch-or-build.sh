@@ -26,8 +26,10 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 dest=$out/git
-work=$out/.git-work
-rm -rf "$dest" "$work"
+# Outside the repository: git's own Cargo.toml (Rust parts since 2.52) must not
+# be taken for a member of GitWarp's cargo workspace when <out-dir> is inside it.
+work=$(mktemp -d "${TMPDIR:-/tmp}/gitwarp-git.XXXXXX")
+rm -rf "$dest"
 mkdir -p "$work/dl" "$work/src"
 trap 'rm -rf "$work"' EXIT
 
@@ -38,7 +40,9 @@ sha256_of() {
 
 # fetch <url> <sha256> <file-in-dl-dir>; refuses anything whose sum differs.
 fetch() {
+  # Retries: runners occasionally fail to connect to the download host (curl exit 28).
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 30 --retry 4 --retry-delay 5 \
     --output "$work/dl/$3" "$1"
   local got
   got=$(sha256_of "$work/dl/$3")

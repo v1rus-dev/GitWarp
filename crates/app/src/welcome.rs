@@ -12,9 +12,9 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, div, px, transparent_black, uniform_list, App, AppContext, ClickEvent, Context,
-    Decorations, ElementId, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, PathPromptOptions, Render, ScrollStrategy, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle, WeakEntity, Window,
+    ElementId, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement, ParentElement,
+    PathPromptOptions, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, UniformListScrollHandle, WeakEntity, Window,
 };
 
 use git_core::{Error, Git, Head, Repo};
@@ -33,7 +33,8 @@ use crate::init_flow::{banner_body, details, DialogKind, InitFlow, StatusKind};
 use crate::settings::RecentRepo;
 use crate::welcome_activity::WelcomeActivity;
 use crate::workspace::{
-    git_label, git_tooltip, repo_name, titlebar, titlebar_end, titlebar_fill, Workspace,
+    git_label, git_tooltip, inline_window_controls, repo_name, title_strip, titlebar_end,
+    titlebar_fill, uses_title_strip, window_titlebar, Workspace,
 };
 
 actions!(welcome, [NewRepository, RemoveSelected]);
@@ -682,12 +683,12 @@ impl Render for WelcomeView {
         self.sync_activity(cx);
         self.ensure_branches(cx);
 
-        let client = matches!(window.window_decorations(), Decorations::Client { .. });
+        let client = inline_window_controls(window);
         let colors = cx.theme().colors;
         let git = git_label(&self.git);
         let workspace = self.workspace.clone();
 
-        let bar = titlebar(cx)
+        let bar = window_titlebar(window, cx)
             .child(
                 div()
                     .flex()
@@ -728,6 +729,9 @@ impl Render for WelcomeView {
             .capture_action(
                 cx.listener(|view, _: &TextInputSubmit, window, cx| view.open_selected(window, cx)),
             )
+            .when(uses_title_strip(), |column| {
+                column.child(title_strip("GitWarp".into(), cx))
+            })
             .child(titlebar_end(bar, client))
             .child(
                 div()
@@ -1300,7 +1304,7 @@ fn action_row(
             div()
                 .flex_none()
                 .when(spec.disabled, |this| this.opacity(0.6))
-                .child(Kbd::new(kbd)),
+                .child(Kbd::new(ui::kbd::platform_label(kbd))),
         );
     }
 

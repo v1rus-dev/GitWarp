@@ -18,7 +18,7 @@ use gpui::{
     Decorations, Div, Entity, HitboxBehavior, InteractiveElement, IntoElement, MouseButton,
     MouseMoveEvent, ParentElement, Pixels, Point, Render, ResizeEdge, SharedString, Styled,
     Subscription, Task, Tiling, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowOptions,
+    WindowControlArea, WindowDecorations, WindowOptions,
 };
 
 use git_core::{Error, Git, GitChoice};
@@ -229,7 +229,7 @@ impl Workspace {
                 titlebar: Some(TitlebarOptions {
                     title: Some(format!("{name} — GitWarp").into()),
                     appears_transparent: true,
-                    ..Default::default()
+                    traffic_light_position: traffic_light_position(),
                 }),
                 app_id: Some("dev.v1rus.gitwarp".into()),
                 icon: crate::app_icon::window_icon(),
@@ -468,10 +468,10 @@ pub fn titlebar(cx: &App) -> Div {
     let colors = cx.theme().colors;
     div()
         .h(BAR)
-        .px(px(12.))
+        .px(px(BAR_PAD))
         .flex()
         .items_center()
-        .gap(px(6.))
+        .gap(px(BAR_GAP))
         .bg(colors.bg)
         .border_b_1()
         .border_color(colors.border)
@@ -479,16 +479,57 @@ pub fn titlebar(cx: &App) -> Div {
         .font_family(FONT_UI)
 }
 
+/// [`titlebar`] for a bar that sits at the window's top-left edge.
+///
+/// On macOS it starts with a draggable spacer so the content clears the
+/// traffic lights. Full screen hides them, so the content then sits flush left.
+pub fn window_titlebar(window: &Window, cx: &App) -> Div {
+    titlebar(cx).when(cfg!(target_os = "macos") && !window.is_fullscreen(), |d| {
+        d.child(titlebar_fill().flex_none().w(px(MAC_TRAFFIC_LIGHTS_SPACER)))
+    })
+}
+
+/// Where macOS puts the traffic lights so they sit on the titlebar's centre line.
+///
+/// `y` is the gap above *and* below the buttons (gpui sizes the native titlebar
+/// container as button height + 2·y), so with the ~14px buttons it is
+/// (BAR - 14) / 2. `x` keeps the lights inside [`MAC_TRAFFIC_LIGHTS_INSET`].
+/// `None` elsewhere: only macOS reads the option.
+pub fn traffic_light_position() -> Option<Point<Pixels>> {
+    cfg!(target_os = "macos").then(|| point(px(14.), px(13.)))
+}
+
+/// Horizontal padding and child gap of [`titlebar`].
+const BAR_PAD: f32 = 12.;
+const BAR_GAP: f32 = 6.;
+
+/// Width the macOS traffic lights (close/minimise/zoom) occupy from the window's
+/// left edge at their default position: roughly 70-78px; 78 leaves a small margin.
+const MAC_TRAFFIC_LIGHTS_INSET: f32 = 78.;
+
+/// The spacer's own width: the inset minus the bar padding and the gap that
+/// follows the spacer, so the first real item starts at `MAC_TRAFFIC_LIGHTS_INSET`.
+const MAC_TRAFFIC_LIGHTS_SPACER: f32 = MAC_TRAFFIC_LIGHTS_INSET - BAR_PAD - BAR_GAP;
+
 /// The empty stretch of the titlebar: the window drag area.
 ///
 /// The empty area of the bar moves the window; a double-click toggles
 /// maximise, a right-click opens the system window menu. Buttons and other
 /// controls sit beside it, so pressing them never starts a window move.
+///
+/// On Windows `start_window_move` is a no-op and the window has no native title
+/// bar, so the drag is handed to the OS instead: marking the stretch as a
+/// [`WindowControlArea::Drag`] makes the Windows hit-test report `HTCAPTION`,
+/// which gives native move, Aero Snap, double-click-maximise and the system
+/// menu for free. Linux keeps the explicit handlers below.
 pub fn titlebar_fill() -> Div {
     div()
         .flex_1()
         .min_w_0()
         .h_full()
+        .when(cfg!(target_os = "windows"), |d| {
+            d.window_control_area(WindowControlArea::Drag)
+        })
         .on_mouse_down(MouseButton::Left, move |event, window, _| {
             if event.click_count == 2 {
                 window.zoom_window();
@@ -501,7 +542,72 @@ pub fn titlebar_fill() -> Div {
         })
 }
 
-/// Appends the window controls when the window uses client decorations.
+/// Whether the toolbar itself ends with the minimise/maximise/close buttons.
+///
+/// Only Linux client-side decorations put them there. Windows draws no native
+/// title bar either, but its buttons live in the dedicated [`title_strip`] above
+/// the toolbar, so the toolbar gets none; `window_decorations()` reports `Server`
+/// on Windows, so the check below already excludes it. macOS also reports `Server`
+/// (gpui's `PlatformWindow::window_decorations` default, not overridden by the macOS
+/// backend), and the native traffic lights cover that case.
+pub fn inline_window_controls(window: &Window) -> bool {
+    matches!(window.window_decorations(), Decorations::Client { .. })
+}
+
+/// Whether to show the dedicated drag strip above the toolbar.
+///
+/// Windows has no native title bar and the toolbar is too packed to grab, so a
+/// slim strip (like Fork's) gives a wide drag area and holds the window buttons.
+pub fn uses_title_strip() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// The height of the Windows drag strip.
+const STRIP: Pixels = px(30.);
+
+/// The slim drag strip shown above the toolbar on Windows: a wide
+/// `WindowControlArea::Drag` region with the window buttons at its right end and
+/// the window title centred between them. Call it only when [`uses_title_strip`]
+/// is true.
+pub fn title_strip(title: SharedString, cx: &App) -> Div {
+    let colors = cx.theme().colors;
+    // A left spacer the width of the controls (8px margin + 3×32px) keeps the
+    // title centred over the window rather than over the drag region alone.
+    let controls_w = px(8. + 3. * 32.);
+    div()
+        .h(STRIP)
+        .w_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .bg(colors.bg)
+        .border_b_1()
+        .border_color(colors.border)
+        .child(
+            div()
+                .w(controls_w)
+                .h_full()
+                .flex_none()
+                .window_control_area(WindowControlArea::Drag),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .window_control_area(WindowControlArea::Drag)
+                .text_size(FS_BASE)
+                .text_color(colors.muted)
+                .child(div().truncate().child(title)),
+        )
+        .child(WindowControls::new("window-controls").height(STRIP))
+}
+
+/// Appends the window controls when the toolbar draws its own title bar end
+/// (Linux client-side decorations).
 pub fn titlebar_end(bar: Div, client: bool) -> Div {
     if client {
         // Never shrink: the three buttons must stay fully visible at the

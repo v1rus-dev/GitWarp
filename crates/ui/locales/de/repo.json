@@ -136,6 +136,7 @@
   "repo.toolbar.stash_tip": "Lokale Änderungen stashen",
   "repo.toolbar.switch_branch": "Branch wechseln",
   "repo.toolbar.switch_repository": "Repository wechseln",
+  "repo.toolbar.toggle_dock": "Detailbereich umschalten",
   "repo.toolbar.toggle_sidebar": "Seitenleiste umschalten",
   "repo.toolbar.view_changes": "Änderungen",
   "repo.toolbar.view_history": "Verlauf",

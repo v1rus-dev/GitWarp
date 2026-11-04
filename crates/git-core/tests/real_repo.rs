@@ -1,7 +1,7 @@
 //! End-to-end: build a small repository with the real `git`, read it back
 //! and lay out its graph.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -250,9 +250,21 @@ fn lists_stashes_newest_first() {
 }
 
 fn worktree<'a>(list: &'a [Worktree], path: &Path) -> &'a Worktree {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Compare canonicalized paths on both sides, the way production `same_path` does: on macOS the
+    // temp dir is under /var, a symlink to the /private/var git reports, and on Windows
+    // `canonicalize` adds the `\\?\` verbatim prefix that git's plain path lacks. A removed worktree
+    // no longer exists, so fall back to canonicalizing its parent and rejoining the final name.
+    fn canon(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap_or_else(|_| {
+            match (path.parent().map(Path::canonicalize), path.file_name()) {
+                (Some(Ok(parent)), Some(name)) => parent.join(name),
+                _ => path.to_path_buf(),
+            }
+        })
+    }
+    let path = canon(path);
     list.iter()
-        .find(|w| w.path == path)
+        .find(|w| canon(&w.path) == path)
         .unwrap_or_else(|| panic!("no worktree at {}", path.display()))
 }
 
@@ -1339,6 +1351,9 @@ fn discards_tracked_and_untracked_files() {
     let tmp = tempfile::tempdir().unwrap();
     let d = tmp.path();
     git(d, &["init", "-q"]);
+    // Pin the line-ending policy locally so `discard` restores the file byte-for-byte
+    // regardless of the machine's global `core.autocrlf` (true by default on Windows).
+    git(d, &["config", "core.autocrlf", "false"]);
     write(d, "a.txt", "one\n");
     commit_all(d, "one");
     write(d, "a.txt", "changed\n");

@@ -51,6 +51,9 @@ fn repo_with_history() -> (tempfile::TempDir, Repo) {
     git(dir, &["config", "user.email", "test@example.com"]);
     git(dir, &["config", "commit.gpgsign", "false"]);
     git(dir, &["config", "tag.gpgsign", "false"]);
+    // Keep line endings byte-exact so the file-content assertions below are not
+    // broken by the machine's global `core.autocrlf` (true by default on Windows).
+    git(dir, &["config", "core.autocrlf", "false"]);
     commit_file(dir, "a.txt", "one\n", "A");
     let repo = open(dir);
     (tmp, repo)

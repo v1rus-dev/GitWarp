@@ -46,7 +46,9 @@ fn update_submodule_initialises_it() {
     let main = base.path().join("main");
     fs::create_dir(&main).unwrap();
     git(&main, &["init", "-q"]);
-    let url = format!("file://{}", lib.display());
+    // A file:// URL uses forward slashes; git stores it that way, so build it
+    // with forward slashes too (on Windows `display()` would yield backslashes).
+    let url = format!("file://{}", lib.display().to_string().replace('\\', "/"));
     git(&main, &["submodule", "add", "-q", &url, "vendor/lib"]);
     git(&main, &["commit", "-q", "-m", "add submodule"]);
     // Drop the checkout, keeping the recorded submodule: the state a fresh

@@ -1,3 +1,8 @@
+// Release builds on Windows are GUI-subsystem: no console window behind the app.
+// Debug builds keep the console for logs. Git's askpass calls of this binary
+// still work: piped stdout/stdin handles are inherited either way.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod accounts;
 mod activity_strip;
 mod app_icon;
@@ -380,7 +385,7 @@ fn main() {
                     titlebar: Some(TitlebarOptions {
                         title: Some("GitWarp".into()),
                         appears_transparent: true,
-                        ..Default::default()
+                        traffic_light_position: workspace::traffic_light_position(),
                     }),
                     app_id: Some("dev.v1rus.gitwarp".into()),
                     icon: app_icon::window_icon(),

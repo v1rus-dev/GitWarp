@@ -554,9 +554,9 @@ impl ActivityStrip {
 
         // Design: the legend stays while loading; it goes with an error or an
         // empty repository.
-        let show_legend = !collapsed
-            && !matches!(self.status, Status::Failed(_))
-            && !(matches!(self.status, Status::Ready) && self.all.is_empty());
+        let show_legend = !(collapsed
+            || matches!(self.status, Status::Failed(_))
+            || matches!(self.status, Status::Ready) && self.all.is_empty());
         // The identity is unknown until the first count (and after an error),
         // so `Me` is only disabled once git said there is no user.email.
         let me_disabled =

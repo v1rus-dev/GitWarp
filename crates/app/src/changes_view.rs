@@ -1632,7 +1632,10 @@ impl ChangesView {
                                 div()
                                     .text_size(FS_XS)
                                     .text_color(colors.muted)
-                                    .child(ui::t!("changes.commit.hint", key = "Ctrl+Enter")),
+                                    .child(ui::t!(
+                                        "changes.commit.hint",
+                                        key = ui::kbd::platform_label("Ctrl+Enter")
+                                    )),
                             ),
                     ),
             )

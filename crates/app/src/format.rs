@@ -96,7 +96,15 @@ pub fn display_path(path: &Path, home: Option<&Path>) -> String {
     };
     match path.strip_prefix(home) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Ok(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        Ok(rest) => {
+            // Normalize to the platform separator so the shortened path never mixes
+            // `/` and `\` on Windows (git and the OS can each hand us either).
+            let rest = rest
+                .display()
+                .to_string()
+                .replace('/', std::path::MAIN_SEPARATOR_STR);
+            format!("~{}{rest}", std::path::MAIN_SEPARATOR)
+        }
         Err(_) => path.display().to_string(),
     }
 }

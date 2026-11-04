@@ -2,11 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
+  # Full debug info of the test binaries fills the ubuntu runner's disk (ld: Bus error).
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   build:

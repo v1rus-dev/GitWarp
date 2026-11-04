@@ -42,6 +42,7 @@ pub enum IconName {
     Init,
     Min,
     Max,
+    Restore,
     Undo,
     Edit,
     Trash,
@@ -74,8 +75,8 @@ pub enum IconName {
 }
 
 impl IconName {
-    /// All 62 icons, in the design's order.
-    pub const ALL: [IconName; 62] = [
+    /// All 63 icons, in the design's order.
+    pub const ALL: [IconName; 63] = [
         Self::Branch,
         Self::Tag,
         Self::Cloud,
@@ -138,6 +139,7 @@ impl IconName {
         Self::Repo,
         Self::RepoForked,
         Self::Archive,
+        Self::Restore,
     ];
 
     /// Asset path, e.g. `icons/chev-r.svg`.
@@ -176,6 +178,7 @@ impl IconName {
             Self::Init => "icons/init.svg",
             Self::Min => "icons/min.svg",
             Self::Max => "icons/max.svg",
+            Self::Restore => "icons/restore.svg",
             Self::Undo => "icons/undo.svg",
             Self::Edit => "icons/edit.svg",
             Self::Trash => "icons/trash.svg",

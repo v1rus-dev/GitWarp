@@ -1396,7 +1396,10 @@ mod tests {
                 "Switch should open the new worktree in this window"
             ),
             AfterCreate::Stay => {
-                assert_eq!(root, repo.path());
+                assert_eq!(
+                    root.canonicalize().unwrap(),
+                    repo.path().canonicalize().unwrap()
+                );
                 opened.read_with(&cx, |model, _| {
                     assert!(model
                         .entries()

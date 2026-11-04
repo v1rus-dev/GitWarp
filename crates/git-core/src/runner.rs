@@ -271,9 +271,15 @@ mod tests {
         let native = git(GitEngine::Native).discover(tmp.path()).expect("native");
         let cli = git(GitEngine::Cli).discover(tmp.path()).expect("cli");
         assert!(!native.bare);
-        assert_eq!(native.root, cli.root);
-        assert_eq!(native.git_dir, cli.git_dir);
-        assert_eq!(native.objects_info, cli.objects_info);
+        // On Windows git prints `C:/...` while the native side canonicalizes to `\\?\C:\...`;
+        // canonicalize git's answer too so the same directory compares equal.
+        assert_eq!(native.root, abs_existing(&cli.root));
+        assert_eq!(native.git_dir, abs_existing(&cli.git_dir));
+        // `objects/info` may not exist; compare through the objects directory, which does.
+        assert_eq!(
+            native.objects_info,
+            abs_existing(cli.objects_info.parent().unwrap()).join("info")
+        );
         assert_eq!(native.root, tmp.path().canonicalize().unwrap());
     }
 

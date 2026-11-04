@@ -82,7 +82,7 @@ pub fn set_global_identity(git: &crate::Git, name: &str, email: &str) -> Result<
             cmd.args([key, value]);
         }
         let out = cmd.stdin(Stdio::null()).output().map_err(Error::Spawn)?;
-        if !out.status.success() && !(value.is_empty() && out.status.code() == Some(5)) {
+        if !(out.status.success() || value.is_empty() && out.status.code() == Some(5)) {
             return Err(Error::Git {
                 command: "config",
                 code: out.status.code(),
@@ -107,7 +107,7 @@ pub fn set_global_signing(git: &crate::Git, sign: bool, key: &str) -> Result<()>
             cmd.args([name, value]);
         }
         let out = cmd.stdin(Stdio::null()).output().map_err(Error::Spawn)?;
-        if !out.status.success() && !(value.is_empty() && out.status.code() == Some(5)) {
+        if !(out.status.success() || value.is_empty() && out.status.code() == Some(5)) {
             return Err(Error::Git {
                 command: "config",
                 code: out.status.code(),

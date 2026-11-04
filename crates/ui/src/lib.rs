@@ -12,6 +12,7 @@ pub mod focus;
 pub mod fonts;
 pub mod i18n;
 pub mod icon;
+pub mod kbd;
 pub mod metrics;
 pub mod overlay;
 pub mod theme;
