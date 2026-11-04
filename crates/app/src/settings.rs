@@ -180,10 +180,13 @@ pub struct Settings {
     pub language: Language,
     /// What opens when the app starts.
     pub on_launch: OnLaunch,
-    /// Download and offer updates in the background.
+    /// Check GitHub for new releases and show a toast when one is out.
     pub check_updates: bool,
-    /// Stable or beta update channel.
+    /// Which releases the update check reports: stable only, or pre-releases too.
     pub update_channel: UpdateChannel,
+    /// The last version an update toast was shown for; a version is announced
+    /// only if it is newer than this.
+    pub update_notified_version: Option<String>,
     /// Minutes between background fetches.
     pub fetch_interval_minutes: u16,
     /// Ask before force-pushing.
@@ -267,6 +270,7 @@ impl Default for Settings {
             on_launch: OnLaunch::default(),
             check_updates: true,
             update_channel: UpdateChannel::default(),
+            update_notified_version: None,
             fetch_interval_minutes: 5,
             confirm_force_push: true,
             confirm_discard: true,
@@ -901,6 +905,11 @@ fn settings_from_value(value: Value) -> Settings {
         on_launch: take(&mut object, "on_launch", defaults.on_launch),
         check_updates: take(&mut object, "check_updates", defaults.check_updates),
         update_channel: take(&mut object, "update_channel", defaults.update_channel),
+        update_notified_version: take(
+            &mut object,
+            "update_notified_version",
+            defaults.update_notified_version,
+        ),
         fetch_interval_minutes: take(
             &mut object,
             "fetch_interval_minutes",
@@ -1467,6 +1476,7 @@ mod tests {
             on_launch: OnLaunch::Welcome,
             check_updates: false,
             update_channel: UpdateChannel::Beta,
+            update_notified_version: Some("0.2.0".to_string()),
             fetch_interval_minutes: 15,
             confirm_force_push: false,
             confirm_discard: false,

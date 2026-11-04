@@ -4,6 +4,9 @@ use crate::ServiceKind;
 use std::fmt;
 
 /// The public instances GitWarp knows out of the box, as `(kind, host)`.
+/// Base URL of the public GitHub REST API.
+pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
+
 pub const PUBLIC_INSTANCES: [(ServiceKind, &str); 5] = [
     (ServiceKind::GitHub, "github.com"),
     (ServiceKind::GitLab, "gitlab.com"),
@@ -106,7 +109,7 @@ impl Instance {
         let base = &self.base_url;
         let public = self.is_public();
         match self.kind {
-            ServiceKind::GitHub if public => "https://api.github.com".to_string(),
+            ServiceKind::GitHub if public => GITHUB_API_BASE.to_string(),
             ServiceKind::GitHub => format!("{base}/api/v3"),
             ServiceKind::GitLab => format!("{base}/api/v4"),
             ServiceKind::Gitea => format!("{base}/api/v1"),

@@ -1,1 +1,4 @@
-{}
+{
+  "app.update.available": "Доступен GitWarp {version}",
+  "app.update.view_release": "Открыть релиз"
+}
