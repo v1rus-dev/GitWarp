@@ -81,7 +81,11 @@
     return `<div class="frow${sel ? ' sel' : ''}" role="option" aria-selected="${sel}" tabindex="-1" data-g="c" data-p="${esc(f.path)}"><span class="fs U" aria-label="Conflicted">U</span><span class="fname" title="${esc(f.path)}"><bdi><span class="fdir">${esc(f.path.slice(0, d + 1))}</span>${esc(f.path.slice(d + 1))}</bdi></span><span class="acts"><button class="btn btn-xs btn-ghost" data-act="openTool" data-tip="Open in merge tool" aria-label="Open in merge tool">${ic('external', 12)}</button><button class="btn btn-xs btn-ghost" data-act="cmenu" data-tip="Resolve…" aria-label="Resolve options">…</button></span></div>`;
   };
   const conflictGroup = () => `<section class="grp grp-c" aria-label="Conflicts"><div class="grp-h"><span>Conflicts</span><span class="ncount">${S.conflicts.length}</span></div><div class="flist" role="listbox" tabindex="0" aria-label="Conflicts files" data-g="c">${S.conflicts.length ? S.conflicts.map(conflictRow).join('') : '<div class="none">All conflicts resolved</div>'}</div></section>`;
+  /* GitWarp's own conflict editor (conflicts.html): resolve chunk by chunk */
+  const openEditor = (path) => { location.href = 'conflicts.html?op=' + (S.op || 'merge') + '&file=' + encodeURIComponent(path); };
   const conflictMenu = (path) => { const sd = sides(); return [
+    { label: 'Resolve in GitWarp…', icon: 'edit', onClick: () => openEditor(path) },
+    { sep: 1 },
     { label: `Take ${sd.a}`, icon: 'check', onClick: () => { resolveFile(path, 'a'); render(); } },
     { label: `Take ${sd.bTake}`, icon: 'check', onClick: () => { resolveFile(path, 'b'); render(); } },
     { sep: 1 },
@@ -110,7 +114,7 @@
     if (S.diffState === 'binary') return `<div class="dstate">Binary file</div>`;
     if (S.diffState === 'empty') return `<div class="dstate">No changes</div>`;
     if (!c || S.diffState === 'none') return `<div class="dstate">Select a file</div>`;
-    if (c.g === 'c') return `<div class="cnote">Conflicted — pick a side, edit the file, or open your merge tool. GitWarp's own conflict editor comes later.</div><div class="dscroll" id="diff" tabindex="0" aria-label="Conflicted file"></div>`;
+    if (c.g === 'c') return `<div class="cnote" style="display:flex;align-items:center;gap:12px"><span class="od-fill">Conflicted — resolve it here, take one side, or open your merge tool.</span><button class="btn btn-sm btn-primary" data-act="resolve">Resolve…</button></div><div class="dscroll" id="diff" tabindex="0" aria-label="Conflicted file"></div>`;
     return `<div class="dscroll" id="diff" tabindex="0" aria-label="Diff"></div>`;
   }
 
@@ -191,6 +195,7 @@
     }
     if (act) {
       const a = act.dataset.act;
+      if (a === 'resolve') return openEditor(S.sel.path);
       if (a === 'abort') S.abortAsk = true;
       else if (a === 'abortNo') S.abortAsk = false;
       else if (a === 'abortYes') { const merge = S.op === 'merge'; clearOp(); toast(merge ? 'Merge aborted, main is back where it was' : 'Rebase aborted, main is back where it was', 'ok'); }

@@ -95,8 +95,8 @@ menu model tests in `sidebar.rs` / `history_view.rs` in the existing style.
 
 ## Later, needs its own design
 
-Interactive rebase, a three-pane conflict editor (until then: "Open in merge tool" using
-Settings → Diff & merge), blame, file history. Fork's AI submenu is deliberately not taken.
+Interactive rebase, blame, file history. The conflict editor is now designed
+(`docs/design/prototype/conflicts.html`) and is the next step after merge. Fork's AI submenu is deliberately not taken.
 
 ## Checks per step (from CLAUDE.md)
 
