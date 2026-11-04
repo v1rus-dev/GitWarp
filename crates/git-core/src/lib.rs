@@ -10,6 +10,7 @@
 pub mod activity;
 mod branch_log;
 mod config;
+mod conflict;
 pub mod credential;
 mod diff;
 mod error;
@@ -40,6 +41,7 @@ pub use branch_log::BranchLog;
 pub use config::{
     global_get, global_identity, set_global_identity, set_global_signing, ConfigScope, Identity,
 };
+pub use conflict::{ConflictKind, ConflictResolution, ConflictSegment, LineEnding, TextConflict};
 pub use credential::Credential;
 pub use diff::{
     ChangeKind, ChangedFile, CommitDetails, DiffLine, DiffOptions, DiffWhitespace, FileDiff,
@@ -414,6 +416,18 @@ impl Repo {
     /// staging it (or deleting the file when that side deleted it).
     pub fn resolve_take(&self, path: &str, side: ConflictSide) -> Result<()> {
         status::resolve_take(self, path, side)
+    }
+
+    /// Loads the conflict at `path`: the sides and their segments for a text
+    /// conflict, or the kind for one that can only be resolved by picking a side.
+    pub fn conflict(&self, path: &str) -> Result<ConflictKind> {
+        conflict::conflict(self, path)
+    }
+
+    /// Writes `content` to the work-tree file `path` and stages it, which
+    /// ends the conflict for that path.
+    pub fn save_resolution(&self, path: &str, content: &str) -> Result<()> {
+        conflict::save_resolution(self, path, content)
     }
 
     /// Removes `paths` from the index, leaving the work tree alone.

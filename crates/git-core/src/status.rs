@@ -12,7 +12,7 @@ use crate::diff::{parse_name_status, parse_numstat};
 use crate::{check_output, ChangeKind, Error, FileDiff, Oid, Repo, Result};
 
 /// Largest untracked file whose lines are counted for the `+N` column.
-const UNTRACKED_COUNT_CAP: u64 = 2 * 1024 * 1024;
+pub(crate) const UNTRACKED_COUNT_CAP: u64 = 2 * 1024 * 1024;
 
 /// One file with local changes, on one side of the index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,7 +272,7 @@ pub(crate) fn head_commit(repo: &Repo) -> Result<Option<HeadCommit>> {
 
 /// A git command whose pathspecs are all literal: user paths such as
 /// `a[1].txt` must not glob onto other files (`a1.txt`).
-fn literal_command(repo: &Repo) -> std::process::Command {
+pub(crate) fn literal_command(repo: &Repo) -> std::process::Command {
     let mut command = repo.command();
     command.env("GIT_LITERAL_PATHSPECS", "1");
     command
