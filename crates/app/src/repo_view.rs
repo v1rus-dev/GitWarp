@@ -699,6 +699,41 @@ where
     }
 }
 
+/// What a finished ref operation changed in the repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefChange {
+    /// HEAD or the refs moved, but the commits reachable from `--all` are the
+    /// same: re-read HEAD and the refs, not the log.
+    RefsOnly,
+    /// Commits may have appeared or disappeared: walk the history again.
+    History,
+}
+
+/// How much a ref dialog's operation can change. Checkout-like operations —
+/// switching branches, detaching, creating a branch or tag at an existing
+/// commit, renaming a branch — only move refs. Everything that can add or
+/// remove commits (reset, delete, cherry-pick, revert, remote edits, stash
+/// drops) keeps the full reload. Renaming a tag is left on the full reload
+/// because tags can be the only ref that keeps a commit alive; the walk is
+/// cheap enough there.
+fn ref_change_for_dialog(kind: &RefDialogKind) -> RefChange {
+    match kind {
+        RefDialogKind::CreateBranch { .. }
+        | RefDialogKind::CreateTag { .. }
+        | RefDialogKind::RenameBranch { .. } => RefChange::RefsOnly,
+        RefDialogKind::RenameTag { .. }
+        | RefDialogKind::Remote { .. }
+        | RefDialogKind::Reset { .. }
+        | RefDialogKind::DeleteBranch { .. }
+        | RefDialogKind::DeleteTag { .. }
+        | RefDialogKind::RemoveRemote { .. }
+        | RefDialogKind::DropStash { .. }
+        | RefDialogKind::CherryPick { .. }
+        | RefDialogKind::Revert { .. }
+        | RefDialogKind::RenameWorktree { .. } => RefChange::History,
+    }
+}
+
 impl RepositoryView {
     pub fn new(
         path: PathBuf,
@@ -814,10 +849,12 @@ impl RepositoryView {
             &worktrees_model,
             |this, _, event: &WorktreesModelEvent, cx| {
                 if *event == WorktreesModelEvent::Changed {
-                    // A branch was created or deleted, or a worktree changed:
-                    // the sidebar, the history's ref labels and the local
-                    // changes all read the same repository.
-                    this.reload_history(cx);
+                    // A worktree was added, removed or moved: its HEAD is a
+                    // ref already covered by `--all`, so the set of commits
+                    // cannot change. Re-read HEAD and the refs so the sidebar,
+                    // the history's badges and the local changes follow.
+                    this.history
+                        .update(cx, |history, cx| history.refresh_refs(cx));
                     this.changes.update(cx, |changes, cx| changes.refresh(cx));
                     this.refresh_with(hosting_status::INTERNAL_RELOAD, cx);
                     cx.notify();
@@ -1770,7 +1807,7 @@ impl RepositoryView {
             }
             SidebarAction::SetUpstream(branch) => {
                 let fallback = self.default_remote_name();
-                self.run_repo_action(window, cx, move |repo| {
+                self.run_ref_action(window, cx, move |repo| {
                     let remote = git_core::network::default_remote(repo)?
                         .unwrap_or_else(|| fallback.clone());
                     let upstream = format!("{remote}/{branch}");
@@ -2320,6 +2357,7 @@ impl RepositoryView {
             previous.update(cx, |dialog, cx| dialog.close(window, cx));
         }
         let context = self.ref_dialog_context(&kind, cx);
+        let change = ref_change_for_dialog(&kind);
         let view = cx.entity();
         // A removed remote must not leave its remembered account behind.
         let removed_remote = match &kind {
@@ -2335,7 +2373,7 @@ impl RepositoryView {
                 // The dialog entity stays owned until the next one replaces
                 // it: dropping it here would free the state that is running
                 // this callback.
-                view.after_ref_change(cx);
+                view.after_ref_change(change, cx);
                 window.refresh();
             });
         });
@@ -2402,9 +2440,11 @@ impl RepositoryView {
                 move |window, cx| {
                     let checkout = take(&checkout);
                     view.update(cx, |view, cx| {
-                        view.run_repo_action(window, cx, move |repo| {
+                        view.run_ref_action(window, cx, move |repo| {
                             // An empty stash (nothing left to save) is fine:
-                            // the switch still happens.
+                            // the switch still happens. The stash ref is
+                            // excluded from the log (`--exclude=refs/stash`),
+                            // so even this path only moves HEAD and refs.
                             stash_then_checkout(repo, checkout)
                         });
                     });
@@ -2426,7 +2466,7 @@ impl RepositoryView {
                 move |window, cx| {
                     let checkout = take(&checkout);
                     view.update(cx, |view, cx| {
-                        view.run_repo_action(window, cx, move |repo| {
+                        view.run_ref_action(window, cx, move |repo| {
                             repo.discard_all()?;
                             checkout(repo)
                         });
@@ -2448,38 +2488,51 @@ impl RepositoryView {
             + 'static,
     {
         let retry = checkout.clone();
-        self.run_repo_action_with(window, cx, checkout, move |view, error, window, cx| {
-            let Some(known) = error_dialog::classify_git_error(&error) else {
-                view.show_git_error(error, window, cx);
-                return;
-            };
-            if !matches!(&known, KnownError::LocalChangesOverwritten) {
-                view.show_git_error(error, window, cx);
-                return;
-            }
-            let title = known.title();
-            let explanation = known.explanation();
-            let details = error_dialog::raw_output(&error);
-            let entity = cx.entity();
-            let actions = vec![ErrorAction::new(
-                ui::t!("dialogs.error.stash_and_switch"),
-                move |window, cx| {
-                    entity.update(cx, |view, cx| {
-                        let checkout = retry.clone();
-                        view.run_repo_action(window, cx, move |repo| {
-                            stash_then_checkout(repo, checkout)
+        self.run_repo_action_with(
+            RefChange::RefsOnly,
+            window,
+            cx,
+            checkout,
+            move |view, error, window, cx| {
+                let Some(known) = error_dialog::classify_git_error(&error) else {
+                    view.show_git_error(error, window, cx);
+                    return;
+                };
+                if !matches!(&known, KnownError::LocalChangesOverwritten) {
+                    view.show_git_error(error, window, cx);
+                    return;
+                }
+                let title = known.title();
+                let explanation = known.explanation();
+                let details = error_dialog::raw_output(&error);
+                let entity = cx.entity();
+                let actions = vec![ErrorAction::new(
+                    ui::t!("dialogs.error.stash_and_switch"),
+                    move |window, cx| {
+                        entity.update(cx, |view, cx| {
+                            let checkout = retry.clone();
+                            view.run_ref_action(window, cx, move |repo| {
+                                stash_then_checkout(repo, checkout)
+                            });
                         });
-                    });
-                },
-            )];
-            error_dialog::open(title, explanation, details, actions, window, cx);
-        });
+                    },
+                )];
+                error_dialog::open(title, explanation, details, actions, window, cx);
+            },
+        );
     }
 
-    /// Reloads everything a ref operation can have changed: the history and
-    /// its badges, the sidebar's lists, the local-changes view and HEAD.
-    fn after_ref_change(&mut self, cx: &mut Context<Self>) {
-        self.reload_history(cx);
+    /// Reloads everything a ref operation can have changed. A refs-only
+    /// operation (a checkout, branch/tag creation, rename, upstream) leaves
+    /// the rows in place; only a walk-changing one reloads the history.
+    fn after_ref_change(&mut self, change: RefChange, cx: &mut Context<Self>) {
+        match change {
+            RefChange::RefsOnly => {
+                self.history
+                    .update(cx, |history, cx| history.refresh_refs(cx));
+            }
+            RefChange::History => self.reload_history(cx),
+        }
         self.changes.update(cx, |changes, cx| changes.refresh(cx));
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.refresh(cx));
@@ -2492,15 +2545,39 @@ impl RepositoryView {
     where
         F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)> + Send + 'static,
     {
-        self.run_repo_action_with(window, cx, action, |view, error, window, cx| {
-            view.show_git_error(error, window, cx);
-        });
+        self.run_repo_action_with(
+            RefChange::History,
+            window,
+            cx,
+            action,
+            |view, error, window, cx| {
+                view.show_git_error(error, window, cx);
+            },
+        );
+    }
+
+    /// [`run_repo_action`] for an operation that only moves HEAD or the refs:
+    /// the history keeps its rows and just re-reads its badges.
+    fn run_ref_action<F>(&mut self, window: &mut Window, cx: &mut Context<Self>, action: F)
+    where
+        F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)> + Send + 'static,
+    {
+        self.run_repo_action_with(
+            RefChange::RefsOnly,
+            window,
+            cx,
+            action,
+            |view, error, window, cx| {
+                view.show_git_error(error, window, cx);
+            },
+        );
     }
 
     /// [`run_repo_action`] with a caller-specific failure path, for operations
     /// that can offer a retry with a preparatory step.
     fn run_repo_action_with<F, E>(
         &mut self,
+        change: RefChange,
         window: &mut Window,
         cx: &mut Context<Self>,
         action: F,
@@ -2534,7 +2611,7 @@ impl RepositoryView {
                 match result {
                     Ok((kind, notice)) => {
                         toast::show(kind, notice, window, cx);
-                        view.after_ref_change(cx);
+                        view.after_ref_change(change, cx);
                     }
                     Err(error) => on_error(view, error, window, cx),
                 }
@@ -8420,8 +8497,9 @@ mod tests {
         );
     }
 
-    /// Checking out a branch from the sidebar switcher moves HEAD and reloads
-    /// the history.
+    /// A checkout-like ref operation re-reads HEAD and the refs without
+    /// walking the log: the rows, the selection and the scroll stay, and only
+    /// the HEAD badge moves.
     #[gpui::test]
     fn a_sidebar_checkout_moves_head(cx: &mut gpui::TestAppContext) {
         let repo = crate::test_support::TempRepo::new("sidebar-checkout");
@@ -8439,6 +8517,26 @@ mod tests {
 
         let (mut cx, view) = open_repository_view(&repo, cx);
         cx.run_until_parked();
+        let history = view.read_with(&cx, |view, _| view.history());
+        let (rows, selected, generation, meta_version) = history.read_with(&cx, |history, _| {
+            assert!(matches!(history.state(), LoadState::Loaded));
+            assert_eq!(
+                history.selected_oid(),
+                Some(oid),
+                "the HEAD row is not selected"
+            );
+            (
+                history.commit_count(),
+                history.selected_row(),
+                history.load_generation(),
+                history.meta_version(),
+            )
+        });
+        assert_eq!(
+            history.read_with(&cx, |history, _| history.head_badge(oid).map(str::to_owned)),
+            Some("main".to_owned())
+        );
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.run_sidebar_action(
@@ -8455,6 +8553,112 @@ mod tests {
         match repo.head().unwrap() {
             Head::Branch { name, .. } => assert_eq!(name, "feature"),
             Head::Detached(_) => panic!("checkout left a detached HEAD"),
+        }
+        history.read_with(&cx, |history, _| {
+            assert!(
+                matches!(history.state(), LoadState::Loaded),
+                "the checkout restarted the load: {:?}",
+                history.state()
+            );
+            assert_eq!(
+                history.commit_count(),
+                rows,
+                "the checkout changed the rows"
+            );
+            assert_eq!(
+                history.selected_row(),
+                selected,
+                "the checkout lost the selection"
+            );
+            assert_eq!(history.selected_oid(), Some(oid));
+            assert_eq!(
+                history.load_generation(),
+                generation,
+                "the checkout walked the log again"
+            );
+            assert!(
+                history.meta_version() > meta_version,
+                "the checkout did not re-read HEAD and the refs"
+            );
+            assert_eq!(
+                history.head_badge(oid),
+                Some("feature"),
+                "the HEAD badge did not move to the checked-out branch"
+            );
+        });
+    }
+
+    /// Every ref dialog is classified deliberately: checkout-like ones refresh
+    /// the refs, the rest keep the full history walk.
+    #[test]
+    fn only_ref_moving_dialogs_skip_the_history_walk() {
+        let card = CommitCard::bare(Oid::from_hex(&"a".repeat(40)).unwrap());
+        let cases = [
+            (
+                RefDialogKind::CreateBranch { card: card.clone() },
+                RefChange::RefsOnly,
+            ),
+            (
+                RefDialogKind::CreateTag { card: card.clone() },
+                RefChange::RefsOnly,
+            ),
+            (
+                RefDialogKind::RenameBranch {
+                    old: "old".to_owned(),
+                },
+                RefChange::RefsOnly,
+            ),
+            (
+                RefDialogKind::RenameTag {
+                    old: "v1".to_owned(),
+                },
+                RefChange::History,
+            ),
+            (RefDialogKind::Remote { editing: None }, RefChange::History),
+            (
+                RefDialogKind::Reset { card: card.clone() },
+                RefChange::History,
+            ),
+            (
+                RefDialogKind::DeleteBranch {
+                    name: "gone".to_owned(),
+                    force: false,
+                },
+                RefChange::History,
+            ),
+            (
+                RefDialogKind::DeleteTag {
+                    name: "v1".to_owned(),
+                },
+                RefChange::History,
+            ),
+            (
+                RefDialogKind::RemoveRemote {
+                    name: "origin".to_owned(),
+                },
+                RefChange::History,
+            ),
+            (
+                RefDialogKind::DropStash {
+                    index: 0,
+                    label: "stash@{0}".to_owned(),
+                },
+                RefChange::History,
+            ),
+            (
+                RefDialogKind::CherryPick { card: card.clone() },
+                RefChange::History,
+            ),
+            (RefDialogKind::Revert { card }, RefChange::History),
+            (
+                RefDialogKind::RenameWorktree {
+                    from: PathBuf::from("/tmp/wt"),
+                },
+                RefChange::History,
+            ),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(ref_change_for_dialog(&kind), expected, "{kind:?}");
         }
     }
 

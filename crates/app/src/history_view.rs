@@ -885,11 +885,18 @@ pub struct HistoryView {
     /// A reload is in flight and the rows still belong to the previous walk.
     /// The first page of the new walk replaces them.
     pending_rows: bool,
+    /// The commit the reload should select again, once its new row arrives.
+    /// Only set when the rows were already shown and the user had a selection.
+    pending_selection: Option<Oid>,
     max_lanes: usize,
     selected: Option<usize>,
     state: LoadState,
     /// Bumped for every load; results from an older load are dropped.
     generation: u64,
+    /// Bumped for every HEAD/refs read; a stale answer never overwrites a
+    /// newer one. Separate from `generation` because a refs-only refresh does
+    /// not restart the history walk.
+    meta_generation: u64,
     /// The running load. Dropping it cancels the page task and the git log.
     task: Option<Task<()>>,
     /// The `commit_count` probe that feeds the load bar; cancelled with the
@@ -1554,10 +1561,12 @@ impl HistoryView {
             root: None,
             items: Vec::new(),
             pending_rows: false,
+            pending_selection: None,
             max_lanes: 1,
             selected: None,
             state: LoadState::Loading { total: None },
             generation: 0,
+            meta_generation: 0,
             task: None,
             count_task: None,
             init_task: None,
@@ -1618,6 +1627,9 @@ impl HistoryView {
         self.stop_tasks();
         self.generation += 1;
         let generation = self.generation;
+        // A fresh walk reads HEAD and the refs again: an older refs-only
+        // refresh must not overwrite that answer.
+        self.meta_generation = self.meta_generation.wrapping_add(1);
         self.state = LoadState::Loading { total: None };
         // The graph starts over with the load, so its geometry does too.
         self.idle_lanes = IdleLanes::new();
@@ -1685,16 +1697,18 @@ impl HistoryView {
 
         // HEAD and the refs feed the toolbar and the sidebar; read them in the
         // background so the log is not held back.
+        let meta_generation = this
+            .update(cx, |view, _cx| view.next_meta_generation())
+            .unwrap_or(0);
         let meta_repo = repo.clone();
         let meta_root = root.clone();
         let meta_this = this.clone();
         cx.spawn(async move |cx| {
-            let (head, refs) = cx
-                .background_executor()
-                .spawn(async move { (meta_repo.head(), meta_repo.refs()) })
-                .await;
+            let (head, refs) = Self::read_meta(meta_repo, cx).await;
             meta_this
-                .update(cx, |view, cx| view.set_meta(meta_root, head, refs, cx))
+                .update(cx, |view, cx| {
+                    view.set_meta(meta_generation, meta_root, head, refs, cx)
+                })
                 .ok();
         })
         .detach();
@@ -1812,6 +1826,11 @@ impl HistoryView {
             self.max_lanes = 1;
             self.idle_lanes = IdleLanes::new();
             self.pending_rows = false;
+            // The old rows are gone; the selected commit is selected again by
+            // oid once its new row arrives.
+            if self.pending_selection.is_some() {
+                self.selected = None;
+            }
         }
         let start = self.items.len();
         for (commit, row) in page {
@@ -1823,6 +1842,15 @@ impl HistoryView {
             });
         }
         self.refresh_geometry();
+        // A reload keeps the selection on the commit it was on, by oid: the
+        // row number may have moved. Pages land in order, so a commit below
+        // the first page is restored by a later append.
+        if let Some(oid) = self.pending_selection {
+            if let Some(index) = self.items.iter().position(|item| item.commit.id == oid) {
+                self.selected = Some(index);
+                self.pending_selection = None;
+            }
+        }
         // The HEAD row may only arrive now; the initial selection follows it
         // until the user picks a row.
         self.settle_initial_selection(cx);
@@ -2173,6 +2201,9 @@ impl HistoryView {
     /// Selects `index`, scrolls it minimally into view and repaints. Any pick
     /// stops the initial selection from following the load.
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+        // A pick, a search jump or a reveal is newer than the reload's kept
+        // selection, so the reload must not put the old row back.
+        self.pending_selection = None;
         if index >= self.rows().len() || self.selected == Some(index) {
             self.user_selected = true;
             return;
@@ -2694,13 +2725,52 @@ impl HistoryView {
         }
     }
 
+    /// Reads HEAD and the refs off the UI thread: the first load and the
+    /// refs-only refresh must read them the same way.
+    async fn read_meta(
+        repo: Repo,
+        cx: &mut AsyncApp,
+    ) -> (Result<Head, Error>, Result<Vec<Ref>, Error>) {
+        cx.background_executor()
+            .spawn(async move { (repo.head(), repo.refs()) })
+            .await
+    }
+
+    /// Bumps and returns the HEAD/refs read generation.
+    fn next_meta_generation(&mut self) -> u64 {
+        self.meta_generation = self.meta_generation.wrapping_add(1);
+        self.meta_generation
+    }
+
     fn set_meta(
         &mut self,
+        generation: u64,
         root: PathBuf,
         head: Result<Head, Error>,
         refs: Result<Vec<Ref>, Error>,
         cx: &mut Context<Self>,
     ) {
+        if !self.apply_meta(generation, root, head, refs) {
+            return;
+        }
+        // HEAD may have arrived after the first rows: the initial selection
+        // can now move to its row.
+        self.settle_initial_selection(cx);
+        cx.notify();
+    }
+
+    /// Stores a HEAD/refs answer and rebuilds the badges. Returns whether the
+    /// answer was still current.
+    fn apply_meta(
+        &mut self,
+        generation: u64,
+        root: PathBuf,
+        head: Result<Head, Error>,
+        refs: Result<Vec<Ref>, Error>,
+    ) -> bool {
+        if generation != self.meta_generation {
+            return false;
+        }
         self.root = Some(root);
         match head {
             Ok(head) => self.head = Some(Ok(head)),
@@ -2724,10 +2794,59 @@ impl HistoryView {
         };
         self.badges = build_badges(head, refs);
         self.meta_version = self.meta_version.wrapping_add(1);
-        // HEAD may have arrived after the first rows: the initial selection
-        // can now move to its row.
-        self.settle_initial_selection(cx);
-        cx.notify();
+        true
+    }
+
+    /// Re-reads HEAD and the refs without touching the rows, the selection,
+    /// the scroll offset, the hover or the search. A checkout moves HEAD and a
+    /// branch ref but cannot change the set of commits reachable from `--all`,
+    /// so the walking load is left alone; only the badges and the HEAD ring
+    /// change.
+    pub(crate) fn refresh_refs(&mut self, cx: &mut Context<Self>) {
+        let Ok(git) = self.git.clone() else {
+            return;
+        };
+        // The old refs stay on screen while the read runs: no Loading flash.
+        let generation = self.next_meta_generation();
+        let path = self.path.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &path)?;
+                    let root = repo.root().to_path_buf();
+                    Ok::<_, Error>((root, repo))
+                })
+                .await;
+            let (root, repo) = match result {
+                Ok(opened) => opened,
+                Err(error) => {
+                    log::warn!("could not read HEAD and the refs: {error}");
+                    return;
+                }
+            };
+            let (head, refs) = Self::read_meta(repo, cx).await;
+            this.update(cx, |view, cx| {
+                view.refresh_meta(generation, root, head, refs, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Applies a [`Self::refresh_refs`] answer: the badges, HEAD and meta
+    /// version, and nothing the list draws.
+    fn refresh_meta(
+        &mut self,
+        generation: u64,
+        root: PathBuf,
+        head: Result<Head, Error>,
+        refs: Result<Vec<Ref>, Error>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_meta(generation, root, head, refs) {
+            cx.notify();
+        }
     }
 
     /// The search field's text changed. The actual search waits for the
@@ -2818,6 +2937,31 @@ impl HistoryView {
     #[cfg(test)]
     pub(crate) fn selected_row(&self) -> Option<usize> {
         self.selected
+    }
+
+    /// The selected commit, for the shell's checkout test.
+    #[cfg(test)]
+    pub(crate) fn selected_oid(&self) -> Option<Oid> {
+        self.selected
+            .and_then(|index| self.rows().get(index))
+            .map(|item| item.commit.id)
+    }
+
+    /// The load generation, for the shell's checkout test: an unchanged value
+    /// proves the log was not walked again.
+    #[cfg(test)]
+    pub(crate) fn load_generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The HEAD badge's label on `oid`, for the shell's checkout test.
+    #[cfg(test)]
+    pub(crate) fn head_badge(&self, oid: Oid) -> Option<&str> {
+        self.badges
+            .get(&oid)?
+            .iter()
+            .find(|badge| badge.kind == RefKind::Head)
+            .map(|badge| badge.label.as_ref())
     }
 
     /// Enter / F3 (next) and Shift+Enter / Shift+F3 (previous), both wrapping.
@@ -2946,6 +3090,17 @@ impl HistoryView {
         if let Some(oid) = self.pending_reveal.take() {
             log::info!("the commit {oid} is not in the loaded history");
         }
+        // A selection kept across the reload whose commit is gone falls back
+        // to the top and the HEAD (or first) row, as a fresh load would.
+        if self.pending_selection.take().is_some() {
+            self.selected = None;
+            self.user_selected = false;
+            self.scroll.0.borrow().base_handle.set_offset(Point {
+                x: px(0.),
+                y: px(0.),
+            });
+            self.settle_initial_selection(cx);
+        }
         cx.notify();
     }
 
@@ -2959,6 +3114,11 @@ impl HistoryView {
         // must not touch the view any more.
         self.generation += 1;
         self.state = LoadState::Cancelled;
+        // The rows of the abandoned walk may not contain the kept commit.
+        if self.pending_selection.take().is_some() {
+            self.user_selected = false;
+            self.settle_initial_selection(cx);
+        }
         cx.notify();
     }
 
@@ -2969,16 +3129,34 @@ impl HistoryView {
 
     /// Start over: load again, keeping the rows until the first new page lands.
     fn retry(&mut self, cx: &mut Context<Self>) {
+        // Rows that are already shown keep their selection and scroll offset
+        // when the selected commit survives the walk (the commit count is
+        // usually unchanged on a reload). The very first load and an empty
+        // list start at the top again.
+        let restoring = !self.items.is_empty()
+            && self.day_rows.is_none()
+            && self.branch_rows.is_none()
+            && self.selected.is_some();
+        self.pending_selection = if restoring {
+            self.selected
+                .and_then(|index| self.items.get(index))
+                .map(|item| item.commit.id)
+        } else {
+            None
+        };
         self.pending_rows = !self.items.is_empty();
-        self.selected = None;
-        self.user_selected = false;
+        if self.pending_selection.is_none() {
+            self.selected = None;
+            self.user_selected = false;
+            // The new load starts at the top, so the HEAD selection that
+            // settles later is visible instead of being left below the old
+            // scroll offset.
+            self.scroll.0.borrow().base_handle.set_offset(Point {
+                x: px(0.),
+                y: px(0.),
+            });
+        }
         self.hovered = None;
-        // The new load starts at the top, so the HEAD selection that settles
-        // later is visible instead of being left below the old scroll offset.
-        self.scroll.0.borrow().base_handle.set_offset(Point {
-            x: px(0.),
-            y: px(0.),
-        });
         // The query stays in the field; its matches belong to the old rows.
         self.restart_search(cx);
         self.start(cx);
