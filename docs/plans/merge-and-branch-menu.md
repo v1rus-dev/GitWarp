@@ -1,7 +1,8 @@
 # Merge, rebase and branch-menu additions (from the Fork review)
 
-Status: Step 0 (design) done — `docs/design/prototype/dialogs-merge.html` and the Operation
-states of `changes.html`. Next: Step 1.
+Status: Step 0 (design) and Step 1 (merge: dialog, menus, Changes banner and Conflicts group,
+squash) done. Next: "Open in merge tool" for conflicted files, then Step 2. Before Step 3, generalise
+the Changes operation state (merge-only today) and move conflict side labels into git-core.
 
 ## Where we are
 
