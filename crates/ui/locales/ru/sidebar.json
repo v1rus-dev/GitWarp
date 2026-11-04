@@ -20,7 +20,7 @@
   "sidebar.menu.fetch_tags_from_origin": "Загрузить теги из origin",
   "sidebar.menu.lock": "Заблокировать",
   "sidebar.menu.manage_worktrees": "Управление рабочими деревьями…",
-  "sidebar.menu.merge_into": "Слить {name} в {head}",
+  "sidebar.menu.merge_into": "Слить {name} в {head}…",
   "sidebar.menu.open_in_new_window": "Открыть в новом окне",
   "sidebar.menu.open_on_host": "Открыть на {service}",
   "sidebar.menu.pop_stash": "Извлечь stash",

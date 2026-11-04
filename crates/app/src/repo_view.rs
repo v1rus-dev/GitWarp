@@ -548,6 +548,8 @@ pub struct RepositoryView {
     _worktree_switcher_release: Option<Subscription>,
     /// The stage 7 dialog currently open, if any.
     ref_dialog: Option<Entity<RefDialog>>,
+    /// The Merge dialog while it is open (kept so its state outlives `open`).
+    merge_dialog: Option<Entity<crate::merge_dialog::MergeDialog>>,
     /// The "Create pull request" dialog while it is open.
     pr_dialog: Option<Entity<CreatePrDialog>>,
     /// The loaded pull requests of the sidebar's panel.
@@ -1002,6 +1004,7 @@ impl RepositoryView {
             worktree_switcher: None,
             _worktree_switcher_release: None,
             ref_dialog: None,
+            merge_dialog: None,
             pr_dialog: None,
             pr_model,
             _pr_events: pr_events,
@@ -1576,6 +1579,7 @@ impl RepositoryView {
                     cx,
                 );
             }
+            SidebarAction::Merge(branch) => self.open_merge_dialog(branch, window, cx),
             SidebarAction::CreateBranchAt(oid) => {
                 let card = self.card_for(oid, cx);
                 self.open_ref_dialog(RefDialogKind::CreateBranch { card }, window, cx);
@@ -2398,6 +2402,44 @@ impl RepositoryView {
         });
         let dialog = ref_dialog::open(kind, context, on_done, window, cx);
         self.ref_dialog = Some(dialog);
+    }
+
+    /// Opens the Merge dialog for `branch` (a local branch or `origin/x`).
+    fn open_merge_dialog(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        // Like the ref dialogs: a new dialog replaces one still open.
+        if let Some(previous) = self.merge_dialog.take() {
+            previous.update(cx, |dialog, cx| dialog.close(window, cx));
+        }
+        let head = match self.history.read(cx).head() {
+            Some(Head::Branch { name, .. }) => name.clone(),
+            // The menu disables Merge without a branch checked out.
+            _ => return,
+        };
+        let changes = self.changes.read(cx);
+        let context = crate::merge_dialog::MergeDialogContext {
+            root: self.root.clone(),
+            git: self.git.clone(),
+            branch,
+            head,
+            dirty: changes.staged_count() + changes.unstaged_count(),
+        };
+        let view = cx.entity();
+        let dialog = crate::merge_dialog::open(
+            context,
+            move |show_changes, window, cx| {
+                view.update(cx, |view, cx| {
+                    // A merge adds commits (or stops with conflicts): full reload.
+                    view.after_ref_change(RefChange::History, cx);
+                    if show_changes {
+                        view.show_changes(window, cx);
+                    }
+                    window.refresh();
+                });
+            },
+            window,
+            cx,
+        );
+        self.merge_dialog = Some(dialog);
     }
 
     /// Checks out a local branch, asking first when the work tree is dirty.

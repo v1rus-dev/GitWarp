@@ -231,6 +231,9 @@ pub enum SidebarAction {
     CheckoutRemoteBranch(String),
     /// Checks out a tag with a detached HEAD.
     CheckoutTag(String),
+    /// Opens the Merge dialog for a local branch or a remote-tracking ref
+    /// (`origin/feat/x`), merging it into the current branch.
+    Merge(String),
     /// Opens "Create branch here" at `oid`.
     CreateBranchAt(Oid),
     /// Opens "Create pull request" for a local branch.
@@ -418,6 +421,8 @@ pub fn sidebar_menu_with_links(
         let (link, target) = web_links::branch_target(links, targets, refs.unwrap_or(&[]), key)?;
         open_item(link, &target)
     };
+    // Merging needs a branch to merge into: not on a detached or unread HEAD.
+    let on_branch = matches!(head, Some(Head::Branch { .. }));
     let head = match head {
         Some(Head::Branch { name, .. }) => name.as_str(),
         Some(Head::Detached(_)) | None => "HEAD",
@@ -438,8 +443,9 @@ pub fn sidebar_menu_with_links(
             .action(SidebarAction::ShowBranchCommits(name.to_owned())),
             item(
                 &ui::t!("sidebar.menu.merge_into", name = name, head = head),
-                IconName::Branch,
-            ),
+                IconName::Merge,
+            )
+            .maybe_action((on_branch && !current).then(|| SidebarAction::Merge(name.to_owned()))),
             item(
                 &ui::t!("sidebar.menu.rebase_onto", name = name, head = head),
                 IconName::Branch,
@@ -481,8 +487,9 @@ pub fn sidebar_menu_with_links(
             .action(SidebarAction::ShowBranchCommits(name.to_owned())),
             item(
                 &ui::t!("sidebar.menu.merge_into", name = name, head = head),
-                IconName::Branch,
-            ),
+                IconName::Merge,
+            )
+            .maybe_action(on_branch.then(|| SidebarAction::Merge(name.to_owned()))),
             SidebarMenuEntry::Separator,
             item(
                 &ui::t!("sidebar.menu.delete_remote_branch"),
@@ -3121,7 +3128,7 @@ mod tests {
             vec![
                 "Checkout",
                 "Show all commits of feat/idle-lanes",
-                "Merge feat/idle-lanes into main",
+                "Merge feat/idle-lanes into main…",
                 "Rebase main onto feat/idle-lanes",
                 "—",
                 "Rename…",
@@ -3141,7 +3148,7 @@ mod tests {
             vec![
                 "Checkout as local branch",
                 "Show all commits of origin/feat/idle-lanes",
-                "Merge origin/feat/idle-lanes into main",
+                "Merge origin/feat/idle-lanes into main…",
                 "—",
                 "Delete remote branch…",
                 "Copy branch name",
@@ -3279,6 +3286,58 @@ mod tests {
     }
 
     #[test]
+    fn merge_is_enabled_for_another_local_branch() {
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        let menu = sidebar_menu("local:feat/x", Some(&head), None, None);
+        let merge = menu_item(&menu, "Merge feat/x into main…");
+        assert!(merge.enabled);
+        assert_eq!(merge.action, SidebarAction::Merge("feat/x".to_owned()));
+        // Rebase stays disabled until its own stage.
+        assert!(!menu_item(&menu, "Rebase main onto feat/x").enabled);
+    }
+
+    #[test]
+    fn merge_is_disabled_for_the_current_branch() {
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        let menu = sidebar_menu("local:main", Some(&head), None, None);
+        let merge = menu_item(&menu, "Merge main into main…");
+        assert!(!merge.enabled);
+        assert_eq!(merge.action, SidebarAction::None);
+    }
+
+    #[test]
+    fn merge_is_disabled_on_a_detached_head() {
+        let detached = Head::Detached(oid());
+        let local = sidebar_menu("local:feat/x", Some(&detached), None, None);
+        assert!(!menu_item(&local, "Merge feat/x into HEAD…").enabled);
+        let remote = sidebar_menu("rbranch:origin/feat/x", Some(&detached), None, None);
+        assert!(!menu_item(&remote, "Merge origin/feat/x into HEAD…").enabled);
+        let unread = sidebar_menu("local:feat/x", None, None, None);
+        assert!(!menu_item(&unread, "Merge feat/x into HEAD…").enabled);
+    }
+
+    #[test]
+    fn merge_is_enabled_for_a_remote_branch() {
+        let head = Head::Branch {
+            name: "main".into(),
+            target: None,
+        };
+        let menu = sidebar_menu("rbranch:origin/feat/x", Some(&head), None, None);
+        let merge = menu_item(&menu, "Merge origin/feat/x into main…");
+        assert!(merge.enabled);
+        assert_eq!(
+            merge.action,
+            SidebarAction::Merge("origin/feat/x".to_owned())
+        );
+    }
+
+    #[test]
     fn a_detached_head_says_head_in_the_branch_menus() {
         let detached = Head::Detached(oid());
         assert_eq!(
@@ -3286,7 +3345,7 @@ mod tests {
             vec![
                 "Checkout",
                 "Show all commits of feat/x",
-                "Merge feat/x into HEAD",
+                "Merge feat/x into HEAD…",
                 "Rebase HEAD onto feat/x",
                 "—",
                 "Rename…",
@@ -3306,7 +3365,7 @@ mod tests {
             vec![
                 "Checkout as local branch",
                 "Show all commits of origin/feat/x",
-                "Merge origin/feat/x into HEAD",
+                "Merge origin/feat/x into HEAD…",
                 "—",
                 "Delete remote branch…",
                 "Copy branch name",
@@ -3315,7 +3374,7 @@ mod tests {
         // HEAD not read yet is named the same way.
         assert_eq!(
             menu_labels(&sidebar_menu("local:feat/x", None, None, None))[2],
-            "Merge feat/x into HEAD"
+            "Merge feat/x into HEAD…"
         );
     }
 
@@ -3355,6 +3414,7 @@ mod tests {
                 "local:feat/idle-lanes" => &[
                     "Checkout",
                     "Show all commits of feat/idle-lanes",
+                    "Merge feat/idle-lanes into main…",
                     "Rename…",
                     "Set upstream",
                     "Delete branch",
@@ -3363,6 +3423,7 @@ mod tests {
                 "rbranch:origin/feat/idle-lanes" => &[
                     "Checkout as local branch",
                     "Show all commits of origin/feat/idle-lanes",
+                    "Merge origin/feat/idle-lanes into main…",
                     "Delete remote branch…",
                     "Copy branch name",
                 ],

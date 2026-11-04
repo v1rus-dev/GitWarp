@@ -5496,8 +5496,9 @@ mod tests {
         let view = open(&menu.entries(), "Branch feat");
 
         assert!(!find(&view, "Checkout").disabled);
-        // Merge is not wired yet in the sidebar either.
-        assert!(find(&view, "Merge feat into main").disabled);
+        // Merge follows the sidebar: enabled for another branch, rebase not wired yet.
+        assert!(!find(&view, "Merge feat into main…").disabled);
+        assert!(find(&view, "Rebase main onto feat").disabled);
     }
 
     #[test]

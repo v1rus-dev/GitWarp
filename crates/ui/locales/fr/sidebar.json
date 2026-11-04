@@ -20,7 +20,7 @@
   "sidebar.menu.fetch_tags_from_origin": "Récupérer les étiquettes depuis origin",
   "sidebar.menu.lock": "Verrouiller",
   "sidebar.menu.manage_worktrees": "Gérer les arbres de travail…",
-  "sidebar.menu.merge_into": "Fusionner {name} dans {head}",
+  "sidebar.menu.merge_into": "Fusionner {name} dans {head}…",
   "sidebar.menu.open_in_new_window": "Ouvrir dans une nouvelle fenêtre",
   "sidebar.menu.open_on_host": "Ouvrir sur {service}",
   "sidebar.menu.pop_stash": "Appliquer et retirer le remisage",
