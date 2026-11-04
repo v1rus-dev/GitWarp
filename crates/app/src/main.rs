@@ -11,6 +11,7 @@ mod checkout_dialog;
 mod cli_import;
 mod clone_dialog;
 mod confirm_dialog;
+mod conflict_editor;
 mod create_pr_dialog;
 mod credential_dialog;
 mod details;

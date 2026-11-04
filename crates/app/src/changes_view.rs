@@ -33,6 +33,7 @@ use ui::{
     SegmentItem, Segmented, SelectableText, Skeleton, Switch, TextArea, TextAreaEvent,
 };
 
+use crate::conflict_editor::{self, ConflictEditor, EditorEvent};
 use crate::diff_model::{
     build_rows_with, build_split_rows, max_columns, DiffRow, RowKind, SplitCell, SplitCellKind,
     SplitRow,
@@ -245,6 +246,11 @@ pub struct ChangesView {
     /// buttons, to anchor the resolve menu.
     conflict_row_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
     conflict_button_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    /// The conflict editor, while it replaces the lists and the diff.
+    editor: Option<(Entity<ConflictEditor>, Subscription)>,
+    /// The editor went away without a window at hand: focus the view on the
+    /// next paint so its keys keep working.
+    refocus: bool,
     focus: FocusHandle,
     conflicts_scroll: ScrollHandle,
     unstaged_scroll: ScrollHandle,
@@ -310,6 +316,8 @@ impl ChangesView {
             keep_focus: cx.focus_handle().tab_stop(true),
             conflict_row_bounds: Rc::default(),
             conflict_button_bounds: Rc::default(),
+            editor: None,
+            refocus: false,
             focus: cx.focus_handle().tab_stop(false),
             conflicts_scroll: ScrollHandle::new(),
             unstaged_scroll: ScrollHandle::new(),
@@ -488,6 +496,7 @@ impl ChangesView {
         self.state = StatusState::Loaded(status);
         self.apply_merge(merge, cx);
         self.start_diff(cx);
+        self.sync_editor(cx);
         cx.notify();
     }
 
@@ -1018,6 +1027,82 @@ impl ChangesView {
         }
     }
 
+    /// Opens the conflict editor on the conflicted `path`. Only while an
+    /// operation is stopped with conflicts.
+    fn open_conflict_editor(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(git) = &self.git else {
+            return;
+        };
+        let git = git.clone();
+        let Some(status) = self.status() else {
+            return;
+        };
+        if self.operation == Operation::None
+            || !status.conflicted.iter().any(|file| file.path == path)
+        {
+            return;
+        }
+        let files = status
+            .conflicted
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        let root = self.path.clone();
+        let (ours, theirs) = (
+            self.side_label(ConflictSide::Ours),
+            self.side_label(ConflictSide::Theirs),
+        );
+        let editor = cx.new(|cx| ConflictEditor::new(git, root, files, path, ours, theirs, cx));
+        let subscription = cx.subscribe_in(
+            &editor,
+            window,
+            |view, _, event: &EditorEvent, window, cx| {
+                match event {
+                    EditorEvent::Close => {
+                        view.editor = None;
+                        window.focus(&view.focus, cx);
+                        cx.notify();
+                    }
+                    // The status read that follows tells the editor what is
+                    // left (see `sync_editor`).
+                    EditorEvent::Saved => view.start_status(cx),
+                }
+            },
+        );
+        self.editor = Some((editor, subscription));
+        cx.notify();
+    }
+
+    fn open_selected_conflict_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((Side::Conflicted, path)) = self.selection_path() {
+            self.open_conflict_editor(path, window, cx);
+        }
+    }
+
+    /// Hands a fresh status to the open editor: it moves to the next
+    /// conflicted file when its own was resolved, and the view takes the
+    /// lists back when nothing is left.
+    fn sync_editor(&mut self, cx: &mut Context<Self>) {
+        let Some((editor, _)) = &self.editor else {
+            return;
+        };
+        let editor = editor.clone();
+        let files = self
+            .status()
+            .map(|status| status.conflicted.iter().map(|f| f.path.clone()).collect())
+            .unwrap_or_default();
+        let (ours, theirs) = (
+            self.side_label(ConflictSide::Ours),
+            self.side_label(ConflictSide::Theirs),
+        );
+        let keep = self.operation != Operation::None
+            && editor.update(cx, |editor, cx| editor.sync(files, ours, theirs, cx));
+        if !keep {
+            self.editor = None;
+            self.refocus = true;
+        }
+    }
+
     /// Resolves the conflicted `path` (see the row menu). The menu captures the
     /// path, not the row index: the list may have changed while the menu was
     /// open, and then the path is simply no longer conflicted.
@@ -1105,7 +1190,23 @@ impl ChangesView {
                     },
                 ))
             };
-        let entries = vec![
+        let mut entries = Vec::new();
+        if self.operation != Operation::None {
+            let editor_view = view.clone();
+            let editor_path = path.clone();
+            entries.push(MenuEntry::Item(
+                MenuItem::new(ui::t!("changes.editor.open_menu"))
+                    .icon(IconName::Merge)
+                    .disabled(busy)
+                    .action(move |window, cx| {
+                        editor_view.update(cx, |view, cx| {
+                            view.open_conflict_editor(editor_path.clone(), window, cx);
+                        });
+                    }),
+            ));
+            entries.push(MenuEntry::Separator);
+        }
+        entries.extend(vec![
             item(
                 ui::t!(
                     "changes.conflict.take",
@@ -1128,7 +1229,7 @@ impl ChangesView {
                 IconName::Plus,
                 Resolve::MarkResolved,
             ),
-        ];
+        ]);
         match anchor {
             MenuAnchor::Pointer(position) => menu::open_context_menu(position, entries, window, cx),
             MenuAnchor::Bounds(bounds) => menu::open_dropdown(bounds, entries, window, cx),
@@ -1368,6 +1469,10 @@ impl ChangesView {
 
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
+        if self.refocus {
+            self.refocus = false;
+            window.focus(&self.focus, cx);
+        }
         let pane_width = (f32::from(window.viewport_size().width) - FILES_WIDTH - 560.).max(320.);
         div()
             .size_full()
@@ -1404,16 +1509,44 @@ impl ChangesView {
                 view.step_selection(-1, cx);
             }))
             .children(self.render_merge_banner(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .flex()
-                    .child(self.render_files(cx))
-                    .child(self.render_diff(pane_width, colors, cx)),
+            .map(
+                |this| match self.editor.as_ref().map(|(editor, _)| editor.clone()) {
+                    // The editor takes the whole centre area, commit box included.
+                    Some(editor) => this.child(div().flex_1().min_h_0().w_full().child(editor)),
+                    None => this
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .flex()
+                                .child(self.render_files(cx))
+                                .child(self.render_diff(pane_width, colors, cx)),
+                        )
+                        .child(self.render_commit_box(cx)),
+                },
             )
-            .child(self.render_commit_box(cx))
+    }
+
+    /// The primary "Resolve…" button of a conflicted file's diff pane.
+    fn resolve_button(&self, cx: &mut Context<Self>) -> Option<Button> {
+        let conflicted = self
+            .selection
+            .is_some_and(|selection| selection.side == Side::Conflicted);
+        if !conflicted || self.operation == Operation::None || self.git.is_err() {
+            return None;
+        }
+        let view = cx.entity();
+        Some(
+            Button::primary("resolve-conflict")
+                .size(ButtonSize::Small)
+                .label(ui::t!("changes.editor.open_button"))
+                .on_click(move |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.open_selected_conflict_editor(window, cx);
+                    });
+                }),
+        )
     }
 
     fn render_files(&mut self, cx: &mut Context<Self>) -> Div {
@@ -1833,10 +1966,17 @@ impl ChangesView {
                     message.clone(),
                 )),
             DiffState::Conflict(data) => {
+                let resolve = self.resolve_button(cx);
                 if data.binary {
                     diff_note(ui::t!("changes.diff.binary"), colors)
+                        .flex_col()
+                        .gap(px(12.))
+                        .children(resolve)
                 } else if data.missing {
                     diff_note(ui::t!("changes.conflict.no_file"), colors)
+                        .flex_col()
+                        .gap(px(12.))
+                        .children(resolve)
                 } else {
                     let row_width = conflict_width(self.mono_cell, data.columns, pane_width);
                     let data = data.clone();
@@ -1862,11 +2002,20 @@ impl ChangesView {
                                 .flex_none()
                                 .px(px(16.))
                                 .py(px(6.))
+                                .flex()
+                                .items_center()
+                                .gap(px(12.))
                                 .text_size(FS_SM)
                                 .text_color(colors.muted)
                                 .border_b_1()
                                 .border_color(colors.border)
-                                .child(ui::t!("changes.conflict.note")),
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(ui::t!("changes.conflict.note")),
+                                )
+                                .children(resolve),
                         )
                         .child(div().flex_1().min_h_0().flex().child(list).child(
                             Scrollbar::uniform("changes-diff-bar", self.diff_scroll.clone()),
@@ -2414,6 +2563,7 @@ pub fn bind_keys(cx: &mut App, settings: &crate::settings::Settings) {
         key_binding(cx, "menu", OpenConflictMenu, conflict),
         key_binding(cx, "shift-f10", OpenConflictMenu, conflict),
     ]);
+    conflict_editor::bind_keys(cx);
 }
 
 actions!(
@@ -3350,6 +3500,117 @@ mod tests {
         assert!(cx.debug_bounds("merge-banner").is_none());
         let repo = Repo::open(crate::test_support::git(), dir).unwrap();
         assert_eq!(repo.operation().unwrap(), Operation::None);
+    }
+
+    /// The conflict editor end to end on a real merge: two conflicts in
+    /// `a.txt`, one in `b.txt`. Picks rebuild the file, save writes and stages
+    /// it and moves to the next conflicted file, Esc with picks asks first, and
+    /// resolving the last file hands the view back.
+    #[gpui::test]
+    fn the_conflict_editor_resolves_files_in_turn(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-editor");
+        let dir = repo.path();
+        let base = "a1\none\na2\na3\na4\na5\na6\ntwo\na7\n";
+        write(dir, "a.txt", base);
+        write(dir, "b.txt", "x\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        let edit = |one: &str, two: &str| base.replace("one", one).replace("two", two);
+        write(dir, "a.txt", edit("one-main", "two-main"));
+        write(dir, "b.txt", "x-main\n");
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", edit("one-side", "two-side"));
+        write(dir, "b.txt", "x-side\n");
+        git(dir, &["commit", "-q", "-am", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        let outcome = Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::FastForwardIfPossible)
+            .unwrap();
+        assert!(matches!(outcome, git_core::MergeOutcome::Stopped { .. }));
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_conflict_editor("a.txt".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let editor = view.read_with(&cx, |view, _| {
+            view.editor.as_ref().expect("the editor opened").0.clone()
+        });
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.path(), "a.txt");
+            assert_eq!(editor.counts(), Some((2, 2)));
+            assert!(!editor.can_save(), "save must wait for every conflict");
+        });
+
+        // Save is a no-op while a conflict is open.
+        editor.update(&mut cx, |editor, cx| editor.save(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert_eq!(view.conflicted_count(), 2));
+
+        // Alt+1 toggles ours on the focused (first) conflict.
+        cx.simulate_keystrokes("alt-1");
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.focused(), Some(0));
+            assert_eq!(
+                editor.resolution(0),
+                Some(&git_core::ConflictResolution::Picked(vec![
+                    ConflictSide::Ours
+                ]))
+            );
+        });
+        // Second conflict: theirs ticked first, then ours.
+        editor.update(&mut cx, |editor, cx| {
+            editor.toggle_pick(1, ConflictSide::Theirs, cx);
+            editor.toggle_pick(1, ConflictSide::Ours, cx);
+        });
+        editor.read_with(&cx, |editor, _| assert!(editor.can_save()));
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+
+        let saved = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        assert_eq!(
+            saved,
+            "a1\none-main\na2\na3\na4\na5\na6\ntwo-side\ntwo-main\na7\n"
+        );
+        view.read_with(&cx, |view, _| {
+            let status = view.status().expect("loaded");
+            let conflicted: Vec<_> = status.conflicted.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(conflicted, ["b.txt"]);
+            assert!(status.staged.iter().any(|f| f.path == "a.txt"));
+        });
+        // The editor moved on to the next conflicted file by itself.
+        let editor = view.read_with(&cx, |view, _| {
+            view.editor.as_ref().expect("still open").0.clone()
+        });
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.path(), "b.txt");
+            assert_eq!(editor.counts(), Some((1, 1)));
+        });
+
+        // Esc without picks would leave at once; with a pick it asks first.
+        editor.update(&mut cx, |editor, cx| {
+            editor.toggle_pick(0, ConflictSide::Theirs, cx)
+        });
+        cx.simulate_keystrokes("escape");
+        editor.read_with(&cx, |editor, _| assert!(editor.confirming()));
+        view.read_with(&cx, |view, _| assert!(view.editor.is_some()));
+        // A second Esc is "Keep editing".
+        cx.simulate_keystrokes("escape");
+        editor.read_with(&cx, |editor, _| assert!(!editor.confirming()));
+
+        editor.update(&mut cx, |editor, cx| editor.save(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(view.editor.is_none(), "the last file closes the editor");
+            assert_eq!(view.conflicted_count(), 0);
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.txt")).unwrap(),
+            "x-side\n"
+        );
     }
 
     /// A conflicted squash has no `MERGE_HEAD`: it still gets the banner, the
