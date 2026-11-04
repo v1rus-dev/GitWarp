@@ -1,8 +1,10 @@
 # Merge, rebase and branch-menu additions (from the Fork review)
 
-Status: Step 0 (design) and Step 1 (merge: dialog, menus, Changes banner and Conflicts group,
-squash) done. Next: "Open in merge tool" for conflicted files, then Step 2. Before Step 3, generalise
-the Changes operation state (merge-only today) and move conflict side labels into git-core.
+Status: Step 0 (design), Step 1 (merge: dialog, menus, Changes banner and Conflicts group,
+squash) and the conflict editor (12a model, 12c editor, 12d hand-edited result;
+`docs/design/prototype/conflicts.html`) done. Next: "Open in merge tool", then Step 2. Before
+Step 3, generalise the Changes operation state (merge-only today) and move conflict side labels
+into git-core; rebase side labelling in the editor (12e) comes with Step 3.
 
 ## Where we are
 
@@ -95,8 +97,7 @@ menu model tests in `sidebar.rs` / `history_view.rs` in the existing style.
 
 ## Later, needs its own design
 
-Interactive rebase, blame, file history. The conflict editor is now designed
-(`docs/design/prototype/conflicts.html`) and is the next step after merge. Fork's AI submenu is deliberately not taken.
+Interactive rebase, blame, file history. Fork's AI submenu is deliberately not taken.
 
 ## Checks per step (from CLAUDE.md)
 
