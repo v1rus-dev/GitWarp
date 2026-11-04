@@ -1,1 +1,4 @@
-{}
+{
+  "app.update.available": "GitWarp {version} is available",
+  "app.update.view_release": "View release"
+}

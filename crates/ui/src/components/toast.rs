@@ -184,6 +184,22 @@ impl ToastQueue {
         id
     }
 
+    /// [`ToastQueue::push_with`] for a toast that never auto-hides, whatever its
+    /// kind: it stays until dismissed or its button is clicked.
+    pub fn push_persistent(
+        &mut self,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        body: Option<ToastBody>,
+        now: Instant,
+    ) -> ToastId {
+        let id = self.push_with(kind, message, body, now);
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.toast.id == id) {
+            entry.deadline = None;
+        }
+        id
+    }
+
     /// Pauses or resumes the timer when the pointer enters, leaves or selects
     /// the toast's text. The remaining lifetime is kept across the pause.
     fn set_paused(
@@ -321,6 +337,23 @@ pub fn show_with(
         })
         .detach();
     }
+    id
+}
+
+/// [`show_with`] for a toast that stays until dismissed or its button is
+/// clicked, whatever its kind (no hide timer is scheduled).
+pub fn show_persistent(
+    kind: ToastKind,
+    message: impl Into<SharedString>,
+    body: Option<ToastBody>,
+    window: &mut Window,
+    cx: &mut App,
+) -> ToastId {
+    let now = cx.background_executor().now();
+    let id = with_queue(window, cx, |queue| {
+        queue.push_persistent(kind, message, body, now)
+    });
+    window.refresh();
     id
 }
 
@@ -613,6 +646,15 @@ mod tests {
         assert_eq!(expired, vec![ok, info, warn]);
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.iter().next().map(|toast| toast.id), Some(error));
+    }
+
+    #[test]
+    fn a_persistent_info_toast_survives_expiry() {
+        let mut queue = ToastQueue::new();
+        let now = Instant::now();
+        let id = queue.push_persistent(ToastKind::Info, "update", None, now);
+        assert!(queue.expire(now + Duration::from_secs(3600)).is_empty());
+        assert_eq!(queue.iter().next().map(|toast| toast.id), Some(id));
     }
 
     #[test]

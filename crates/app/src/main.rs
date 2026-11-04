@@ -45,6 +45,7 @@ mod telemetry;
 mod test_support;
 mod text_runs;
 mod theme;
+mod update_check;
 mod web_links;
 mod welcome;
 mod welcome_activity;
@@ -376,29 +377,31 @@ fn main() {
                 size(px(960.), px(680.))
             };
             let bounds = Bounds::centered(None, window_size, cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    // Always request client-side decorations: on GNOME Wayland
-                    // server-side ones leave the window without any frame.
-                    window_decorations: Some(WindowDecorations::Client),
-                    window_background: WindowBackgroundAppearance::Transparent,
-                    window_min_size: Some(size(px(620.), px(420.))),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("GitWarp".into()),
-                        appears_transparent: true,
-                        traffic_light_position: workspace::traffic_light_position(),
-                    }),
-                    app_id: Some("dev.v1rus.gitwarp".into()),
-                    icon: app_icon::window_icon(),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    ui::theme::follow_system(window, cx);
-                    cx.new(|cx| Workspace::new(path, git, git_choice, window, cx))
-                },
-            )
-            .expect("failed to open the main window");
+            let main_window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        // Always request client-side decorations: on GNOME Wayland
+                        // server-side ones leave the window without any frame.
+                        window_decorations: Some(WindowDecorations::Client),
+                        window_background: WindowBackgroundAppearance::Transparent,
+                        window_min_size: Some(size(px(620.), px(420.))),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some("GitWarp".into()),
+                            appears_transparent: true,
+                            traffic_light_position: workspace::traffic_light_position(),
+                        }),
+                        app_id: Some("dev.v1rus.gitwarp".into()),
+                        icon: app_icon::window_icon(),
+                        ..Default::default()
+                    },
+                    |window, cx| {
+                        ui::theme::follow_system(window, cx);
+                        cx.new(|cx| Workspace::new(path, git, git_choice, window, cx))
+                    },
+                )
+                .expect("failed to open the main window");
+            update_check::start(main_window, cx);
             cx.activate(true);
         });
 }
