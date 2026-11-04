@@ -29,8 +29,8 @@ use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
     menu, toast, Avatar, Banner, BannerKind, Button, ButtonSize, CiGlyph, CountPill, Counter,
     EmptyState, FileRow, Icon, IconName, MenuEntry, MenuItem, PrBadge, Scrollbar, SearchField,
-    SegmentItem, Segmented, Skeleton, Spinner, Splitter, TextInput, TextInputEvent, Tooltip, Tree,
-    TreeNodeData, TreePr,
+    SegmentItem, Segmented, SelectableText, Skeleton, Spinner, Splitter, TextInput, TextInputEvent,
+    Tooltip, Tree, TreeNodeData, TreePr,
 };
 
 use crate::activity_strip::ActivityStrip;
@@ -38,6 +38,7 @@ use crate::changes_view::{change_counts, ChangesEvent, ChangesView};
 use crate::create_pr_dialog::{self, CreatePrDialog, PrDialogContext, PushRun};
 use crate::details::{read_details, read_diff, DetailsState, DiffState};
 use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
+use crate::error_dialog::{self, ErrorAction, KnownError};
 use crate::format::{absolute_time, format_count, relative_time};
 use crate::history_state::LoadState;
 use crate::history_view::{HistoryEvent, HistoryView};
@@ -551,6 +552,8 @@ pub struct RepositoryView {
     sidebar_tab: SidebarTab,
     /// A ref operation without a dialog (checkout, stash apply, …) is running.
     ref_action_running: bool,
+    /// The current pull was started by "Pull, then push": push on success.
+    push_after_pull: bool,
     /// The network action that is running, if any.
     network: Option<NetworkActivity>,
     /// Bumped per network job; an older poll loop stops.
@@ -900,6 +903,7 @@ impl RepositoryView {
             _pr_redraw: pr_redraw,
             sidebar_tab: SidebarTab::Repository,
             ref_action_running: false,
+            push_after_pull: false,
             network: None,
             network_generation: 0,
             background_fetch: settings.background_fetch,
@@ -2317,7 +2321,7 @@ impl RepositoryView {
             changes.staged_count() + changes.unstaged_count()
         };
         if dirty == 0 {
-            self.run_repo_action(window, cx, checkout);
+            self.run_checkout_action(checkout, window, cx);
             return;
         }
         let body = ui::i18n::t_count("repo.checkout.dirty_body", dirty as u64, &[]);
@@ -2351,7 +2355,9 @@ impl RepositoryView {
                 let checkout = checkout.clone();
                 move |window, cx| {
                     let checkout = take(&checkout);
-                    view.update(cx, |view, cx| view.run_repo_action(window, cx, checkout));
+                    view.update(cx, |view, cx| {
+                        view.run_checkout_action(checkout, window, cx)
+                    });
                 }
             },
             {
@@ -2372,6 +2378,45 @@ impl RepositoryView {
         );
     }
 
+    /// Runs a checkout and, when git refuses because local changes would be
+    /// overwritten, offers to stash them and retry the same checkout.
+    fn run_checkout_action<F>(&mut self, checkout: F, window: &mut Window, cx: &mut Context<Self>)
+    where
+        F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)>
+            + Send
+            + Clone
+            + 'static,
+    {
+        let retry = checkout.clone();
+        self.run_repo_action_with(window, cx, checkout, move |view, error, window, cx| {
+            let Some(known) = error_dialog::classify_git_error(&error) else {
+                view.show_git_error(error, window, cx);
+                return;
+            };
+            if !matches!(&known, KnownError::LocalChangesOverwritten) {
+                view.show_git_error(error, window, cx);
+                return;
+            }
+            let title = known.title();
+            let explanation = known.explanation();
+            let details = error_dialog::raw_output(&error);
+            let entity = cx.entity();
+            let actions = vec![ErrorAction::new(
+                ui::t!("dialogs.error.stash_and_switch"),
+                move |window, cx| {
+                    entity.update(cx, |view, cx| {
+                        let checkout = retry.clone();
+                        view.run_repo_action(window, cx, move |repo| {
+                            repo.stash_save(Some("GitWarp: stashed before switching"))?;
+                            checkout(repo)
+                        });
+                    });
+                },
+            )];
+            error_dialog::open(title, explanation, details, actions, window, cx);
+        });
+    }
+
     /// Reloads everything a ref operation can have changed: the history and
     /// its badges, the sidebar's lists, the local-changes view and HEAD.
     fn after_ref_change(&mut self, cx: &mut Context<Self>) {
@@ -2387,6 +2432,23 @@ impl RepositoryView {
     fn run_repo_action<F>(&mut self, window: &mut Window, cx: &mut Context<Self>, action: F)
     where
         F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)> + Send + 'static,
+    {
+        self.run_repo_action_with(window, cx, action, |view, error, window, cx| {
+            view.show_git_error(error, window, cx);
+        });
+    }
+
+    /// [`run_repo_action`] with a caller-specific failure path, for operations
+    /// that can offer a retry with a preparatory step.
+    fn run_repo_action_with<F, E>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        action: F,
+        on_error: E,
+    ) where
+        F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)> + Send + 'static,
+        E: FnOnce(&mut Self, Error, &mut Window, &mut Context<Self>) + 'static,
     {
         if self.ref_action_running {
             return;
@@ -2415,15 +2477,57 @@ impl RepositoryView {
                         toast::show(kind, notice, window, cx);
                         view.after_ref_change(cx);
                     }
-                    Err(error) => {
-                        toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
-                    }
+                    Err(error) => on_error(view, error, window, cx),
                 }
             })
             .ok();
         })
         .detach();
         cx.notify();
+    }
+
+    /// The failure path shared by repository actions: a known git failure
+    /// opens a dialog with a remedy, everything else stays a toast.
+    fn show_git_error(&mut self, error: Error, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(known) = error_dialog::classify_git_error(&error) else {
+            toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+            return;
+        };
+        let title = known.title();
+        let explanation = known.explanation();
+        let details = error_dialog::raw_output(&error);
+        match known {
+            KnownError::BranchInWorktree { path, .. } => {
+                let model = self.worktrees_model.clone();
+                let path = PathBuf::from(path);
+                let actions = vec![ErrorAction::new(
+                    ui::t!("dialogs.error.open_worktree"),
+                    move |window, cx| {
+                        model.update(cx, |model, cx| model.switch_to(&path, window, cx));
+                    },
+                )];
+                error_dialog::open(title, explanation, details, actions, window, cx);
+            }
+            KnownError::PushRejected => {
+                let view = cx.entity();
+                let actions = vec![ErrorAction::new(
+                    ui::t!("dialogs.error.pull_then_push"),
+                    move |window, cx| {
+                        view.update(cx, |view, cx| view.pull_then_push(window, cx));
+                    },
+                )];
+                error_dialog::open(title, explanation, details, actions, window, cx);
+            }
+            KnownError::LocalChangesOverwritten | KnownError::PullNotFastForward => {
+                error_dialog::open(title, explanation, details, Vec::new(), window, cx);
+            }
+        }
+    }
+
+    /// Pulls the current branch, then pushes once the pull completed.
+    fn pull_then_push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.push_after_pull = true;
+        self.pull_branch(window, cx);
     }
 
     /// The toolbar's Stash button: stashes every local change.
@@ -2708,8 +2812,15 @@ impl RepositoryView {
                 Ok(outcome) => {
                     toast::show(ui::ToastKind::Ok, job.done_message(&outcome), window, cx);
                     self.reload_after_network(cx);
+                    if matches!(job, Job::Pull) && self.push_after_pull {
+                        self.push_after_pull = false;
+                        self.push_branch(window, cx);
+                    }
                 }
-                Err(error) => self.show_job_error(&error, meta, window, cx),
+                Err(error) => {
+                    self.push_after_pull = false;
+                    self.show_job_error(&error, meta, job, window, cx);
+                }
             }
             return true;
         }
@@ -2822,9 +2933,39 @@ impl RepositoryView {
         &mut self,
         error: &Error,
         meta: &JobMeta,
+        job: &Job,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(known) = error_dialog::classify_git_error(error) {
+            let pull_or_push = match &known {
+                KnownError::PushRejected => {
+                    matches!(job, Job::Push | Job::PushTag { .. } | Job::PushTags { .. })
+                        || matches!(job, Job::DeleteRemoteBranch { .. })
+                }
+                KnownError::PullNotFastForward => matches!(job, Job::Pull),
+                _ => false,
+            };
+            if pull_or_push {
+                let title = known.title();
+                let explanation = known.explanation();
+                let details = error_dialog::raw_output(error);
+                let actions = match &known {
+                    KnownError::PushRejected => {
+                        let view = cx.entity();
+                        vec![ErrorAction::new(
+                            ui::t!("dialogs.error.pull_then_push"),
+                            move |window, cx| {
+                                view.update(cx, |view, cx| view.pull_then_push(window, cx));
+                            },
+                        )]
+                    }
+                    _ => Vec::new(),
+                };
+                error_dialog::open(title, explanation, details, actions, window, cx);
+                return;
+            }
+        }
         if network_ops::is_auth_error(error) {
             if let Some(account) = remote_accounts::failed_account(&meta.used, &error.to_string()) {
                 let body = ui::ToastBody {
@@ -4832,7 +4973,10 @@ impl RepositoryView {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(ui::t!("repo.details.load_failed")),
                 )
-                .child(div().text_color(colors.error).child(message.clone()))
+                .child(div().text_color(colors.error).child(SelectableText::new(
+                    gpui::ElementId::Name("details-info-error".into()),
+                    message.clone(),
+                )))
                 .into_any_element(),
             DetailsState::Loaded(data) => self.render_loaded_info(&data.details, cx),
         }
@@ -5181,10 +5325,15 @@ impl RepositoryView {
                             )
                         }))
                 }
-                DetailsState::Failed(message) => div()
-                    .p(px(12.))
-                    .text_color(colors.error)
-                    .child(message.clone()),
+                DetailsState::Failed(message) => {
+                    div()
+                        .p(px(12.))
+                        .text_color(colors.error)
+                        .child(SelectableText::new(
+                            gpui::ElementId::Name("details-files-error".into()),
+                            message.clone(),
+                        ))
+                }
                 _ => muted_note(ui::t!("repo.details.no_files"), colors),
             };
         };
@@ -5331,7 +5480,10 @@ impl RepositoryView {
                 .min_h_0()
                 .p(px(12.))
                 .text_color(colors.error)
-                .child(message.clone()),
+                .child(SelectableText::new(
+                    gpui::ElementId::Name("details-diff-error".into()),
+                    message.clone(),
+                )),
             DiffState::Loaded(data) => {
                 if data.diff.binary {
                     diff_note(ui::t!("repo.diff.binary"), colors)

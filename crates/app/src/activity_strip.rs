@@ -26,7 +26,7 @@ use ui::metrics::{FONT_MONO, FONT_UI, FS_SM};
 use crate::text_runs::{mono, strong};
 use ui::{
     long_date, ActiveTheme, Button, ButtonSize, HeatLegend, Heatmap, Icon, IconName, Kbd,
-    SegmentItem, Segmented, Select, Skeleton,
+    SegmentItem, Segmented, Select, SelectableText, Skeleton,
 };
 
 use crate::format::format_count;
@@ -672,11 +672,10 @@ impl ActivityStrip {
                                     .text_color(colors.text)
                                     .child(ui::t!("activity.error.title")),
                             )
-                            .child(
-                                div()
-                                    .font_family(FONT_MONO)
-                                    .child(SharedString::from(message.clone())),
-                            ),
+                            .child(div().font_family(FONT_MONO).child(SelectableText::new(
+                                gpui::ElementId::Name("activity-error".into()),
+                                SharedString::from(message.clone()),
+                            ))),
                     )
                     .child(
                         Button::new("activity-retry")

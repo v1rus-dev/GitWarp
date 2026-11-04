@@ -33,6 +33,7 @@ mod scrollbar;
 mod search_field;
 mod segmented;
 pub mod select;
+mod selectable_text;
 mod skeleton;
 mod spinner;
 mod splitter;
@@ -63,6 +64,7 @@ pub use scrollbar::{thumb_metrics, ScrollArea, ScrollHandleSource, Scrollbar, Th
 pub use search_field::SearchField;
 pub use segmented::{SegmentItem, Segmented};
 pub use select::Select;
+pub use selectable_text::SelectableText;
 pub use skeleton::Skeleton;
 pub use spinner::Spinner;
 pub use splitter::{clamp_size, SplitAxis, Splitter};
@@ -77,6 +79,7 @@ pub use tooltip::Tooltip;
 pub use tree::{Tree, TreeNodeData, TreeNodeTrailing, TreePr};
 pub use window_controls::WindowControls;
 
+pub(crate) use selectable_text::bind_keys as bind_selectable_text_keys;
 pub(crate) use text_input::bind_keys as bind_text_input_keys;
 
 /// UI text with tabular figures, for counts and ahead/behind markers.

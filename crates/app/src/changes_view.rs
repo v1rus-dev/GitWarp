@@ -25,7 +25,7 @@ use ui::metrics::{FONT_MONO, FS_SM, FS_XS, MONO};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
     Button, ButtonSize, CountPill, FileRow, IconName, ScrollArea, Scrollbar, SegmentItem,
-    Segmented, Skeleton, Switch, TextArea, TextAreaEvent,
+    Segmented, SelectableText, Skeleton, Switch, TextArea, TextAreaEvent,
 };
 
 use crate::diff_model::{
@@ -1244,7 +1244,10 @@ impl ChangesView {
                 .min_h_0()
                 .p(px(12.))
                 .text_color(colors.error)
-                .child(message.clone()),
+                .child(SelectableText::new(
+                    gpui::ElementId::Name("changes-diff-error".into()),
+                    message.clone(),
+                )),
             DiffState::Loaded(data) => {
                 if data.diff.binary {
                     diff_note(ui::t!("changes.diff.binary"), colors)

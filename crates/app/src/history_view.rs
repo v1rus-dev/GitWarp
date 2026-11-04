@@ -30,8 +30,8 @@ use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD, R_SM};
 use ui::theme::ThemeColors;
 use ui::{
     menu, ActiveTheme, Avatar, Button, ButtonSize, CiGlyph, EmptyState, Icon, IconName, ListRow,
-    MenuEntry, MenuItem, PrBadge, Progress, RefBadge, RefKind, Skeleton, Spinner, ToastKind,
-    Tooltip,
+    MenuEntry, MenuItem, PrBadge, Progress, RefBadge, RefKind, SelectableText, Skeleton, Spinner,
+    ToastKind, Tooltip,
 };
 
 use crate::format::{format_count, relative_time};
@@ -4320,7 +4320,10 @@ impl HistoryView {
             .text_size(FS_SM)
             .text_color(colors.muted)
             .child(Icon::new(icon).size(px(14.)).color(color))
-            .child(text)
+            .child(SelectableText::new(
+                gpui::ElementId::Name("history-strip-text".into()),
+                text,
+            ))
             .child(div().flex_1())
             .child(
                 Button::new("history-strip-retry")

@@ -1,11 +1,14 @@
 //! Inline banners.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, AnyElement, App, Hsla, IntoElement, ParentElement, RenderOnce, SharedString, Styled,
-    Window,
+    div, px, AnyElement, App, ElementId, Hsla, IntoElement, ParentElement, RenderOnce,
+    SharedString, Styled, Window,
 };
 
+use crate::components::SelectableText;
 use crate::icon::{Icon, IconName};
 use crate::metrics::{FONT_MONO, FS_BASE, FS_SM, R_MD};
 use crate::theme::{ActiveTheme, ThemeColors};
@@ -82,10 +85,32 @@ fn style_for(kind: BannerKind, colors: ThemeColors) -> (Hsla, f32, f32, IconName
     }
 }
 
+fn kind_tag(kind: BannerKind) -> u8 {
+    match kind {
+        BannerKind::Warn => 0,
+        BannerKind::Error => 1,
+        BannerKind::Info => 2,
+        BannerKind::Ok => 3,
+    }
+}
+
+/// A stable id for the banner's text state; banners have no id of their own,
+/// and two identical banners may share their (read-only) selection harmlessly.
+fn banner_fingerprint(kind: BannerKind, title: &str, body: Option<&str>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    kind_tag(kind).hash(&mut hasher);
+    title.hash(&mut hasher);
+    body.hash(&mut hasher);
+    hasher.finish()
+}
+
 impl RenderOnce for Banner {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors;
         let (color, border_alpha, background_alpha, icon) = style_for(self.kind, colors);
+        let fingerprint = banner_fingerprint(self.kind, &self.title, self.body.as_deref());
+        let title_id = ElementId::Name(format!("banner-title-{fingerprint}").into());
+        let body_id = ElementId::Name(format!("banner-body-{fingerprint}").into());
 
         div()
             .flex()
@@ -116,14 +141,14 @@ impl RenderOnce for Banner {
                         div()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(colors.text)
-                            .child(self.title),
+                            .child(SelectableText::new(title_id, self.title.clone())),
                     )
                     .when_some(self.body, |this, body| {
                         this.child(
                             div()
                                 .when(self.mono_body, |this| this.font_family(FONT_MONO))
                                 .text_color(colors.muted)
-                                .child(body),
+                                .child(SelectableText::new(body_id, body)),
                         )
                     })
                     .when(!self.list.is_empty(), |this| {
@@ -136,13 +161,21 @@ impl RenderOnce for Banner {
                                 .gap(px(2.))
                                 .text_size(FS_SM)
                                 .text_color(colors.muted)
-                                .children(self.list.into_iter().map(|item| {
-                                    if self.plain_list {
-                                        div().child(item)
-                                    } else {
-                                        div().child(format!("• {item}"))
-                                    }
-                                })),
+                                .children(self.list.into_iter().enumerate().map(
+                                    |(index, item)| {
+                                        let text: SharedString = if self.plain_list {
+                                            item
+                                        } else {
+                                            SharedString::from(format!("• {item}"))
+                                        };
+                                        div().child(SelectableText::new(
+                                            ElementId::Name(
+                                                format!("banner-list-{fingerprint}-{index}").into(),
+                                            ),
+                                            text,
+                                        ))
+                                    },
+                                )),
                         )
                     })
                     .when_some(self.action, |this, action| {

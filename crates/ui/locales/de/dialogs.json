@@ -219,5 +219,17 @@
   "dialogs.remote_name.spaces": "Der Name darf keine Leerzeichen enthalten.",
   "dialogs.remote_url.bad": "Keine Git-Adresse. Verwende https://host/user/repo.git oder git@host:user/repo.git",
   "dialogs.remote_url.https": "HTTPS · verwendet dein gespeichertes Konto",
-  "dialogs.remote_url.ssh": "SSH · verwendet deine SSH-Schlüssel"
+  "dialogs.remote_url.ssh": "SSH · verwendet deine SSH-Schlüssel",
+  "dialogs.error.title_fallback": "Repository-Vorgang fehlgeschlagen",
+  "dialogs.error.worktree_title": "Branch wird bereits verwendet",
+  "dialogs.error.worktree_body": "Branch {branch} ist in einem anderen Worktree ausgecheckt ({path}). Wechsle zu diesem Worktree oder wähle einen anderen Branch.",
+  "dialogs.error.local_changes_title": "Lokale Änderungen würden überschrieben",
+  "dialogs.error.local_changes_body": "Der Wechsel würde Dateien mit nicht committeten Änderungen überschreiben. Verstauche oder committe sie zuerst.",
+  "dialogs.error.push_rejected_title": "Push abgelehnt",
+  "dialogs.error.push_rejected_body": "Der Remote hat Commits, die dein Branch nicht hat. Hole die Remote-Änderungen zuerst, dann pushe erneut.",
+  "dialogs.error.pull_diverged_title": "Branch ist divergiert",
+  "dialogs.error.pull_diverged_body": "Dieser Pull ist kein Fast-Forward, und GitWarp führt nur Fast-Forward-Pulls aus. Merge oder rebase den Branch und pulle dann erneut.",
+  "dialogs.error.open_worktree": "Diesen Worktree öffnen",
+  "dialogs.error.stash_and_switch": "Verstauchen und wechseln",
+  "dialogs.error.pull_then_push": "Pullen, dann pushen"
 }
