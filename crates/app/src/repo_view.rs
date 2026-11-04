@@ -5,11 +5,11 @@
 //! stage is a placeholder or a disabled control, never a dead click.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
@@ -552,8 +552,6 @@ pub struct RepositoryView {
     sidebar_tab: SidebarTab,
     /// A ref operation without a dialog (checkout, stash apply, …) is running.
     ref_action_running: bool,
-    /// The current pull was started by "Pull, then push": push on success.
-    push_after_pull: bool,
     /// The network action that is running, if any.
     network: Option<NetworkActivity>,
     /// Bumped per network job; an older poll loop stops.
@@ -572,6 +570,9 @@ pub struct RepositoryView {
     hosting_view: Arc<HostingView>,
     /// The commits the history currently shows, as its last report said.
     ci_visible: Vec<Oid>,
+    /// The commits a running checks batch still wants, shared with it: a row
+    /// that scrolled away before its chunk starts is skipped.
+    ci_wanted: Arc<Mutex<HashSet<String>>>,
     /// Whether the CI dots, the checks block and check requests are wanted;
     /// mirrored from the settings and kept current while the view renders.
     show_ci_status: bool,
@@ -625,6 +626,15 @@ enum NetworkEvent {
     Done(Result<git_core::network::NetworkOutcome, Error>),
 }
 
+/// What the poll loop needs about the job it watches: the intent belongs to
+/// this job instance and dies with it.
+#[derive(Clone, Copy)]
+struct NetworkRun<'a> {
+    generation: u64,
+    job: &'a Job,
+    then_push: bool,
+}
+
 /// The first background fetch waits a little, so opening a repository is not
 /// immediately followed by network traffic.
 const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(30);
@@ -636,6 +646,57 @@ const NETWORK_POLL: Duration = Duration::from_millis(80);
 fn ci_status_enabled(cx: &App) -> bool {
     cx.try_global::<crate::AppSettings>()
         .is_none_or(|state| state.settings.show_ci_status)
+}
+
+/// Whether a finished network job is followed by a push: only the pull that
+/// "Pull, then push" started, never another job or a later pull.
+fn follow_with_push(job: &Job, then_push: bool) -> bool {
+    then_push && matches!(job, Job::Pull)
+}
+
+/// Which failures open the error dialog, and whether it offers "Pull, then
+/// push". Only a rejected *branch* push can be fixed that way: a rejected tag
+/// or remote-branch delete has no branch to pull.
+fn error_dialog_remedy(known: &KnownError, job: &Job) -> Option<bool> {
+    match known {
+        KnownError::PushRejected => Some(matches!(job, Job::Push)),
+        KnownError::PullNotFastForward if matches!(job, Job::Pull) => Some(false),
+        _ => None,
+    }
+}
+
+/// The stash message a switch saves the work tree under, so a failed restore
+/// can name the stash that still holds the changes.
+const SWITCH_STASH: &str = "GitWarp: stashed before switching";
+
+/// Runs `checkout` after stashing the work tree. A failed checkout pops the
+/// stash again, restoring the staged/unstaged split where git can so the
+/// user's changes are not hidden; if that pop fails too, the error says the
+/// changes are still in the stash, by its message.
+fn stash_then_checkout<F>(
+    repo: &git_core::Repo,
+    checkout: F,
+) -> git_core::Result<(ui::ToastKind, String)>
+where
+    F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)>,
+{
+    if !repo.stash_save(Some(SWITCH_STASH))? {
+        return checkout(repo);
+    }
+    match checkout(repo) {
+        Ok(done) => Ok(done),
+        Err(error) => match repo.stash_pop_keep_index(0) {
+            Ok(()) => Err(error),
+            Err(restore) => Err(Error::Git {
+                command: "stash pop",
+                code: None,
+                stderr: format!(
+                    "{error}\nThe switch failed and the changes could not be restored; they are \
+                     still in the stash \"{SWITCH_STASH}\": {restore}"
+                ),
+            }),
+        },
+    }
 }
 
 impl RepositoryView {
@@ -903,7 +964,6 @@ impl RepositoryView {
             _pr_redraw: pr_redraw,
             sidebar_tab: SidebarTab::Repository,
             ref_action_running: false,
-            push_after_pull: false,
             network: None,
             network_generation: 0,
             background_fetch: settings.background_fetch,
@@ -915,6 +975,7 @@ impl RepositoryView {
             hosting: HostingState::default(),
             hosting_view: Arc::default(),
             ci_visible: Vec::new(),
+            ci_wanted: Arc::default(),
             show_ci_status: settings.show_ci_status,
             hosting_meta_version: 0,
             hosting_trigger: PrTrigger::Open,
@@ -2344,8 +2405,7 @@ impl RepositoryView {
                         view.run_repo_action(window, cx, move |repo| {
                             // An empty stash (nothing left to save) is fine:
                             // the switch still happens.
-                            repo.stash_save(Some("GitWarp: stashed before switching"))?;
-                            checkout(repo)
+                            stash_then_checkout(repo, checkout)
                         });
                     });
                 }
@@ -2407,8 +2467,7 @@ impl RepositoryView {
                     entity.update(cx, |view, cx| {
                         let checkout = retry.clone();
                         view.run_repo_action(window, cx, move |repo| {
-                            repo.stash_save(Some("GitWarp: stashed before switching"))?;
-                            checkout(repo)
+                            stash_then_checkout(repo, checkout)
                         });
                     });
                 },
@@ -2524,10 +2583,10 @@ impl RepositoryView {
         }
     }
 
-    /// Pulls the current branch, then pushes once the pull completed.
+    /// Pulls the current branch, then pushes once the pull completed. The
+    /// intent rides with this pull only; a refused start pushes nothing.
     fn pull_then_push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.push_after_pull = true;
-        self.pull_branch(window, cx);
+        self.start_network_job_with(Job::Pull, true, window, cx);
     }
 
     /// The toolbar's Stash button: stashes every local change.
@@ -2655,7 +2714,23 @@ impl RepositoryView {
     /// Runs a network job in the background and paints its progress in the
     /// status bar. Only one runs at a time.
     fn start_network_job(&mut self, job: Job, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_network_job_with(job, false, window, cx);
+    }
+
+    /// [`Self::start_network_job`] carrying the intent that belongs to this one
+    /// job: `then_push` makes a successful pull push afterwards. It is passed
+    /// with the job, so it cannot outlive it or fire on a later pull.
+    fn start_network_job_with(
+        &mut self,
+        job: Job,
+        then_push: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.network.is_some() {
+            if then_push {
+                toast::show(ui::ToastKind::Warn, ui::t!("sidebar.prs.busy"), window, cx);
+            }
             return;
         }
         let git = match &self.git {
@@ -2669,7 +2744,7 @@ impl RepositoryView {
         // Several accounts fit a remote and none was chosen: ask first, then
         // start again (it asks about the next remote, if any).
         if let Some(remote) = credentials.choose.first() {
-            self.pick_account_for_job(remote.clone(), job, window, cx);
+            self.pick_account_for_job(remote.clone(), job, then_push, window, cx);
             return;
         }
         let (accounts, remembered) = self.account_settings(cx);
@@ -2718,9 +2793,14 @@ impl RepositoryView {
 
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(NETWORK_POLL).await;
+            let run = NetworkRun {
+                generation,
+                job: &job,
+                then_push,
+            };
             let done = this
                 .update_in(cx, |view, window, cx| {
-                    view.poll_network(&rx, generation, &job, &meta, window, cx)
+                    view.poll_network(&rx, run, &meta, window, cx)
                 })
                 .unwrap_or(true);
             if done {
@@ -2764,17 +2844,17 @@ impl RepositoryView {
         }
     }
 
-    /// Returns whether the job finished.
+    /// Returns whether the job finished. `run.then_push` belongs to this job
+    /// alone: only the pull started by "Pull, then push" pushes afterwards.
     fn poll_network(
         &mut self,
         rx: &Receiver<NetworkEvent>,
-        generation: u64,
-        job: &Job,
+        run: NetworkRun<'_>,
         meta: &JobMeta,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if generation != self.network_generation {
+        if run.generation != self.network_generation {
             return true;
         }
         let mut finished = None;
@@ -2803,23 +2883,26 @@ impl RepositoryView {
                         self.reload_after_network(cx);
                     }
                 }
-                Ok(_) if matches!(job, Job::FetchPullRequest { .. }) => {
+                Ok(_) if matches!(run.job, Job::FetchPullRequest { .. }) => {
                     self.reload_after_network(cx);
-                    if let Job::FetchPullRequest { branch, number, .. } = job {
+                    if let Job::FetchPullRequest { branch, number, .. } = run.job {
                         self.checkout_pr_branch(branch.clone(), *number, window, cx);
                     }
                 }
                 Ok(outcome) => {
-                    toast::show(ui::ToastKind::Ok, job.done_message(&outcome), window, cx);
+                    toast::show(
+                        ui::ToastKind::Ok,
+                        run.job.done_message(&outcome),
+                        window,
+                        cx,
+                    );
                     self.reload_after_network(cx);
-                    if matches!(job, Job::Pull) && self.push_after_pull {
-                        self.push_after_pull = false;
+                    if follow_with_push(run.job, run.then_push) {
                         self.push_branch(window, cx);
                     }
                 }
                 Err(error) => {
-                    self.push_after_pull = false;
-                    self.show_job_error(&error, meta, job, window, cx);
+                    self.show_job_error(&error, meta, run.job, window, cx);
                 }
             }
             return true;
@@ -2862,12 +2945,13 @@ impl RepositoryView {
         }
     }
 
-    /// Asks which account answers for `remote`, then starts `job` again. Cancel
-    /// starts nothing.
+    /// Asks which account answers for `remote`, then starts `job` again with
+    /// the same intent. Cancel starts nothing.
     fn pick_account_for_job(
         &mut self,
         remote: String,
         job: Job,
+        then_push: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2899,7 +2983,7 @@ impl RepositoryView {
                 let name = name.clone();
                 view.update(cx, |view, cx| {
                     if view.remember_account(&name, account, window, cx) {
-                        view.start_network_job(job, window, cx);
+                        view.start_network_job_with(job, then_push, window, cx);
                     }
                 });
             }),
@@ -2938,29 +3022,20 @@ impl RepositoryView {
         cx: &mut Context<Self>,
     ) {
         if let Some(known) = error_dialog::classify_git_error(error) {
-            let pull_or_push = match &known {
-                KnownError::PushRejected => {
-                    matches!(job, Job::Push | Job::PushTag { .. } | Job::PushTags { .. })
-                        || matches!(job, Job::DeleteRemoteBranch { .. })
-                }
-                KnownError::PullNotFastForward => matches!(job, Job::Pull),
-                _ => false,
-            };
-            if pull_or_push {
+            if let Some(offer_pull_then_push) = error_dialog_remedy(&known, job) {
                 let title = known.title();
                 let explanation = known.explanation();
                 let details = error_dialog::raw_output(error);
-                let actions = match &known {
-                    KnownError::PushRejected => {
-                        let view = cx.entity();
-                        vec![ErrorAction::new(
-                            ui::t!("dialogs.error.pull_then_push"),
-                            move |window, cx| {
-                                view.update(cx, |view, cx| view.pull_then_push(window, cx));
-                            },
-                        )]
-                    }
-                    _ => Vec::new(),
+                let actions = if offer_pull_then_push {
+                    let view = cx.entity();
+                    vec![ErrorAction::new(
+                        ui::t!("dialogs.error.pull_then_push"),
+                        move |window, cx| {
+                            view.update(cx, |view, cx| view.pull_then_push(window, cx));
+                        },
+                    )]
+                } else {
+                    Vec::new()
                 };
                 error_dialog::open(title, explanation, details, actions, window, cx);
                 return;
@@ -5962,6 +6037,16 @@ impl RepositoryView {
             return;
         };
         self.refresh_reach(cx);
+        // Keep the shared wanted set current even when nothing is due, so a
+        // batch already running skips rows that scrolled away.
+        let candidates =
+            self.hosting
+                .ci_candidates(self.details_oid, self.head_oid(cx), &self.ci_visible, true);
+        {
+            let mut wanted = self.ci_wanted.lock().unwrap_or_else(|e| e.into_inner());
+            wanted.clear();
+            wanted.extend(candidates.iter().map(Oid::to_string));
+        }
         let due = self.hosting.ci_due(
             self.details_oid,
             self.head_oid(cx),
@@ -5977,7 +6062,9 @@ impl RepositoryView {
         for sha in &shas {
             self.hosting.ci.mark_inflight(sha);
         }
-        let request = self.hosting_request(&target, cx);
+        let request = self
+            .hosting_request(&target, cx)
+            .only_wanted(self.ci_wanted.clone());
         cx.spawn(async move |this, cx| {
             let asked = shas.clone();
             let answers = cx
@@ -9045,5 +9132,104 @@ mod tests {
         });
         assert!(has_dialog(&cx), "Remove should open for a linked worktree");
         let _ = std::fs::remove_dir_all(linked);
+    }
+
+    #[test]
+    fn push_after_pull_belongs_only_to_that_pull() {
+        assert!(follow_with_push(&Job::Pull, true));
+        assert!(!follow_with_push(&Job::Pull, false));
+        // Any later job, including a plain pull, must not inherit the intent.
+        assert!(!follow_with_push(&Job::Push, true));
+        assert!(!follow_with_push(
+            &Job::Fetch(FetchOptions::default()),
+            true
+        ));
+    }
+
+    #[test]
+    fn only_a_branch_push_offers_pull_then_push() {
+        assert_eq!(
+            error_dialog_remedy(&KnownError::PushRejected, &Job::Push),
+            Some(true)
+        );
+        for job in [
+            Job::PushTag {
+                remote: "origin".into(),
+                tag: "v1".into(),
+            },
+            Job::PushTags {
+                remote: "origin".into(),
+            },
+            Job::DeleteRemoteBranch {
+                remote: "origin".into(),
+                branch: "topic".into(),
+            },
+        ] {
+            assert_eq!(
+                error_dialog_remedy(&KnownError::PushRejected, &job),
+                Some(false),
+                "{job:?} must show the dialog without the pull-then-push remedy"
+            );
+        }
+        assert_eq!(
+            error_dialog_remedy(&KnownError::PullNotFastForward, &Job::Pull),
+            Some(false)
+        );
+        assert_eq!(
+            error_dialog_remedy(&KnownError::PullNotFastForward, &Job::Push),
+            None
+        );
+        assert_eq!(
+            error_dialog_remedy(&KnownError::LocalChangesOverwritten, &Job::Pull),
+            None
+        );
+    }
+
+    fn checkout_failed() -> Error {
+        Error::Git {
+            command: "checkout",
+            code: None,
+            stderr: "fatal: checkout refused".into(),
+        }
+    }
+
+    #[test]
+    fn a_failed_switch_restores_the_stashed_changes() {
+        let tmp = crate::test_support::TempRepo::new("stash-switch");
+        commit(tmp.path(), "seed.txt", "init");
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "unsaved").unwrap();
+        let repo = git_core::Repo::open(crate::test_support::git(), tmp.path()).unwrap();
+
+        let result = stash_then_checkout(&repo, |_| Err(checkout_failed()));
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unsaved");
+        assert!(
+            repo.stashes().unwrap().is_empty(),
+            "the stash was not popped after the failed switch"
+        );
+    }
+
+    #[test]
+    fn a_failed_restore_says_the_changes_are_in_the_stash() {
+        let tmp = crate::test_support::TempRepo::new("stash-switch-pop-fails");
+        commit(tmp.path(), "seed.txt", "init");
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "unsaved").unwrap();
+        let repo = git_core::Repo::open(crate::test_support::git(), tmp.path()).unwrap();
+
+        let result = stash_then_checkout(&repo, |_| {
+            // Recreate the stashed file with other content: popping would
+            // overwrite it, so git refuses.
+            std::fs::write(&file, "changed again").unwrap();
+            Err(checkout_failed())
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains(SWITCH_STASH),
+            "the error does not name the stash: {message}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "changed again");
+        assert_eq!(repo.stashes().unwrap().len(), 1);
     }
 }

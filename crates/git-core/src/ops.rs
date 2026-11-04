@@ -343,6 +343,38 @@ pub(crate) fn stash_pop(repo: &Repo, index: usize) -> Result<()> {
     run(repo, &["stash", "pop", &reference], "stash pop")
 }
 
+/// Whether `git stash pop --index` failed only because it could not rebuild
+/// the index (a conflicting index, or an index with its own changes). Git
+/// says so outright and keeps the stash entry; a plain pop can still apply it.
+fn index_restore_failed(error: &Error) -> bool {
+    let Error::Git { stderr, .. } = error else {
+        return false;
+    };
+    let stderr = stderr.to_lowercase();
+    stderr.contains("conflicts in index")
+        || stderr.contains("try without --index")
+        || stderr.contains("your index contains uncommitted changes")
+}
+
+/// Pops a stash and restores which changes were staged. When the index cannot
+/// be restored, falls back to a plain pop: the changes come back unstaged but
+/// are not lost.
+pub(crate) fn stash_pop_keep_index(repo: &Repo, index: usize) -> Result<()> {
+    let reference = format!("stash@{{{index}}}");
+    let out = repo
+        .command()
+        .args(["stash", "pop", "--index", &reference])
+        .output()
+        .map_err(Error::Spawn)?;
+    match check_output(out, "stash pop") {
+        Ok(_) => Ok(()),
+        Err(error) if index_restore_failed(&error) => {
+            run(repo, &["stash", "pop", &reference], "stash pop")
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn stash_drop(repo: &Repo, index: usize) -> Result<()> {
     let reference = format!("stash@{{{index}}}");
     run(repo, &["stash", "drop", &reference], "stash drop")

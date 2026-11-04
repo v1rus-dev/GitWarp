@@ -592,6 +592,12 @@ impl Repo {
         ops::stash_pop(self, index)
     }
 
+    /// Pops a stash, restoring which changes were staged. A pop that cannot
+    /// rebuild the index falls back to a plain pop (changes unstaged, not lost).
+    pub fn stash_pop_keep_index(&self, index: usize) -> Result<()> {
+        ops::stash_pop_keep_index(self, index)
+    }
+
     pub fn stash_drop(&self, index: usize) -> Result<()> {
         ops::stash_drop(self, index)
     }

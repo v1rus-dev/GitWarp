@@ -404,6 +404,33 @@ fn stash_save_apply_pop_and_drop() {
 }
 
 #[test]
+fn popping_a_stash_with_the_index_keeps_staged_changes_staged() {
+    let (tmp, repo) = repo_with_history();
+    let dir = tmp.path();
+    // One staged change, then a further unstaged change on top of it.
+    fs::write(dir.join("a.txt"), "one\nstaged\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    fs::write(dir.join("a.txt"), "one\nstaged\nunstaged\n").unwrap();
+    assert!(repo.stash_save(Some("WIP")).unwrap());
+    assert_eq!(repo.working_status().unwrap().staged_count(), 0);
+    assert_eq!(repo.working_status().unwrap().unstaged_count(), 0);
+
+    repo.stash_pop_keep_index(0).unwrap();
+    let status = repo.working_status().unwrap();
+    assert_eq!(
+        status.staged_count(),
+        1,
+        "the staged change came back unstaged"
+    );
+    assert_eq!(status.unstaged_count(), 1);
+    assert_eq!(
+        fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "one\nstaged\nunstaged\n"
+    );
+    assert!(repo.stashes().unwrap().is_empty());
+}
+
+#[test]
 fn a_clean_work_tree_has_nothing_to_stash() {
     let (_tmp, repo) = repo_with_history();
     assert!(!repo.stash_save(None).unwrap());

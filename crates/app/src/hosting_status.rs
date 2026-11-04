@@ -14,13 +14,15 @@
 //!   calls on GitLab (one `source_branch` query each);
 //! - checks: 2 calls per commit on GitHub and GitLab, 1 on Gitea, only for
 //!   commits whose answer is missing or not final (see [`CiCache::needs_fetch`]);
-//!   at most [`MAX_CI_CONCURRENT`] calls run at once, in candidate order;
+//!   at most [`MAX_CI_CONCURRENT`] calls run at once, in candidate order; the
+//!   visible rows also share [`CI_VISIBLE_BUDGET`] requests per
+//!   [`CI_VISIBLE_WINDOW`], so scrolling cannot spend the rate limit;
 //! - review state: 1 call each time a popover opens.
 //!
 //! Requests share one `forge::api::Client`, whose conditional-request cache
 //! answers unchanged resources with a free 304.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -59,9 +61,14 @@ pub const MAX_PR_BRANCHES: usize = 30;
 pub const MAX_CI_TIPS: usize = 10;
 /// How many rows above and below the viewport are also asked about, so a small
 /// scroll does not wait for a new request.
-pub const CI_VISIBLE_MARGIN: usize = 10;
+pub const CI_VISIBLE_MARGIN: usize = 3;
 /// At most this many visible commits are asked about per batch, in row order.
 pub const MAX_CI_VISIBLE: usize = 60;
+/// Visible-row commits asked about in one rolling window: scrolling through a
+/// long history must not spend the whole hourly rate limit.
+pub const CI_VISIBLE_BUDGET: usize = 120;
+/// The window of [`CI_VISIBLE_BUDGET`].
+pub const CI_VISIBLE_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// A changing visible range rests this long before its rows are asked about.
 pub const CI_VISIBLE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// One batch of checks requests runs at most this many calls at once.
@@ -265,6 +272,47 @@ pub fn ci_wanted(
         }
     }
     wanted
+}
+
+/// A rolling budget of visible-row checks requests. Selected, HEAD and pull
+/// request tip commits are not counted: only the rows that scroll past.
+#[derive(Debug, Default)]
+pub struct CiBudget {
+    /// Grants inside the window, oldest first.
+    grants: VecDeque<(Instant, usize)>,
+}
+
+impl CiBudget {
+    /// How many of `n` visible-row requests may go out at `now`, recording the
+    /// grant. Zero while the window is full; the rest wait for the next one.
+    pub fn allow(&mut self, now: Instant, n: usize) -> usize {
+        self.expire(now);
+        let used = self.used(now);
+        let allowed = n.min(CI_VISIBLE_BUDGET.saturating_sub(used));
+        if allowed > 0 {
+            self.grants.push_back((now, allowed));
+        }
+        allowed
+    }
+
+    /// How many requests the window holds at `now`.
+    pub fn used(&self, now: Instant) -> usize {
+        self.grants
+            .iter()
+            .filter(|(at, _)| now.saturating_duration_since(*at) < CI_VISIBLE_WINDOW)
+            .map(|(_, count)| count)
+            .sum()
+    }
+
+    fn expire(&mut self, now: Instant) {
+        while self
+            .grants
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= CI_VISIBLE_WINDOW)
+        {
+            self.grants.pop_front();
+        }
+    }
 }
 
 /* -------------------------------- health --------------------------------- */
@@ -792,6 +840,8 @@ pub struct HostingState {
     reach: HashSet<Oid>,
     /// How many loaded commits `reach` was computed over; `None` = outdated.
     reach_loaded: Option<usize>,
+    /// The rolling limit of visible-row checks requests.
+    ci_budget: CiBudget,
 }
 
 impl Default for HostingState {
@@ -811,6 +861,7 @@ impl Default for HostingState {
             remote_tips: Vec::new(),
             reach: HashSet::new(),
             reach_loaded: None,
+            ci_budget: CiBudget::default(),
         }
     }
 }
@@ -835,6 +886,7 @@ impl HostingState {
             self.reviews.clear();
             self.ci.clear();
             self.health = Health::default();
+            self.ci_budget = CiBudget::default();
         }
         self.target = target;
         self.tracked = tracked;
@@ -1005,9 +1057,11 @@ impl HostingState {
             })
     }
 
-    /// The commits whose checks should be asked for now.
+    /// The commits whose checks should be asked for now. Selected, HEAD and
+    /// pull request tips are always asked first and are never counted by the
+    /// visible-row budget; the rows that scroll past wait once it is spent.
     pub fn ci_due(
-        &self,
+        &mut self,
         selected: Option<Oid>,
         head: Option<Oid>,
         visible: &[Oid],
@@ -1018,10 +1072,34 @@ impl HostingState {
         if self.target.is_none() || !self.health.can_request(now_unix) {
             return Vec::new();
         }
-        self.ci_candidates(selected, head, visible, show_ci_status)
+        let candidates = self.ci_candidates(selected, head, visible, show_ci_status);
+        // The same set `ci_candidates` puts first, so a row that is also
+        // selected, HEAD or a pull request tip is never charged to the budget.
+        let priority: HashSet<Oid> = ci_wanted(
+            selected.filter(|oid| self.on_remote(*oid)),
+            head.filter(|oid| self.on_remote(*oid)),
+            &self.pr_tips(),
+            &[],
+            show_ci_status,
+        )
+        .into_iter()
+        .collect();
+        let due: Vec<Oid> = candidates
             .into_iter()
             .filter(|oid| self.ci.needs_fetch(&oid.to_string(), now))
-            .collect()
+            .collect();
+        let mut wanted = Vec::with_capacity(due.len());
+        let mut rows = Vec::new();
+        for oid in due {
+            if priority.contains(&oid) {
+                wanted.push(oid);
+            } else {
+                rows.push(oid);
+            }
+        }
+        let allowed = self.ci_budget.allow(now, rows.len());
+        wanted.extend(rows.into_iter().take(allowed));
+        wanted
     }
 
     /// What the rows draw.
@@ -1068,6 +1146,16 @@ impl HostingState {
 
 /* -------------------------------- requests -------------------------------- */
 
+/// The rows of `chunk` still wanted when a batch starts it. A row that
+/// scrolled away is skipped instead of spending a call; `None` asks all.
+fn wanted_chunk(wanted: Option<&HashSet<String>>, chunk: &[String]) -> Vec<String> {
+    chunk
+        .iter()
+        .filter(|sha| wanted.is_none_or(|wanted| wanted.contains(*sha)))
+        .cloned()
+        .collect()
+}
+
 /// One batch of blocking calls against the target; build it on the UI thread,
 /// run it on the background executor.
 #[derive(Clone)]
@@ -1077,6 +1165,9 @@ pub struct Request {
     coords: RepoCoords,
     account_id: Option<String>,
     store: Option<Arc<dyn SecretStore>>,
+    /// The commits still wanted, shared with the view: a row scrolled away
+    /// before its chunk starts is skipped rather than asked and cached.
+    wanted: Option<Arc<Mutex<HashSet<String>>>>,
 }
 
 impl Request {
@@ -1087,7 +1178,14 @@ impl Request {
             coords: target.link.coords.clone(),
             account_id: target.account_id.clone(),
             store,
+            wanted: None,
         }
+    }
+
+    /// Restricts a checks batch to the commits still wanted at each chunk.
+    pub fn only_wanted(mut self, wanted: Arc<Mutex<HashSet<String>>>) -> Self {
+        self.wanted = Some(wanted);
+        self
     }
 
     /// The account's token and how to send it (a browser sign-in's token is
@@ -1127,15 +1225,26 @@ impl Request {
     }
 
     /// Asks for each sha in turn, up to [`MAX_CI_CONCURRENT`] at once, in the
-    /// order given. Stops after the batch that hit a failure that would repeat
-    /// (rejected token, rate limit, unsupported service) and leaves the rest
-    /// unanswered.
+    /// order given. Before each chunk the shared wanted set is tested, so a
+    /// row the user scrolled past is not asked for and not cached as answered.
+    /// Stops after the batch that hit a failure that would repeat (rejected
+    /// token, rate limit, unsupported service) and leaves the rest unanswered.
     pub fn checks(&self, shas: &[String]) -> Vec<(String, Result<CommitChecks, ApiError>)> {
         let token = self.token();
         let auth = Request::auth_of(&token);
         let mut answers = Vec::with_capacity(shas.len());
         let mut stop = false;
         for chunk in shas.chunks(MAX_CI_CONCURRENT) {
+            let chunk = match &self.wanted {
+                Some(wanted) => {
+                    let wanted = wanted.lock().unwrap_or_else(|e| e.into_inner());
+                    wanted_chunk(Some(&wanted), chunk)
+                }
+                None => wanted_chunk(None, chunk),
+            };
+            if chunk.is_empty() {
+                continue;
+            }
             let batch: Vec<_> = std::thread::scope(|scope| {
                 let handles: Vec<_> = chunk
                     .iter()
@@ -1613,6 +1722,33 @@ mod tests {
     }
 
     #[test]
+    fn the_visible_row_budget_is_a_rolling_window() {
+        let now = Instant::now();
+        let mut budget = CiBudget::default();
+        assert_eq!(budget.allow(now, 50), 50);
+        let later = now + Duration::from_secs(1);
+        assert_eq!(budget.allow(later, 100), 70);
+        assert_eq!(budget.allow(later, 10), 0);
+        assert_eq!(budget.used(later), CI_VISIBLE_BUDGET);
+        // The first grant ages out; its 50 are free again.
+        let rolled = now + CI_VISIBLE_WINDOW;
+        assert_eq!(budget.used(rolled), 70);
+        assert_eq!(budget.allow(rolled, 100), 50);
+    }
+
+    #[test]
+    fn a_chunk_keeps_only_the_commits_still_wanted() {
+        let chunk = ["a", "b", "c", "d"].map(str::to_owned).to_vec();
+        assert_eq!(wanted_chunk(None, &chunk), chunk);
+        let wanted: HashSet<String> = ["a", "c"].map(str::to_owned).into_iter().collect();
+        assert_eq!(
+            wanted_chunk(Some(&wanted), &chunk),
+            vec!["a".to_owned(), "c".to_owned()]
+        );
+        assert!(wanted_chunk(Some(&HashSet::new()), &chunk).is_empty());
+    }
+
+    #[test]
     fn a_final_answer_is_never_asked_again() {
         let mut cache = CiCache::default();
         let now = Instant::now();
@@ -1701,6 +1837,31 @@ mod tests {
             state.ci_due(None, Some(oid(1)), &[], true, now, 100),
             vec![oid(2)]
         );
+    }
+
+    #[test]
+    fn visible_rows_wait_once_the_rolling_budget_is_spent() {
+        let mut state = state_with(&[], None);
+        let head = oid(1);
+        let visible: Vec<Oid> = (10..100).map(oid).collect();
+        let mut reach: HashSet<Oid> = visible.iter().copied().collect();
+        reach.insert(head);
+        state.set_reach(reach, 0);
+        let now = Instant::now();
+
+        // The priority commit is first and always asked; at most 60 rows.
+        let first = state.ci_due(None, Some(head), &visible, true, now, 0);
+        assert_eq!(first.first(), Some(&head));
+        assert_eq!(first.len(), 1 + MAX_CI_VISIBLE);
+        // 60 more rows fit the 120-request window; then only the priority one.
+        let second = state.ci_due(None, Some(head), &visible, true, now, 0);
+        assert_eq!(second.len(), 1 + (CI_VISIBLE_BUDGET - MAX_CI_VISIBLE));
+        let third = state.ci_due(None, Some(head), &visible, true, now, 0);
+        assert_eq!(third, vec![head]);
+        // The window rolled over: visible rows are allowed again.
+        let rolled = now + CI_VISIBLE_WINDOW;
+        let again = state.ci_due(None, Some(head), &visible, true, rolled, 0);
+        assert_eq!(again.len(), 1 + MAX_CI_VISIBLE);
     }
 
     // ----- errors -----

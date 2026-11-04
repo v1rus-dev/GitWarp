@@ -29,6 +29,10 @@ struct SelectableDrag(ElementId);
 
 struct SelectableTextState {
     focus: FocusHandle,
+    /// The text the selection was made for. Keyed state outlives a text
+    /// change under the same element id, so the selection must be dropped
+    /// when the text is no longer this one.
+    text: gpui::SharedString,
     /// Where the selection started; `cursor` is its moving end.
     anchor: usize,
     cursor: usize,
@@ -44,6 +48,7 @@ impl SelectableTextState {
     fn new(focus: FocusHandle) -> Self {
         Self {
             focus,
+            text: gpui::SharedString::default(),
             anchor: 0,
             cursor: 0,
             selecting: false,
@@ -94,6 +99,40 @@ fn normalize_selection(anchor: usize, cursor: usize) -> Range<usize> {
     } else {
         cursor..anchor
     }
+}
+
+/// `selection` cut to `text`'s length and to whole characters. A selection can
+/// outlive its text (keyed state, same element id) and a byte index inside a
+/// character would panic both `&text[range]` and the text layout.
+fn clamp_selection(text: &str, selection: &Range<usize>) -> Range<usize> {
+    let len = text.len();
+    let mut start = selection.start.min(len);
+    let mut end = selection.end.min(len);
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < start {
+        end = start;
+    }
+    start..end
+}
+
+/// The selection that is still valid for `text`: none unless `stored` is still
+/// the text the state was made for.
+fn live_selection(stored: &str, text: &str, selection: &Range<usize>) -> Range<usize> {
+    if stored != text {
+        return 0..0;
+    }
+    clamp_selection(text, selection)
+}
+
+/// The selected part of `text`, or `None` when the range is empty or stale.
+fn selected_text<'a>(text: &'a str, selection: &Range<usize>) -> Option<&'a str> {
+    text.get(clamp_selection(text, selection))
+        .filter(|selected| !selected.is_empty())
 }
 
 /// The word (or whitespace/punctuation run) around `index`.
@@ -157,10 +196,31 @@ fn end_selection(state: &Entity<SelectableTextState>, window: &mut Window, cx: &
     window.refresh();
 }
 
+/// Drops the selection (focus or the pointer left): a listener, e.g. a toast's
+/// timer, must know it is no longer paused by a selection.
+fn clear_selection(
+    state: &Entity<SelectableTextState>,
+    listener: &Option<SelectionHandler>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if state.read(cx).selection().is_empty() {
+        return;
+    }
+    state.update(cx, |state, _| {
+        state.anchor = 0;
+        state.cursor = 0;
+        state.selecting = false;
+    });
+    notify_selection(state, listener, window, cx);
+    window.refresh();
+}
+
 fn copy_selection(state: &Entity<SelectableTextState>, text: &str, cx: &mut App) {
-    let selection = state.read(cx).selection();
-    if !selection.is_empty() {
-        cx.write_to_clipboard(ClipboardItem::new_string(text[selection].to_string()));
+    let state = state.read(cx);
+    let selection = live_selection(state.text.as_ref(), text, &state.selection());
+    if let Some(selected) = selected_text(text, &selection) {
+        cx.write_to_clipboard(ClipboardItem::new_string(selected.to_string()));
     }
 }
 
@@ -170,6 +230,26 @@ impl RenderOnce for SelectableText {
             SelectableTextState::new(cx.focus_handle())
         });
         let focus = state.read(cx).focus.clone();
+        // The keyed state outlives the text: a selection made in a longer text
+        // must not survive a shorter one, and a text that lost focus must not
+        // keep a toast timer paused.
+        let changed = state.read(cx).text != self.text;
+        let had_selection = !state.read(cx).selection().is_empty();
+        let unfocused = had_selection && !focus.is_focused(window);
+        if changed || unfocused {
+            let text = self.text.clone();
+            state.update(cx, |state, _| {
+                state.text = text;
+                state.anchor = 0;
+                state.cursor = 0;
+                state.selecting = false;
+            });
+            if had_selection {
+                if let Some(listener) = self.on_selection_change.as_ref() {
+                    listener(false, window, cx);
+                }
+            }
+        }
         let layout_slot = state.read(cx).layout.clone();
         let ready = state.read(cx).ready.clone();
         ready.set(false);
@@ -178,6 +258,7 @@ impl RenderOnce for SelectableText {
         let selection = state.read(cx).selection();
         let inner = SelectableTextElement {
             text: StyledText::new(text.clone()),
+            source: text.clone(),
             selection,
             layout_slot: layout_slot.clone(),
             ready: ready.clone(),
@@ -253,6 +334,13 @@ impl RenderOnce for SelectableText {
                 end_selection(&state, window, cx);
             }
         };
+        let on_mouse_down_out = {
+            let state = state.clone();
+            let listener = listener.clone();
+            move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                clear_selection(&state, &listener, window, cx);
+            }
+        };
         let on_drag_move = {
             let state = state.clone();
             let drag_id = self.id.clone();
@@ -279,6 +367,7 @@ impl RenderOnce for SelectableText {
             .on_action(on_copy)
             .on_action(on_select_all)
             .on_mouse_down(MouseButton::Left, on_mouse_down)
+            .on_mouse_down_out(on_mouse_down_out)
             .on_mouse_up(MouseButton::Left, on_mouse_up)
             .on_mouse_up_out(MouseButton::Left, on_mouse_up_out)
             .on_mouse_move(on_mouse_move)
@@ -300,6 +389,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
 
 struct SelectableTextElement {
     text: StyledText,
+    /// The bytes the layout was made from, for clamping the selection.
+    source: gpui::SharedString,
     selection: Range<usize>,
     layout_slot: Rc<RefCell<Option<TextLayout>>>,
     ready: Rc<Cell<bool>>,
@@ -359,7 +450,13 @@ impl Element for SelectableTextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        paint_selection(self.text.layout(), &self.selection, window, cx);
+        paint_selection(
+            &self.source,
+            self.text.layout(),
+            &self.selection,
+            window,
+            cx,
+        );
         Element::paint(
             &mut self.text,
             id,
@@ -375,11 +472,13 @@ impl Element for SelectableTextElement {
 
 /// Paints the selection highlight for `selection` behind the text.
 fn paint_selection(
+    text: &str,
     layout: &TextLayout,
     selection: &Range<usize>,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let selection = clamp_selection(text, selection);
     if selection.is_empty() {
         return;
     }
@@ -473,5 +572,33 @@ mod tests {
         assert_eq!(&text[range], "héllo");
         let range = word_range(text, 7);
         assert_eq!(&text[range], "wörld");
+    }
+
+    #[test]
+    fn a_selection_from_a_longer_text_is_dropped_when_the_text_shrinks() {
+        let long = "a much longer line of text";
+        let short = "tiny";
+        assert_eq!(live_selection(long, short, &(4..20)), 0..0);
+        assert_eq!(
+            selected_text(short, &live_selection(long, short, &(4..20))),
+            None
+        );
+        // The same text keeps its selection.
+        assert_eq!(live_selection(short, short, &(0..4)), 0..4);
+        assert_eq!(selected_text(short, &(0..4)), Some("tiny"));
+    }
+
+    #[test]
+    fn selections_are_clamped_to_the_text_and_to_whole_characters() {
+        let text = "héllo";
+        // The end falls inside `é` (bytes 1..3): only `h` is selected.
+        assert_eq!(clamp_selection(text, &(0..2)), 0..1);
+        assert_eq!(selected_text(text, &(0..2)), Some("h"));
+        assert_eq!(selected_text(text, &(0..99)), Some("héllo"));
+        assert_eq!(selected_text(text, &(99..120)), None);
+        assert_eq!(selected_text("", &(5..9)), None);
+        // A reverse range (stale anchor/cursor) is empty, never inverted.
+        let (anchor, cursor) = (4usize, 2usize);
+        assert_eq!(clamp_selection(text, &(anchor..cursor)), 4..4);
     }
 }

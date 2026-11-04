@@ -651,6 +651,22 @@ mod tests {
     }
 
     #[test]
+    fn a_cleared_selection_resumes_the_timer() {
+        let mut queue = ToastQueue::new();
+        let now = Instant::now();
+        let id = queue.push(ToastKind::Info, "fetched", now);
+
+        // Selecting the text pauses the timer; clicking elsewhere clears the
+        // selection and the remaining lifetime resumes.
+        queue.set_paused(id, None, Some(true), now + Duration::from_secs(1));
+        assert!(queue.expire(now + Duration::from_secs(30)).is_empty());
+        let cleared = now + Duration::from_secs(30);
+        queue.set_paused(id, None, Some(false), cleared);
+        assert!(queue.expire(cleared + Duration::from_secs(3)).is_empty());
+        assert_eq!(queue.expire(cleared + Duration::from_secs(4)), vec![id]);
+    }
+
+    #[test]
     fn nothing_expires_before_the_deadline() {
         let mut queue = ToastQueue::new();
         let now = Instant::now();
