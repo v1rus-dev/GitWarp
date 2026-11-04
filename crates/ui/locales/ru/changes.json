@@ -175,6 +175,7 @@
   "changes.editor.replace_disk_ask": "Заменить изменения на диске?",
   "changes.editor.changed_on_disk": "{path} изменился на диске — откройте его заново, чтобы увидеть изменения",
   "changes.editor.not_same_conflict": "{path} больше не в том же конфликте — перечитан",
+  "changes.editor.mode_kept": "Обе стороны изменили режим файла; оставлен режим текущей ветки.",
   "changes.editor.open_menu": "Решить в GitWarp…",
   "changes.editor.open_button": "Решить…"
 }

@@ -870,3 +870,93 @@ fn one_sided_kinds_keep_or_delete_through_resolve_take() {
     assert_eq!(unmerged("both-gone.txt"), "");
     assert_eq!(tracked("both-gone.txt"), "");
 }
+
+#[test]
+fn save_takes_the_mode_the_way_git_does() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, repo) = new_repo();
+    let dir = tmp.path();
+    // Only theirs made it executable: that wins, though ours is stage 2.
+    index_conflict(
+        dir,
+        "run.sh",
+        &[
+            (1, "100644", b"a\nb\nc\n"),
+            (2, "100644", b"a\nX\nc\n"),
+            (3, "100755", b"a\nb\nY\n"),
+        ],
+    );
+    let model = text(repo.conflict("run.sh").unwrap());
+    assert_eq!(
+        repo.save_resolution("run.sh", "a\nX\nY\n", &model.guard)
+            .unwrap(),
+        SaveOutcome::Saved
+    );
+    assert!(git(dir, &["ls-files", "-s", "run.sh"]).starts_with("100755"));
+    let meta = fs::metadata(dir.join("run.sh")).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o111, 0o111);
+}
+
+#[test]
+fn a_failed_checkout_puts_the_conflict_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, repo) = new_repo();
+    let dir = tmp.path();
+    fs::create_dir(dir.join("sub")).unwrap();
+    index_conflict(
+        dir,
+        "sub/f.txt",
+        &[
+            (1, "100644", b"a\nb\nc\n"),
+            (2, "100644", b"a\nX\nc\n"),
+            (3, "100644", b"a\nY\nc\n"),
+        ],
+    );
+    let model = text(repo.conflict("sub/f.txt").unwrap());
+    let before = git(dir, &["ls-files", "-u", "--", "sub/f.txt"]);
+    // git cannot create the file in a read-only directory.
+    fs::set_permissions(dir.join("sub"), fs::Permissions::from_mode(0o555)).unwrap();
+    let result = repo.save_resolution("sub/f.txt", "a\nZ\nc\n", &model.guard);
+    fs::set_permissions(dir.join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
+    if fs::write(dir.join("sub/probe"), "x").is_err() {
+        return; // not enforced (running as root)
+    }
+    assert!(result.is_err(), "checkout-index must fail");
+    assert_eq!(git(dir, &["ls-files", "-u", "--", "sub/f.txt"]), before);
+}
+
+#[test]
+fn diff3_and_zdiff3_files_are_compared_by_their_sides() {
+    for style in ["diff3", "zdiff3"] {
+        let (tmp, repo) = new_repo();
+        let dir = tmp.path();
+        git(dir, &["config", "merge.conflictStyle", style]);
+        {
+            let (name, base, ours, theirs) = ("f.txt", "1\nb\n2\n", "1\nX\n2\n", "1\nY\n2\n");
+            fs::write(dir.join(name), base).unwrap();
+            git(dir, &["add", name]);
+            git(dir, &["commit", "-q", "-m", "base"]);
+            git(dir, &["branch", "side"]);
+            fs::write(dir.join(name), ours).unwrap();
+            git(dir, &["commit", "-q", "-am", "ours"]);
+            git(dir, &["switch", "-q", "side"]);
+            fs::write(dir.join(name), theirs).unwrap();
+            git(dir, &["commit", "-q", "-am", "theirs"]);
+            git(dir, &["switch", "-q", "main"]);
+        }
+        git_command(dir)
+            .args(["merge", "side", "-q", "--no-edit"])
+            .output()
+            .unwrap();
+        let written = fs::read_to_string(dir.join("f.txt")).unwrap();
+        assert!(
+            written.contains("|||||||"),
+            "{style}: git wrote a base part"
+        );
+        let model = text(repo.conflict("f.txt").unwrap());
+        assert!(!model.guard.changed_after_merge, "{style}: untouched");
+        fs::write(dir.join("f.txt"), written.replace("X", "Z")).unwrap();
+        let model = text(repo.conflict("f.txt").unwrap());
+        assert!(model.guard.changed_after_merge, "{style}: edited");
+    }
+}

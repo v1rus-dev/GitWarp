@@ -162,6 +162,7 @@
   "changes.editor.replace_disk_ask": "¿Sustituir los cambios del disco?",
   "changes.editor.changed_on_disk": "{path} cambió en el disco: ábrelo de nuevo para ver los cambios",
   "changes.editor.not_same_conflict": "{path} ya no está en el mismo conflicto: se recargó",
+  "changes.editor.mode_kept": "Ambos lados cambiaron el modo del archivo; se conservó el de la rama actual.",
   "changes.editor.open_menu": "Resolver en GitWarp…",
   "changes.editor.open_button": "Resolver…"
 }

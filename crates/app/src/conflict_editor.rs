@@ -1460,7 +1460,12 @@ impl ConflictEditor {
     ) {
         let [saved, changed_on_disk, not_same] = notices;
         match result {
-            Ok(SaveOutcome::Saved) => {
+            Ok(outcome @ (SaveOutcome::Saved | SaveOutcome::SavedModeConflict)) => {
+                let saved = if outcome == SaveOutcome::SavedModeConflict {
+                    format!("{saved}. {}", ui::t!("changes.editor.mode_kept"))
+                } else {
+                    saved
+                };
                 toast::show(ToastKind::Ok, saved, window, cx);
                 // The editor waits for the Changes view's status read (it ends
                 // in `sync`, or in `status_failed`), so the file cannot be

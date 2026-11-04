@@ -162,6 +162,7 @@
   "changes.editor.replace_disk_ask": "Replace the changes on disk?",
   "changes.editor.changed_on_disk": "{path} changed on disk — reopen it to see the changes",
   "changes.editor.not_same_conflict": "{path} is no longer in the same conflict — reloaded",
+  "changes.editor.mode_kept": "Both sides changed the file mode; the current branch's mode was kept.",
   "changes.editor.open_menu": "Resolve in GitWarp…",
   "changes.editor.open_button": "Resolve…"
 }

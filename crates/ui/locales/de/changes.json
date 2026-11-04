@@ -162,6 +162,7 @@
   "changes.editor.replace_disk_ask": "Änderungen auf der Festplatte ersetzen?",
   "changes.editor.changed_on_disk": "{path} hat sich auf der Festplatte geändert — öffne die Datei erneut, um die Änderungen zu sehen",
   "changes.editor.not_same_conflict": "{path} gehört nicht mehr zum selben Konflikt — neu geladen",
+  "changes.editor.mode_kept": "Beide Seiten haben den Dateimodus geändert; der Modus des aktuellen Branches wurde beibehalten.",
   "changes.editor.open_menu": "In GitWarp lösen…",
   "changes.editor.open_button": "Lösen…"
 }

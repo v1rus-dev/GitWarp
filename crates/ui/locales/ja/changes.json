@@ -149,6 +149,7 @@
   "changes.editor.replace_disk_ask": "ディスク上の変更を置き換えますか？",
   "changes.editor.changed_on_disk": "{path} がディスク上で変更されました — 開き直して変更を確認してください",
   "changes.editor.not_same_conflict": "{path} は同じコンフリクトではなくなりました — 再読み込みしました",
+  "changes.editor.mode_kept": "両方がファイルモードを変更したため、現在のブランチのモードを維持しました。",
   "changes.editor.open_menu": "GitWarp で解決…",
   "changes.editor.open_button": "解決…"
 }

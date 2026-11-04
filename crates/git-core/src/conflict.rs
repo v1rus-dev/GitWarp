@@ -89,6 +89,9 @@ pub struct ConflictGuard {
 pub enum SaveOutcome {
     /// Written and staged; the conflict is over.
     Saved,
+    /// Like `Saved`, but both sides changed the file mode differently: ours
+    /// was kept (git would have left the path conflicted).
+    SavedModeConflict,
     /// The path is not in the conflict that was loaded (merge aborted,
     /// resolved elsewhere, or the sides changed). Nothing was written.
     StagesChanged,
@@ -1308,10 +1311,37 @@ fn normalize_markers(text: &str) -> String {
         .join("\n")
 }
 
+/// The two sides of a marker file: the text with every conflict block
+/// replaced by its ours part, and by its theirs part. The `|||||||` base
+/// sections of `diff3`/`zdiff3` are dropped. `zdiff3` moves lines common to
+/// both sides out of the blocks, which leaves both results unchanged, so they
+/// compare equal whatever the conflict style.
+fn marker_sides(text: &str) -> (String, String) {
+    let (mut ours, mut theirs) = (String::new(), String::new());
+    // 0 outside, 1 ours, 2 base, 3 theirs
+    let mut state = 0;
+    for line in text.replace("\r\n", "\n").split_inclusive('\n') {
+        match state {
+            0 if line.starts_with("<<<<<<<") => state = 1,
+            1 | 2 if line.starts_with("|||||||") => state = 2,
+            1 | 2 if line.starts_with("=======") => state = 3,
+            3 if line.starts_with(">>>>>>>") => state = 0,
+            1 => ours.push_str(line),
+            3 => theirs.push_str(line),
+            0 => {
+                ours.push_str(line);
+                theirs.push_str(line);
+            }
+            _ => {}
+        }
+    }
+    (ours, theirs)
+}
+
 /// Whether the file git left in the work tree is not what an unresolved merge
-/// writes (rerere, an IDE, a half-done manual resolution). Only judged for
-/// the default `merge` conflict style: with `diff3`/`zdiff3` configured the
-/// file has a different layout and the answer is "no".
+/// writes (rerere, an IDE, a half-done manual resolution). For the default
+/// `merge` style the marker file is compared as a whole; for `diff3` and
+/// `zdiff3` (different block layout) by what each side's text comes to.
 fn changed_after_merge(repo: &Repo, model: &TextConflict, disk: Option<&[u8]>) -> bool {
     let style = repo
         .command()
@@ -1320,14 +1350,16 @@ fn changed_after_merge(repo: &Repo, model: &TextConflict, disk: Option<&[u8]>) -
         .ok()
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_lowercase())
         .unwrap_or_default();
-    if !style.is_empty() && style != "merge" {
-        return false;
-    }
     let Some(disk) = disk else {
         return true;
     };
-    normalize_markers(&String::from_utf8_lossy(disk))
-        != normalize_markers(&model.render_markers("", ""))
+    let disk = String::from_utf8_lossy(disk);
+    let expected = model.render_markers("", "");
+    if style.is_empty() || style == "merge" {
+        normalize_markers(&disk) != normalize_markers(&expected)
+    } else {
+        marker_sides(&disk) != marker_sides(&expected)
+    }
 }
 
 /// Loads the conflict at `path` (repo-relative, literal).
@@ -1448,12 +1480,8 @@ pub(crate) fn save_resolution(
     if disk.as_deref().map(digest) != guard.work_tree_digest {
         return Ok(SaveOutcome::WorkTreeChanged);
     }
-    let mode = current
-        .iter()
-        .find(|entry| entry.stage == 2)
-        .or_else(|| current.iter().find(|entry| entry.stage == 3))
-        .map(|entry| entry.mode.clone())
-        .ok_or(Error::Parse("path has no side to take the mode from"))?;
+    let (mode, mode_conflict) =
+        resolved_mode(&current).ok_or(Error::Parse("path has no side to take the mode from"))?;
 
     let mut child = repo
         .command()
@@ -1481,13 +1509,80 @@ pub(crate) fn save_resolution(
         .output()
         .map_err(Error::Spawn)?;
     check_output(out, "update-index")?;
-    let out = repo
+    let checkout = repo
         .command()
         .args(["checkout-index", "-f", "--", path])
         .output()
+        .map_err(Error::Spawn)
+        .and_then(|out| check_output(out, "checkout-index"));
+    if let Err(error) = checkout {
+        // The work tree could not be written: put the conflict back, so the
+        // path is not left staged with content that never reached the file.
+        restore_stages(repo, path, &current)?;
+        return Err(error);
+    }
+    Ok(if mode_conflict {
+        SaveOutcome::SavedModeConflict
+    } else {
+        SaveOutcome::Saved
+    })
+}
+
+/// The mode of the resolved file, picked like git: the same on both sides, or
+/// the side that changed it from the base. `true` when both sides changed it
+/// differently (ours is kept). `None` without a side to look at.
+fn resolved_mode(stages: &[IndexStage]) -> Option<(String, bool)> {
+    let mode = |stage: u8| {
+        stages
+            .iter()
+            .find(|entry| entry.stage == stage)
+            .map(|entry| entry.mode.clone())
+    };
+    let (base, ours, theirs) = (mode(1), mode(2), mode(3));
+    let (ours, theirs) = match (ours, theirs) {
+        (Some(ours), Some(theirs)) => (ours, theirs),
+        (one, other) => return one.or(other).map(|mode| (mode, false)),
+    };
+    if ours == theirs {
+        return Some((ours, false));
+    }
+    match base {
+        Some(base) if ours == base => Some((theirs, false)),
+        Some(base) if theirs == base => Some((ours, false)),
+        _ => Some((ours, true)),
+    }
+}
+
+/// Puts the unmerged entries `stages` back into the index for `path`.
+fn restore_stages(repo: &Repo, path: &str, stages: &[IndexStage]) -> Result<()> {
+    let out = repo
+        .command()
+        .args(["update-index", "--force-remove", "--"])
+        .arg(path)
+        .output()
         .map_err(Error::Spawn)?;
-    check_output(out, "checkout-index")?;
-    Ok(SaveOutcome::Saved)
+    check_output(out, "update-index --force-remove")?;
+    let mut child = repo
+        .command()
+        .args(["update-index", "--index-info"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(Error::Spawn)?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or(Error::Parse("update-index stdin"))?;
+    let info: String = stages
+        .iter()
+        .map(|entry| format!("{} {} {}\t{path}\n", entry.mode, entry.oid, entry.stage))
+        .collect();
+    let written = stdin.write_all(info.as_bytes());
+    drop(stdin);
+    let out = child.wait_with_output().map_err(Error::Io)?;
+    check_output(out, "update-index --index-info")?;
+    written.map_err(Error::Io)
 }
 
 #[cfg(test)]
@@ -1905,5 +2000,41 @@ mod tests {
         let a = keys(&["x", "x", "u", "x", "x"]);
         let b = keys(&["y", "u", "y"]);
         assert_eq!(diff_lines(&a, &b), vec![(0..2, 0..1), (3..5, 2..3)]);
+    }
+
+    #[test]
+    fn the_resolved_mode_follows_the_side_that_changed_it() {
+        let stages = |modes: &[(u8, &str)]| -> Vec<IndexStage> {
+            modes
+                .iter()
+                .map(|(stage, mode)| IndexStage {
+                    stage: *stage,
+                    mode: (*mode).into(),
+                    oid: String::new(),
+                })
+                .collect()
+        };
+        let pick = |modes: &[(u8, &str)]| resolved_mode(&stages(modes));
+        let some = |mode: &str, conflict: bool| Some((mode.to_string(), conflict));
+        assert_eq!(
+            pick(&[(1, "100644"), (2, "100644"), (3, "100755")]),
+            some("100755", false)
+        );
+        assert_eq!(
+            pick(&[(1, "100644"), (2, "100755"), (3, "100644")]),
+            some("100755", false)
+        );
+        assert_eq!(
+            pick(&[(1, "100644"), (2, "100755"), (3, "100755")]),
+            some("100755", false)
+        );
+        // Both changed it, differently: ours stays, and the caller is told.
+        assert_eq!(
+            pick(&[(1, "100644"), (2, "100755"), (3, "100664")]),
+            some("100755", true)
+        );
+        assert_eq!(pick(&[(2, "100755"), (3, "100644")]), some("100755", true));
+        assert_eq!(pick(&[(3, "100644")]), some("100644", false));
+        assert_eq!(pick(&[]), None);
     }
 }
