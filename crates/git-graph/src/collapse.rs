@@ -18,7 +18,7 @@
 use crate::Row;
 
 /// Width of one unfolded lane, px.
-pub const LANE_WIDTH: f32 = 14.0;
+pub const LANE_WIDTH: f32 = 16.0;
 
 /// Width of the gap lane that replaces a run of folded lanes, px.
 pub const FOLDED_WIDTH: f32 = 12.0;
@@ -80,8 +80,9 @@ impl IdleLanes {
             self.occupied[s.to] = true;
         }
         // A lane is only present at the bottom edge when it carries straight
-        // down in its column. A lane change (`c -> d`) leaves the column, and a
-        // line entering a column is a new lane there, not a continuation.
+        // down in its column. A lane change (`c -> d`, including a passing lane
+        // compacted left) leaves the column, and a line entering a column is a
+        // new lane there, not a continuation.
         self.continuing.fill(false);
         for s in &row.below {
             if s.from == s.to {

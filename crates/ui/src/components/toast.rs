@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, App, BorrowAppContext, Div, FontWeight, Global, ParentElement, SharedString, Styled,
-    Window, WindowId,
+    div, px, App, BorrowAppContext, ClipboardItem, Div, ElementId, FontWeight, Global,
+    InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
+    Styled, Window, WindowId,
 };
 
-use crate::components::{Button, ButtonSize};
+use crate::components::{Button, ButtonSize, SelectableText};
 use crate::icon::{Icon, IconName};
 use crate::metrics::{FS_BASE, R_MD};
 use crate::theme::{ActiveTheme, ThemeColors};
@@ -130,6 +131,10 @@ pub struct Toast {
 struct QueuedToast {
     toast: Toast,
     deadline: Option<Instant>,
+    /// What was left when the pointer or a selection paused the timer.
+    remaining: Option<Duration>,
+    hovered: bool,
+    selected: bool,
 }
 
 /// The pure toast state of one window: ordering, expiry and dismissal.
@@ -172,8 +177,42 @@ impl ToastQueue {
                 body,
             },
             deadline: kind.auto_hide().then(|| now + TOAST_LIFETIME),
+            remaining: None,
+            hovered: false,
+            selected: false,
         });
         id
+    }
+
+    /// Pauses or resumes the timer when the pointer enters, leaves or selects
+    /// the toast's text. The remaining lifetime is kept across the pause.
+    fn set_paused(
+        &mut self,
+        id: ToastId,
+        hovered: Option<bool>,
+        selected: Option<bool>,
+        now: Instant,
+    ) {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.toast.id == id) else {
+            return;
+        };
+        let was_paused = entry.hovered || entry.selected;
+        if let Some(hovered) = hovered {
+            entry.hovered = hovered;
+        }
+        if let Some(selected) = selected {
+            entry.selected = selected;
+        }
+        let paused = entry.hovered || entry.selected;
+        if paused && !was_paused {
+            if let Some(deadline) = entry.deadline.take() {
+                entry.remaining = Some(deadline.saturating_duration_since(now));
+            }
+        } else if !paused && was_paused {
+            if let Some(remaining) = entry.remaining.take() {
+                entry.deadline = Some(now + remaining);
+            }
+        }
     }
 
     /// Removes `id`; returns whether it was still visible.
@@ -265,14 +304,60 @@ pub fn show_with(
     if kind.auto_hide() {
         let window_handle = window.window_handle();
         cx.spawn(async move |cx| {
-            cx.background_executor().timer(TOAST_LIFETIME).await;
-            window_handle
-                .update(cx, |_, window, cx| dismiss(id, window, cx))
-                .ok();
+            // Poll instead of sleeping for the whole lifetime: a paused toast
+            // (pointer over it, or text selected) must resume where it left
+            // off once the pause ends.
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let done = window_handle
+                    .update(cx, |_, window, cx| expire_if_due(id, window, cx))
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
         })
         .detach();
     }
     id
+}
+
+/// Removes `id` when its timer ran out; keeps a paused toast and reports
+/// whether the toast is gone.
+fn expire_if_due(id: ToastId, window: &mut Window, cx: &mut App) -> bool {
+    let now = cx.background_executor().now();
+    let (present, removed) = with_queue(window, cx, |queue| {
+        let Some(entry) = queue.entries.iter().find(|entry| entry.toast.id == id) else {
+            return (false, false);
+        };
+        let due = entry.deadline.is_some_and(|deadline| deadline <= now);
+        if due {
+            queue.dismiss(id);
+        }
+        (true, due)
+    });
+    if removed {
+        window.refresh();
+    }
+    !present || removed
+}
+
+/// Pauses the toast's expiry while the pointer is over it.
+pub fn set_hovered(id: ToastId, hovered: bool, window: &mut Window, cx: &mut App) {
+    let now = cx.background_executor().now();
+    with_queue(window, cx, |queue| {
+        queue.set_paused(id, Some(hovered), None, now);
+    });
+}
+
+/// Pauses the toast's expiry while one of its texts has a selection.
+pub fn set_selected(id: ToastId, selected: bool, window: &mut Window, cx: &mut App) {
+    let now = cx.background_executor().now();
+    with_queue(window, cx, |queue| {
+        queue.set_paused(id, None, Some(selected), now);
+    });
 }
 
 /// Removes one toast; returns whether it was visible.
@@ -328,7 +413,27 @@ pub(crate) fn render_stack(window: &Window, cx: &App) -> Option<Div> {
     Some(stack)
 }
 
-fn render_toast(toast: &Toast, colors: ThemeColors, shadows: Vec<gpui::BoxShadow>) -> Div {
+/// Every line of a toast, for the Copy button on error toasts.
+fn toast_text(toast: &Toast) -> String {
+    let mut text = toast.message.to_string();
+    if let Some(body) = &toast.body {
+        for line in &body.lines {
+            text.push('\n');
+            text.push_str(&line.text);
+            if let Some(detail) = &line.detail {
+                text.push_str(": ");
+                text.push_str(detail);
+            }
+        }
+    }
+    text
+}
+
+fn render_toast(
+    toast: &Toast,
+    colors: ThemeColors,
+    shadows: Vec<gpui::BoxShadow>,
+) -> impl IntoElement {
     let color = toast.kind.color(colors);
     let id = toast.id;
     let body = toast.body.as_ref();
@@ -355,7 +460,15 @@ fn render_toast(toast: &Toast, colors: ThemeColors, shadows: Vec<gpui::BoxShadow
                 .text_size(FS_BASE)
                 .text_color(colors.text)
                 .when(has_lines, |title| title.font_weight(FontWeight::SEMIBOLD))
-                .child(toast.message.clone()),
+                .child(
+                    SelectableText::new(
+                        ElementId::Name(format!("toast-message-{}", id.0).into()),
+                        toast.message.clone(),
+                    )
+                    .on_selection_change(move |selected, window, cx| {
+                        set_selected(id, selected, window, cx);
+                    }),
+                ),
         );
     if let Some(body) = body {
         for (index, line) in body.lines.iter().enumerate() {
@@ -375,14 +488,32 @@ fn render_toast(toast: &Toast, colors: ThemeColors, shadows: Vec<gpui::BoxShadow
                 .gap(px(6.))
                 .text_size(FS_BASE)
                 .child(Icon::new(icon).size(px(12.)).color(line_color))
-                .child(div().text_color(colors.text).child(line.text.clone()));
+                .child(
+                    div().text_color(colors.text).child(
+                        SelectableText::new(
+                            ElementId::Name(format!("toast-line-{}-{index}", id.0).into()),
+                            line.text.clone(),
+                        )
+                        .on_selection_change(
+                            move |selected, window, cx| {
+                                set_selected(id, selected, window, cx);
+                            },
+                        ),
+                    ),
+                );
             if let Some(detail) = &line.detail {
                 row = row.child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_color(colors.muted)
-                        .child(detail.clone()),
+                    div().flex_1().min_w_0().text_color(colors.muted).child(
+                        SelectableText::new(
+                            ElementId::Name(format!("toast-detail-{}-{index}", id.0).into()),
+                            detail.clone(),
+                        )
+                        .on_selection_change(
+                            move |selected, window, cx| {
+                                set_selected(id, selected, window, cx);
+                            },
+                        ),
+                    ),
                 );
             }
             if let Some(action) = &line.action {
@@ -397,6 +528,7 @@ fn render_toast(toast: &Toast, colors: ThemeColors, shadows: Vec<gpui::BoxShadow
     }
 
     let mut toast_el = div()
+        .id(ElementId::Name(format!("toast-{}", id.0).into()))
         .relative()
         .flex()
         .items_center()
@@ -412,6 +544,9 @@ fn render_toast(toast: &Toast, colors: ThemeColors, shadows: Vec<gpui::BoxShadow
         .rounded(R_MD)
         .overflow_hidden()
         .shadow(shadows)
+        .on_hover(move |hovered, window, cx| {
+            set_hovered(id, *hovered, window, cx);
+        })
         .child(
             div()
                 .absolute()
@@ -428,6 +563,18 @@ fn render_toast(toast: &Toast, colors: ThemeColors, shadows: Vec<gpui::BoxShadow
     toast_el = toast_el
         .child(Icon::new(toast.kind.icon()).size(px(14.)).color(color))
         .child(message);
+    if toast.kind == ToastKind::Error {
+        let text = toast_text(toast);
+        toast_el = toast_el.child(
+            Button::ghost(ElementId::Name(format!("toast-copy-{}", id.0).into()))
+                .icon_only(IconName::Copy)
+                .size(ButtonSize::Xs)
+                .tooltip(crate::i18n::t("kit.toast.copy"))
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                }),
+        );
+    }
     if let Some(action) = body.and_then(|body| body.action.as_ref()) {
         toast_el = toast_el.child(action_button(
             action,
@@ -484,6 +631,39 @@ mod tests {
         assert!(!queue.dismiss(first));
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.iter().next().map(|toast| toast.id), Some(second));
+    }
+
+    #[test]
+    fn hovering_or_selecting_pauses_the_timer_and_resumes_it() {
+        let mut queue = ToastQueue::new();
+        let now = Instant::now();
+        let id = queue.push(ToastKind::Info, "fetched", now);
+
+        // Hover after one second: four seconds are left.
+        queue.set_paused(id, Some(true), None, now + Duration::from_secs(1));
+        assert!(queue.expire(now + TOAST_LIFETIME * 4).is_empty());
+
+        // Leaving resumes with the same four seconds, counted from then.
+        let left = now + Duration::from_secs(10);
+        queue.set_paused(id, Some(false), None, left);
+        assert!(queue.expire(left + Duration::from_secs(3)).is_empty());
+        assert_eq!(queue.expire(left + Duration::from_secs(5)), vec![id],);
+    }
+
+    #[test]
+    fn a_cleared_selection_resumes_the_timer() {
+        let mut queue = ToastQueue::new();
+        let now = Instant::now();
+        let id = queue.push(ToastKind::Info, "fetched", now);
+
+        // Selecting the text pauses the timer; clicking elsewhere clears the
+        // selection and the remaining lifetime resumes.
+        queue.set_paused(id, None, Some(true), now + Duration::from_secs(1));
+        assert!(queue.expire(now + Duration::from_secs(30)).is_empty());
+        let cleared = now + Duration::from_secs(30);
+        queue.set_paused(id, None, Some(false), cleared);
+        assert!(queue.expire(cleared + Duration::from_secs(3)).is_empty());
+        assert_eq!(queue.expire(cleared + Duration::from_secs(4)), vec![id]);
     }
 
     #[test]

@@ -219,5 +219,17 @@
   "dialogs.remote_name.spaces": "Le nom ne peut pas contenir d’espaces.",
   "dialogs.remote_url.bad": "Ce n’est pas une adresse Git. Utilisez https://hôte/utilisateur/dépôt.git ou git@hôte:utilisateur/dépôt.git",
   "dialogs.remote_url.https": "HTTPS · utilise votre compte enregistré",
-  "dialogs.remote_url.ssh": "SSH · utilise vos clés SSH"
+  "dialogs.remote_url.ssh": "SSH · utilise vos clés SSH",
+  "dialogs.error.title_fallback": "Échec de l’opération sur le dépôt",
+  "dialogs.error.worktree_title": "Branche déjà utilisée",
+  "dialogs.error.worktree_body": "La branche {branch} est extraite dans un autre arbre de travail ({path}). Ouvrez cet arbre de travail ou choisissez une autre branche.",
+  "dialogs.error.local_changes_title": "Les modifications locales seraient écrasées",
+  "dialogs.error.local_changes_body": "Le changement écraserait des fichiers ayant des modifications non validées. Remisez-les ou validez-les d’abord.",
+  "dialogs.error.push_rejected_title": "Envoi rejeté",
+  "dialogs.error.push_rejected_body": "Le dépôt distant a des commits que votre branche n’a pas. Récupérez d’abord les modifications distantes, puis envoyez à nouveau.",
+  "dialogs.error.pull_diverged_title": "La branche a divergé",
+  "dialogs.error.pull_diverged_body": "Cette récupération n’est pas un avancement rapide, et GitWarp ne fait que des avancements rapides. Fusionnez ou rebasez la branche, puis récupérez à nouveau.",
+  "dialogs.error.open_worktree": "Ouvrir cet arbre de travail",
+  "dialogs.error.stash_and_switch": "Remiser et changer",
+  "dialogs.error.pull_then_push": "Récupérer, puis envoyer"
 }

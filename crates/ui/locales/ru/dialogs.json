@@ -223,5 +223,17 @@
   "dialogs.pr.reviewers_failed": "{noun} создан, но запросить ревью не удалось",
   "dialogs.pr.diverged_title": "Ветка разошлась с {remote}",
   "dialogs.pr.diverged_body": "В {head} и {remote}/{head} есть коммиты, которых нет в другой. Сначала сделайте pull или rebase, затем создайте {noun}.",
-  "dialogs.pr.no_base": "В {remote} нет другой ветки, в которую можно влить {head}."
+  "dialogs.pr.no_base": "В {remote} нет другой ветки, в которую можно влить {head}.",
+  "dialogs.error.title_fallback": "Операция с репозиторием не удалась",
+  "dialogs.error.worktree_title": "Ветка уже используется",
+  "dialogs.error.worktree_body": "Ветка {branch} выгружена в другом рабочем дереве ({path}). Переключитесь на него или выберите другую ветку.",
+  "dialogs.error.local_changes_title": "Локальные изменения будут перезаписаны",
+  "dialogs.error.local_changes_body": "Переключение перезапишет файлы с незакоммиченными изменениями. Сначала спрячьте или закоммитьте их.",
+  "dialogs.error.push_rejected_title": "Отправка отклонена",
+  "dialogs.error.push_rejected_body": "В удалённом репозитории есть коммиты, которых нет в вашей ветке. Сначала получите изменения, затем отправьте снова.",
+  "dialogs.error.pull_diverged_title": "Ветка разошлась",
+  "dialogs.error.pull_diverged_body": "Это получение не fast-forward, а GitWarp выполняет только fast-forward. Слейте или перебазируйте ветку, затем повторите.",
+  "dialogs.error.open_worktree": "Открыть это рабочее дерево",
+  "dialogs.error.stash_and_switch": "Спрятать и переключиться",
+  "dialogs.error.pull_then_push": "Получить, затем отправить"
 }

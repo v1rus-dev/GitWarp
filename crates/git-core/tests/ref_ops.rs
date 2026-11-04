@@ -137,34 +137,129 @@ fn an_unmerged_branch_needs_force() {
     assert!(!repo.refs().unwrap().iter().any(|r| r.name == "side"));
 }
 
-#[test]
-fn checkout_remote_creates_a_tracking_branch() {
-    let (tmp, repo) = repo_with_history();
-    let dir = tmp.path();
-    let target = head_target(&repo);
-    // A configured remote and its tracking ref, as a fetch would have written
-    // them.
+fn branch_ref(repo: &Repo, name: &str) -> git_core::Ref {
+    repo.refs()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.kind == RefKind::LocalBranch && r.name == name)
+        .unwrap_or_else(|| panic!("the local branch {name} exists"))
+}
+
+/// A configured remote and its tracking ref, as a fetch would have written
+/// them.
+fn add_remote_ref(dir: &Path, remote: &str, branch: &str, target: git_core::Oid) {
     git(
         dir,
-        &["remote", "add", "origin", "https://example.com/repo.git"],
+        &["remote", "add", remote, "https://example.com/repo.git"],
     );
     git(
         dir,
         &[
             "update-ref",
-            "refs/remotes/origin/feat",
+            &format!("refs/remotes/{remote}/{branch}"),
             &target.to_string(),
         ],
     );
+}
+
+#[test]
+fn checkout_remote_creates_a_tracking_branch() {
+    let (tmp, repo) = repo_with_history();
+    let dir = tmp.path();
+    let target = head_target(&repo);
+    add_remote_ref(dir, "origin", "feat", target);
     repo.checkout_remote("origin/feat").unwrap();
     assert_eq!(branch_name(&repo).as_deref(), Some("feat"));
-    let branch = repo
-        .refs()
-        .unwrap()
-        .into_iter()
-        .find(|r| r.kind == RefKind::LocalBranch && r.name == "feat")
-        .expect("the tracking branch exists");
+    let branch = branch_ref(&repo, "feat");
     assert_eq!(branch.upstream.as_deref(), Some("origin/feat"));
+}
+
+#[test]
+fn checkout_remote_fast_forwards_an_existing_branch_that_is_behind() {
+    let (tmp, repo) = repo_with_history();
+    let dir = tmp.path();
+    let first = head_target(&repo);
+    repo.create_branch("feat", first, false).unwrap();
+    // The remote moved on while the local branch stayed at the first commit.
+    commit_file(dir, "b.txt", "two\n", "B");
+    let second = head_target(&repo);
+    add_remote_ref(dir, "origin", "feat", second);
+
+    repo.checkout_remote("origin/feat").unwrap();
+
+    assert_eq!(branch_name(&repo).as_deref(), Some("feat"));
+    assert_eq!(head_target(&repo), second);
+    assert_eq!(summary(&repo), "B");
+    // It had no upstream, so the remote becomes its upstream.
+    assert_eq!(
+        branch_ref(&repo, "feat").upstream.as_deref(),
+        Some("origin/feat")
+    );
+}
+
+#[test]
+fn checkout_remote_leaves_a_diverged_branch_alone() {
+    let (tmp, repo) = repo_with_history();
+    let dir = tmp.path();
+    let first = head_target(&repo);
+    // The local branch gets a commit of its own while the remote gets another.
+    repo.create_branch("feat", first, false).unwrap();
+    repo.checkout_branch("feat").unwrap();
+    commit_file(dir, "feat.txt", "local\n", "Local");
+    let local = head_target(&repo);
+    repo.checkout_branch("main").unwrap();
+    commit_file(dir, "main.txt", "remote\n", "Remote");
+    let remote = head_target(&repo);
+    add_remote_ref(dir, "origin", "feat", remote);
+
+    repo.checkout_remote("origin/feat").unwrap();
+
+    assert_eq!(branch_name(&repo).as_deref(), Some("feat"));
+    assert_eq!(head_target(&repo), local, "the local commit is kept");
+    assert_eq!(summary(&repo), "Local");
+    assert_eq!(
+        branch_ref(&repo, "feat").upstream.as_deref(),
+        Some("origin/feat")
+    );
+}
+
+#[test]
+fn checkout_remote_keeps_an_existing_upstream() {
+    let (tmp, repo) = repo_with_history();
+    let dir = tmp.path();
+    let first = head_target(&repo);
+    add_remote_ref(dir, "origin", "feat", first);
+    repo.checkout_remote("origin/feat").unwrap();
+    repo.checkout_branch("main").unwrap();
+    // A second remote is ahead; the existing upstream must not be replaced.
+    commit_file(dir, "b.txt", "two\n", "B");
+    let second = head_target(&repo);
+    add_remote_ref(dir, "upstream", "feat", second);
+
+    repo.checkout_remote("upstream/feat").unwrap();
+
+    assert_eq!(branch_name(&repo).as_deref(), Some("feat"));
+    assert_eq!(head_target(&repo), second);
+    assert_eq!(
+        branch_ref(&repo, "feat").upstream.as_deref(),
+        Some("origin/feat")
+    );
+}
+
+#[test]
+fn checkout_remote_keeps_slashes_in_a_branch_name() {
+    let (tmp, repo) = repo_with_history();
+    let dir = tmp.path();
+    let target = head_target(&repo);
+    add_remote_ref(dir, "origin", "fix/mms2-8048", target);
+
+    repo.checkout_remote("origin/fix/mms2-8048").unwrap();
+
+    assert_eq!(branch_name(&repo).as_deref(), Some("fix/mms2-8048"));
+    assert_eq!(
+        branch_ref(&repo, "fix/mms2-8048").upstream.as_deref(),
+        Some("origin/fix/mms2-8048")
+    );
 }
 
 #[test]
@@ -308,6 +403,33 @@ fn stash_save_apply_pop_and_drop() {
     // The pop restored the changes, so stash them once more and drop them.
     assert!(repo.stash_save(None).unwrap());
     repo.stash_drop(0).unwrap();
+    assert!(repo.stashes().unwrap().is_empty());
+}
+
+#[test]
+fn popping_a_stash_with_the_index_keeps_staged_changes_staged() {
+    let (tmp, repo) = repo_with_history();
+    let dir = tmp.path();
+    // One staged change, then a further unstaged change on top of it.
+    fs::write(dir.join("a.txt"), "one\nstaged\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    fs::write(dir.join("a.txt"), "one\nstaged\nunstaged\n").unwrap();
+    assert!(repo.stash_save(Some("WIP")).unwrap());
+    assert_eq!(repo.working_status().unwrap().staged_count(), 0);
+    assert_eq!(repo.working_status().unwrap().unstaged_count(), 0);
+
+    repo.stash_pop_keep_index(0).unwrap();
+    let status = repo.working_status().unwrap();
+    assert_eq!(
+        status.staged_count(),
+        1,
+        "the staged change came back unstaged"
+    );
+    assert_eq!(status.unstaged_count(), 1);
+    assert_eq!(
+        fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "one\nstaged\nunstaged\n"
+    );
     assert!(repo.stashes().unwrap().is_empty());
 }
 

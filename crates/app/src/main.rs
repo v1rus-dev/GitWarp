@@ -15,6 +15,7 @@ mod create_pr_dialog;
 mod credential_dialog;
 mod details;
 mod diff_model;
+mod error_dialog;
 mod format;
 mod graph_paint;
 mod history_search;

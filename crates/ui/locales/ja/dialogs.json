@@ -215,5 +215,17 @@
   "dialogs.remote_name.spaces": "名前にスペースは使えません。",
   "dialogs.remote_url.bad": "Git のアドレスではありません。https://host/user/repo.git または git@host:user/repo.git の形式を使用してください",
   "dialogs.remote_url.https": "HTTPS · 保存済みのアカウントを使用します",
-  "dialogs.remote_url.ssh": "SSH · SSH キーを使用します"
+  "dialogs.remote_url.ssh": "SSH · SSH キーを使用します",
+  "dialogs.error.title_fallback": "リポジトリ操作に失敗しました",
+  "dialogs.error.worktree_title": "ブランチは使用中です",
+  "dialogs.error.worktree_body": "ブランチ {branch} は別のワークツリー（{path}）でチェックアウトされています。そのワークツリーを開くか、別のブランチを選んでください。",
+  "dialogs.error.local_changes_title": "ローカル変更が上書きされます",
+  "dialogs.error.local_changes_body": "切り替えると、コミットされていない変更のあるファイルが上書きされます。先にスタッシュするかコミットしてください。",
+  "dialogs.error.push_rejected_title": "プッシュが拒否されました",
+  "dialogs.error.push_rejected_body": "リモートにはブランチにないコミットがあります。先にリモートの変更を取得してから、もう一度プッシュしてください。",
+  "dialogs.error.pull_diverged_title": "ブランチが分岐しています",
+  "dialogs.error.pull_diverged_body": "この取得は fast-forward ではなく、GitWarp は fast-forward のみを行います。ブランチをマージまたはリベースしてから、もう一度取得してください。",
+  "dialogs.error.open_worktree": "そのワークツリーを開く",
+  "dialogs.error.stash_and_switch": "スタッシュして切り替え",
+  "dialogs.error.pull_then_push": "取得してからプッシュ"
 }
