@@ -47,12 +47,37 @@ pub fn sidebar_width_limit(window_width: f32) -> f32 {
     (window_width * SIDEBAR_MAX_SHARE).max(SIDEBAR_WIDTH_MIN)
 }
 
+/// A persisted column width, clamped to its minimum and the file sanity cap;
+/// a broken value falls back to the design default.
+fn clamp_width(width: f32, min: f32, default: f32) -> f32 {
+    if width.is_finite() {
+        width.clamp(min, COLUMN_WIDTH_MAX)
+    } else {
+        default
+    }
+}
+
 /// The narrowest graph column.
 pub const GRAPH_WIDTH_MIN: f32 = 40.0;
-/// The widest graph column; the pane's own share can still narrow it.
-pub const GRAPH_WIDTH_MAX: f32 = 480.0;
+/// A sanity cap for a persisted column width. Dragging has no fixed maximum:
+/// the pane's own room is the only bound.
+pub const COLUMN_WIDTH_MAX: f32 = 10_000.0;
+/// The widest graph column a settings file may carry.
+pub const GRAPH_WIDTH_MAX: f32 = COLUMN_WIDTH_MAX;
 /// The graph column width used when the file has no usable value.
 pub const GRAPH_WIDTH_DEFAULT: f32 = 112.0;
+/// The narrowest author column.
+pub const AUTHOR_WIDTH_MIN: f32 = 48.0;
+/// The narrowest date column.
+pub const DATE_WIDTH_MIN: f32 = 48.0;
+/// The narrowest hash column.
+pub const HASH_WIDTH_MIN: f32 = 40.0;
+/// The author column width used when the file has no usable value.
+pub const AUTHOR_WIDTH_DEFAULT: f32 = 130.0;
+/// The date column width used when the file has no usable value.
+pub const DATE_WIDTH_DEFAULT: f32 = 104.0;
+/// The hash column width used when the file has no usable value.
+pub const HASH_WIDTH_DEFAULT: f32 = 64.0;
 
 /// Prefix of the ids given to accounts migrated from the old
 /// `account_github` / `account_gitlab` settings. The id is fixed per service
@@ -118,6 +143,12 @@ pub struct Settings {
     pub details_size: Option<f32>,
     /// Width of the graph column in the history table.
     pub graph_width: f32,
+    /// Width of the author column in the history table.
+    pub author_width: f32,
+    /// Width of the date column in the history table.
+    pub date_width: f32,
+    /// Width of the hash column in the history table.
+    pub hash_width: f32,
     /// Whether idle lanes fold into gap lanes.
     pub collapse_idle_lanes: bool,
     /// Whether the History pane's Activity strip is collapsed to its header.
@@ -216,6 +247,9 @@ impl Default for Settings {
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             details_size: None,
             graph_width: GRAPH_WIDTH_DEFAULT,
+            author_width: AUTHOR_WIDTH_DEFAULT,
+            date_width: DATE_WIDTH_DEFAULT,
+            hash_width: HASH_WIDTH_DEFAULT,
             collapse_idle_lanes: false,
             activity_collapsed: false,
             diff_layout: DiffLayout::default(),
@@ -450,6 +484,9 @@ impl Settings {
         } else {
             self.graph_width = GRAPH_WIDTH_DEFAULT;
         }
+        self.author_width = clamp_width(self.author_width, AUTHOR_WIDTH_MIN, AUTHOR_WIDTH_DEFAULT);
+        self.date_width = clamp_width(self.date_width, DATE_WIDTH_MIN, DATE_WIDTH_DEFAULT);
+        self.hash_width = clamp_width(self.hash_width, HASH_WIDTH_MIN, HASH_WIDTH_DEFAULT);
         self.ui_font_size = self.ui_font_size.clamp(12, 14);
         self.mono_font_size = self.mono_font_size.clamp(MONO_SIZE_MIN, MONO_SIZE_MAX);
         self.graph_line_width = self.graph_line_width.clamp(1, 3);
@@ -836,6 +873,9 @@ fn settings_from_value(value: Value) -> Settings {
         sidebar_width: take(&mut object, "sidebar_width", defaults.sidebar_width),
         details_size: take(&mut object, "details_size", defaults.details_size),
         graph_width: take(&mut object, "graph_width", defaults.graph_width),
+        author_width: take(&mut object, "author_width", defaults.author_width),
+        date_width: take(&mut object, "date_width", defaults.date_width),
+        hash_width: take(&mut object, "hash_width", defaults.hash_width),
         collapse_idle_lanes: take(
             &mut object,
             "collapse_idle_lanes",
@@ -1071,6 +1111,9 @@ mod tests {
             sidebar_width: 320.5,
             details_size: Some(180.0),
             graph_width: 176.0,
+            author_width: 180.0,
+            date_width: 90.0,
+            hash_width: 72.0,
             collapse_idle_lanes: true,
             activity_collapsed: true,
             diff_layout: DiffLayout::Split,
@@ -1203,17 +1246,25 @@ mod tests {
     fn graph_settings_default_and_are_clamped_on_load() {
         let defaults = Settings::default();
         assert_eq!(defaults.graph_width, GRAPH_WIDTH_DEFAULT);
+        assert_eq!(defaults.author_width, AUTHOR_WIDTH_DEFAULT);
+        assert_eq!(defaults.date_width, DATE_WIDTH_DEFAULT);
+        assert_eq!(defaults.hash_width, HASH_WIDTH_DEFAULT);
         assert!(!defaults.collapse_idle_lanes);
 
         let dir = TempDir::new("graph-settings");
         // A file written before the graph settings existed loads the defaults.
         let old = load_json(dir.path(), r#"{"theme":"dark"}"#);
         assert_eq!(old.graph_width, GRAPH_WIDTH_DEFAULT);
+        assert_eq!(old.author_width, AUTHOR_WIDTH_DEFAULT);
+        assert_eq!(old.date_width, DATE_WIDTH_DEFAULT);
+        assert_eq!(old.hash_width, HASH_WIDTH_DEFAULT);
         assert!(!old.collapse_idle_lanes);
 
+        // Widths above the old 480 px graph cap are kept: dragging has no
+        // fixed maximum, only the file sanity cap.
         assert_eq!(
             load_json(dir.path(), r#"{"graph_width":9999}"#).graph_width,
-            GRAPH_WIDTH_MAX
+            9999.
         );
         assert_eq!(
             load_json(dir.path(), r#"{"graph_width":1}"#).graph_width,
@@ -1222,6 +1273,26 @@ mod tests {
         assert_eq!(
             load_json(dir.path(), r#"{"graph_width":"wide"}"#).graph_width,
             GRAPH_WIDTH_DEFAULT
+        );
+        assert_eq!(
+            load_json(dir.path(), r#"{"author_width":2000}"#).author_width,
+            2000.
+        );
+        assert_eq!(
+            load_json(dir.path(), r#"{"author_width":1}"#).author_width,
+            AUTHOR_WIDTH_MIN
+        );
+        assert_eq!(
+            load_json(dir.path(), r#"{"date_width":1}"#).date_width,
+            DATE_WIDTH_MIN
+        );
+        assert_eq!(
+            load_json(dir.path(), r#"{"hash_width":1}"#).hash_width,
+            HASH_WIDTH_MIN
+        );
+        assert_eq!(
+            load_json(dir.path(), r#"{"hash_width":"wide"}"#).hash_width,
+            HASH_WIDTH_DEFAULT
         );
         assert!(load_json(dir.path(), r#"{"collapse_idle_lanes":true}"#).collapse_idle_lanes);
     }

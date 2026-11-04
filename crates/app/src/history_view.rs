@@ -69,7 +69,10 @@ use crate::hosting_status::{
     ci_label, HostingView, PrBadgeView, CI_VISIBLE_DEBOUNCE, CI_VISIBLE_MARGIN,
 };
 use crate::remote_accounts::RemoteTargets;
-use crate::settings::{GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MAX, GRAPH_WIDTH_MIN};
+use crate::settings::{
+    AUTHOR_WIDTH_DEFAULT, AUTHOR_WIDTH_MIN, DATE_WIDTH_DEFAULT, DATE_WIDTH_MIN,
+    GRAPH_WIDTH_DEFAULT, GRAPH_WIDTH_MIN, HASH_WIDTH_DEFAULT, HASH_WIDTH_MIN,
+};
 use crate::sidebar::{sidebar_menu_with_links, SidebarAction, SidebarExtras, SidebarMenuEntry};
 use crate::theme;
 use crate::web_links::{self, HostLink};
@@ -81,26 +84,15 @@ const PAGE: usize = 2_000;
 /// How long the field waits after the last keystroke before the search runs.
 const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// Column widths of the history table, shared by the header and the rows.
+/// The gap between the history table's columns.
 const COL_GAP: f32 = 18.;
-/// Author and date columns on a wide pane.
-const COL_AUTHOR: f32 = 130.;
-const COL_DATE: f32 = 104.;
-/// The narrower author and date columns below [`PANE_MEDIUM`].
-const COL_AUTHOR_NARROW: f32 = 104.;
-const COL_DATE_NARROW: f32 = 76.;
-const COL_HASH: f32 = 64.;
 /// The pane widths where the table drops a column, as the design's container
 /// queries do: 560 px loses Hash, 460 px loses Author.
 const PANE_MEDIUM: f32 = 560.;
 const PANE_NARROW: f32 = 460.;
-/// The graph column's design cap on a wide pane and on top of that its share
-/// of the pane, so the summary always keeps room. The user width `gw` (40–480)
-/// replaces the old lane auto-fit; the 480 cap stays a belt-and-braces bound.
-const GRAPH_MAX_WIDE: f32 = GRAPH_WIDTH_MAX;
-const GRAPH_SHARE_WIDE: f32 = 0.40;
-const GRAPH_SHARE_MEDIUM: f32 = 0.40;
-const GRAPH_SHARE_NARROW: f32 = 0.36;
+/// The summary column is flexible; a fixed column may never be dragged so far
+/// that it leaves the summary less room than this.
+const SUMMARY_MIN: f32 = 80.;
 /// The header and the rows share this side margin and padding.
 const SIDE_MARGIN: f32 = 6.;
 const PAD_LEFT: f32 = 14.;
@@ -401,58 +393,157 @@ pub struct Columns {
     pub hash: Option<f32>,
 }
 
-/// The table layout for a history pane `pane_width` wide whose graph column
-/// has the user width `graph_width` (`gw`, 40–480).
-///
-/// This is the design's container-query table: the user width shrinks to a
-/// share of the pane (40 % down to 560 px, 36 % below 460 px), the hash column
-/// goes at 560 px and the author column at 460 px.
-pub fn columns(pane_width: f32, graph_width: f32) -> Columns {
-    let gw = clamp_graph_width(graph_width);
-    let share = if pane_width <= PANE_NARROW {
-        GRAPH_SHARE_NARROW
-    } else if pane_width <= PANE_MEDIUM {
-        GRAPH_SHARE_MEDIUM
-    } else {
-        GRAPH_SHARE_WIDE
-    };
-    let graph = gw
-        .min(GRAPH_MAX_WIDE)
-        .min(share * pane_width)
-        .max(GRAPH_MIN);
+/// A fixed-width column the grips can resize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResizeColumn {
+    Graph,
+    Author,
+    Date,
+    Hash,
+}
 
-    if pane_width <= PANE_NARROW {
-        Columns {
-            graph,
-            author: None,
-            date: COL_DATE_NARROW,
-            hash: None,
+impl ResizeColumn {
+    /// The narrowest the column may get.
+    fn min(self) -> f32 {
+        match self {
+            Self::Graph => GRAPH_MIN,
+            Self::Author => AUTHOR_WIDTH_MIN,
+            Self::Date => DATE_WIDTH_MIN,
+            Self::Hash => HASH_WIDTH_MIN,
         }
-    } else if pane_width <= PANE_MEDIUM {
-        Columns {
-            graph,
-            author: Some(COL_AUTHOR_NARROW),
-            date: COL_DATE_NARROW,
-            hash: None,
+    }
+
+    /// The width a double-click restores.
+    fn default_width(self) -> f32 {
+        match self {
+            Self::Graph => GRAPH_WIDTH_DEFAULT,
+            Self::Author => AUTHOR_WIDTH_DEFAULT,
+            Self::Date => DATE_WIDTH_DEFAULT,
+            Self::Hash => HASH_WIDTH_DEFAULT,
         }
-    } else {
-        Columns {
-            graph,
-            author: Some(COL_AUTHOR),
-            date: COL_DATE,
-            hash: Some(COL_HASH),
+    }
+
+    /// The drag direction: the graph's grip sits on its right edge, so moving
+    /// right widens it; the others sit on their left edge, so moving right
+    /// narrows them.
+    fn drag_sign(self) -> f32 {
+        match self {
+            Self::Graph => 1.,
+            Self::Author | Self::Date | Self::Hash => -1.,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Graph => "history-graph-grip",
+            Self::Author => "history-author-grip",
+            Self::Date => "history-date-grip",
+            Self::Hash => "history-hash-grip",
         }
     }
 }
 
-/// The graph width clamped to its persisted range; a value from a broken file
-/// falls back to the design default.
-fn clamp_graph_width(graph_width: f32) -> f32 {
-    if graph_width.is_finite() {
-        graph_width.clamp(GRAPH_MIN, GRAPH_MAX_WIDE)
+/// The table layout for a history pane `pane_width` wide with the user widths
+/// of the four resizable columns.
+///
+/// The hash column goes at 560 px and the author column at 460 px. Otherwise
+/// the saved widths are used as they are (each at least its own minimum); no
+/// fixed cap applies, only the pane's room and the summary's minimum.
+pub fn columns(
+    pane_width: f32,
+    graph_width: f32,
+    author_width: f32,
+    date_width: f32,
+    hash_width: f32,
+) -> Columns {
+    let graph = clamp_graph_width(graph_width);
+    let author = clamp_width(author_width, AUTHOR_WIDTH_MIN, AUTHOR_WIDTH_DEFAULT);
+    let date = clamp_width(date_width, DATE_WIDTH_MIN, DATE_WIDTH_DEFAULT);
+    let hash = clamp_width(hash_width, HASH_WIDTH_MIN, HASH_WIDTH_DEFAULT);
+
+    let mut table = if pane_width <= PANE_NARROW {
+        Columns {
+            graph,
+            author: None,
+            date,
+            hash: None,
+        }
+    } else if pane_width <= PANE_MEDIUM {
+        Columns {
+            graph,
+            author: Some(author),
+            date,
+            hash: None,
+        }
     } else {
-        GRAPH_WIDTH_DEFAULT
+        Columns {
+            graph,
+            author: Some(author),
+            date,
+            hash: Some(hash),
+        }
+    };
+    // Keep the summary's minimum even when a saved width no longer fits the
+    // pane (a window may have shrunk since the drag). Later clamps only shrink
+    // the total, so one pass leaves the table within the pane's room.
+    table.graph = clamp_column_width(ResizeColumn::Graph, table.graph, pane_width, table);
+    if let Some(author) = table.author {
+        table.author = Some(clamp_column_width(
+            ResizeColumn::Author,
+            author,
+            pane_width,
+            table,
+        ));
     }
+    table.date = clamp_column_width(ResizeColumn::Date, table.date, pane_width, table);
+    if let Some(hash) = table.hash {
+        table.hash = Some(clamp_column_width(
+            ResizeColumn::Hash,
+            hash,
+            pane_width,
+            table,
+        ));
+    }
+    table
+}
+
+/// Clamps a resized (or saved) column width to its own minimum and to the room
+/// the pane leaves after the other fixed columns, the gaps and the summary's
+/// minimum. There is deliberately no fixed maximum.
+fn clamp_column_width(
+    column: ResizeColumn,
+    requested: f32,
+    pane_width: f32,
+    columns: Columns,
+) -> f32 {
+    let panel = pane_width - 2. * SIDE_MARGIN - PAD_LEFT - PAD_RIGHT;
+    let count = 3 + usize::from(columns.author.is_some()) + usize::from(columns.hash.is_some());
+    let gaps = (count - 1) as f32 * COL_GAP;
+    let others =
+        columns.graph + columns.date + columns.author.unwrap_or(0.) + columns.hash.unwrap_or(0.)
+            - match column {
+                ResizeColumn::Graph => columns.graph,
+                ResizeColumn::Author => columns.author.unwrap_or(0.),
+                ResizeColumn::Date => columns.date,
+                ResizeColumn::Hash => columns.hash.unwrap_or(0.),
+            };
+    let max = (panel - gaps - SUMMARY_MIN - others).max(column.min());
+    requested.clamp(column.min(), max)
+}
+
+/// A saved column width: finite and at least `min`, otherwise `default`.
+fn clamp_width(width: f32, min: f32, default: f32) -> f32 {
+    if width.is_finite() {
+        width.max(min)
+    } else {
+        default
+    }
+}
+
+/// The graph width clamped to its floor; a value from a broken file falls back
+/// to the design default. There is no upper cap.
+fn clamp_graph_width(graph_width: f32) -> f32 {
+    clamp_width(graph_width, GRAPH_MIN, GRAPH_WIDTH_DEFAULT)
 }
 
 /// The "fit the graph to its content" width: the graph's current full width
@@ -518,11 +609,14 @@ impl PendingReveal {
     }
 }
 
-/// The grip drag in flight: where the pointer started and the width it is
-/// resizing from. A click that never moved does not persist anything.
+/// The grip drag in flight: which column it resizes, where the pointer started
+/// and the width it is resizing from. A click that never moved does not persist
+/// anything.
 struct GripDrag {
+    column: ResizeColumn,
     start_x: f32,
     start_width: f32,
+    pane_width: f32,
     dragging: bool,
 }
 
@@ -728,9 +822,13 @@ pub struct HistoryView {
     /// Notifies once a minute so relative dates stay fresh; dropped with the
     /// view.
     clock_task: Option<Task<()>>,
-    /// The user's graph column width (`gw`), kept live while the grip drags
-    /// and persisted on drag end.
+    /// The user's graph column width, kept live while its grip drags and
+    /// persisted on drag end.
     graph_width: f32,
+    /// The user's author, date and hash widths, handled like `graph_width`.
+    author_width: f32,
+    date_width: f32,
+    hash_width: f32,
     /// Per-column statistics for the idle-lane collapse, fed every emitted row
     /// in order. Reset whenever the graph is rebuilt.
     idle_lanes: IdleLanes,
@@ -1306,18 +1404,30 @@ impl HistoryView {
         on_action: RefActionHandler,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (graph_width, collapse) = cx
+        let (graph_width, author_width, date_width, hash_width, collapse) = cx
             .try_global::<crate::AppSettings>()
             .map(|state| {
                 (
                     state.settings.graph_width,
+                    state.settings.author_width,
+                    state.settings.date_width,
+                    state.settings.hash_width,
                     state.settings.collapse_idle_lanes,
                 )
             })
-            .unwrap_or((GRAPH_WIDTH_DEFAULT, false));
+            .unwrap_or((
+                GRAPH_WIDTH_DEFAULT,
+                AUTHOR_WIDTH_DEFAULT,
+                DATE_WIDTH_DEFAULT,
+                HASH_WIDTH_DEFAULT,
+                false,
+            ));
         let graph_width = clamp_graph_width(graph_width);
+        let author_width = clamp_width(author_width, AUTHOR_WIDTH_MIN, AUTHOR_WIDTH_DEFAULT);
+        let date_width = clamp_width(date_width, DATE_WIDTH_MIN, DATE_WIDTH_DEFAULT);
+        let hash_width = clamp_width(hash_width, HASH_WIDTH_MIN, HASH_WIDTH_DEFAULT);
         // Replaced with the pane's real width in the first prepaint.
-        let columns = columns(1200., graph_width);
+        let columns = columns(1200., graph_width, author_width, date_width, hash_width);
         let mut view = Self {
             path,
             git,
@@ -1352,6 +1462,9 @@ impl HistoryView {
             summary_width: summary_width(1200., columns),
             clock_task: None,
             graph_width,
+            author_width,
+            date_width,
+            hash_width,
             idle_lanes: IdleLanes::new(),
             geometry: Rc::new(IdleLanes::new().geometry(collapse)),
             collapse,
@@ -2332,6 +2445,50 @@ impl HistoryView {
         cx.notify();
     }
 
+    /// The current width of a resizable column.
+    fn column_width(&self, column: ResizeColumn) -> f32 {
+        match column {
+            ResizeColumn::Graph => self.graph_width,
+            ResizeColumn::Author => self.author_width,
+            ResizeColumn::Date => self.date_width,
+            ResizeColumn::Hash => self.hash_width,
+        }
+    }
+
+    /// Sets a resizable column's live width without persisting it; the grip
+    /// drag persists on release.
+    fn set_column_width(&mut self, column: ResizeColumn, width: f32) {
+        match column {
+            ResizeColumn::Graph => self.graph_width = width,
+            ResizeColumn::Author => self.author_width = width,
+            ResizeColumn::Date => self.date_width = width,
+            ResizeColumn::Hash => self.hash_width = width,
+        }
+    }
+
+    /// Persists one column's width in the settings.
+    fn persist_column_width(&mut self, column: ResizeColumn, width: f32, cx: &mut Context<Self>) {
+        crate::update_settings(cx, move |settings| match column {
+            ResizeColumn::Graph => settings.graph_width = width,
+            ResizeColumn::Author => settings.author_width = width,
+            ResizeColumn::Date => settings.date_width = width,
+            ResizeColumn::Hash => settings.hash_width = width,
+        });
+    }
+
+    /// Restores a column's default width on a grip double-click. The graph
+    /// keeps its own content-fitting behaviour.
+    fn reset_column_width(&mut self, column: ResizeColumn, cx: &mut Context<Self>) {
+        if column == ResizeColumn::Graph {
+            self.fit_graph(cx);
+            return;
+        }
+        let width = column.default_width();
+        self.set_column_width(column, width);
+        self.persist_column_width(column, width, cx);
+        cx.notify();
+    }
+
     /// Ends a grip drag: only a drag that actually moved is persisted, so a
     /// plain click on the grip does not write the settings.
     fn finish_grip_drag(&mut self, cx: &mut Context<Self>) {
@@ -2341,8 +2498,8 @@ impl HistoryView {
         if !drag.dragging {
             return;
         }
-        let width = self.graph_width;
-        crate::update_settings(cx, move |settings| settings.graph_width = width);
+        let width = self.column_width(drag.column);
+        self.persist_column_width(drag.column, width, cx);
         cx.notify();
     }
 
@@ -2788,11 +2945,15 @@ impl HistoryView {
 
     /// The graph header cell: the label, the "+N" clipped-lanes pill, the
     /// resize grip and the right-click menu.
-    fn render_graph_header(&self, columns: Columns, cx: &Context<Self>) -> impl IntoElement {
+    fn render_graph_header(
+        &self,
+        columns: Columns,
+        pane_width: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let colors = cx.theme().colors;
         let accent = colors.accent;
         let clipped = clipped_lanes(self.geometry(), columns.graph);
-        let dragging = self.grip_drag.as_ref().is_some_and(|drag| drag.dragging);
 
         let mut cell = div()
             .id("history-graph-header")
@@ -2833,15 +2994,36 @@ impl HistoryView {
             );
         }
 
-        let grip = div()
-            .id("history-graph-grip")
+        cell.child(self.render_grip(ResizeColumn::Graph, pane_width, cx))
+    }
+
+    /// One column boundary's resize grip. The graph's grip sits on its right
+    /// edge; every other column's grip sits on its left edge and resizes that
+    /// column.
+    fn render_grip(
+        &self,
+        column: ResizeColumn,
+        pane_width: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let accent = colors.accent;
+        let dragging = self
+            .grip_drag
+            .as_ref()
+            .is_some_and(|drag| drag.dragging && drag.column == column);
+        let left_edge = column != ResizeColumn::Graph;
+
+        div()
+            .id(column.id())
             .absolute()
-            .right(px(-8.))
+            .when(left_edge, |this| this.left(px(-8.)))
+            .when(!left_edge, |this| this.right(px(-8.)))
             .top(px(3.))
             .bottom(px(3.))
             .w(px(7.))
             .rounded(px(2.))
-            .cursor_col_resize()
+            .cursor_ew_resize()
             .hover(move |style| style.bg(accent.opacity(0.7)))
             .when(dragging, |this| this.bg(accent.opacity(0.7)))
             // A resting 1px divider, so the grip is visible before hover.
@@ -2859,13 +3041,15 @@ impl HistoryView {
             .tooltip(Tooltip::text(ui::t!("history.header.grip_tooltip")))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|view, event: &MouseDownEvent, _, cx| {
+                cx.listener(move |view, event: &MouseDownEvent, _, cx| {
                     if event.click_count >= 2 {
-                        view.fit_graph(cx);
+                        view.reset_column_width(column, cx);
                     } else {
                         view.grip_drag = Some(GripDrag {
+                            column,
                             start_x: f32::from(event.position.x),
-                            start_width: view.graph_width,
+                            start_width: view.column_width(column),
+                            pane_width,
                             dragging: false,
                         });
                     }
@@ -2874,14 +3058,19 @@ impl HistoryView {
             .on_drag(GripDragPayload, |_, _, _, cx| cx.new(|_| EmptyView))
             .on_drag_move(
                 cx.listener(|view, event: &DragMoveEvent<GripDragPayload>, _, cx| {
-                    let Some(drag) = &mut view.grip_drag else {
+                    let Some(drag) = &view.grip_drag else {
                         return;
                     };
-                    let dx = f32::from(event.event.position.x) - drag.start_x;
-                    drag.dragging = true;
-                    let width = (drag.start_width + dx).clamp(GRAPH_MIN, GRAPH_MAX_WIDE);
-                    if view.graph_width != width {
-                        view.graph_width = width;
+                    let (column, start_x, start_width, pane_width) =
+                        (drag.column, drag.start_x, drag.start_width, drag.pane_width);
+                    let dx = f32::from(event.event.position.x) - start_x;
+                    if let Some(drag) = &mut view.grip_drag {
+                        drag.dragging = true;
+                    }
+                    let requested = start_width + column.drag_sign() * dx;
+                    let width = clamp_column_width(column, requested, pane_width, view.columns);
+                    if view.column_width(column) != width {
+                        view.set_column_width(column, width);
                         cx.notify();
                     }
                 }),
@@ -2893,12 +3082,15 @@ impl HistoryView {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|view, _: &MouseUpEvent, _, cx| view.finish_grip_drag(cx)),
-            );
-
-        cell.child(grip)
+            )
     }
 
-    fn render_header(&self, columns: Columns, cx: &Context<Self>) -> impl IntoElement {
+    fn render_header(
+        &self,
+        columns: Columns,
+        pane_width: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let colors = cx.theme().colors;
         // A 6px gutter around the header, so it lines up with the rows.
         let mut head = div()
@@ -2915,7 +3107,7 @@ impl HistoryView {
             .text_size(FS_SM)
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(colors.muted)
-            .child(self.render_graph_header(columns, cx))
+            .child(self.render_graph_header(columns, pane_width, cx))
             .child(
                 div()
                     .flex_1()
@@ -2926,23 +3118,29 @@ impl HistoryView {
         if let Some(author) = columns.author {
             head = head.child(
                 div()
+                    .relative()
                     .w(px(author))
                     .flex_none()
-                    .child(ui::t!("history.header.author")),
+                    .child(ui::t!("history.header.author"))
+                    .child(self.render_grip(ResizeColumn::Author, pane_width, cx)),
             );
         }
         head = head.child(
             div()
+                .relative()
                 .w(px(columns.date))
                 .flex_none()
-                .child(ui::t!("history.header.date")),
+                .child(ui::t!("history.header.date"))
+                .child(self.render_grip(ResizeColumn::Date, pane_width, cx)),
         );
         if let Some(hash) = columns.hash {
             head = head.child(
                 div()
+                    .relative()
                     .w(px(hash))
                     .flex_none()
-                    .child(ui::t!("history.header.hash")),
+                    .child(ui::t!("history.header.hash"))
+                    .child(self.render_grip(ResizeColumn::Hash, pane_width, cx)),
             );
         }
         div().w_full().px(px(SIDE_MARGIN)).child(head)
@@ -4153,7 +4351,13 @@ impl HistoryView {
     /// current state. Called with the width the pane was actually assigned.
     fn render_at(&mut self, pane_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
-        let columns = columns(pane_width, self.graph_width);
+        let columns = columns(
+            pane_width,
+            self.graph_width,
+            self.author_width,
+            self.date_width,
+            self.hash_width,
+        );
         // The virtualized rows are painted after this and must agree with the
         // header.
         self.columns = columns;
@@ -4178,7 +4382,7 @@ impl HistoryView {
                     cx.propagate();
                 }
             }))
-            .child(self.render_header(columns, cx))
+            .child(self.render_header(columns, pane_width, cx))
             .children(self.render_branch_bar(cx))
             .child(body)
             .into_any_element()
@@ -5132,11 +5336,22 @@ mod tests {
         );
     }
 
+    /// The table for `pane_width` with every column at its default width.
+    fn default_columns(pane_width: f32) -> Columns {
+        columns(
+            pane_width,
+            GRAPH_WIDTH_DEFAULT,
+            AUTHOR_WIDTH_DEFAULT,
+            DATE_WIDTH_DEFAULT,
+            HASH_WIDTH_DEFAULT,
+        )
+    }
+
     #[test]
     fn summary_width_subtracts_the_fixed_columns_and_gaps() {
-        let wide = columns(1200., GRAPH_WIDTH_DEFAULT);
+        let wide = default_columns(1200.);
         assert_eq!(summary_width(1200., wide), 674.);
-        let medium = columns(560., GRAPH_WIDTH_DEFAULT);
+        let medium = default_columns(560.);
         assert_eq!(
             summary_width(560., medium),
             560. - 2. * SIDE_MARGIN
@@ -5154,46 +5369,110 @@ mod tests {
 
     #[test]
     fn columns_drop_the_wide_columns_at_the_container_queries() {
-        // 560 px is the design's first breakpoint: Hash goes, Author and Date
-        // take their narrow widths; the default graph width still fits.
-        let medium = columns(560., GRAPH_WIDTH_DEFAULT);
+        // 560 px is the design's first breakpoint: Hash goes; the saved Author
+        // and Date widths stay.
+        let medium = default_columns(560.);
         assert_eq!(medium.hash, None);
-        assert_eq!(medium.author, Some(COL_AUTHOR_NARROW));
-        assert_eq!(medium.date, COL_DATE_NARROW);
+        assert_eq!(medium.author, Some(AUTHOR_WIDTH_DEFAULT));
+        assert_eq!(medium.date, DATE_WIDTH_DEFAULT);
         assert_eq!(medium.graph, GRAPH_WIDTH_DEFAULT);
 
         // 460 px is the second: Author goes too.
-        let narrow = columns(460., GRAPH_WIDTH_DEFAULT);
+        let narrow = default_columns(460.);
         assert_eq!(narrow.hash, None);
         assert_eq!(narrow.author, None);
-        assert_eq!(narrow.date, COL_DATE_NARROW);
+        assert_eq!(narrow.date, DATE_WIDTH_DEFAULT);
         assert_eq!(narrow.graph, GRAPH_WIDTH_DEFAULT);
 
         // A wide pane keeps all five columns.
-        let wide = columns(1200., GRAPH_WIDTH_DEFAULT);
-        assert_eq!(wide.author, Some(COL_AUTHOR));
-        assert_eq!(wide.date, COL_DATE);
-        assert_eq!(wide.hash, Some(COL_HASH));
+        let wide = default_columns(1200.);
+        assert_eq!(wide.author, Some(AUTHOR_WIDTH_DEFAULT));
+        assert_eq!(wide.date, DATE_WIDTH_DEFAULT);
+        assert_eq!(wide.hash, Some(HASH_WIDTH_DEFAULT));
     }
 
     #[test]
-    fn columns_use_the_user_graph_width_at_the_three_pane_widths() {
-        // The user width is the column width while it fits the pane's share.
-        assert_eq!(columns(1200., 400.).graph, 400.);
-        // A 300 px user width still fits the 40 % share at 560 px.
-        assert_eq!(columns(560., 200.).graph, 200.);
-        assert_eq!(columns(460., 150.).graph, 150.);
-
-        // Above 560 px the 40 % share and the 480 cap bound it.
-        assert_eq!(columns(800., 400.).graph, 320.);
-        assert_eq!(columns(1200., 9999.).graph, GRAPH_MAX_WIDE);
-        // At and below 560 / 460 the pane's share narrows it further.
-        assert_eq!(columns(560., 480.).graph, GRAPH_SHARE_MEDIUM * 560.);
-        assert_eq!(columns(460., 480.).graph, GRAPH_SHARE_NARROW * 460.);
+    fn columns_have_no_fixed_graph_max_only_the_summary_minimum() {
+        // A 400 px graph fits the pane and is used as saved.
+        assert_eq!(
+            columns(
+                1200.,
+                400.,
+                AUTHOR_WIDTH_DEFAULT,
+                DATE_WIDTH_DEFAULT,
+                HASH_WIDTH_DEFAULT
+            )
+            .graph,
+            400.
+        );
+        // 306 px is the room a 800 px pane leaves after the other columns,
+        // the gaps and the 80 px summary minimum.
+        assert_eq!(columns(800., 400., 130., 104., 64.).graph, 306.);
+        // No 480 px cap: the pane's room alone bounds the graph.
+        let huge = columns(1200., 9999., 130., 104., 64.);
+        assert_eq!(huge.graph, 706.);
+        assert!(huge.graph > 480.);
+        assert_eq!(summary_width(1200., huge), SUMMARY_MIN);
+        // At 560 / 460 the saved graph is narrowed to keep the summary room.
+        assert_eq!(columns(560., 480., 130., 104., 64.).graph, 148.);
+        assert_eq!(columns(460., 480., 130., 104., 64.).graph, 196.);
         // The 40 px floor holds whatever the file or the pane says.
-        assert_eq!(columns(1200., 1.).graph, GRAPH_MIN);
-        assert_eq!(columns(300., 480.).graph, GRAPH_SHARE_NARROW * 300.);
-        assert_eq!(columns(100., 480.).graph, GRAPH_MIN);
+        assert_eq!(columns(1200., 1., 130., 104., 64.).graph, GRAPH_MIN);
+        assert_eq!(columns(300., 480., 130., 104., 64.).graph, GRAPH_MIN);
+        // A saved width that no longer fits a shrunk window is narrowed so the
+        // summary keeps its minimum.
+        assert_eq!(
+            summary_width(600., columns(600., 112., 900., 104., 64.)),
+            SUMMARY_MIN
+        );
+    }
+
+    #[test]
+    fn every_column_respects_its_minimum() {
+        let tiny = columns(1200., 1., 1., 1., 1.);
+        assert_eq!(tiny.graph, GRAPH_MIN);
+        assert_eq!(tiny.author, Some(AUTHOR_WIDTH_MIN));
+        assert_eq!(tiny.date, DATE_WIDTH_MIN);
+        assert_eq!(tiny.hash, Some(HASH_WIDTH_MIN));
+    }
+
+    #[test]
+    fn a_dragged_column_may_not_squeeze_the_summary_below_its_minimum() {
+        let wide = default_columns(1200.);
+        // Each column may grow until only the 80 px summary minimum is left.
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Graph, 9999., 1200., wide),
+            706.
+        );
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Author, 9999., 1200., wide),
+            724.
+        );
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Date, 9999., 1200., wide),
+            698.
+        );
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Hash, 9999., 1200., wide),
+            658.
+        );
+        // Each column also stops at its own minimum.
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Graph, 0., 1200., wide),
+            GRAPH_MIN
+        );
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Author, 0., 1200., wide),
+            AUTHOR_WIDTH_MIN
+        );
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Date, 0., 1200., wide),
+            DATE_WIDTH_MIN
+        );
+        assert_eq!(
+            clamp_column_width(ResizeColumn::Hash, 0., 1200., wide),
+            HASH_WIDTH_MIN
+        );
     }
 
     #[test]
@@ -5224,7 +5503,7 @@ mod tests {
 
     #[test]
     fn skeleton_widths_are_cell_percentages() {
-        let wide = columns(1200., GRAPH_WIDTH_DEFAULT);
+        let wide = default_columns(1200.);
         assert_eq!(skeleton_width(SkeletonColumn::Summary, 0, wide), px(144.));
         assert_eq!(
             skeleton_width(SkeletonColumn::Summary, 1, wide),
@@ -5233,11 +5512,11 @@ mod tests {
         assert_eq!(skeleton_width(SkeletonColumn::Author, 0, wide), px(65.));
         assert_eq!(skeleton_width(SkeletonColumn::Date, 4, wide), px(62.4));
         assert_eq!(skeleton_width(SkeletonColumn::Hash, 4, wide), px(51.2));
-        // The narrow table uses the narrow date column.
-        let narrow = columns(460., GRAPH_WIDTH_DEFAULT);
+        // The narrow table uses the saved date column without an author.
+        let narrow = default_columns(460.);
         assert_eq!(
             skeleton_width(SkeletonColumn::Date, 4, narrow),
-            px(COL_DATE_NARROW * (skeleton_percent(SkeletonColumn::Date, 4) / 100.))
+            px(DATE_WIDTH_DEFAULT * (skeleton_percent(SkeletonColumn::Date, 4) / 100.))
         );
     }
 
