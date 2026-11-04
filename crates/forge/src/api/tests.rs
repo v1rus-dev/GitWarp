@@ -865,7 +865,6 @@ fn list_releases_decodes_and_sends_github_headers() {
         .unwrap();
     assert_eq!(releases.len(), 2);
     assert_eq!(releases[0].tag_name, "v0.2.0");
-    assert_eq!(releases[0].html_url, "https://example.test/r/v0.2.0");
     assert!(!releases[0].prerelease && !releases[0].draft);
     assert!(releases[1].prerelease && releases[1].draft);
     assert_eq!(

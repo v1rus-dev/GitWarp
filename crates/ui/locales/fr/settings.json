@@ -253,7 +253,7 @@
   "settings.general.subtitle": "Démarrage, mises à jour et confirmations de sécurité. S’applique à tous les dépôts.",
   "settings.general.telemetry.desc": "Envoyés uniquement en cas de plantage. Les noms d’utilisateur et de machine sont supprimés, le dossier personnel dans les chemins devient ~.",
   "settings.general.telemetry.title": "Envoyer les rapports de plantage",
-  "settings.general.updates.desc": "GitWarp vérifie les nouvelles versions sur GitHub et vous prévient dès qu'une est publiée.",
+  "settings.general.updates.desc": "GitWarp vérifie les nouvelles versions sur GitHub et vous prévient dès qu’une est publiée.",
   "settings.general.updates.title": "Rechercher les mises à jour automatiquement",
   "settings.git.banner.bundled_title": "Git intégré inutilisable",
   "settings.git.banner.custom_title": "Ce fichier ne peut pas être utilisé comme git",

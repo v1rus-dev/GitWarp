@@ -217,7 +217,7 @@
   "settings.general.activity.title": "Показывать статистику активности",
   "settings.general.channel.beta": "Бета",
   "settings.general.channel.desc_off": "Включите проверку обновлений, чтобы выбрать канал.",
-  "settings.general.channel.desc_on": "Бета также сообщает о пре-релизных сборках, в них возможны регрессии.",
+  "settings.general.channel.desc_on": "Бета также сообщает о пререлизных сборках, в них возможны регрессии.",
   "settings.general.channel.stable": "Стабильный",
   "settings.general.channel.title": "Канал обновлений",
   "settings.general.confirm.branch.desc": "Неслитые коммиты остаются доступными через reflog в течение 30 дней.",

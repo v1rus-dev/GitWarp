@@ -1,9 +1,9 @@
 //! Per-window toast stack.
 //!
 //! Toasts are drawn by [`crate::overlay::render_overlays`] above every layer,
-//! bottom-right and newest last. Errors stay until dismissed; every other kind
-//! hides itself after five seconds, except toasts shown with
-//! [`show_persistent`], which stay whatever their kind.
+//! bottom-right and newest last. Errors stay until dismissed, and so does any
+//! toast with a button (five seconds are too short to press one); every other
+//! toast hides itself after five seconds.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -60,6 +60,15 @@ impl ToastKind {
             Self::Error => colors.error,
         }
     }
+}
+
+/// Whether a toast hides itself: not an error and without a button (the
+/// message button or any line button), which needs more than five seconds.
+fn auto_hides(kind: ToastKind, body: Option<&ToastBody>) -> bool {
+    let has_button = body.is_some_and(|body| {
+        body.action.is_some() || body.lines.iter().any(|line| line.action.is_some())
+    });
+    kind.auto_hide() && !has_button
 }
 
 /// What a toast button runs.
@@ -170,6 +179,7 @@ impl ToastQueue {
     ) -> ToastId {
         self.next_id += 1;
         let id = ToastId(self.next_id);
+        let auto_hide = auto_hides(kind, body.as_ref());
         self.entries.push(QueuedToast {
             toast: Toast {
                 id,
@@ -177,27 +187,11 @@ impl ToastQueue {
                 message: message.into(),
                 body,
             },
-            deadline: kind.auto_hide().then(|| now + TOAST_LIFETIME),
+            deadline: auto_hide.then(|| now + TOAST_LIFETIME),
             remaining: None,
             hovered: false,
             selected: false,
         });
-        id
-    }
-
-    /// [`ToastQueue::push_with`] for a toast that never auto-hides, whatever its
-    /// kind: it stays until dismissed or its button is clicked.
-    pub fn push_persistent(
-        &mut self,
-        kind: ToastKind,
-        message: impl Into<SharedString>,
-        body: Option<ToastBody>,
-        now: Instant,
-    ) -> ToastId {
-        let id = self.push_with(kind, message, body, now);
-        if let Some(entry) = self.entries.last_mut() {
-            entry.deadline = None;
-        }
         id
     }
 
@@ -313,12 +307,13 @@ pub fn show_with(
     cx: &mut App,
 ) -> ToastId {
     let now = cx.background_executor().now();
+    let auto_hide = auto_hides(kind, body.as_ref());
     let id = with_queue(window, cx, |queue| {
         queue.push_with(kind, message, body, now)
     });
     window.refresh();
 
-    if kind.auto_hide() {
+    if auto_hide {
         let window_handle = window.window_handle();
         cx.spawn(async move |cx| {
             // Poll instead of sleeping for the whole lifetime: a paused toast
@@ -338,23 +333,6 @@ pub fn show_with(
         })
         .detach();
     }
-    id
-}
-
-/// [`show_with`] for a toast that stays until dismissed or its button is
-/// clicked, whatever its kind (no hide timer is scheduled).
-pub fn show_persistent(
-    kind: ToastKind,
-    message: impl Into<SharedString>,
-    body: Option<ToastBody>,
-    window: &mut Window,
-    cx: &mut App,
-) -> ToastId {
-    let now = cx.background_executor().now();
-    let id = with_queue(window, cx, |queue| {
-        queue.push_persistent(kind, message, body, now)
-    });
-    window.refresh();
     id
 }
 
@@ -650,12 +628,29 @@ mod tests {
     }
 
     #[test]
-    fn a_persistent_info_toast_survives_expiry() {
+    fn an_info_toast_with_a_button_stays_and_one_without_expires() {
         let mut queue = ToastQueue::new();
         let now = Instant::now();
-        let id = queue.push_persistent(ToastKind::Info, "update", None, now);
-        assert!(queue.expire(now + Duration::from_secs(3600)).is_empty());
-        assert_eq!(queue.iter().next().map(|toast| toast.id), Some(id));
+        let body = ToastBody {
+            lines: Vec::new(),
+            action: Some(ToastAction::new("View release", |_, _| {})),
+        };
+        let with_button = queue.push_with(ToastKind::Info, "update", Some(body), now);
+        let line_body = ToastBody {
+            lines: vec![ToastLine {
+                ok: true,
+                text: "done".into(),
+                detail: None,
+                action: Some(ToastAction::new("Open", |_, _| {})),
+            }],
+            action: None,
+        };
+        let with_line_button = queue.push_with(ToastKind::Ok, "done", Some(line_body), now);
+        let plain = queue.push(ToastKind::Info, "fetched", now);
+        let expired = queue.expire(now + Duration::from_secs(3600));
+        assert_eq!(expired, vec![plain]);
+        let left: Vec<_> = queue.iter().map(|toast| toast.id).collect();
+        assert_eq!(left, vec![with_button, with_line_button]);
     }
 
     #[test]

@@ -5,19 +5,14 @@
 //! Anonymous: no token is ever sent.
 
 use super::{ApiError, Auth, Client};
+use crate::instance::GITHUB_API_BASE;
 use crate::ServiceKind;
 use serde::Deserialize;
-
-/// Base URL of the GitHub REST API. `Instance::api_base` yields the same value
-/// but only through a fallible `Instance::new`, which is not worth it for a
-/// fixed host.
-const GITHUB_API: &str = "https://api.github.com";
 
 /// One release as far as the update check needs it; unknown fields are ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Release {
     pub tag_name: String,
-    pub html_url: String,
     pub prerelease: bool,
     pub draft: bool,
 }
@@ -27,7 +22,7 @@ impl Client {
     /// github.com, drafts included (callers filter them). 100 so that a long
     /// run of pre-releases cannot hide the latest stable one.
     pub fn list_releases(&self, owner: &str, repo: &str) -> Result<Vec<Release>, ApiError> {
-        self.list_releases_at(GITHUB_API, owner, repo)
+        self.list_releases_at(GITHUB_API_BASE, owner, repo)
     }
 
     pub(super) fn list_releases_at(
