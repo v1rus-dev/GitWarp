@@ -635,11 +635,106 @@
     });
   };
 
+  /* ====================================================================
+     Merge / rebase (stage 12)
+     The status area is computed "when the dialog opens": init.preview is the git fact
+     (checking | clean | ff | conflicts | uptodate | diverged | failed), the chosen merge type
+     re-evaluates it (D.mergeStatus), so Fast-forward only on a diverged branch turns into a block.
+     ==================================================================== */
+  const MERGE_FILES = ['src/history/graph.rs', 'src/ui/sidebar.rs', 'src/settings/git_exec.rs', 'src/ui/toolbar.rs', 'src/ui/tree.rs', 'src/history/layout.rs', 'src/history/row.rs', 'src/settings/git_detect.rs', 'src/ui/palette.rs', 'src/changes/status.rs', 'Cargo.lock', 'docs/graph.md'];
+  const MERGE_TYPES = [['ff-if', 'Fast-forward if possible'], ['noff', 'No fast-forward'], ['ffonly', 'Fast-forward only'], ['squash', 'Squash']];
+  const MERGE_HELP = {
+    'ff-if': (h) => `Moves ${esc(h)} forward when it can, otherwise creates a merge commit.`,
+    noff: () => 'Always creates a merge commit, even when the branch could fast-forward.',
+    ffonly: (h) => `Moves ${esc(h)} forward or stops. Never creates a commit.`,
+    squash: () => 'Stages the combined changes without committing. Changes opens with the commit message prefilled.'
+  };
+  const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  /* the dialog's derived state for the current merge type: { kind } */
+  D.mergeStatus = (s) => {
+    const p = s.preview, t = s.type;
+    if (p === 'checking' || p === 'failed' || p === 'uptodate') return { kind: p };
+    if (t === 'ffonly' && (p === 'clean' || p === 'conflicts' || p === 'diverged')) return { kind: 'ffonly-diverged' };
+    if (p === 'ff') return { kind: t === 'noff' ? 'ff-noff' : t === 'squash' ? 'clean' : 'ff' };
+    if (p === 'conflicts') return { kind: 'conflicts' };
+    return { kind: 'clean' };
+  };
+  const kvRow = (label, val) => `<dt>${label}</dt><dd>${val}</dd>`;
+  D.merge = function (win, init) {
+    const st = Object.assign({ branch: 'feat/palette', head: 'main', type: 'ff-if', preview: 'clean', n: 4, files: MERGE_FILES.slice(0, 3), reason: 'git 2.37 is too old for a conflict preview', dirty: 0, expanded: false, phase: 'idle', err: '' }, init || {});
+    return D.open(win, {
+      st, width: 520, busy: (s) => s.phase === 'running',
+      onOpen: (s, api) => { if (s.preview === 'checking' && s.resolve) setTimeout(() => { if (!api.el.isConnected) return; s.preview = s.resolve; api.redraw(); }, 700); },
+      view: (s) => {
+        const run = s.phase === 'running', stt = D.mergeStatus(s), b = esc(s.branch), h = esc(s.head), nf = s.files.length;
+        let status = '', label = s.type === 'squash' ? 'Squash' : 'Merge', dis = false, hint = '';
+        if (stt.kind === 'checking') status = `<div class="muted od-row" style="gap:8px;font-size:var(--fs-sm)">${ic('fetch', 14, 'spin')}<span>Checking for conflicts…</span></div>`;
+        else if (stt.kind === 'failed') status = `<div class="muted od-row" style="gap:8px;font-size:var(--fs-sm)">${ic('err', 14)}<span>Could not check for conflicts: ${esc(s.reason)}</span></div>`;
+        else if (stt.kind === 'clean') status = D.banner('ok', 'Merge can be done without conflicts', `${plural(s.n, 'commit')} from <span class="mono">${b}</span> will be merged.`);
+        else if (stt.kind === 'ff') status = D.banner('ok', `<span class="mono">${h}</span> will fast-forward to <span class="mono">${b}</span>`, 'No merge commit is needed.');
+        else if (stt.kind === 'ff-noff') status = D.banner('info', 'A merge commit will be created', `<span class="mono">${h}</span> can fast-forward to <span class="mono">${b}</span>, but No fast-forward always adds a merge commit.`);
+        else if (stt.kind === 'uptodate') { status = D.banner('info', 'Nothing to merge', `<span class="mono">${h}</span> already contains every commit of <span class="mono">${b}</span>.`); dis = true; hint = 'Nothing to merge'; }
+        else if (stt.kind === 'ffonly-diverged') { status = D.banner('warn', `<span class="mono">${h}</span> cannot fast-forward to <span class="mono">${b}</span>`, 'Both branches have new commits. Pick another merge type.'); dis = true; hint = 'Pick another merge type'; }
+        else if (stt.kind === 'conflicts') {
+          const shown = s.expanded ? s.files : s.files.slice(0, 5), more = nf - shown.length;
+          status = D.banner('warn', `Merging will cause conflicts in ${plural(nf, 'file')}`, 'GitWarp merges what it can and opens Changes, where the conflicted files wait under Conflicts.',
+            `<ul class="filelist">${shown.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>${more > 0 ? `<button type="button" class="linkbtn" data-do="more">Show ${more} more</button>` : nf > 5 ? '<button type="button" class="linkbtn" data-do="more">Show less</button>' : ''}`);
+          if (s.type !== 'squash') label = 'Merge with conflicts';
+        }
+        const local = s.dirty > 0 ? D.banner('info', `${plural(s.dirty, 'local change')} stay${s.dirty === 1 ? 's' : ''} in the work tree`, 'Git stops before touching a file that has local changes.') : '';
+        return { title: 'Merge branch', icon: 'merge', body: `<dl class="kv" style="grid-template-columns:88px minmax(0,1fr);align-items:center;gap:8px 12px">
+            ${kvRow('Merge:', `<span class="od-row" style="gap:6px">${ic('branch', 14)}<span>${b}</span></span>`)}
+            ${kvRow('Into:', `<span class="od-row" style="gap:6px">${ic('branch', 14)}<span>${h}</span><span class="chip">HEAD</span></span>`)}
+            ${kvRow('Merge type:', D.sel('type', s.type, MERGE_TYPES, run))}</dl>
+          <div class="field-help" style="margin-top:-6px">${MERGE_HELP[s.type](s.head)}</div>
+          ${status}${local}${D.rerr(s)}`,
+          foot: D.rfoot(s, label, { act: 'ok', dis, hint }) };
+      },
+      actions: {
+        more: (s) => { s.expanded = !s.expanded; },
+        ok: (s, api) => {
+          const k = D.mergeStatus(s).kind;
+          if (s.failWith) return D.fail(s, api, s.failWith);
+          if (s.type === 'squash') return D.go(s, api, `Squashed ${s.branch} into the index — commit it from Changes`);
+          if (k === 'conflicts') return D.go(s, api, `Merge stopped: ${plural(s.files.length, 'file')} ${s.files.length === 1 ? 'has' : 'have'} conflicts`, { kind: 'warn' });
+          if (k === 'ff') return D.go(s, api, `Fast-forwarded ${s.head} to ${s.branch}`);
+          return D.go(s, api, `Merged ${s.branch} into ${s.head}`);
+        }
+      }
+    });
+  };
+  D.rebase = function (win, init) {
+    const st = Object.assign({ branch: 'feat/palette', head: 'main', preview: 'clean', n: 4, dirty: 0, autostash: false, merges: false, published: false, upstream: 'origin/main', phase: 'idle', err: '' }, init || {});
+    return D.open(win, {
+      st, width: 520, busy: (s) => s.phase === 'running',
+      view: (s) => {
+        const run = s.phase === 'running', b = esc(s.branch), h = esc(s.head), blocked = s.dirty > 0 && !s.autostash, up = s.preview === 'uptodate';
+        const cs = G.commits.slice(0, Math.min(4, s.n));
+        let status = '', hint = '';
+        if (up) status = D.banner('info', 'Nothing to rebase', `<span class="mono">${h}</span> is already based on <span class="mono">${b}</span>.`);
+        else status = D.banner('info', `${plural(s.n, 'commit')} of <span class="mono">${h}</span> will be replayed onto <span class="mono">${b}</span>`, '', `<ul class="filelist oneline">${cs.map((c) => `<li><span class="hash">${c.hash}</span><span class="sum" title="${esc(c.summary)}">${esc(c.summary)}</span></li>`).join('')}${s.n > cs.length ? `<li>and ${s.n - cs.length} more</li>` : ''}</ul>`);
+        if (blocked && !up) hint = 'Commit or stash local changes first';
+        if (up) hint = 'Nothing to rebase';
+        const dirtyBn = blocked ? D.banner('warn', 'Rebase needs a clean work tree', `Commit or stash your ${plural(s.dirty, 'local change')} first, or turn on the stash option.`) : '';
+        const pub = s.published && !up ? D.banner('warn', `These commits are already on <span class="mono">${esc(s.upstream)}</span>`, 'Rebasing rewrites them; you will need to force-push.') : '';
+        return { title: 'Rebase branch', icon: 'branch', body: `<dl class="kv" style="grid-template-columns:88px minmax(0,1fr);align-items:center;gap:8px 12px">
+            ${kvRow('Rebase:', `<span class="od-row" style="gap:6px">${ic('branch', 14)}<span>${h}</span><span class="chip">HEAD</span></span>`)}
+            ${kvRow('Onto:', `<span class="od-row" style="gap:6px">${ic('branch', 14)}<span>${b}</span></span>`)}</dl>
+          <div class="od-stack" style="--od-gap:8px">
+            <div class="od-stack" style="--od-gap:2px">${D.chk('autostash', s.autostash, 'Stash local changes and reapply them afterwards', run)}<div class="field-help" style="margin-left:24px">Runs a stash before the rebase and applies it when the rebase is done.</div></div>
+            <div class="od-stack" style="--od-gap:2px">${D.chk('merges', s.merges, 'Keep merge commits', run)}<div class="field-help" style="margin-left:24px">Recreates merge commits instead of flattening them into a straight line.</div></div></div>
+          ${status}${dirtyBn}${pub}${D.rerr(s)}`,
+          foot: D.rfoot(s, 'Rebase', { act: 'ok', dis: up || blocked, hint }) };
+      },
+      actions: { ok: (s, api) => (s.failWith ? D.fail(s, api, s.failWith) : D.go(s, api, `Rebased ${s.head} onto ${s.branch}`)) }
+    });
+  };
+
   /* ---------- entry used by context menus in the main window ---------- */
   D.openIn = (kind, win) => {
     win = win || document.querySelector('.win'); if (!win) return;
     let c = G.commits[0]; const r = win.querySelector('.lrow.sel'); if (r && r.dataset.i != null && G.commits[+r.dataset.i]) c = G.commits[+r.dataset.i];
-    ({ branch: () => D.branch(win, { commit: c }), tag: () => D.tag(win, { commit: c }), worktreeAdd: () => D.worktreeAdd(win), worktreeRemove: () => D.worktreeRemove(win), remoteAdd: () => D.remoteAdd(win), remoteEdit: () => D.remoteEdit(win), renameBranch: () => D.rename(win, 'branch'), renameTag: () => D.rename(win, 'tag'), renameWorktree: () => D.rename(win, 'worktree'), reset: () => D.reset(win, { commit: c }), cherry: () => D.cherry(win, { commit: c }), revert: () => D.revert(win, { commit: c }), delBranch: () => D.del(win, 'branch'), delTag: () => D.del(win, 'tag'), delRemote: () => D.del(win, 'remote'), dropStash: () => D.del(win, 'stash'), checkout: () => D.checkout(win), clone: () => D.repo(win, { tab: 'clone' }), open: () => D.repo(win, { tab: 'open' }) })[kind]();
+    ({ branch: () => D.branch(win, { commit: c }), tag: () => D.tag(win, { commit: c }), worktreeAdd: () => D.worktreeAdd(win), worktreeRemove: () => D.worktreeRemove(win), remoteAdd: () => D.remoteAdd(win), remoteEdit: () => D.remoteEdit(win), renameBranch: () => D.rename(win, 'branch'), renameTag: () => D.rename(win, 'tag'), renameWorktree: () => D.rename(win, 'worktree'), reset: () => D.reset(win, { commit: c }), cherry: () => D.cherry(win, { commit: c }), revert: () => D.revert(win, { commit: c }), delBranch: () => D.del(win, 'branch'), delTag: () => D.del(win, 'tag'), delRemote: () => D.del(win, 'remote'), dropStash: () => D.del(win, 'stash'), checkout: () => D.checkout(win), merge: () => D.merge(win), rebase: () => D.rebase(win), clone: () => D.repo(win, { tab: 'clone' }), open: () => D.repo(win, { tab: 'open' }) })[kind]();
   };
 
   /* ---------- gallery page: one main window, a scenario switcher, the dialog on top ---------- */

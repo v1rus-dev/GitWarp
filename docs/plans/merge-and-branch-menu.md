@@ -1,7 +1,7 @@
 # Merge, rebase and branch-menu additions (from the Fork review)
 
-Status: not started. Written on a machine without the OpenDesign project, to be picked up
-on another one. The design half has to be done there first (see "Step 0").
+Status: Step 0 (design) done — `docs/design/prototype/dialogs-merge.html` and the Operation
+states of `changes.html`. Next: Step 1.
 
 ## Where we are
 

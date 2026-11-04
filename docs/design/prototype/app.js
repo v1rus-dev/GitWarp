@@ -79,7 +79,7 @@
   G.logo = (size) => `<img class="app-logo" src="assets/app-icon/${size > 32 ? 'gitwarp' : 'gitwarp-small'}.svg" width="${size}" height="${size}" alt="" style="flex:none;border-radius:${Math.round(size * 0.22)}px">`;
 
   /* ---------- stage bar (presentation only) ---------- */
-  G.PAGES = [['index.html', 'Overview'], ['tokens.html', 'Tokens'], ['components.html', 'Components'], ['graph.html', 'Graph'], ['main-1200.html', 'Main 1200×800'], ['main-1600.html', 'Main 1600×1000'], ['changes.html', 'Local changes'], ['activity.html', 'Activity'], ['settings-general.html', 'Settings'], ['settings-git.html', 'Settings → Git'], ['history-states.html', 'History states'], ['welcome.html', 'Welcome'], ['dialogs-repo.html', 'Dialogs: clone / open'], ['dialogs-ref.html', 'Dialogs: branch / tag'], ['dialogs-checkout.html', 'Dialogs: checkout'], ['dialogs-network.html', 'Dialogs: network'], ['dialogs-worktree.html', 'Worktrees'], ['worktrees.html', 'Worktrees workspace'], ['settings-ssh.html', 'Settings → SSH keys'], ['settings-accounts.html', 'Settings → Accounts'], ['dialogs-account.html', 'Dialogs: account'], ['remotes-accounts.html', 'Remotes & accounts'], ['hosting-features.html', 'Hosting features'], ['palette.html', 'Palette']];
+  G.PAGES = [['index.html', 'Overview'], ['tokens.html', 'Tokens'], ['components.html', 'Components'], ['graph.html', 'Graph'], ['main-1200.html', 'Main 1200×800'], ['main-1600.html', 'Main 1600×1000'], ['changes.html', 'Local changes'], ['activity.html', 'Activity'], ['settings-general.html', 'Settings'], ['settings-git.html', 'Settings → Git'], ['history-states.html', 'History states'], ['welcome.html', 'Welcome'], ['dialogs-repo.html', 'Dialogs: clone / open'], ['dialogs-ref.html', 'Dialogs: branch / tag'], ['dialogs-checkout.html', 'Dialogs: checkout'], ['dialogs-merge.html', 'Dialogs: merge'], ['dialogs-network.html', 'Dialogs: network'], ['dialogs-worktree.html', 'Worktrees'], ['worktrees.html', 'Worktrees workspace'], ['settings-ssh.html', 'Settings → SSH keys'], ['settings-accounts.html', 'Settings → Accounts'], ['dialogs-account.html', 'Dialogs: account'], ['remotes-accounts.html', 'Remotes & accounts'], ['hosting-features.html', 'Hosting features'], ['palette.html', 'Palette']];
   G.stagebar = function (extra) {
     const cur = location.pathname.split('/').pop() || 'index.html';
     const bar = G.h(`<header class="stagebar"><span class="brand">${G.logo(16)} GitWarp <span class="muted" style="font-weight:400">design</span></span>${G.PAGES.map(([h, l]) => `<a class="nav" href="${h}"${h === cur ? ' aria-current="page"' : ''}>${l}</a>`).join('')}<span class="od-fill"></span>${extra || ''}<button class="btn btn-sm" id="gl-theme" aria-label="Switch theme"></button></header>`);
@@ -366,7 +366,7 @@
   };
 
   /* ---------- shared repository state (design prototype: stands in for the app's repo model) ---------- */
-  G.state = { head: 'main', detached: null, dirty: false, dirtyCount: 6, branches: 'loaded', bgfetch: true, remotes: ['main', 'feat/idle-lanes', 'fix/git-detect'] };
+  G.state = { head: 'main', detached: null, dirty: false, dirtyCount: 6, behind: { 'feat/palette': 2 }, branches: 'loaded', bgfetch: true, remotes: ['main', 'feat/idle-lanes', 'fix/git-detect'] };
   G.commits.forEach((c) => { c.base = c.refs.map((r) => Object.assign({}, r)); });
   /* move HEAD: {branch} checks a local branch out, {commit} detaches at a commit. The badges, toolbar label, sidebar marker and row menus follow. */
   G.applyHead = function (spec) {
@@ -382,7 +382,7 @@
   G.headName = () => G.state.head || 'HEAD';
 
   /* Dialog hand-off: opens the matching dialog from dialogs.js when it exists; the dialog designs live in dialogs-ref / dialogs-checkout / dialogs-worktree / dialogs-network. */
-  const DLG = { branch: 'Create branch here', tag: 'Create tag here', renameBranch: 'Rename branch', deleteBranch: 'Delete branch', renameTag: 'Rename tag', deleteTag: 'Delete tag', dropStash: 'Drop stash', deleteRemoteBranch: 'Delete remote branch', cherryPick: 'Cherry-pick commit', revert: 'Revert commit', reset: 'Reset branch to here', editRemote: 'Edit remote', removeRemote: 'Remove remote', renameWorktree: 'Rename worktree', checkout: 'Uncommitted changes before checkout' };
+  const DLG = { branch: 'Create branch here', tag: 'Create tag here', renameBranch: 'Rename branch', deleteBranch: 'Delete branch', renameTag: 'Rename tag', deleteTag: 'Delete tag', dropStash: 'Drop stash', deleteRemoteBranch: 'Delete remote branch', cherryPick: 'Cherry-pick commit', revert: 'Revert commit', reset: 'Reset branch to here', editRemote: 'Edit remote', removeRemote: 'Remove remote', renameWorktree: 'Rename worktree', checkout: 'Uncommitted changes before checkout', merge: 'Merge branch', rebase: 'Rebase branch' };
   G.act = function (win, name, arg) {
     const D = window.GLD; if (!D) return G.toast(win, `Opens the “${DLG[name] || name}” dialog — see dialogs-ref.html`, 'info');
     const br = G.headName();
@@ -398,7 +398,10 @@
       deleteRemoteBranch: () => { const i = arg.indexOf('/'); D.confirmRemoteBranch(win, { remote: arg.slice(0, i), branch: arg.slice(i + 1) }); },
       cherryPick: () => D.cherry(win, { commit: arg, branch: br }),
       revert: () => D.revert(win, { commit: arg, branch: br }),
-      reset: () => D.reset(win, { commit: arg, branch: br })
+      reset: () => D.reset(win, { commit: arg, branch: br }),
+      /* sample previews per branch, resolved after a short "Checking…" like the app does when the dialog opens */
+      merge: () => D.merge(win, { branch: arg, head: br, preview: 'checking', resolve: ({ 'feat/idle-lanes': 'conflicts', 'origin/fix/git-detect': 'ff' })[arg] || 'clean', dirty: G.state.dirty ? G.state.dirtyCount : 0 }),
+      rebase: () => D.rebase(win, { branch: arg, head: br, dirty: G.state.dirty ? G.state.dirtyCount : 0 })
     };
     if (m[name]) return m[name]();
     G.toast(win, `Opens the “${DLG[name] || name}” dialog — see dialogs-ref.html`, 'info');
@@ -527,7 +530,8 @@
        1 branch on the commit: the action names it. 2 or more: "Action…" opens the picker. "Branch…" goes one step further: pick the branch, then get its full sidebar menu.
        The last-picked branch is listed first, but never acted on automatically. */
     let lastPick = null;
-    const branchMenuItems = (w, x) => (MENUS(w)[x.remote ? 'rbranch' : 'branch'](x.n));
+    /* History shows no merge / rebase for the branch HEAD stands on (the sidebar keeps them, disabled) */
+    const branchMenuItems = (w, x) => MENUS(w)[x.remote ? 'rbranch' : 'branch'](x.n).filter((it) => !(x.n === G.state.head && /^(Merge|Rebase) /.test(it.label || '')));
     function picker(c, ev, w, fl, run) {
       const back = { label: 'Back', icon: 'undo', key: '‹', onClick: () => G.menu(w, ev, rowMenu(c, ev)) };
       const list = fl.slice(); const i = list.findIndex((x) => x.n === lastPick); if (i > 0) list.unshift(list.splice(i, 1)[0]);
@@ -788,18 +792,22 @@
     branch: (n) => { const cur = n === G.state.head, h = G.headName(); return [
       { label: 'Checkout', icon: 'check', key: 'Enter', disabled: cur, onClick: () => G.checkout(win, { branch: n }) },
       { label: `Show all commits of ${n}`, icon: 'branch', onClick: () => document.dispatchEvent(new CustomEvent('gl-branch-filter', { detail: { win, branch: n } })) },
-      { label: `Merge ${n} into ${h}`, icon: 'branch', disabled: true },
-      { label: `Rebase ${h} onto ${n}`, icon: 'branch', disabled: true },
+      /* merge / rebase need a branch to stand on: disabled for HEAD itself and while HEAD is detached */
+      { label: `Merge ${n} into ${h}…`, icon: 'merge', disabled: cur || !!G.state.detached, onClick: () => G.act(win, 'merge', n) },
+      { label: `Rebase ${h} onto ${n}…`, icon: 'branch', disabled: cur || !!G.state.detached, onClick: () => G.act(win, 'rebase', n) },
+      /* fast-forward is enabled only for a branch that is behind its upstream (sample data: feat/palette ↓2) */
+      { label: `Fast-forward ${n} to origin/${n}`, icon: 'down', disabled: !(G.state.behind || {})[n], onClick: () => G.toast(win, `Fast-forwarded ${n} to origin/${n}`, 'ok') },
       { sep: 1 },
       { label: 'Rename…', icon: 'edit', key: 'F2', onClick: () => G.act(win, 'renameBranch', n) },
       { label: 'Set upstream', icon: 'link', onClick: () => (G.state.remotes.includes(n) ? G.toast(win, `${n} now tracks origin/${n}`, 'ok') : G.toast(win, `There is no origin/${n} yet. Push ${n} first to create it.`, 'error')) },
+      { label: `Push ${n} to origin…`, icon: 'up', onClick: () => G.toast(win, `Pushed ${n} to origin`, 'ok') },
       { label: 'Delete branch', icon: 'trash', key: 'Del', danger: 1, disabled: cur, onClick: () => G.act(win, 'deleteBranch', n) },
       { sep: 1 },
       { label: 'Copy branch name', icon: 'copy', onClick: () => { try { navigator.clipboard.writeText(n); } catch (e) {} } }]; },
     rbranch: (n) => [
       { label: 'Checkout as local branch', icon: 'check', onClick: () => G.checkout(win, { remote: n }) },
       { label: `Show all commits of ${n}`, icon: 'branch', onClick: () => document.dispatchEvent(new CustomEvent('gl-branch-filter', { detail: { win, branch: n } })) },
-      { label: `Merge ${n} into ${G.headName()}`, icon: 'branch', disabled: true },
+      { label: `Merge ${n} into ${G.headName()}…`, icon: 'merge', disabled: !!G.state.detached, onClick: () => G.act(win, 'merge', n) },
       { sep: 1 },
       { label: 'Delete remote branch…', icon: 'trash', danger: 1, onClick: () => G.act(win, 'deleteRemoteBranch', n) },
       { label: 'Copy branch name', icon: 'copy', onClick: () => { try { navigator.clipboard.writeText(n); } catch (e) {} } }],
@@ -846,6 +854,7 @@
       { label: 'Prune missing worktrees', icon: 'trash', onClick: () => G.toast(win, 'Pruned stale worktree records', 'ok') },
       { label: 'Refresh list', icon: 'fetch' }]
   });
+  G.MENUS = MENUS; /* gallery pages open the real branch menus from a scene */
   /* re-derive which nodes are visible from the expansion state (used after filtering) */
   function applyVis(tree) {
     let skip = null;
