@@ -3613,6 +3613,118 @@ mod tests {
         );
     }
 
+    /// Hand-editing the result: F2 opens the text area (untouched, the region
+    /// stays a pick), typing makes it a hand edit that locks the picks, Esc
+    /// stops editing without leaving the editor, Reset restores the picks,
+    /// take-all asks before replacing an edit, and save writes the edit with
+    /// the file's own line endings.
+    #[gpui::test]
+    fn the_conflict_editor_edits_the_result_by_hand(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-editor-custom");
+        let dir = repo.path();
+        git(dir, &["config", "core.autocrlf", "false"]);
+        let file = |middle: &str| format!("a\r\n{middle}\r\nb\r\n");
+        write(dir, "a.txt", file("one"));
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        write(dir, "a.txt", file("one-main"));
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", file("one-side"));
+        git(dir, &["commit", "-q", "-am", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        let outcome = Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::FastForwardIfPossible)
+            .unwrap();
+        assert!(matches!(outcome, git_core::MergeOutcome::Stopped { .. }));
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_conflict_editor("a.txt".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let editor = view.read_with(&cx, |view, _| {
+            view.editor.as_ref().expect("the editor opened").0.clone()
+        });
+        let ours = git_core::ConflictResolution::Picked(vec![ConflictSide::Ours]);
+        let custom = |text: &str| git_core::ConflictResolution::Custom(text.to_owned());
+
+        // Alt+1, then F2: the text area opens on the picked lines; opening it
+        // does not make the region a hand edit.
+        cx.simulate_keystrokes("alt-1");
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        editor.read_with(&cx, |editor, cx| {
+            assert_eq!(editor.editing(), Some(0));
+            assert_eq!(editor.resolution(0), Some(&ours));
+            assert_eq!(editor.edit_area().unwrap().read(cx).text(), "one-main");
+        });
+
+        // Typing makes the region a hand edit: resolved, picks locked.
+        let area = editor.read_with(&cx, |editor, _| editor.edit_area().unwrap());
+        area.update(&mut cx, |area, cx| area.set_text("first\nsecond", cx));
+        cx.run_until_parked();
+        editor.update(&mut cx, |editor, cx| {
+            editor.toggle_pick(0, ConflictSide::Theirs, cx)
+        });
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.resolution(0), Some(&custom("first\nsecond")));
+            assert!(editor.can_save());
+        });
+
+        // Esc in the text area only stops editing: the editor stays open and
+        // nothing asks for a confirmation.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.editing(), None);
+            assert!(!editor.confirming());
+            assert_eq!(editor.resolution(0), Some(&custom("first\nsecond")));
+        });
+        view.read_with(&cx, |view, _| assert!(view.editor.is_some()));
+
+        // Reset to picks brings the tick back.
+        editor.update(&mut cx, |editor, cx| editor.reset_picks(0, cx));
+        editor.read_with(&cx, |editor, _| {
+            assert_eq!(editor.resolution(0), Some(&ours));
+        });
+
+        // Edit again; "take theirs for all" must ask before replacing it.
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        let area = editor.read_with(&cx, |editor, _| editor.edit_area().unwrap());
+        area.update(&mut cx, |area, cx| area.set_text("hand edit", cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        editor.update(&mut cx, |editor, cx| {
+            editor.request_take_all(ConflictSide::Theirs, cx)
+        });
+        editor.read_with(&cx, |editor, _| {
+            assert!(editor.confirming());
+            assert_eq!(editor.resolution(0), Some(&custom("hand edit")));
+        });
+        // Esc is "Keep editing".
+        cx.simulate_keystrokes("escape");
+        editor.read_with(&cx, |editor, _| {
+            assert!(!editor.confirming());
+            assert_eq!(editor.resolution(0), Some(&custom("hand edit")));
+        });
+
+        // Ctrl+S saves the edit with the file's CRLF endings.
+        cx.simulate_keystrokes("secondary-s");
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "a\r\nhand edit\r\nb\r\n"
+        );
+        view.read_with(&cx, |view, _| {
+            assert!(view.editor.is_none(), "the last file closes the editor");
+            assert_eq!(view.conflicted_count(), 0);
+        });
+    }
+
     /// A conflicted squash has no `MERGE_HEAD`: it still gets the banner, the
     /// squash message prefill and an abort that works.
     #[gpui::test]

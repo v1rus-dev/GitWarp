@@ -2,9 +2,9 @@
 //!
 //! The two sides (and optionally the base) sit side by side over one shared
 //! vertical scroll; every conflict is a boxed region with a "Use these lines"
-//! checkbox per side. The result pane below is rebuilt from the picks and is
-//! read-only in this version (hand edits are `ConflictResolution::Custom`,
-//! which the state already carries and the result pane already renders).
+//! checkbox per side. The result pane below is rebuilt from the picks; a
+//! conflict region of it can be edited by hand (`ConflictResolution::Custom`):
+//! the region's rows are then reserved blank and a `TextArea` is laid over them.
 //!
 //! The first half of the file is the pure model (rows, result lines, pick
 //! toggling); the second half is the view.
@@ -17,10 +17,10 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, canvas, div, px, relative, uniform_list, AnyElement, App, Bounds, Context, Div,
-    ElementId, EventEmitter, FocusHandle, FontWeight, Hsla, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
+    actions, canvas, div, px, relative, uniform_list, AnyElement, App, AppContext, Bounds, Context,
+    Div, ElementId, Entity, EventEmitter, FocusHandle, FontWeight, Hsla, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Pixels, Render, ScrollStrategy, SharedString,
+    Stateful, StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle, Window,
 };
 
 use git_core::{
@@ -33,7 +33,7 @@ use ui::metrics::{FONT_MONO, FS_LG, FS_SM, FS_XS, R_SM};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
     Button, ButtonSize, Checkbox, Chip, ChipKind, Icon, IconName, Scrollbar, Skeleton, Switch,
-    Tooltip,
+    TextArea, TextAreaEvent, Tooltip,
 };
 
 /// Height of every row of both lists (a `uniform_list` needs one height; the
@@ -41,6 +41,10 @@ use ui::{
 const ROW: f32 = 24.;
 const GUTTER: f32 = 44.;
 const BASE_WIDTH: f32 = 260.;
+/// The line height of the result's text area and its border + padding
+/// (`ui::TextArea`: 20 px lines, 6 px padding top and bottom, 1 px border).
+const EDIT_LINE: f32 = 20.;
+const EDIT_CHROME: f32 = 14.;
 
 // ───────────────────────────── pure model ─────────────────────────────
 
@@ -184,6 +188,9 @@ pub(crate) enum ResultLine {
     Placeholder { index: usize },
     /// The body of a resolved conflict that has no lines.
     Empty { index: usize },
+    /// One reserved row of the region being hand-edited: the text area is laid
+    /// over these rows. `last` closes the conflict's box.
+    EditRow { index: usize, last: bool },
 }
 
 impl ResultLine {
@@ -284,13 +291,8 @@ pub(crate) fn result_lines(
                         }
                     }
                     Some(ConflictResolution::Custom(custom)) => {
-                        // Same splitting as `TextConflict::render`.
-                        if !custom.is_empty() {
-                            let body = custom.strip_suffix('\n').unwrap_or(custom);
-                            for line in body.split('\n') {
-                                let line = line.strip_suffix('\r').unwrap_or(line);
-                                text(&mut out, &mut no, Source::Custom(line.to_owned()), region);
-                            }
+                        for line in custom_lines(custom) {
+                            text(&mut out, &mut no, Source::Custom(line.to_owned()), region);
                         }
                     }
                 }
@@ -301,6 +303,61 @@ pub(crate) fn result_lines(
                 }
                 index += 1;
             }
+        }
+    }
+    out
+}
+
+/// The lines of a hand-edited region. Same splitting as `TextConflict::render`:
+/// a final newline is a terminator, not an extra empty line.
+fn custom_lines(custom: &str) -> Vec<&str> {
+    if custom.is_empty() {
+        return Vec::new();
+    }
+    let body = custom.strip_suffix('\n').unwrap_or(custom);
+    body.split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect()
+}
+
+/// The text a text area starts from for a region made of `lines`. A final
+/// empty line gets one more `\n`, because a single final newline would be read
+/// back as a terminator and drop that line.
+fn lines_text(lines: &[&str]) -> String {
+    let mut text = lines.join("\n");
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        text.push('\n');
+    }
+    text
+}
+
+/// The text area height of a region of `text`, in result rows (it is laid over
+/// that many reserved rows): 3 to 12 lines of the area, then it scrolls.
+pub(crate) fn edit_rows(text: &str) -> usize {
+    let lines = text.split('\n').count().clamp(3, 12);
+    let height = lines as f32 * EDIT_LINE + EDIT_CHROME;
+    (height / ROW).ceil() as usize
+}
+
+/// Replaces the body of conflict `index` (its text, placeholder or empty-note
+/// rows) by `rows` reserved edit rows.
+pub(crate) fn with_edit_rows(lines: Vec<ResultLine>, index: usize, rows: usize) -> Vec<ResultLine> {
+    let in_body = |line: &ResultLine| match line {
+        ResultLine::Text { region, .. } => *region == Some(index),
+        ResultLine::Placeholder { index: at } | ResultLine::Empty { index: at } => *at == index,
+        _ => false,
+    };
+    let mut out = Vec::with_capacity(lines.len() + rows);
+    let mut inserted = false;
+    for line in lines {
+        if !in_body(&line) {
+            out.push(line);
+        } else if !inserted {
+            inserted = true;
+            out.extend((0..rows).map(|row| ResultLine::EditRow {
+                index,
+                last: row + 1 == rows,
+            }));
         }
     }
     out
@@ -342,7 +399,7 @@ pub(crate) fn is_dirty(resolutions: &[ConflictResolution]) -> bool {
 
 /// Ticks or unticks `side`. Ticking appends to the pick order; unticking the
 /// last side makes the conflict unresolved again. A hand edit is replaced by
-/// the tick (there is no way to create one yet).
+/// the tick (the view never offers one: ticks are disabled while edited).
 pub(crate) fn toggle_pick(current: &ConflictResolution, side: ConflictSide) -> ConflictResolution {
     let mut sides = match current {
         ConflictResolution::Picked(sides) => sides.clone(),
@@ -368,6 +425,13 @@ pub(crate) fn swap_order(current: &ConflictResolution) -> ConflictResolution {
         }
         other => other.clone(),
     }
+}
+
+/// Whether any conflict is hand-edited.
+pub(crate) fn has_custom(resolutions: &[ConflictResolution]) -> bool {
+    resolutions
+        .iter()
+        .any(|r| matches!(r, ConflictResolution::Custom(_)))
 }
 
 /// Every conflict set to the single side `side`.
@@ -431,12 +495,20 @@ enum Whole {
 struct TextState {
     conflict: Arc<TextConflict>,
     ranges: Vec<(Range<usize>, Range<usize>, Range<usize>)>,
+    /// What `render` gets: the picks of each conflict, or `Custom` after a
+    /// hand edit.
     resolutions: Vec<ConflictResolution>,
+    /// The picks of each conflict (never `Custom`), kept under a hand edit so
+    /// "Reset to picks" can restore them.
+    picks: Vec<ConflictResolution>,
     rows: Vec<Row>,
     head_rows: Vec<usize>,
     result: Vec<ResultLine>,
     result_heads: Vec<usize>,
     focused: Option<usize>,
+    /// The conflict whose result region shows the text area, and the number
+    /// of result rows reserved for it.
+    editing: Option<(usize, usize)>,
 }
 
 impl TextState {
@@ -446,12 +518,14 @@ impl TextState {
         let mut state = Self {
             ranges: conflict_ranges(&conflict),
             conflict: Arc::new(conflict),
+            picks: resolutions.clone(),
             resolutions,
             rows: Vec::new(),
             head_rows: Vec::new(),
             result: Vec::new(),
             result_heads: Vec::new(),
             focused,
+            editing: None,
         };
         state.rebuild_rows(show_base);
         state.rebuild_result();
@@ -464,25 +538,124 @@ impl TextState {
     }
 
     fn rebuild_result(&mut self) {
-        self.result = result_lines(&self.conflict, &self.resolutions);
+        let lines = result_lines(&self.conflict, &self.resolutions);
+        self.result = match self.editing {
+            Some((index, rows)) => with_edit_rows(lines, index, rows),
+            None => lines,
+        };
         self.result_heads = result_heads(&self.result);
     }
 
+    /// Replaces every conflict's state (take-all): hand edits go too.
     fn set_all(&mut self, resolutions: Vec<ConflictResolution>) {
+        self.picks = resolutions.clone();
         self.resolutions = resolutions;
+        self.editing = None;
         self.rebuild_result();
     }
 
+    fn is_custom(&self, index: usize) -> bool {
+        matches!(
+            self.resolutions.get(index),
+            Some(ConflictResolution::Custom(_))
+        )
+    }
+
+    /// Ticks `side` of conflict `index`. Ignored while it is hand-edited
+    /// (the checkboxes are disabled until "Reset to picks").
     fn toggle(&mut self, index: usize, side: ConflictSide) {
-        if let Some(current) = self.resolutions.get(index) {
-            self.resolutions[index] = toggle_pick(current, side);
+        if self.is_custom(index) {
+            return;
+        }
+        if let Some(current) = self.picks.get(index) {
+            self.picks[index] = toggle_pick(current, side);
+            self.resolutions[index] = self.picks[index].clone();
             self.rebuild_result();
         }
     }
 
     fn swap(&mut self, index: usize) {
-        if let Some(current) = self.resolutions.get(index) {
-            self.resolutions[index] = swap_order(current);
+        if self.is_custom(index) {
+            return;
+        }
+        if let Some(current) = self.picks.get(index) {
+            self.picks[index] = swap_order(current);
+            self.resolutions[index] = self.picks[index].clone();
+            self.rebuild_result();
+        }
+    }
+
+    /// The lines conflict `index` renders from its picks (`None` while it has
+    /// none: an edit then has nothing to compare with).
+    fn picked_lines(&self, index: usize) -> Option<Vec<&str>> {
+        let ConflictResolution::Picked(sides) = self.picks.get(index)? else {
+            return None;
+        };
+        if sides.is_empty() {
+            return None;
+        }
+        let (_, ours, theirs) = &self.ranges[index];
+        let mut lines = Vec::new();
+        let mut seen: Vec<ConflictSide> = Vec::new();
+        for side in sides {
+            if seen.contains(side) {
+                continue;
+            }
+            seen.push(*side);
+            match side {
+                ConflictSide::Ours => {
+                    lines.extend(ours.clone().map(|ix| self.conflict.ours[ix].as_str()))
+                }
+                ConflictSide::Theirs => {
+                    lines.extend(theirs.clone().map(|ix| self.conflict.theirs[ix].as_str()))
+                }
+            }
+        }
+        Some(lines)
+    }
+
+    /// The text the text area of conflict `index` starts from: the hand edit,
+    /// else the lines of the picks (empty while unresolved).
+    fn edit_text(&self, index: usize) -> String {
+        match self.resolutions.get(index) {
+            Some(ConflictResolution::Custom(text)) => text.clone(),
+            _ => lines_text(&self.picked_lines(index).unwrap_or_default()),
+        }
+    }
+
+    /// The text area of conflict `index` now holds `text`. It becomes a hand
+    /// edit when it renders differently from the picks; an unresolved conflict
+    /// has no picks to compare with, so any change makes it one. (Entering the
+    /// edit without typing never gets here.)
+    fn apply_edit(&mut self, index: usize, text: String, rows: usize) {
+        if index >= self.resolutions.len() {
+            return;
+        }
+        self.editing = Some((index, rows));
+        let same = self
+            .picked_lines(index)
+            .is_some_and(|picked| picked == custom_lines(&text));
+        self.resolutions[index] = if same {
+            self.picks[index].clone()
+        } else {
+            ConflictResolution::Custom(text)
+        };
+        self.rebuild_result();
+    }
+
+    /// "Reset to picks": the picks the conflict had before the edit.
+    fn reset(&mut self, index: usize) {
+        if self.is_custom(index) {
+            self.resolutions[index] = self.picks[index].clone();
+            self.rebuild_result();
+        }
+    }
+
+    /// Reserves `rows` result rows for the text area of conflict `index`
+    /// (`None`: back to the plain rows).
+    fn set_editing(&mut self, editing: Option<(usize, usize)>) {
+        if self.editing != editing {
+            self.editing = editing;
             self.rebuild_result();
         }
     }
@@ -509,11 +682,20 @@ enum Load {
     },
 }
 
-/// Where a confirmed "discard your picks" goes.
+/// Where a confirmed "discard your picks" goes (or, for `TakeAll`, a confirmed
+/// "replace your edits too").
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Leave {
     Close,
     File(String),
+    TakeAll(ConflictSide),
+}
+
+/// The open text area of a hand-edited result region.
+struct EditArea {
+    index: usize,
+    area: Entity<TextArea>,
+    _subscription: Subscription,
 }
 
 /// What reaches the repository on save.
@@ -538,7 +720,8 @@ actions!(
         NextConflict,
         PickOurs,
         PickTheirs,
-        SaveResolution
+        SaveResolution,
+        EditResult
     ]
 );
 
@@ -551,6 +734,15 @@ pub fn bind_keys(cx: &mut App) {
         key_binding(cx, "alt-1", PickOurs, editor),
         key_binding(cx, "alt-2", PickTheirs, editor),
         key_binding(cx, "secondary-s", SaveResolution, editor),
+        key_binding(cx, "f2", EditResult, editor),
+        // Enter belongs to the focused button / checkbox / text area when
+        // there is one; only the editor itself takes it as "edit the result".
+        key_binding(
+            cx,
+            "enter",
+            EditResult,
+            Some("conflict-editor && !ui-button && !ui-checkbox && !ui-switch && !TextArea"),
+        ),
     ]);
 }
 
@@ -566,6 +758,8 @@ pub(crate) struct ConflictEditor {
     generation: u64,
     show_base: bool,
     confirm: Option<Leave>,
+    /// The result region being edited by hand, if any.
+    edit: Option<EditArea>,
     /// A save is running (or its status refresh is pending).
     saving: bool,
     focus: FocusHandle,
@@ -598,6 +792,7 @@ impl ConflictEditor {
             generation: 0,
             show_base: false,
             confirm: None,
+            edit: None,
             saving: false,
             focus: cx.focus_handle().tab_stop(true),
             needs_focus: true,
@@ -639,6 +834,18 @@ impl ConflictEditor {
         self.confirm.is_some()
     }
 
+    /// The conflict whose result region has the text area open.
+    #[cfg(test)]
+    pub(crate) fn editing(&self) -> Option<usize> {
+        self.edit.as_ref().map(|edit| edit.index)
+    }
+
+    /// The text area of the region being edited.
+    #[cfg(test)]
+    pub(crate) fn edit_area(&self) -> Option<Entity<TextArea>> {
+        self.edit.as_ref().map(|edit| edit.area.clone())
+    }
+
     fn side_label(&self, side: ConflictSide) -> &str {
         match side {
             ConflictSide::Ours => &self.ours_label,
@@ -651,6 +858,7 @@ impl ConflictEditor {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.load = Load::Loading;
+        self.edit = None;
         self.top_scroll = UniformListScrollHandle::new();
         self.result_scroll = UniformListScrollHandle::new();
         let (git, root, path) = (self.git.clone(), self.root.clone(), self.path.clone());
@@ -766,8 +974,20 @@ impl ConflictEditor {
     pub(crate) fn toggle_pick(&mut self, index: usize, side: ConflictSide, cx: &mut Context<Self>) {
         if let Load::Text(state) = &mut self.load {
             state.focused = Some(index);
-            state.toggle(index, side);
+            // A hand edit keeps its text until "Reset to picks".
+            if !state.is_custom(index) {
+                state.toggle(index, side);
+                self.close_edit_of(index);
+            }
             cx.notify();
+        }
+    }
+
+    /// Drops the open text area when it belongs to conflict `index` (its
+    /// text would no longer match the region).
+    fn close_edit_of(&mut self, index: usize) {
+        if self.edit.as_ref().is_some_and(|edit| edit.index == index) {
+            self.stop_edit();
         }
     }
 
@@ -782,7 +1002,20 @@ impl ConflictEditor {
     fn swap_pick(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Load::Text(state) = &mut self.load {
             state.swap(index);
+            self.close_edit_of(index);
             cx.notify();
+        }
+    }
+
+    /// The footer's "Take {branch} for all": asks first when it would replace
+    /// hand edits.
+    pub(crate) fn request_take_all(&mut self, side: ConflictSide, cx: &mut Context<Self>) {
+        let custom = matches!(&self.load, Load::Text(state) if has_custom(&state.resolutions));
+        if custom {
+            self.confirm = Some(Leave::TakeAll(side));
+            cx.notify();
+        } else {
+            self.take_all(side, cx);
         }
     }
 
@@ -790,8 +1023,111 @@ impl ConflictEditor {
         if let Load::Text(state) = &mut self.load {
             let count = state.resolutions.len();
             state.set_all(take_all(count, side));
+            self.edit = None;
+            self.needs_focus = true;
             cx.notify();
         }
+    }
+
+    // ── hand edit of the result ──
+
+    /// Opens the text area over the result region of conflict `index`,
+    /// prefilled with what the region holds now, and focuses it.
+    fn start_edit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
+        if let Some(edit) = &self.edit {
+            if edit.index == index {
+                let handle = edit.area.read(cx).focus_handle().clone();
+                window.focus(&handle, cx);
+                return;
+            }
+        }
+        let Load::Text(state) = &mut self.load else {
+            return;
+        };
+        if index >= state.resolutions.len() {
+            return;
+        }
+        let text = state.edit_text(index);
+        let rows = edit_rows(&text);
+        let placeholder = ui::t!("changes.editor.edit_placeholder");
+        let area = cx.new(|cx| {
+            let mut area = TextArea::new(window, cx);
+            area.set_text(text, cx);
+            area.set_placeholder(placeholder, cx);
+            area.set_height(px(rows as f32 * ROW), cx);
+            area
+        });
+        let subscription = cx.subscribe(&area, move |editor, area, event: &TextAreaEvent, cx| {
+            let TextAreaEvent::Changed(text) = event;
+            editor.edit_changed(index, text.clone(), &area, cx);
+        });
+        state.focused = Some(index);
+        state.set_editing(Some((index, rows)));
+        if let Some(row) = state.result_heads.get(index) {
+            self.result_scroll
+                .scroll_to_item_strict(*row, ScrollStrategy::Top);
+        }
+        let handle = area.read(cx).focus_handle().clone();
+        window.focus(&handle, cx);
+        self.edit = Some(EditArea {
+            index,
+            area,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// F2 / Enter: edits the focused conflict's result.
+    fn edit_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = match &self.load {
+            Load::Text(state) => state.focused,
+            _ => None,
+        };
+        if let Some(index) = focused {
+            self.start_edit(index, window, cx);
+        }
+    }
+
+    /// The text area of conflict `index` changed: the region becomes (or stops
+    /// being) a hand edit, and its reserved rows follow the text height.
+    fn edit_changed(
+        &mut self,
+        index: usize,
+        text: String,
+        area: &Entity<TextArea>,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = edit_rows(&text);
+        if let Load::Text(state) = &mut self.load {
+            state.apply_edit(index, text, rows);
+        }
+        area.update(cx, |area, cx| area.set_height(px(rows as f32 * ROW), cx));
+        cx.notify();
+    }
+
+    /// Closes the text area; the region keeps what was typed. The editor
+    /// takes the focus back on the next frame.
+    fn stop_edit(&mut self) {
+        if self.edit.take().is_some() {
+            if let Load::Text(state) = &mut self.load {
+                state.set_editing(None);
+            }
+            self.needs_focus = true;
+        }
+    }
+
+    /// "Reset to picks": the conflict goes back to the picks it had before it
+    /// was edited by hand.
+    pub(crate) fn reset_picks(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.close_edit_of(index);
+        if let Load::Text(state) = &mut self.load {
+            state.focused = Some(index);
+            state.reset(index);
+        }
+        cx.notify();
     }
 
     fn choose(&mut self, side: ConflictSide, cx: &mut Context<Self>) {
@@ -821,6 +1157,8 @@ impl ConflictEditor {
     /// Alt+↑ / Alt+↓: focuses the neighbouring conflict and scrolls it into
     /// view in both panes.
     fn step_conflict(&mut self, delta: isize, cx: &mut Context<Self>) {
+        // Moving on leaves the text area (its region keeps what was typed).
+        self.stop_edit();
         let Load::Text(state) = &mut self.load else {
             return;
         };
@@ -864,6 +1202,10 @@ impl ConflictEditor {
         match leave {
             Leave::Close => cx.emit(EditorEvent::Close),
             Leave::File(path) => self.open_file(path, cx),
+            Leave::TakeAll(side) => {
+                self.confirm = None;
+                self.take_all(side, cx);
+            }
         }
     }
 
@@ -878,9 +1220,13 @@ impl ConflictEditor {
         }
     }
 
-    /// Esc / Cancel: dismisses the confirm, else leaves.
+    /// Esc / Cancel: stops editing by hand, else dismisses the confirm, else leaves.
     pub(crate) fn cancel(&mut self, cx: &mut Context<Self>) {
-        if self.confirm.is_some() {
+        if self.edit.is_some() {
+            // Esc in the text area only stops the editing.
+            self.stop_edit();
+            cx.notify();
+        } else if self.confirm.is_some() {
             self.confirm = None;
             cx.notify();
         } else {
@@ -1377,6 +1723,7 @@ impl ConflictEditor {
             let resolution = &state.resolutions[index];
             let (_, ours, theirs) = &state.ranges[index];
             let unresolved = is_unresolved(resolution);
+            let custom = matches!(resolution, ConflictResolution::Custom(_));
             let side_head = |side: ConflictSide, lines: usize, shell: Div| {
                 let view = view.clone();
                 let order = pick_order(resolution, side);
@@ -1399,6 +1746,8 @@ impl ConflictEditor {
                         Checkbox::new(format!("cfe-pick-{index}-{side:?}"))
                             .label(ui::t!("changes.editor.use_lines"))
                             .checked(is_picked(resolution, side))
+                            // A hand edit locks the picks until "Reset to picks".
+                            .disabled(custom)
                             .on_toggle(move |_, _, cx| {
                                 view.update(cx, |editor, cx| editor.toggle_pick(index, side, cx));
                             }),
@@ -1409,6 +1758,14 @@ impl ConflictEditor {
                             .text_color(colors.muted)
                             .child(ui::i18n::t_count("changes.editor.lines", lines as u64, &[])),
                     );
+                if custom && side == ConflictSide::Ours {
+                    cell = cell.child(
+                        div()
+                            .flex_none()
+                            .text_color(colors.muted)
+                            .child(ui::t!("changes.editor.edited_in_result")),
+                    );
+                }
                 if let Some(order) = order {
                     cell = cell.child(
                         div()
@@ -1462,6 +1819,22 @@ impl ConflictEditor {
                     )
                     .kind(ChipKind::Warn),
                 );
+            } else if custom {
+                let reset_view = view.clone();
+                theirs_cell = theirs_cell
+                    .child(div().flex_1())
+                    .child(Chip::new(
+                        SharedString::from(format!("cfe-side-edited-{index}")),
+                        ui::t!("changes.editor.edited"),
+                    ))
+                    .child(
+                        Button::ghost(format!("cfe-side-reset-{index}"))
+                            .size(ButtonSize::Xs)
+                            .label(ui::t!("changes.editor.reset_picks"))
+                            .on_click(move |_, _, cx| {
+                                reset_view.update(cx, |editor, cx| editor.reset_picks(index, cx));
+                            }),
+                    );
             }
             cells.push(boxed(theirs_cell, Some(style), colors));
             return shell.children(cells).into_any_element();
@@ -1540,7 +1913,8 @@ impl ConflictEditor {
             ResultLine::Text { region, .. } => *region,
             ResultLine::Head { index }
             | ResultLine::Placeholder { index }
-            | ResultLine::Empty { index } => Some(*index),
+            | ResultLine::Empty { index }
+            | ResultLine::EditRow { index, .. } => Some(*index),
             ResultLine::AutoLabel { .. } => None,
         };
         let style = region.map(|index| {
@@ -1552,7 +1926,10 @@ impl ConflictEditor {
                 bottom: matches!(
                     line,
                     ResultLine::Placeholder { .. } | ResultLine::Empty { .. }
-                ) || matches!(line, ResultLine::Text { last: true, .. }),
+                ) || matches!(
+                    line,
+                    ResultLine::Text { last: true, .. } | ResultLine::EditRow { last: true, .. }
+                ),
             }
         });
         let shell = div()
@@ -1572,6 +1949,17 @@ impl ConflictEditor {
             this.on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |editor, _, _, cx| editor.focus_conflict(index, cx)),
+            )
+        });
+        // A click on the body of a region (not its header) edits it by hand.
+        let body_of = match line {
+            ResultLine::Text { region, .. } => *region,
+            ResultLine::Placeholder { index } | ResultLine::Empty { index } => Some(*index),
+            _ => None,
+        };
+        let shell = shell.when_some(body_of, |this, index| {
+            this.cursor_text().on_click(
+                cx.listener(move |editor, _, window, cx| editor.start_edit(index, window, cx)),
             )
         });
         let gutter = |no: Option<usize>| {
@@ -1631,6 +2019,10 @@ impl ConflictEditor {
                         .child(ui::t!("changes.editor.pick_a_side")),
                 )
                 .into_any_element(),
+            // Blank: the text area is laid over these rows (see `render_text`).
+            ResultLine::EditRow { .. } => {
+                shell.bg(colors.bg).child(gutter(None)).into_any_element()
+            }
             ResultLine::Empty { .. } => shell
                 .child(gutter(None))
                 .child(
@@ -1661,6 +2053,8 @@ impl ConflictEditor {
                     ChipKind::None
                 };
                 let swap_view = view.clone();
+                let (edit_view, reset_view) = (view.clone(), view.clone());
+                let custom = matches!(resolution, ConflictResolution::Custom(_));
                 shell
                     .bg(colors.surface)
                     .px(px(12.))
@@ -1690,9 +2084,59 @@ impl ConflictEditor {
                                 }),
                         )
                     })
+                    .child(div().flex_1())
+                    .when(custom, |this| {
+                        this.child(
+                            Button::ghost(format!("cfe-reset-{index}"))
+                                .size(ButtonSize::Xs)
+                                .label(ui::t!("changes.editor.reset_picks"))
+                                .on_click(move |_, _, cx| {
+                                    reset_view
+                                        .update(cx, |editor, cx| editor.reset_picks(index, cx));
+                                }),
+                        )
+                    })
+                    .child(
+                        Button::ghost(format!("cfe-edit-{index}"))
+                            .size(ButtonSize::Xs)
+                            .icon_only(IconName::Edit)
+                            .tooltip_kbd(ui::t!("changes.editor.edit"), "F2")
+                            .on_click(move |_, window, cx| {
+                                edit_view
+                                    .update(cx, |editor, cx| editor.start_edit(index, window, cx));
+                            }),
+                    )
                     .into_any_element()
             }
         }
+    }
+
+    /// The text area over the reserved rows of the region being edited.
+    fn render_edit_area(&self, state: &TextState, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let edit = self.edit.as_ref()?;
+        let (_, rows) = state.editing?;
+        let first = state
+            .result
+            .iter()
+            .position(|line| matches!(line, ResultLine::EditRow { .. }))?;
+        let offset = self.result_scroll.0.borrow().base_handle.offset().y;
+        let top = offset + px(first as f32 * ROW);
+        Some(
+            div()
+                .id("cfe-edit-area")
+                .absolute()
+                .left(px(GUTTER + 2.))
+                .right(px(2.))
+                .top(top)
+                .h(px(rows as f32 * ROW))
+                .occlude()
+                .on_mouse_down_out(cx.listener(|editor, _, _, cx| {
+                    editor.stop_edit();
+                    cx.notify();
+                }))
+                .child(edit.area.clone())
+                .into_any_element(),
+        )
     }
 
     /// The side panes and the result pane of a text conflict.
@@ -1773,9 +2217,30 @@ impl ConflictEditor {
                                 ui::i18n::t_count("changes.editor.lines", lines as u64, &[])
                             ))),
                     )
-                    .child(div().flex_1().min_h_0().flex().child(result).child(
-                        Scrollbar::uniform("cfe-result-bar", self.result_scroll.clone()),
-                    )),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .child(
+                                // The text area of a hand edit is laid over the
+                                // rows reserved for it, at the list's scroll offset.
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .flex()
+                                    .flex_col()
+                                    .overflow_hidden()
+                                    .child(result)
+                                    .children(self.render_edit_area(state, cx)),
+                            )
+                            .child(Scrollbar::uniform(
+                                "cfe-result-bar",
+                                self.result_scroll.clone(),
+                            )),
+                    ),
             )
     }
 
@@ -1977,13 +2442,23 @@ impl ConflictEditor {
 
         if let Some(leave) = self.confirm.clone() {
             let (discard_view, keep_view) = (view.clone(), view);
+            let (ask, discard) = match leave {
+                Leave::TakeAll(_) => (
+                    ui::t!("changes.editor.replace_ask"),
+                    ui::t!("changes.editor.replace"),
+                ),
+                _ => (
+                    ui::t!("changes.editor.discard_ask", path = self.path),
+                    ui::t!("changes.editor.discard"),
+                ),
+            };
             return bar
                 .child(Icon::new(IconName::Warn).color(colors.warning))
-                .child(ui::t!("changes.editor.discard_ask", path = self.path))
+                .child(ask)
                 .child(div().flex_1())
                 .child(
                     Button::danger("cfe-discard")
-                        .label(ui::t!("changes.editor.discard"))
+                        .label(discard)
                         .on_click(move |_, _, cx| {
                             discard_view.update(cx, |editor, cx| editor.leave(leave.clone(), cx));
                         }),
@@ -2071,7 +2546,7 @@ impl ConflictEditor {
                                         .action(
                                             move |_, cx| {
                                                 view.update(cx, |editor, cx| {
-                                                    editor.take_all(side, cx)
+                                                    editor.request_take_all(side, cx)
                                                 });
                                             },
                                         ),
@@ -2161,6 +2636,9 @@ impl Render for ConflictEditor {
                 editor.toggle_focused(ConflictSide::Theirs, cx)
             }))
             .on_action(cx.listener(|editor, _: &SaveResolution, _, cx| editor.save(cx)))
+            .on_action(
+                cx.listener(|editor, _: &EditResult, window, cx| editor.edit_focused(window, cx)),
+            )
             .on_action(cx.listener(|editor, _: &Cancel, _, cx| editor.cancel(cx)))
             .child(self.render_header(cx))
             .child(body)
@@ -2352,6 +2830,7 @@ mod tests {
                     ResultLine::Head { index } => format!("h{index}"),
                     ResultLine::Placeholder { index } => format!("p{index}"),
                     ResultLine::Empty { index } => format!("e{index}"),
+                    ResultLine::EditRow { index, .. } => format!("w{index}"),
                 })
                 .collect::<Vec<_>>(),
             ["t1", "h0", "p0", "auto", "t2", "t3", "h1", "p1"]
@@ -2511,5 +2990,197 @@ mod tests {
             .result
             .iter()
             .all(|l| !matches!(l, ResultLine::Placeholder { .. })));
+    }
+
+    fn picked(side: ConflictSide) -> ConflictResolution {
+        ConflictResolution::Picked(vec![side])
+    }
+
+    #[test]
+    fn a_text_area_edit_that_renders_like_the_picks_is_not_custom() {
+        let mut state = TextState::new(sample(), false);
+        state.toggle(0, ConflictSide::Ours);
+        assert_eq!(state.edit_text(0), "x1\nx2");
+        // Entering the edit changes nothing; the same text, with or without
+        // the terminating newline, is still the picks.
+        state.apply_edit(0, "x1\nx2".into(), 4);
+        assert_eq!(state.resolutions[0], picked(ConflictSide::Ours));
+        state.apply_edit(0, "x1\nx2\n".into(), 4);
+        assert_eq!(state.resolutions[0], picked(ConflictSide::Ours));
+        state.apply_edit(0, "x1\nz".into(), 4);
+        assert_eq!(
+            state.resolutions[0],
+            ConflictResolution::Custom("x1\nz".into())
+        );
+        // Typing the text back ends the hand edit.
+        state.apply_edit(0, "x1\nx2".into(), 4);
+        assert_eq!(state.resolutions[0], picked(ConflictSide::Ours));
+    }
+
+    #[test]
+    fn reset_restores_the_picks_the_conflict_had_before_the_edit() {
+        let mut state = TextState::new(sample(), false);
+        state.toggle(0, ConflictSide::Theirs);
+        state.toggle(0, ConflictSide::Ours);
+        state.apply_edit(0, "hand".into(), 4);
+        assert!(state.is_custom(0));
+        // The picks are locked while edited.
+        state.toggle(0, ConflictSide::Ours);
+        state.swap(0);
+        assert_eq!(
+            state.resolutions[0],
+            ConflictResolution::Custom("hand".into())
+        );
+        assert_eq!(state.edit_text(0), "hand");
+        // (While the text area is open the region's rows are reserved blank.)
+        state.set_editing(None);
+        assert!(state
+            .result
+            .iter()
+            .any(|l| l.text(&state.conflict) == Some("hand")));
+        state.reset(0);
+        assert_eq!(
+            state.resolutions[0],
+            ConflictResolution::Picked(vec![ConflictSide::Theirs, ConflictSide::Ours])
+        );
+        // A conflict that was unresolved goes back to unresolved.
+        state.apply_edit(1, "typed".into(), 4);
+        assert!(state.is_custom(1));
+        state.reset(1);
+        assert_eq!(state.resolutions[1], ConflictResolution::Unresolved);
+        // Reset of a conflict that is not edited does nothing.
+        state.reset(1);
+        assert_eq!(state.resolutions[1], ConflictResolution::Unresolved);
+    }
+
+    #[test]
+    fn an_empty_hand_edit_resolves_and_deletes_the_region() {
+        let mut state = TextState::new(sample(), false);
+        state.apply_edit(0, "kept".into(), 4);
+        assert!(!can_save(&state.resolutions));
+        assert_eq!(state.edit_text(1), "");
+        // The unresolved conflict has nothing to compare with: any change is
+        // an edit, and an empty one is allowed.
+        state.apply_edit(1, String::new(), 4);
+        assert_eq!(
+            state.resolutions[1],
+            ConflictResolution::Custom(String::new())
+        );
+        assert!(can_save(&state.resolutions));
+        assert!(is_dirty(&state.resolutions));
+        assert_eq!(
+            state.conflict.render(&state.resolutions).unwrap(),
+            "a\nkept\nC\ns\n"
+        );
+    }
+
+    #[test]
+    fn a_hand_edit_alone_makes_the_file_dirty() {
+        assert!(is_dirty(&[
+            ConflictResolution::Unresolved,
+            ConflictResolution::Custom(String::new())
+        ]));
+        assert!(has_custom(&[
+            ConflictResolution::Unresolved,
+            ConflictResolution::Custom("x".into())
+        ]));
+        assert!(!has_custom(&[
+            ConflictResolution::Unresolved,
+            picked(ConflictSide::Ours)
+        ]));
+    }
+
+    #[test]
+    fn take_all_replaces_hand_edits_and_forgets_their_picks() {
+        let mut state = TextState::new(sample(), false);
+        state.toggle(0, ConflictSide::Ours);
+        state.apply_edit(0, "hand".into(), 4);
+        state.set_all(take_all(2, ConflictSide::Theirs));
+        assert!(!has_custom(&state.resolutions));
+        assert_eq!(state.picks, state.resolutions);
+        // Reset after take-all has nothing to restore.
+        state.reset(0);
+        assert_eq!(state.resolutions[0], picked(ConflictSide::Theirs));
+    }
+
+    #[test]
+    fn a_region_with_a_final_empty_line_survives_an_untouched_edit() {
+        assert_eq!(lines_text(&[]), "");
+        assert_eq!(lines_text(&["a"]), "a");
+        assert_eq!(lines_text(&["a", ""]), "a\n\n");
+        assert_eq!(lines_text(&[""]), "\n");
+        for lines in [vec![], vec!["a"], vec!["a", ""], vec![""], vec!["", ""]] {
+            assert_eq!(custom_lines(&lines_text(&lines)), lines);
+        }
+    }
+
+    #[test]
+    fn the_edit_region_reserves_three_to_twelve_text_lines_of_rows() {
+        assert_eq!(edit_rows(""), 4);
+        assert_eq!(edit_rows("a\nb\nc"), 4);
+        assert_eq!(edit_rows("a\nb\nc\nd\ne"), 5);
+        assert_eq!(edit_rows(&"x\n".repeat(40)), 11);
+
+        let conflict = sample();
+        let lines = result_lines(
+            &conflict,
+            &[picked(ConflictSide::Ours), ConflictResolution::Unresolved],
+        );
+        let edited = with_edit_rows(lines.clone(), 0, 3);
+        assert_eq!(edited.len(), lines.len() - 2 + 3);
+        let at = edited
+            .iter()
+            .position(|l| matches!(l, ResultLine::EditRow { .. }))
+            .unwrap();
+        assert!(matches!(edited[at - 1], ResultLine::Head { index: 0 }));
+        assert_eq!(
+            edited[at..at + 3],
+            [
+                ResultLine::EditRow {
+                    index: 0,
+                    last: false
+                },
+                ResultLine::EditRow {
+                    index: 0,
+                    last: false
+                },
+                ResultLine::EditRow {
+                    index: 0,
+                    last: true
+                },
+            ]
+        );
+        // The other conflict keeps its placeholder; the edited unresolved one
+        // swaps its own for the reserved rows.
+        assert!(edited
+            .iter()
+            .any(|l| matches!(l, ResultLine::Placeholder { index: 1 })));
+        let edited = with_edit_rows(lines, 1, 4);
+        assert!(!edited
+            .iter()
+            .any(|l| matches!(l, ResultLine::Placeholder { .. })));
+    }
+
+    #[test]
+    fn the_state_reserves_rows_while_editing_and_drops_them_after() {
+        let mut state = TextState::new(sample(), false);
+        state.toggle(0, ConflictSide::Ours);
+        let plain = state.result.len();
+        state.set_editing(Some((0, 5)));
+        assert_eq!(state.result.len(), plain - 2 + 5);
+        state.apply_edit(0, "one".into(), 4);
+        assert_eq!(
+            state
+                .result
+                .iter()
+                .filter(|l| matches!(l, ResultLine::EditRow { .. }))
+                .count(),
+            4
+        );
+        state.set_editing(None);
+        assert!(!state
+            .result
+            .iter()
+            .any(|l| matches!(l, ResultLine::EditRow { .. })));
     }
 }
