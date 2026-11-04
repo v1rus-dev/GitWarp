@@ -815,9 +815,13 @@ fn killing_a_log_stops_git() {
         !process_alive(pid),
         "git log (pid {pid}) is still running after the kill"
     );
-    // The stream ends after the kill: either with no commits or an error.
+    // The stream ends after the kill (collecting it returns). Commits git had
+    // already written into the stdout pipe before SIGKILL are still read as
+    // Ok items, so under load any number of them may arrive, but never more
+    // than the repository has.
+    let total = repo.log(&LogOptions::default()).unwrap().count();
     let rest: Vec<_> = stream.by_ref().collect();
-    assert!(rest.iter().all(|item| item.is_err()) || rest.is_empty());
+    assert!(rest.iter().filter(|item| item.is_ok()).count() <= total);
 }
 
 #[cfg(target_os = "linux")]
