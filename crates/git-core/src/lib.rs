@@ -10,6 +10,7 @@
 pub mod activity;
 mod branch_log;
 mod config;
+mod conflict;
 pub mod credential;
 mod diff;
 mod error;
@@ -40,6 +41,10 @@ pub use branch_log::BranchLog;
 pub use config::{
     global_get, global_identity, set_global_identity, set_global_signing, ConfigScope, Identity,
 };
+pub use conflict::{
+    ConflictGuard, ConflictKind, ConflictResolution, ConflictSegment, IndexStage, LineEnding,
+    SaveOutcome, TextConflict,
+};
 pub use credential::Credential;
 pub use diff::{
     ChangeKind, ChangedFile, CommitDetails, DiffLine, DiffOptions, DiffWhitespace, FileDiff,
@@ -49,11 +54,14 @@ pub use error::{Error, ErrorClass, Result};
 pub use git::{Git, GitChoice, GitEngine, GitSource, GitVersion, Resolution};
 pub use log::{commits_on_day, CommitCount, CommitInfo, LogKiller, LogOptions, LogStream};
 pub use oid::Oid;
-pub use ops::ResetMode;
+pub use ops::{MergeOutcome, MergePreview, MergeType, Operation, PreviewUnavailable, ResetMode};
 pub use refs::{Head, Ref, RefKind};
 pub use runner::{DiscoveredRepo, GitRunner};
 pub use stash::Stash;
-pub use status::{ChangedEntry, HeadCommit, HunkPick, WorkingFile, WorkingStatus};
+pub use status::{
+    ChangedEntry, ConflictSide, HeadCommit, HunkPick, WorkingFile, WorkingStatus, WorktreeFile,
+    WorktreeText,
+};
 pub use submodule::{Submodule, SubmoduleState};
 pub use worktree::Worktree;
 
@@ -182,6 +190,11 @@ impl Repo {
 
     pub fn git_dir(&self) -> &Path {
         &self.git_dir
+    }
+
+    /// The version of the resolved `git` executable.
+    pub(crate) fn git_version(&self) -> GitVersion {
+        self.git.version()
     }
 
     /// A `git` command already pointed at this repository.
@@ -402,6 +415,32 @@ impl Repo {
         status::stage(self, paths)
     }
 
+    /// Resolves a conflicted `path` by taking one side of the merge whole and
+    /// staging it (or deleting the file when that side deleted it).
+    pub fn resolve_take(&self, path: &str, side: ConflictSide) -> Result<()> {
+        status::resolve_take(self, path, side)
+    }
+
+    /// Loads the conflict at `path`: the sides and their segments for a text
+    /// conflict, or the kind for one that can only be resolved by picking a side.
+    pub fn conflict(&self, path: &str) -> Result<ConflictKind> {
+        conflict::conflict(self, path)
+    }
+
+    /// Saves `content` (the clean, index form) as the resolution of `path`:
+    /// hashes it, replaces the conflict stages with it and checks the file out
+    /// through git's conversions (`eol`, smudge filters). Writes nothing when
+    /// the path left the conflict `guard` (from the loaded [`TextConflict`])
+    /// describes or its work-tree file changed since; see [`SaveOutcome`].
+    pub fn save_resolution(
+        &self,
+        path: &str,
+        content: &str,
+        guard: &ConflictGuard,
+    ) -> Result<SaveOutcome> {
+        conflict::save_resolution(self, path, content, guard)
+    }
+
     /// Removes `paths` from the index, leaving the work tree alone.
     pub fn unstage(&self, paths: &[String]) -> Result<()> {
         status::unstage(self, paths)
@@ -450,6 +489,12 @@ impl Repo {
     /// An untracked file as an all-additions diff.
     pub fn untracked_diff(&self, path: &str) -> Result<FileDiff> {
         status::untracked_diff(self, path)
+    }
+
+    /// A work-tree file (repo-relative `path`) read for display, with the same
+    /// size cap and binary check as [`Self::untracked_diff`].
+    pub fn worktree_file(&self, path: &str) -> Result<WorktreeFile> {
+        status::worktree_file(self, path)
     }
 
     /// Stages the picked hunks/lines of one unstaged file.
@@ -561,6 +606,50 @@ impl Repo {
     /// Empty when no such remote is configured.
     pub fn remote_push_urls(&self, name: &str) -> Result<Vec<String>> {
         ops::remote_push_urls(self, name)
+    }
+
+    /// Merges `branch` into HEAD. Conflicts are an outcome
+    /// ([`MergeOutcome::Stopped`]) and leave the merge in progress.
+    pub fn merge(&self, branch: &str, ty: MergeType) -> Result<MergeOutcome> {
+        ops::merge(self, branch, ty)
+    }
+
+    /// Predicts merging `branch` into HEAD without touching the work tree or
+    /// the index.
+    pub fn merge_preview(&self, branch: &str) -> Result<MergePreview> {
+        ops::merge_preview(self, branch)
+    }
+
+    /// Abandons the merge or squash in progress.
+    pub fn merge_abort(&self) -> Result<()> {
+        ops::merge_abort(self)
+    }
+
+    /// The merge / rebase / cherry-pick / revert the repository is stopped in.
+    pub fn operation(&self) -> Result<Operation> {
+        ops::operation(self)
+    }
+
+    /// The name of the branch being merged, from the first line of
+    /// `.git/MERGE_MSG` (`Merge branch 'X'`, `Merge remote-tracking branch
+    /// 'X'`, optionally followed by ` of <url>`/` into <name>`). `None` when
+    /// there is no message or it has another shape.
+    pub fn merge_heading(&self) -> Result<Option<String>> {
+        ops::merge_heading(self)
+    }
+
+    /// The prepared commit message of the operation in progress: `MERGE_MSG`
+    /// for a merge, `SQUASH_MSG` for a squash, without comment lines (per
+    /// `core.commentChar`). `None` for any other state. `operation` is the
+    /// already-known [`Repo::operation`].
+    pub fn prepared_message(&self, operation: Operation) -> Result<Option<String>> {
+        ops::prepared_message(self, operation)
+    }
+
+    /// `(merge_heading, prepared_message)` for the known `operation`, reading
+    /// the message file once. The heading is only set for a merge.
+    pub fn merge_info(&self, operation: Operation) -> Result<(Option<String>, Option<String>)> {
+        ops::merge_info(self, operation)
     }
 
     /// Applies `oid` on top of HEAD; a conflict is aborted and returned.

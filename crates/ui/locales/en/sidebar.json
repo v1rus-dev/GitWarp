@@ -20,7 +20,7 @@
   "sidebar.menu.fetch_tags_from_origin": "Fetch tags from origin",
   "sidebar.menu.lock": "Lock",
   "sidebar.menu.manage_worktrees": "Manage worktrees…",
-  "sidebar.menu.merge_into": "Merge {name} into {head}",
+  "sidebar.menu.merge_into": "Merge {name} into {head}…",
   "sidebar.menu.open_in_new_window": "Open in new window",
   "sidebar.menu.open_on_host": "Open on {service}",
   "sidebar.menu.pop_stash": "Pop stash",

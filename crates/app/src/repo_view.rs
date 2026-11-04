@@ -548,6 +548,8 @@ pub struct RepositoryView {
     _worktree_switcher_release: Option<Subscription>,
     /// The stage 7 dialog currently open, if any.
     ref_dialog: Option<Entity<RefDialog>>,
+    /// The Merge dialog while it is open (kept so its state outlives `open`).
+    merge_dialog: Option<Entity<crate::merge_dialog::MergeDialog>>,
     /// The "Create pull request" dialog while it is open.
     pr_dialog: Option<Entity<CreatePrDialog>>,
     /// The loaded pull requests of the sidebar's panel.
@@ -845,9 +847,21 @@ impl RepositoryView {
                     this.reload_history(cx);
                 }
                 ChangesEvent::PushAfterCommit => this.push_branch(window, cx),
+                // `merge --abort` does not move HEAD: the sidebar, the worktree
+                // status and the badges are enough, not a history walk.
+                // `abort_merge` already applied a fresh status, so Changes is not re-read.
+                ChangesEvent::MergeAborted => {
+                    this.after_ref_change_with(RefChange::RefsOnly, false, cx)
+                }
             },
         );
-        let changes_redraw = cx.observe(&changes, |_, _, cx| cx.notify());
+        let changes_redraw = cx.observe(&changes, |this, changes, cx| {
+            // The History's menus need the operation the Changes view read.
+            let operation = changes.read(cx).operation();
+            this.history
+                .update(cx, |history, _| history.set_operation(operation));
+            cx.notify();
+        });
         let worktrees_model =
             cx.new(|cx| WorktreesModel::new(path.clone(), git.clone(), workspace.clone(), cx));
         let worktrees = cx.new(|cx| WorktreesView::new(worktrees_model.clone(), window, cx));
@@ -1002,6 +1016,7 @@ impl RepositoryView {
             worktree_switcher: None,
             _worktree_switcher_release: None,
             ref_dialog: None,
+            merge_dialog: None,
             pr_dialog: None,
             pr_model,
             _pr_events: pr_events,
@@ -1428,6 +1443,7 @@ impl RepositoryView {
                 history.head(),
                 self.sidebar_extras.as_ref(),
                 history.refs(),
+                self.changes.read(cx).operation(),
             )
         };
         match action {
@@ -1449,6 +1465,7 @@ impl RepositoryView {
         cx: &mut Context<Self>,
     ) {
         let links = self.host_links(cx);
+        let operation = self.changes.read(cx).operation();
         let mut model = {
             let history = self.history.read(cx);
             sidebar_menu_with_links(
@@ -1457,6 +1474,7 @@ impl RepositoryView {
                 self.sidebar_extras.as_ref(),
                 history.refs(),
                 &links,
+                operation,
             )
         };
         // "Create pull request…" for a local branch when a remote can take one.
@@ -1576,6 +1594,7 @@ impl RepositoryView {
                     cx,
                 );
             }
+            SidebarAction::Merge(branch) => self.open_merge_dialog(branch, window, cx),
             SidebarAction::CreateBranchAt(oid) => {
                 let card = self.card_for(oid, cx);
                 self.open_ref_dialog(RefDialogKind::CreateBranch { card }, window, cx);
@@ -2349,7 +2368,7 @@ impl RepositoryView {
             view.update(cx, |view, cx| view.start_network_job(job, window, cx));
         });
         let changes = self.changes.read(cx);
-        let dirty = changes.staged_count() + changes.unstaged_count();
+        let dirty = changes.dirty_count();
         RefDialogContext {
             root: self.root.clone(),
             git: self.git.clone(),
@@ -2400,6 +2419,58 @@ impl RepositoryView {
         self.ref_dialog = Some(dialog);
     }
 
+    /// Opens the Merge dialog for `branch` (a local branch or `origin/x`).
+    fn open_merge_dialog(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        // Like the ref dialogs: a new dialog replaces one still open.
+        if let Some(previous) = self.merge_dialog.take() {
+            previous.update(cx, |dialog, cx| dialog.close(window, cx));
+        }
+        let head = match self.history.read(cx).head() {
+            Some(Head::Branch { name, .. }) => name.clone(),
+            // The menu disables Merge without a branch checked out.
+            _ => return,
+        };
+        // Git refuses a merge while another operation is stopped; the menus
+        // disable Merge then, so this is only a guard.
+        if self.changes.read(cx).operation() != git_core::Operation::None {
+            return;
+        }
+        let changes = self.changes.read(cx);
+        let context = crate::merge_dialog::MergeDialogContext {
+            root: self.root.clone(),
+            git: self.git.clone(),
+            branch,
+            head,
+            dirty: changes.dirty_count(),
+        };
+        let view = cx.entity();
+        let dialog = crate::merge_dialog::open(
+            context,
+            move |done, window, cx| {
+                view.update(cx, |view, cx| {
+                    // A merge or fast-forward adds commits; a stop, a squash or
+                    // a failure leaves HEAD where it was.
+                    let change = if done.head_moved {
+                        RefChange::History
+                    } else {
+                        RefChange::RefsOnly
+                    };
+                    // Switching to Changes reads its status itself; when the view
+                    // is already there, `after_ref_change` has to.
+                    let switching = done.show_changes && view.view != ViewMode::Changes;
+                    view.after_ref_change_with(change, !switching, cx);
+                    if done.show_changes {
+                        view.show_changes(window, cx);
+                    }
+                    window.refresh();
+                });
+            },
+            window,
+            cx,
+        );
+        self.merge_dialog = Some(dialog);
+    }
+
     /// Checks out a local branch, asking first when the work tree is dirty.
     fn checkout_branch(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let label = name.clone();
@@ -2436,7 +2507,7 @@ impl RepositoryView {
         }
         let dirty = {
             let changes = self.changes.read(cx);
-            changes.staged_count() + changes.unstaged_count()
+            changes.dirty_count()
         };
         if dirty == 0 {
             self.run_checkout_action(checkout, window, cx);
@@ -2545,6 +2616,17 @@ impl RepositoryView {
     /// operation (a checkout, branch/tag creation, rename, upstream) leaves
     /// the rows in place; only a walk-changing one reloads the history.
     fn after_ref_change(&mut self, change: RefChange, cx: &mut Context<Self>) {
+        self.after_ref_change_with(change, true, cx);
+    }
+
+    /// [`Self::after_ref_change`] that can skip re-reading the Changes status,
+    /// for callers that have just applied a fresh one.
+    fn after_ref_change_with(
+        &mut self,
+        change: RefChange,
+        refresh_changes: bool,
+        cx: &mut Context<Self>,
+    ) {
         match change {
             RefChange::RefsOnly => {
                 self.history
@@ -2552,7 +2634,9 @@ impl RepositoryView {
             }
             RefChange::History => self.reload_history(cx),
         }
-        self.changes.update(cx, |changes, cx| changes.refresh(cx));
+        if refresh_changes {
+            self.changes.update(cx, |changes, cx| changes.refresh(cx));
+        }
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.refresh(cx));
         self.refresh_with(hosting_status::INTERNAL_RELOAD, cx);
@@ -5894,7 +5978,8 @@ impl RepositoryView {
             bar = bar.child(div().flex_1());
             bar = bar.child(ui::t!(
                 "repo.status.unstaged_staged",
-                unstaged = changes.unstaged_count(),
+                // Conflicted paths are still unstaged work for the status bar.
+                unstaged = changes.unstaged_count() + changes.conflicted_count(),
                 staged = changes.staged_count()
             ));
         } else {

@@ -93,3 +93,13 @@ a.link:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .dlg .pick:disabled { opacity: .5; }
 /* toast message keeps git's line breaks */
 .toast .toast-msg { white-space: pre-line; overflow-wrap: anywhere; }
+/* merge dialog: only the branch values are mono, the select keeps the UI font */
+.kv dd .select { font-family: var(--font-ui); }
+/* link-style toggle button (Show more / Show less) */
+.linkbtn { background: none; border: 0; padding: 0; margin-top: 4px; font: inherit; font-size: var(--fs-sm); color: var(--accent); cursor: pointer; border-radius: var(--r-sm); }
+.linkbtn:hover { text-decoration: underline; }
+.linkbtn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+/* one line per commit: hash + summary cut with an ellipsis */
+.filelist.oneline li { display: flex; gap: 8px; min-width: 0; }
+.filelist.oneline .hash { flex: none; }
+.filelist.oneline .sum { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

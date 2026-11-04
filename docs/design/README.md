@@ -40,6 +40,8 @@ both themes are in `screens/` (`<page>.dark.png` and `<page>.light.png`).
 | `settings-ssh.html` | Settings → SSH keys: key list, generate / import / delete, connection test, trusted hosts. | 10 — settings |
 | `palette.html` | Command palette: Ctrl+P quick launcher for commands, branches, commits, files. | 11 — command palette |
 | `dialogs-checkout.html` | Checkout with uncommitted changes: stash / bring changes / discard, for branch, remote branch, tag and commit. | 7 — ref operations |
+| `dialogs-merge.html` | Dialogs: merge / rebase — merge dialog with conflict preview and merge types, rebase dialog, new branch-menu items; the Merge / Rebase in progress banner and Conflicts group are states of `changes.html` (Operation switcher, `?op=`). | 12 — merge / rebase |
+| `conflicts.html` | Conflict editor: resolve a conflicted file chunk by chunk — two side panes (optional base), per-chunk checkboxes, live editable result (picked / both / edited / auto), binary and modify/delete cards, rebase side labelling. Opened from Changes (Resolve…). | 12 — conflict editor |
 | `dialogs-network.html` | Network prompts: HTTPS credentials, SSH host key (first connection, key changed), result toasts. | 8 — network |
 | `activity.html` | Proposal, not scheduled: commit-activity heatmap; placement A (Welcome) vs B (strip above History, recommended), all states. | — |
 | `icons.html` | Icon set: the app's own icons next to their Primer Octicons replacement (adopted in the prototype). | 1 — UI foundation |
@@ -86,7 +88,7 @@ Both themes share one geometry and differ only in colour.
 9. Worktrees
 10. Settings pages
 11. Command palette
-12. Not designed yet: merge/rebase + conflict editor, interactive rebase, blame, file history
+12. Merge / rebase (`dialogs-merge.html`, Changes operation states). Conflict editor (`conflicts.html`). Not designed yet: interactive rebase, blame, file history
 
 Hosting services (GitHub, GitLab, Gitea / Forgejo, Bitbucket, Azure DevOps, self-hosted) are planned
 separately as steps H1–H10; spec in `docs/specs/hosting-services-spec.md`.
