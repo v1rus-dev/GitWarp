@@ -37,6 +37,7 @@ pub struct RefBadge {
     max_label_width: Option<Pixels>,
     tooltip: Option<SharedString>,
     dashed: bool,
+    remote_suffix: Option<SharedString>,
     on_click: Option<ClickHandler>,
 }
 
@@ -49,12 +50,20 @@ impl RefBadge {
             max_label_width: None,
             tooltip: None,
             dashed: false,
+            remote_suffix: None,
             on_click: None,
         }
     }
 
     pub fn kind(mut self, kind: RefKind) -> Self {
         self.kind = kind;
+        self
+    }
+
+    /// A muted tail after the label (`+origin`): the remote a local branch is
+    /// also on, when both point at the same commit.
+    pub fn remote_suffix(mut self, suffix: impl Into<SharedString>) -> Self {
+        self.remote_suffix = Some(suffix.into());
         self
     }
 
@@ -151,6 +160,16 @@ impl RenderOnce for RefBadge {
                     })
                     .child(self.label),
             )
+            .when_some(self.remote_suffix, |this, suffix| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .pl(px(1.))
+                        .text_color(foreground.opacity(0.6))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(suffix),
+                )
+            })
             .when_some(self.tooltip, |this, tooltip| {
                 this.tooltip(Tooltip::text(tooltip))
             })

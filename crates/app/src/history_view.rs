@@ -118,6 +118,8 @@ const BADGE_LABEL_MAX: f32 = 160.;
 /// a kind with an icon adds the 11 px icon and its 3 px gap.
 const BADGE_PADDING: f32 = 14.;
 const BADGE_ICON: f32 = 14.;
+/// The space between a local badge's label and its `+origin` remote suffix.
+const BADGE_SUFFIX_GAP: f32 = 4.;
 /// The narrowest room the summary text keeps beside its badges, and at most
 /// 40 % of the cell when the cell is narrower than 200 px.
 const BADGE_TEXT_MIN: f32 = 80.;
@@ -194,6 +196,16 @@ fn pr_badge_of<'a>(
         .flatten()
 }
 
+/// The muted tail of a merged local/remote badge: `+origin` for one remote,
+/// `+2` for several (their menus still list every ref).
+fn remote_suffix(remotes: &[SharedString]) -> Option<SharedString> {
+    match remotes {
+        [] => None,
+        [remote] => Some(format!("+{remote}").into()),
+        several => Some(format!("+{}", several.len()).into()),
+    }
+}
+
 /// One ref badge on a history row, derived from HEAD and the refs once they
 /// load — never per frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,6 +215,10 @@ pub struct BadgeSpec {
     pub label: SharedString,
     /// The full ref name, shown on hover.
     pub tooltip: SharedString,
+    /// The remotes whose branch of the same name is on this commit. A local
+    /// branch and its remote counterparts then render as one badge with a
+    /// `+origin` suffix instead of two badges.
+    pub remotes: Vec<SharedString>,
 }
 
 /// How many of a row's badges fit beside its summary text.
@@ -262,24 +278,77 @@ pub fn badge_overflow(widths: &[f32], available: f32, gap: f32, plus_width: f32)
 /// badge (never also a local one), symbolic `origin/HEAD` remotes, stashes and
 /// other refs are hidden, and the order is HEAD, local, remote, tag with
 /// alphabetical names inside a kind.
+///
+/// A local branch (or HEAD's branch) and its same-named remote branches on the
+/// same commit become one badge carrying [`BadgeSpec::remotes`]; a remote
+/// branch on another commit stays a badge of its own.
 pub fn build_badges(head: Option<&Head>, refs: &[Ref]) -> HashMap<Oid, Vec<BadgeSpec>> {
     let mut badges: HashMap<Oid, Vec<BadgeSpec>> = HashMap::new();
-    let mut current_branch = None;
-    match head {
-        Some(Head::Branch { name, target }) => {
-            current_branch = Some(name.as_str());
-            if let Some(target) = target {
-                badges.entry(*target).or_default().push(BadgeSpec {
-                    kind: RefKind::Head,
-                    label: name.as_str().into(),
-                    tooltip: format!("refs/heads/{name}").into(),
-                });
-            }
+    let current_branch = match head {
+        Some(Head::Branch { name, .. }) => Some(name.as_str()),
+        Some(Head::Detached(_)) | None => None,
+    };
+
+    // Remote branches by the commit and local branch name they would check out
+    // as, plus the ones that merge into a local or HEAD badge.
+    let mut remote_names: HashMap<(Oid, &str), Vec<&str>> = HashMap::new();
+    let mut merged: HashSet<&str> = HashSet::new();
+    for reference in refs
+        .iter()
+        .filter(|reference| reference.kind == git_core::RefKind::RemoteBranch)
+    {
+        let Some((remote, leaf)) = reference.name.split_once('/') else {
+            continue;
+        };
+        if remote.is_empty() || leaf.is_empty() || leaf == "HEAD" {
+            continue;
         }
+        remote_names
+            .entry((reference.target, leaf))
+            .or_default()
+            .push(remote);
+        let local_here = refs.iter().any(|local| {
+            local.kind == git_core::RefKind::LocalBranch
+                && local.target == reference.target
+                && local.name == leaf
+                && Some(local.name.as_str()) != current_branch
+        });
+        let head_here = matches!(
+            head,
+            Some(Head::Branch { name, target })
+                if name == leaf && *target == Some(reference.target)
+        );
+        if local_here || head_here {
+            merged.insert(reference.full_name.as_str());
+        }
+    }
+    for remotes in remote_names.values_mut() {
+        remotes.sort_unstable();
+        remotes.dedup();
+    }
+    let remotes_for = |target: Oid, branch: &str| -> Vec<SharedString> {
+        remote_names
+            .get(&(target, branch))
+            .map(|remotes| remotes.iter().map(|remote| (*remote).into()).collect())
+            .unwrap_or_default()
+    };
+
+    match head {
+        Some(Head::Branch {
+            name,
+            target: Some(target),
+        }) => badges.entry(*target).or_default().push(BadgeSpec {
+            kind: RefKind::Head,
+            label: name.as_str().into(),
+            tooltip: format!("refs/heads/{name}").into(),
+            remotes: remotes_for(*target, name),
+        }),
+        Some(Head::Branch { target: None, .. }) => {}
         Some(Head::Detached(oid)) => badges.entry(*oid).or_default().push(BadgeSpec {
             kind: RefKind::Head,
             label: "HEAD".into(),
             tooltip: "HEAD".into(),
+            remotes: Vec::new(),
         }),
         None => {}
     }
@@ -298,13 +367,23 @@ pub fn build_badges(head: Option<&Head>, refs: &[Ref]) -> HashMap<Oid, Vec<Badge
             })
             // `origin/HEAD` is a symbolic duplicate of a real remote branch.
             .filter(|reference| !(kind == RefKind::Remote && reference.name.ends_with("/HEAD")))
+            // A remote merged into a local/HEAD badge is drawn there.
+            .filter(|reference| {
+                !(kind == RefKind::Remote && merged.contains(reference.full_name.as_str()))
+            })
             .collect();
         group.sort_by(|a, b| a.name.cmp(&b.name));
         for reference in group {
+            let remotes = if kind == RefKind::Local {
+                remotes_for(reference.target, &reference.name)
+            } else {
+                Vec::new()
+            };
             badges.entry(reference.target).or_default().push(BadgeSpec {
                 kind,
                 label: reference.name.clone().into(),
                 tooltip: reference.full_name.clone().into(),
+                remotes,
             });
         }
     }
@@ -352,9 +431,10 @@ fn measure_badge(
     window: &Window,
     label: &SharedString,
     kind: RefKind,
-    cache: &mut HashMap<(SharedString, RefKind), Pixels>,
+    remote_suffix: Option<&SharedString>,
+    cache: &mut HashMap<(SharedString, RefKind, Option<SharedString>), Pixels>,
 ) -> Pixels {
-    let key = (label.clone(), kind);
+    let key = (label.clone(), kind, remote_suffix.cloned());
     if let Some(width) = cache.get(&key) {
         return *width;
     }
@@ -374,7 +454,24 @@ fn measure_badge(
         .layout_line(label, FS_XS, &[run], None)
         .width
         .min(px(BADGE_LABEL_MAX));
-    let width = text + px(BADGE_PADDING + icon);
+    let mut width = text + px(BADGE_PADDING + icon);
+    if let Some(suffix) = remote_suffix {
+        let mut font = gpui::font(FONT_UI);
+        font.weight = FontWeight::MEDIUM;
+        let run = TextRun {
+            len: suffix.len(),
+            font,
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let suffix = window
+            .text_system()
+            .layout_line(suffix, FS_XS, &[run], None)
+            .width;
+        width += px(BADGE_SUFFIX_GAP) + suffix;
+    }
     cache.insert(key, width);
     width
 }
@@ -813,7 +910,7 @@ pub struct HistoryView {
     badges: HashMap<Oid, Vec<BadgeSpec>>,
     /// Measured badge widths, cached per label and kind so the per-frame work
     /// stays proportional to the visible rows.
-    badge_widths: HashMap<(SharedString, RefKind), Pixels>,
+    badge_widths: HashMap<(SharedString, RefKind, Option<SharedString>), Pixels>,
     /// The table layout for the pane's last measured width, so the virtualized
     /// rows paint with the same columns the header was built for.
     columns: Columns,
@@ -1024,6 +1121,18 @@ fn badge_menu_key(spec: &BadgeSpec) -> Option<String> {
         RefKind::Tag => Some(format!("tag:{}", spec.label)),
         _ => None,
     }
+}
+
+/// Every ref a badge's right-click menu covers: the badge's own ref first,
+/// then the remote counterparts of a merged local/HEAD badge.
+fn badge_menu_keys(spec: &BadgeSpec) -> Vec<String> {
+    let mut keys: Vec<String> = badge_menu_key(spec).into_iter().collect();
+    if matches!(spec.kind, RefKind::Local | RefKind::Head) {
+        for remote in &spec.remotes {
+            keys.push(format!("rbranch:{remote}/{}", spec.label));
+        }
+    }
+    keys
 }
 
 /// A sidebar menu model as menu entries; the items dispatch their
@@ -2187,7 +2296,9 @@ impl HistoryView {
     }
 
     /// Double-click: switch to the row's first local branch that is not HEAD,
-    /// or check the commit out detached when the row has no such branch.
+    /// check out the row's first remote branch as a local tracking branch, or
+    /// check the commit out detached when the row has no branch at all (only
+    /// tags or a bare commit).
     fn checkout_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.rows().get(index) else {
             return;
@@ -2211,7 +2322,27 @@ impl HistoryView {
                 // The row's only local branch is the one already checked out.
                 return;
             }
-            None => RefAction::CheckoutCommit(card),
+            None => {
+                // No local branch: a remote branch is downloaded locally
+                // through the sidebar's remote-checkout path, not detached.
+                let remote = self
+                    .refs()
+                    .unwrap_or(&[])
+                    .iter()
+                    .find(|reference| {
+                        reference.kind == git_core::RefKind::RemoteBranch
+                            && reference.target == card.oid
+                            && !reference.name.ends_with("/HEAD")
+                    })
+                    .map(|reference| reference.name.clone());
+                if let (Some(remote), Some(handler)) = (remote, self.sidebar_action.clone()) {
+                    window.defer(cx, move |window, cx| {
+                        handler(SidebarAction::CheckoutRemoteBranch(remote), window, cx);
+                    });
+                    return;
+                }
+                RefAction::CheckoutCommit(card)
+            }
         };
         (self.on_action)(action, window, cx);
     }
@@ -2382,7 +2513,8 @@ impl HistoryView {
     }
 
     /// Right-clicking a branch, tag or remote badge opens that ref's own
-    /// sidebar menu in place of the row menu.
+    /// sidebar menu in place of the row menu. A merged local/remote badge lists
+    /// both refs' menus, separated by a rule.
     fn open_badge_menu(
         &mut self,
         spec: &BadgeSpec,
@@ -2390,11 +2522,22 @@ impl HistoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(key) = badge_menu_key(spec) else {
+        let keys = badge_menu_keys(spec);
+        if keys.is_empty() {
             return;
-        };
+        }
         let source = self.ref_menu_source(self.host_links(cx));
-        let entries = sidebar_menu_entries(source(&key), self.sidebar_action.clone());
+        let mut entries: Vec<MenuEntry> = Vec::new();
+        for key in keys {
+            let menu = sidebar_menu_entries(source(&key), self.sidebar_action.clone());
+            if menu.is_empty() {
+                continue;
+            }
+            if !entries.is_empty() {
+                entries.push(MenuEntry::Separator);
+            }
+            entries.extend(menu);
+        }
         if !entries.is_empty() {
             menu::open_context_menu(position, entries, window, cx);
         }
@@ -3546,10 +3689,12 @@ impl HistoryView {
                     let widths: Vec<f32> = specs
                         .iter()
                         .map(|spec| {
+                            let suffix = remote_suffix(&spec.remotes);
                             let width = f32::from(measure_badge(
                                 window,
                                 &spec.label,
                                 spec.kind,
+                                suffix.as_ref(),
                                 badge_widths,
                             ));
                             // A branch with a pull request also carries its badge.
@@ -3565,14 +3710,20 @@ impl HistoryView {
                         window,
                         &plus,
                         RefKind::Overflow,
+                        None,
                         badge_widths,
                     ));
                     // The "from {x}" chip is not a ref of the row but takes
                     // room beside the badges.
                     let chip_width = merged_from.map_or(0., |name| {
                         let label = ui::t!("history.badge.from", name = name);
-                        f32::from(measure_badge(window, &label, RefKind::Local, badge_widths))
-                            + BADGE_GAP
+                        f32::from(measure_badge(
+                            window,
+                            &label,
+                            RefKind::Local,
+                            None,
+                            badge_widths,
+                        )) + BADGE_GAP
                     });
                     badge_overflow(&widths, summary_width - chip_width, BADGE_GAP, plus_width)
                 };
@@ -3598,7 +3749,7 @@ impl HistoryView {
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-                                    if badge_menu_key(&menu_spec).is_none() {
+                                    if badge_menu_keys(&menu_spec).is_empty() {
                                         return;
                                     }
                                     cx.stop_propagation();
@@ -3610,15 +3761,19 @@ impl HistoryView {
                                     window.prevent_default();
                                 }),
                             )
-                            .child(
-                                RefBadge::new(
+                            .child({
+                                let mut badge = RefBadge::new(
                                     format!("history-badge-{ix}-{index}"),
                                     spec.label.clone(),
                                 )
                                 .kind(spec.kind)
                                 .max_label_width(px(BADGE_LABEL_MAX))
-                                .tooltip(spec.tooltip.clone()),
-                            ),
+                                .tooltip(spec.tooltip.clone());
+                                if let Some(suffix) = remote_suffix(&spec.remotes) {
+                                    badge = badge.remote_suffix(suffix);
+                                }
+                                badge
+                            }),
                     );
                     if let Some((branch, badge)) = pr_badge_of(&hosting, spec) {
                         let branch = branch.to_owned();
@@ -5153,6 +5308,7 @@ mod tests {
             kind,
             label: label.to_owned().into(),
             tooltip: "".into(),
+            remotes: Vec::new(),
         };
         assert_eq!(
             badge_menu_key(&spec(RefKind::Head, "main")).as_deref(),
@@ -5172,6 +5328,21 @@ mod tests {
             Some("tag:v1.0")
         );
         assert_eq!(badge_menu_key(&spec(RefKind::Overflow, "+3")), None);
+        // A merged badge's menu covers the local branch and every remote.
+        let merged = BadgeSpec {
+            kind: RefKind::Local,
+            label: "main".into(),
+            tooltip: "refs/heads/main".into(),
+            remotes: vec![SharedString::from("origin"), SharedString::from("upstream")],
+        };
+        assert_eq!(
+            badge_menu_keys(&merged),
+            [
+                "local:main".to_owned(),
+                "rbranch:origin/main".to_owned(),
+                "rbranch:upstream/main".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -5234,15 +5405,182 @@ mod tests {
                 (&RefKind::Head, "main"),
                 (&RefKind::Local, "alpha"),
                 (&RefKind::Local, "zeta"),
-                (&RefKind::Remote, "origin/main"),
                 (&RefKind::Tag, "v1"),
             ]
         );
+        // HEAD's branch and `origin/main` are the same commit: one badge.
+        assert_eq!(row[0].remotes, vec![SharedString::from("origin")]);
         // The HEAD badge names its branch's full ref.
         assert_eq!(row[0].tooltip.as_ref(), "refs/heads/main");
         // Every other badge points at its own full ref name.
         assert_eq!(row[2].tooltip.as_ref(), "refs/heads/zeta");
-        assert_eq!(row[3].tooltip.as_ref(), "refs/remotes/origin/main");
+        assert_eq!(row[3].tooltip.as_ref(), "refs/tags/v1");
+    }
+
+    #[test]
+    fn a_local_branch_and_its_remote_on_the_same_commit_merge_into_one_badge() {
+        let commit = oid(1);
+        let refs = vec![
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/main",
+                "main",
+                oid(9),
+            ),
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/feat",
+                "feat",
+                commit,
+            ),
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/origin/feat",
+                "origin/feat",
+                commit,
+            ),
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/origin/HEAD",
+                "origin/HEAD",
+                commit,
+            ),
+        ];
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: Some(oid(9)),
+        };
+
+        let badges = build_badges(Some(&head), &refs);
+
+        assert_eq!(
+            badges[&commit],
+            vec![BadgeSpec {
+                kind: RefKind::Local,
+                label: "feat".into(),
+                tooltip: "refs/heads/feat".into(),
+                remotes: vec![SharedString::from("origin")],
+            }]
+        );
+        assert_eq!(
+            remote_suffix(&badges[&commit][0].remotes).as_deref(),
+            Some("+origin")
+        );
+    }
+
+    #[test]
+    fn a_head_badge_merges_its_remote_on_the_same_commit() {
+        let commit = oid(1);
+        let refs = vec![
+            local("main", commit),
+            remote("origin/main", commit),
+            remote("origin/HEAD", commit),
+        ];
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: Some(commit),
+        };
+
+        let badges = build_badges(Some(&head), &refs);
+
+        assert_eq!(
+            badges[&commit],
+            vec![BadgeSpec {
+                kind: RefKind::Head,
+                label: "main".into(),
+                tooltip: "refs/heads/main".into(),
+                remotes: vec![SharedString::from("origin")],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_symbolic_remote_head_is_never_a_badge() {
+        let commit = oid(1);
+        let refs = vec![remote("origin/HEAD", commit)];
+
+        let badges = build_badges(None, &refs);
+
+        assert!(badges.is_empty(), "{badges:?}");
+    }
+
+    #[test]
+    fn a_remote_on_another_commit_stays_its_own_badge() {
+        let local_commit = oid(1);
+        let remote_commit = oid(2);
+        let refs = vec![
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/feat",
+                "feat",
+                local_commit,
+            ),
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/origin/feat",
+                "origin/feat",
+                remote_commit,
+            ),
+        ];
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: Some(oid(9)),
+        };
+
+        let badges = build_badges(Some(&head), &refs);
+
+        assert_eq!(badges[&local_commit].len(), 1);
+        assert!(badges[&local_commit][0].remotes.is_empty());
+        assert_eq!(
+            badges[&remote_commit],
+            vec![BadgeSpec {
+                kind: RefKind::Remote,
+                label: "origin/feat".into(),
+                tooltip: "refs/remotes/origin/feat".into(),
+                remotes: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn several_remotes_on_the_same_commit_merge_into_one_badge() {
+        let commit = oid(1);
+        let refs = vec![
+            reference(
+                git_core::RefKind::LocalBranch,
+                "refs/heads/feat",
+                "feat",
+                commit,
+            ),
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/upstream/feat",
+                "upstream/feat",
+                commit,
+            ),
+            reference(
+                git_core::RefKind::RemoteBranch,
+                "refs/remotes/origin/feat",
+                "origin/feat",
+                commit,
+            ),
+        ];
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: Some(oid(9)),
+        };
+
+        let badges = build_badges(Some(&head), &refs);
+
+        assert_eq!(badges[&commit].len(), 1);
+        assert_eq!(
+            badges[&commit][0].remotes,
+            vec![SharedString::from("origin"), SharedString::from("upstream")]
+        );
+        assert_eq!(
+            remote_suffix(&badges[&commit][0].remotes).as_deref(),
+            Some("+2")
+        );
     }
 
     #[test]
@@ -5262,6 +5600,7 @@ mod tests {
                 kind: RefKind::Head,
                 label: "HEAD".into(),
                 tooltip: "HEAD".into(),
+                remotes: Vec::new(),
             }]
         );
         assert_eq!(badges[&branch][0].kind, RefKind::Local);
