@@ -1,11 +1,14 @@
 //! Empty and error states.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, AnyElement, App, FontWeight, Hsla, IntoElement, ParentElement, RenderOnce,
+    div, px, AnyElement, App, ElementId, FontWeight, Hsla, IntoElement, ParentElement, RenderOnce,
     SharedString, Styled, Window,
 };
 
+use crate::components::SelectableText;
 use crate::icon::{Icon, IconName};
 use crate::metrics::{FONT_MONO, FS_MD, MONO, R_MD};
 use crate::theme::ActiveTheme;
@@ -71,6 +74,13 @@ impl EmptyState {
     }
 }
 
+fn content_id(prefix: &str, title: &str, text: &str) -> ElementId {
+    let mut hasher = DefaultHasher::new();
+    title.hash(&mut hasher);
+    text.hash(&mut hasher);
+    ElementId::Name(format!("{prefix}-{:x}", hasher.finish()).into())
+}
+
 impl RenderOnce for EmptyState {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors;
@@ -80,6 +90,13 @@ impl RenderOnce for EmptyState {
             colors.muted
         });
         let text = self.text.filter(|_| self.body.is_none());
+        let text_element_id = text
+            .as_ref()
+            .map(|text| content_id("empty-state-text", &self.title, text));
+        let error_element_id = self
+            .error
+            .as_ref()
+            .map(|error| content_id("empty-state-error", &self.title, error));
 
         div()
             .flex()
@@ -114,9 +131,16 @@ impl RenderOnce for EmptyState {
                 this.child(div().max_w(px(46. * 7.)).text_center().child(body))
             })
             .when_some(text, |this, text| {
-                this.child(div().max_w(px(46. * 7.)).text_center().child(text))
+                let id = text_element_id.expect("the text id is built with the text");
+                this.child(
+                    div()
+                        .max_w(px(46. * 7.))
+                        .text_center()
+                        .child(SelectableText::new(id, text)),
+                )
             })
             .when_some(self.error, |this, error| {
+                let id = error_element_id.expect("the error id is built with the error");
                 this.child(
                     div()
                         .max_w(px(56. * 7.))
@@ -131,7 +155,7 @@ impl RenderOnce for EmptyState {
                         .text_size(MONO)
                         .line_height(px(18.))
                         .text_color(colors.text)
-                        .child(error),
+                        .child(SelectableText::new(id, error)),
                 )
             })
             .when_some(self.actions, |this, actions| {

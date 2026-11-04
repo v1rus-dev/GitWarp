@@ -128,7 +128,7 @@ impl LogStream {
             });
         }
         let mut cmd = repo.command();
-        cmd.args(["log", "--topo-order", "--no-decorate", FORMAT]);
+        cmd.args(["log", "--date-order", "--no-decorate", FORMAT]);
         if options.all {
             // The stash is shown separately, like Fork does.
             cmd.args(["--exclude=refs/stash", "--all"]);
@@ -200,7 +200,7 @@ impl LogStream {
         match status {
             Ok(status) if status.success() => None,
             Ok(status) => Some(Error::Git {
-                command: "log --all --topo-order",
+                command: "log --all --date-order",
                 code: status.code(),
                 stderr,
             }),
@@ -355,7 +355,7 @@ impl Drop for CommitCount {
 }
 
 /// Commits whose author date falls on the local calendar day `day` (days since
-/// the Unix epoch), newest first in topological order, over the same history
+/// the Unix epoch), newest first in date order, over the same history
 /// the list shows (all refs, stash excluded). With `me`, only commits whose
 /// author email equals it (case-insensitive, mailmap applied), which is how
 /// the activity heatmap counts "mine".
@@ -379,7 +379,7 @@ pub(crate) fn commits_on_day_in(
     // filtering; the rest is the list's own record.
     cmd.args([
         "log",
-        "--topo-order",
+        "--date-order",
         "--no-decorate",
         "--exclude=refs/stash",
         "--all",

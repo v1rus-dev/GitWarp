@@ -64,12 +64,20 @@ pub fn render<Id>(rows: &[Row<Id>], mut label: impl FnMut(&Row<Id>) -> String) -
                         put(&mut conn, c, '─');
                     }
                     put(&mut conn, s.to * 2, '╮');
+                    // A passing lane compacted left leaves its old column with
+                    // a corner, like a child joining a lane in the upper half.
+                    if s.from != row.column {
+                        put(&mut conn, s.from * 2, '╰');
+                    }
                 }
                 Less => {
                     for c in s.to * 2 + 1..s.from * 2 {
                         put(&mut conn, c, '─');
                     }
                     put(&mut conn, s.to * 2, '╭');
+                    if s.from != row.column {
+                        put(&mut conn, s.from * 2, '╯');
+                    }
                 }
             }
         }

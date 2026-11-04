@@ -219,5 +219,17 @@
   "dialogs.remote_name.spaces": "El nombre no puede contener espacios.",
   "dialogs.remote_url.bad": "No es una dirección Git. Usa https://host/usuario/repo.git o git@host:usuario/repo.git",
   "dialogs.remote_url.https": "HTTPS · usa tu cuenta guardada",
-  "dialogs.remote_url.ssh": "SSH · usa tus claves SSH"
+  "dialogs.remote_url.ssh": "SSH · usa tus claves SSH",
+  "dialogs.error.title_fallback": "La operación del repositorio falló",
+  "dialogs.error.worktree_title": "La rama está en uso",
+  "dialogs.error.worktree_body": "La rama {branch} está extraída en otro árbol de trabajo ({path}). Abre ese árbol de trabajo o elige otra rama.",
+  "dialogs.error.local_changes_title": "Se sobrescribirían los cambios locales",
+  "dialogs.error.local_changes_body": "El cambio sobrescribiría archivos con cambios sin confirmar. Guárdalos en stash o confírmalos primero.",
+  "dialogs.error.push_rejected_title": "Envío rechazado",
+  "dialogs.error.push_rejected_body": "El remoto tiene commits que tu rama no tiene. Trae primero los cambios remotos y vuelve a enviar.",
+  "dialogs.error.pull_diverged_title": "La rama ha divergido",
+  "dialogs.error.pull_diverged_body": "Esta traída no es un avance rápido, y GitWarp solo hace avances rápidos. Fusiona o rebasa la rama y vuelve a traer.",
+  "dialogs.error.open_worktree": "Abrir ese árbol de trabajo",
+  "dialogs.error.stash_and_switch": "Guardar en stash y cambiar",
+  "dialogs.error.pull_then_push": "Traer y luego enviar"
 }

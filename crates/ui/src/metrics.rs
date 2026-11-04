@@ -70,8 +70,8 @@ pub const STATUS: Pixels = px(24.);
 pub const DOCK_HEADER: Pixels = px(34.);
 
 /// One graph lane.
-pub const LANE_W: Pixels = px(14.);
+pub const LANE_W: Pixels = px(16.);
 /// Radius of a commit dot.
-pub const DOT_R: Pixels = px(4.5);
+pub const DOT_R: Pixels = px(5.);
 /// Width of a graph edge.
 pub const LINE_W: Pixels = px(2.);

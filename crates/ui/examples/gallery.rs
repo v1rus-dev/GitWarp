@@ -1102,6 +1102,7 @@ fn badges_section(colors: ThemeColors) -> impl IntoElement {
                         .items_center()
                         .gap(px(8.))
                         .child(RefBadge::new("ref-local", "feat/lanes"))
+                        .child(RefBadge::new("ref-merged", "main").remote_suffix("+origin"))
                         .child(RefBadge::new("ref-remote", "origin/main").kind(RefKind::Remote))
                         .child(RefBadge::new("ref-tag", "v0.3.0").kind(RefKind::Tag))
                         .child(RefBadge::new("ref-stash", "stash@{0}").kind(RefKind::Stash))

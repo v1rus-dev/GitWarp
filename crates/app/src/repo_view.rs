@@ -5,11 +5,11 @@
 //! stage is a placeholder or a disabled control, never a dead click.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
@@ -24,23 +24,24 @@ use gpui::{
 use git_core::network::{FetchOptions, Progress};
 use git_core::{ChangedFile, CommitDetails, CommitInfo, Error, Git, Head, Oid, RefKind, Repo};
 use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
-use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, R_SM, STATUS};
+use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, FS_XS, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
     menu, toast, Avatar, Banner, BannerKind, Button, ButtonSize, CiGlyph, CountPill, Counter,
     EmptyState, FileRow, Icon, IconName, MenuEntry, MenuItem, PrBadge, Scrollbar, SearchField,
-    SegmentItem, Segmented, Skeleton, Spinner, Splitter, TextInput, TextInputEvent, Tooltip, Tree,
-    TreeNodeData, TreePr,
+    SegmentItem, Segmented, SelectableText, Skeleton, Spinner, Splitter, TextInput, TextInputEvent,
+    Tooltip, Tree, TreeNodeData, TreePr,
 };
 
 use crate::activity_strip::ActivityStrip;
-use crate::changes_view::{ChangesEvent, ChangesView};
+use crate::changes_view::{change_counts, ChangesEvent, ChangesView};
 use crate::create_pr_dialog::{self, CreatePrDialog, PrDialogContext, PushRun};
 use crate::details::{read_details, read_diff, DetailsState, DiffState};
 use crate::diff_model::{DiffRow, RowKind, SplitCell, SplitCellKind, SplitRow};
+use crate::error_dialog::{self, ErrorAction, KnownError};
 use crate::format::{absolute_time, format_count, relative_time};
 use crate::history_state::LoadState;
-use crate::history_view::HistoryView;
+use crate::history_view::{HistoryEvent, HistoryView};
 use crate::hosting_status::{
     self, CiEntry, ErrorEffect, HostingState, HostingView, PrPopover, PrTrigger, Request, Target,
 };
@@ -454,10 +455,15 @@ pub struct RepositoryView {
     git_tooltip: SharedString,
     history: Entity<HistoryView>,
     _history_observer: Subscription,
+    /// Visible rows reach the fetcher through an event, so reading the history
+    /// in the handler is safe (the emitting update has finished).
+    _history_events: Subscription,
     /// The commit heatmap above the history table.
     activity: Entity<ActivityStrip>,
     changes: Entity<ChangesView>,
     _changes_observer: Subscription,
+    /// Redraws the sidebar's change counters when the status reloads.
+    _changes_redraw: Subscription,
     worktrees: Entity<WorktreesView>,
     /// The worktree list shared by the Worktrees page, the sidebar panel and,
     /// next, the titlebar switcher.
@@ -568,6 +574,14 @@ pub struct RepositoryView {
     hosting: HostingState,
     /// What the rows were last given, to skip a redraw that changes nothing.
     hosting_view: Arc<HostingView>,
+    /// The commits the history currently shows, as its last report said.
+    ci_visible: Vec<Oid>,
+    /// The commits a running checks batch still wants, shared with it: a row
+    /// that scrolled away before its chunk starts is skipped.
+    ci_wanted: Arc<Mutex<HashSet<String>>>,
+    /// Whether the CI dots, the checks block and check requests are wanted;
+    /// mirrored from the settings and kept current while the view renders.
+    show_ci_status: bool,
     /// The `meta_version` of the history the tracking was last read at.
     hosting_meta_version: u64,
     /// What the next sidebar reload means for the pull request map: the
@@ -618,19 +632,112 @@ enum NetworkEvent {
     Done(Result<git_core::network::NetworkOutcome, Error>),
 }
 
+/// What the poll loop needs about the job it watches: the intent belongs to
+/// this job instance and dies with it.
+#[derive(Clone, Copy)]
+struct NetworkRun<'a> {
+    generation: u64,
+    job: &'a Job,
+    then_push: bool,
+}
+
 /// The first background fetch waits a little, so opening a repository is not
 /// immediately followed by network traffic.
 const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(30);
 /// How often the UI drains the job's progress channel.
 const NETWORK_POLL: Duration = Duration::from_millis(80);
 
-/// What [`RepositoryView::run_repo_action`] refreshes once the mutation
-/// succeeds. A checkout only moves HEAD, so it re-reads HEAD and the refs
-/// instead of re-walking the whole history (which would reset the scroll).
-#[derive(Clone, Copy)]
-enum PostRefresh {
-    Full,
-    Checkout,
+/// Whether the settings ask for CI status. Read fresh, so a toggle takes
+/// effect without waiting for the view to render.
+fn ci_status_enabled(cx: &App) -> bool {
+    cx.try_global::<crate::AppSettings>()
+        .is_none_or(|state| state.settings.show_ci_status)
+}
+
+/// Whether a finished network job is followed by a push: only the pull that
+/// "Pull, then push" started, never another job or a later pull.
+fn follow_with_push(job: &Job, then_push: bool) -> bool {
+    then_push && matches!(job, Job::Pull)
+}
+
+/// Which failures open the error dialog, and whether it offers "Pull, then
+/// push". Only a rejected *branch* push can be fixed that way: a rejected tag
+/// or remote-branch delete has no branch to pull.
+fn error_dialog_remedy(known: &KnownError, job: &Job) -> Option<bool> {
+    match known {
+        KnownError::PushRejected => Some(matches!(job, Job::Push)),
+        KnownError::PullNotFastForward if matches!(job, Job::Pull) => Some(false),
+        _ => None,
+    }
+}
+
+/// The stash message a switch saves the work tree under, so a failed restore
+/// can name the stash that still holds the changes.
+const SWITCH_STASH: &str = "GitWarp: stashed before switching";
+
+/// Runs `checkout` after stashing the work tree. A failed checkout pops the
+/// stash again, restoring the staged/unstaged split where git can so the
+/// user's changes are not hidden; if that pop fails too, the error says the
+/// changes are still in the stash, by its message.
+fn stash_then_checkout<F>(
+    repo: &git_core::Repo,
+    checkout: F,
+) -> git_core::Result<(ui::ToastKind, String)>
+where
+    F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)>,
+{
+    if !repo.stash_save(Some(SWITCH_STASH))? {
+        return checkout(repo);
+    }
+    match checkout(repo) {
+        Ok(done) => Ok(done),
+        Err(error) => match repo.stash_pop_keep_index(0) {
+            Ok(()) => Err(error),
+            Err(restore) => Err(Error::Git {
+                command: "stash pop",
+                code: None,
+                stderr: format!(
+                    "{error}\nThe switch failed and the changes could not be restored; they are \
+                     still in the stash \"{SWITCH_STASH}\": {restore}"
+                ),
+            }),
+        },
+    }
+}
+
+/// What a finished ref operation changed in the repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefChange {
+    /// HEAD or the refs moved, but the commits reachable from `--all` are the
+    /// same: re-read HEAD and the refs, not the log.
+    RefsOnly,
+    /// Commits may have appeared or disappeared: walk the history again.
+    History,
+}
+
+/// How much a ref dialog's operation can change. Checkout-like operations —
+/// switching branches, detaching, creating a branch or tag at an existing
+/// commit, renaming a branch — only move refs. Everything that can add or
+/// remove commits (reset, delete, cherry-pick, revert, remote edits, stash
+/// drops) keeps the full reload. Renaming a tag is left on the full reload
+/// because tags can be the only ref that keeps a commit alive; the walk is
+/// cheap enough there.
+fn ref_change_for_dialog(kind: &RefDialogKind) -> RefChange {
+    match kind {
+        RefDialogKind::CreateBranch { .. }
+        | RefDialogKind::CreateTag { .. }
+        | RefDialogKind::RenameBranch { .. } => RefChange::RefsOnly,
+        RefDialogKind::RenameTag { .. }
+        | RefDialogKind::Remote { .. }
+        | RefDialogKind::Reset { .. }
+        | RefDialogKind::DeleteBranch { .. }
+        | RefDialogKind::DeleteTag { .. }
+        | RefDialogKind::RemoveRemote { .. }
+        | RefDialogKind::DropStash { .. }
+        | RefDialogKind::CherryPick { .. }
+        | RefDialogKind::Revert { .. }
+        | RefDialogKind::RenameWorktree { .. } => RefChange::History,
+    }
 }
 
 impl RepositoryView {
@@ -679,6 +786,10 @@ impl RepositoryView {
                 });
             }));
         });
+        let history_events =
+            cx.subscribe(&history, |this, _, event: &HistoryEvent, cx| match event {
+                HistoryEvent::VisibleRowsChanged(oids) => this.set_visible_ci(oids.clone(), cx),
+            });
         let observer = cx.observe(&history, |this, history, cx| {
             // A repository opened from a subdirectory is remembered by its
             // root, so the switcher's "current" marker must follow it.
@@ -736,6 +847,7 @@ impl RepositoryView {
                 ChangesEvent::PushAfterCommit => this.push_branch(window, cx),
             },
         );
+        let changes_redraw = cx.observe(&changes, |_, _, cx| cx.notify());
         let worktrees_model =
             cx.new(|cx| WorktreesModel::new(path.clone(), git.clone(), workspace.clone(), cx));
         let worktrees = cx.new(|cx| WorktreesView::new(worktrees_model.clone(), window, cx));
@@ -743,10 +855,12 @@ impl RepositoryView {
             &worktrees_model,
             |this, _, event: &WorktreesModelEvent, cx| {
                 if *event == WorktreesModelEvent::Changed {
-                    // A branch was created or deleted, or a worktree changed:
-                    // the sidebar, the history's ref labels and the local
-                    // changes all read the same repository.
-                    this.reload_history(cx);
+                    // A worktree was added, removed or moved: its HEAD is a
+                    // ref already covered by `--all`, so the set of commits
+                    // cannot change. Re-read HEAD and the refs so the sidebar,
+                    // the history's badges and the local changes follow.
+                    this.history
+                        .update(cx, |history, cx| history.refresh_refs(cx));
                     this.changes.update(cx, |changes, cx| changes.refresh(cx));
                     this.refresh_with(hosting_status::INTERNAL_RELOAD, cx);
                     cx.notify();
@@ -826,9 +940,11 @@ impl RepositoryView {
             git_tooltip,
             history,
             _history_observer: observer,
+            _history_events: history_events,
             activity,
             changes,
             _changes_observer: changes_observer,
+            _changes_redraw: changes_redraw,
             worktrees,
             worktrees_model,
             _worktrees_observer: worktrees_observer,
@@ -902,6 +1018,9 @@ impl RepositoryView {
             background_fetch_running: false,
             hosting: HostingState::default(),
             hosting_view: Arc::default(),
+            ci_visible: Vec::new(),
+            ci_wanted: Arc::default(),
+            show_ci_status: settings.show_ci_status,
             hosting_meta_version: 0,
             hosting_trigger: PrTrigger::Open,
             pr_popover: None,
@@ -1478,7 +1597,7 @@ impl RepositoryView {
                 self.open_ref_dialog(RefDialogKind::DeleteTag { name }, window, cx);
             }
             SidebarAction::ApplyStash(index) => {
-                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
+                self.run_repo_action(window, cx, move |repo| {
                     repo.stash_apply(index)?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -1491,7 +1610,7 @@ impl RepositoryView {
                 });
             }
             SidebarAction::PopStash(index) => {
-                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
+                self.run_repo_action(window, cx, move |repo| {
                     repo.stash_pop(index)?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -1707,7 +1826,7 @@ impl RepositoryView {
             }
             SidebarAction::SetUpstream(branch) => {
                 let fallback = self.default_remote_name();
-                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
+                self.run_ref_action(window, cx, move |repo| {
                     let remote = git_core::network::default_remote(repo)?
                         .unwrap_or_else(|| fallback.clone());
                     let upstream = format!("{remote}/{branch}");
@@ -1760,7 +1879,7 @@ impl RepositoryView {
             }
             SidebarAction::LockWorktree(path) => {
                 let path = PathBuf::from(path);
-                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
+                self.run_repo_action(window, cx, move |repo| {
                     repo.lock_worktree(&path, Some("locked manually"))?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -1770,7 +1889,7 @@ impl RepositoryView {
             }
             SidebarAction::UnlockWorktree(path) => {
                 let path = PathBuf::from(path);
-                self.run_repo_action(window, cx, PostRefresh::Full, move |repo| {
+                self.run_repo_action(window, cx, move |repo| {
                     repo.unlock_worktree(&path)?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -1793,7 +1912,7 @@ impl RepositoryView {
                 });
             }
             SidebarAction::PruneWorktrees => {
-                self.run_repo_action(window, cx, PostRefresh::Full, |repo| {
+                self.run_repo_action(window, cx, |repo| {
                     repo.prune_worktrees()?;
                     Ok((
                         ui::ToastKind::Ok,
@@ -2257,6 +2376,7 @@ impl RepositoryView {
             previous.update(cx, |dialog, cx| dialog.close(window, cx));
         }
         let context = self.ref_dialog_context(&kind, cx);
+        let change = ref_change_for_dialog(&kind);
         let view = cx.entity();
         // A removed remote must not leave its remembered account behind.
         let removed_remote = match &kind {
@@ -2272,7 +2392,7 @@ impl RepositoryView {
                 // The dialog entity stays owned until the next one replaces
                 // it: dropping it here would free the state that is running
                 // this callback.
-                view.after_ref_change(cx);
+                view.after_ref_change(change, cx);
                 window.refresh();
             });
         });
@@ -2319,7 +2439,7 @@ impl RepositoryView {
             changes.staged_count() + changes.unstaged_count()
         };
         if dirty == 0 {
-            self.run_repo_action(window, cx, PostRefresh::Checkout, checkout);
+            self.run_checkout_action(checkout, window, cx);
             return;
         }
         let body = ui::i18n::t_count("repo.checkout.dirty_body", dirty as u64, &[]);
@@ -2339,11 +2459,12 @@ impl RepositoryView {
                 move |window, cx| {
                     let checkout = take(&checkout);
                     view.update(cx, |view, cx| {
-                        view.run_repo_action(window, cx, PostRefresh::Checkout, move |repo| {
+                        view.run_ref_action(window, cx, move |repo| {
                             // An empty stash (nothing left to save) is fine:
-                            // the switch still happens.
-                            repo.stash_save(Some("GitWarp: stashed before switching"))?;
-                            checkout(repo)
+                            // the switch still happens. The stash ref is
+                            // excluded from the log (`--exclude=refs/stash`),
+                            // so even this path only moves HEAD and refs.
+                            stash_then_checkout(repo, checkout)
                         });
                     });
                 }
@@ -2354,7 +2475,7 @@ impl RepositoryView {
                 move |window, cx| {
                     let checkout = take(&checkout);
                     view.update(cx, |view, cx| {
-                        view.run_repo_action(window, cx, PostRefresh::Checkout, checkout)
+                        view.run_checkout_action(checkout, window, cx)
                     });
                 }
             },
@@ -2364,7 +2485,7 @@ impl RepositoryView {
                 move |window, cx| {
                     let checkout = take(&checkout);
                     view.update(cx, |view, cx| {
-                        view.run_repo_action(window, cx, PostRefresh::Checkout, move |repo| {
+                        view.run_ref_action(window, cx, move |repo| {
                             repo.discard_all()?;
                             checkout(repo)
                         });
@@ -2376,23 +2497,61 @@ impl RepositoryView {
         );
     }
 
-    /// Reloads everything a ref operation can have changed: the history and
-    /// its badges, the sidebar's lists, the local-changes view and HEAD.
-    fn after_ref_change(&mut self, cx: &mut Context<Self>) {
-        self.reload_history(cx);
-        self.changes.update(cx, |changes, cx| changes.refresh(cx));
-        self.worktrees
-            .update(cx, |worktrees, cx| worktrees.refresh(cx));
-        self.refresh_with(hosting_status::INTERNAL_RELOAD, cx);
-        cx.notify();
+    /// Runs a checkout and, when git refuses because local changes would be
+    /// overwritten, offers to stash them and retry the same checkout.
+    fn run_checkout_action<F>(&mut self, checkout: F, window: &mut Window, cx: &mut Context<Self>)
+    where
+        F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)>
+            + Send
+            + Clone
+            + 'static,
+    {
+        let retry = checkout.clone();
+        self.run_repo_action_with(
+            RefChange::RefsOnly,
+            window,
+            cx,
+            checkout,
+            move |view, error, window, cx| {
+                let Some(known) = error_dialog::classify_git_error(&error) else {
+                    view.show_git_error(error, window, cx);
+                    return;
+                };
+                if !matches!(&known, KnownError::LocalChangesOverwritten) {
+                    view.show_git_error(error, window, cx);
+                    return;
+                }
+                let title = known.title();
+                let explanation = known.explanation();
+                let details = error_dialog::raw_output(&error);
+                let entity = cx.entity();
+                let actions = vec![ErrorAction::new(
+                    ui::t!("dialogs.error.stash_and_switch"),
+                    move |window, cx| {
+                        entity.update(cx, |view, cx| {
+                            let checkout = retry.clone();
+                            view.run_ref_action(window, cx, move |repo| {
+                                stash_then_checkout(repo, checkout)
+                            });
+                        });
+                    },
+                )];
+                error_dialog::open(title, explanation, details, actions, window, cx);
+            },
+        );
     }
 
-    /// Like [`Self::after_ref_change`] but for a checkout: HEAD moved while the
-    /// commit set did not, so the history only re-reads its meta (badges and
-    /// the HEAD ring) and keeps the user's scroll position and selection.
-    fn after_checkout(&mut self, cx: &mut Context<Self>) {
-        self.history
-            .update(cx, |history, cx| history.refresh_meta(cx));
+    /// Reloads everything a ref operation can have changed. A refs-only
+    /// operation (a checkout, branch/tag creation, rename, upstream) leaves
+    /// the rows in place; only a walk-changing one reloads the history.
+    fn after_ref_change(&mut self, change: RefChange, cx: &mut Context<Self>) {
+        match change {
+            RefChange::RefsOnly => {
+                self.history
+                    .update(cx, |history, cx| history.refresh_refs(cx));
+            }
+            RefChange::History => self.reload_history(cx),
+        }
         self.changes.update(cx, |changes, cx| changes.refresh(cx));
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.refresh(cx));
@@ -2401,14 +2560,50 @@ impl RepositoryView {
     }
 
     /// Runs a repository mutation without a dialog, then reloads the views.
-    fn run_repo_action<F>(
+    fn run_repo_action<F>(&mut self, window: &mut Window, cx: &mut Context<Self>, action: F)
+    where
+        F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)> + Send + 'static,
+    {
+        self.run_repo_action_with(
+            RefChange::History,
+            window,
+            cx,
+            action,
+            |view, error, window, cx| {
+                view.show_git_error(error, window, cx);
+            },
+        );
+    }
+
+    /// [`run_repo_action`] for an operation that only moves HEAD or the refs:
+    /// the history keeps its rows and just re-reads its badges.
+    fn run_ref_action<F>(&mut self, window: &mut Window, cx: &mut Context<Self>, action: F)
+    where
+        F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)> + Send + 'static,
+    {
+        self.run_repo_action_with(
+            RefChange::RefsOnly,
+            window,
+            cx,
+            action,
+            |view, error, window, cx| {
+                view.show_git_error(error, window, cx);
+            },
+        );
+    }
+
+    /// [`run_repo_action`] with a caller-specific failure path, for operations
+    /// that can offer a retry with a preparatory step.
+    fn run_repo_action_with<F, E>(
         &mut self,
+        change: RefChange,
         window: &mut Window,
         cx: &mut Context<Self>,
-        post: PostRefresh,
         action: F,
+        on_error: E,
     ) where
         F: FnOnce(&git_core::Repo) -> git_core::Result<(ui::ToastKind, String)> + Send + 'static,
+        E: FnOnce(&mut Self, Error, &mut Window, &mut Context<Self>) + 'static,
     {
         if self.ref_action_running {
             return;
@@ -2435,14 +2630,9 @@ impl RepositoryView {
                 match result {
                     Ok((kind, notice)) => {
                         toast::show(kind, notice, window, cx);
-                        match post {
-                            PostRefresh::Full => view.after_ref_change(cx),
-                            PostRefresh::Checkout => view.after_checkout(cx),
-                        }
+                        view.after_ref_change(change, cx);
                     }
-                    Err(error) => {
-                        toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
-                    }
+                    Err(error) => on_error(view, error, window, cx),
                 }
             })
             .ok();
@@ -2451,9 +2641,53 @@ impl RepositoryView {
         cx.notify();
     }
 
+    /// The failure path shared by repository actions: a known git failure
+    /// opens a dialog with a remedy, everything else stays a toast.
+    fn show_git_error(&mut self, error: Error, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(known) = error_dialog::classify_git_error(&error) else {
+            toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+            return;
+        };
+        let title = known.title();
+        let explanation = known.explanation();
+        let details = error_dialog::raw_output(&error);
+        match known {
+            KnownError::BranchInWorktree { path, .. } => {
+                let model = self.worktrees_model.clone();
+                let path = PathBuf::from(path);
+                let actions = vec![ErrorAction::new(
+                    ui::t!("dialogs.error.open_worktree"),
+                    move |window, cx| {
+                        model.update(cx, |model, cx| model.switch_to(&path, window, cx));
+                    },
+                )];
+                error_dialog::open(title, explanation, details, actions, window, cx);
+            }
+            KnownError::PushRejected => {
+                let view = cx.entity();
+                let actions = vec![ErrorAction::new(
+                    ui::t!("dialogs.error.pull_then_push"),
+                    move |window, cx| {
+                        view.update(cx, |view, cx| view.pull_then_push(window, cx));
+                    },
+                )];
+                error_dialog::open(title, explanation, details, actions, window, cx);
+            }
+            KnownError::LocalChangesOverwritten | KnownError::PullNotFastForward => {
+                error_dialog::open(title, explanation, details, Vec::new(), window, cx);
+            }
+        }
+    }
+
+    /// Pulls the current branch, then pushes once the pull completed. The
+    /// intent rides with this pull only; a refused start pushes nothing.
+    fn pull_then_push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_network_job_with(Job::Pull, true, window, cx);
+    }
+
     /// The toolbar's Stash button: stashes every local change.
     fn stash_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_repo_action(window, cx, PostRefresh::Full, |repo| {
+        self.run_repo_action(window, cx, |repo| {
             if repo.stash_save(None)? {
                 Ok((ui::ToastKind::Ok, ui::t!("repo.toast.stashed").to_string()))
             } else {
@@ -2576,7 +2810,23 @@ impl RepositoryView {
     /// Runs a network job in the background and paints its progress in the
     /// status bar. Only one runs at a time.
     fn start_network_job(&mut self, job: Job, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_network_job_with(job, false, window, cx);
+    }
+
+    /// [`Self::start_network_job`] carrying the intent that belongs to this one
+    /// job: `then_push` makes a successful pull push afterwards. It is passed
+    /// with the job, so it cannot outlive it or fire on a later pull.
+    fn start_network_job_with(
+        &mut self,
+        job: Job,
+        then_push: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.network.is_some() {
+            if then_push {
+                toast::show(ui::ToastKind::Warn, ui::t!("sidebar.prs.busy"), window, cx);
+            }
             return;
         }
         let git = match &self.git {
@@ -2590,7 +2840,7 @@ impl RepositoryView {
         // Several accounts fit a remote and none was chosen: ask first, then
         // start again (it asks about the next remote, if any).
         if let Some(remote) = credentials.choose.first() {
-            self.pick_account_for_job(remote.clone(), job, window, cx);
+            self.pick_account_for_job(remote.clone(), job, then_push, window, cx);
             return;
         }
         let (accounts, remembered) = self.account_settings(cx);
@@ -2639,9 +2889,14 @@ impl RepositoryView {
 
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(NETWORK_POLL).await;
+            let run = NetworkRun {
+                generation,
+                job: &job,
+                then_push,
+            };
             let done = this
                 .update_in(cx, |view, window, cx| {
-                    view.poll_network(&rx, generation, &job, &meta, window, cx)
+                    view.poll_network(&rx, run, &meta, window, cx)
                 })
                 .unwrap_or(true);
             if done {
@@ -2685,17 +2940,17 @@ impl RepositoryView {
         }
     }
 
-    /// Returns whether the job finished.
+    /// Returns whether the job finished. `run.then_push` belongs to this job
+    /// alone: only the pull started by "Pull, then push" pushes afterwards.
     fn poll_network(
         &mut self,
         rx: &Receiver<NetworkEvent>,
-        generation: u64,
-        job: &Job,
+        run: NetworkRun<'_>,
         meta: &JobMeta,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if generation != self.network_generation {
+        if run.generation != self.network_generation {
             return true;
         }
         let mut finished = None;
@@ -2724,17 +2979,27 @@ impl RepositoryView {
                         self.reload_after_network(cx);
                     }
                 }
-                Ok(_) if matches!(job, Job::FetchPullRequest { .. }) => {
+                Ok(_) if matches!(run.job, Job::FetchPullRequest { .. }) => {
                     self.reload_after_network(cx);
-                    if let Job::FetchPullRequest { branch, number, .. } = job {
+                    if let Job::FetchPullRequest { branch, number, .. } = run.job {
                         self.checkout_pr_branch(branch.clone(), *number, window, cx);
                     }
                 }
                 Ok(outcome) => {
-                    toast::show(ui::ToastKind::Ok, job.done_message(&outcome), window, cx);
+                    toast::show(
+                        ui::ToastKind::Ok,
+                        run.job.done_message(&outcome),
+                        window,
+                        cx,
+                    );
                     self.reload_after_network(cx);
+                    if follow_with_push(run.job, run.then_push) {
+                        self.push_branch(window, cx);
+                    }
                 }
-                Err(error) => self.show_job_error(&error, meta, window, cx),
+                Err(error) => {
+                    self.show_job_error(&error, meta, run.job, window, cx);
+                }
             }
             return true;
         }
@@ -2776,12 +3041,13 @@ impl RepositoryView {
         }
     }
 
-    /// Asks which account answers for `remote`, then starts `job` again. Cancel
-    /// starts nothing.
+    /// Asks which account answers for `remote`, then starts `job` again with
+    /// the same intent. Cancel starts nothing.
     fn pick_account_for_job(
         &mut self,
         remote: String,
         job: Job,
+        then_push: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2813,7 +3079,7 @@ impl RepositoryView {
                 let name = name.clone();
                 view.update(cx, |view, cx| {
                     if view.remember_account(&name, account, window, cx) {
-                        view.start_network_job(job, window, cx);
+                        view.start_network_job_with(job, then_push, window, cx);
                     }
                 });
             }),
@@ -2847,9 +3113,30 @@ impl RepositoryView {
         &mut self,
         error: &Error,
         meta: &JobMeta,
+        job: &Job,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(known) = error_dialog::classify_git_error(error) {
+            if let Some(offer_pull_then_push) = error_dialog_remedy(&known, job) {
+                let title = known.title();
+                let explanation = known.explanation();
+                let details = error_dialog::raw_output(error);
+                let actions = if offer_pull_then_push {
+                    let view = cx.entity();
+                    vec![ErrorAction::new(
+                        ui::t!("dialogs.error.pull_then_push"),
+                        move |window, cx| {
+                            view.update(cx, |view, cx| view.pull_then_push(window, cx));
+                        },
+                    )]
+                } else {
+                    Vec::new()
+                };
+                error_dialog::open(title, explanation, details, actions, window, cx);
+                return;
+            }
+        }
         if network_ops::is_auth_error(error) {
             if let Some(account) = remote_accounts::failed_account(&meta.used, &error.to_string()) {
                 let body = ui::ToastBody {
@@ -4139,39 +4426,27 @@ impl RepositoryView {
             push,
         );
 
-        let mut bar = window_titlebar(window, cx)
-            .gap(px(layout.gap))
-            .px(px(layout.padding))
-            .child(no_shrink(sidebar_toggle))
-            .child(repo_switcher)
-            .child(branch_switcher)
-            .when(layout.worktree_button, |bar| bar.child(worktree_switcher))
-            .child(no_shrink(
-                div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(colors.border),
-            ))
-            .child(no_shrink(fetch_button))
-            .child(no_shrink(pull_button))
-            .child(no_shrink(push_button))
-            .child(no_shrink(stash_button))
-            .child(titlebar_fill());
-
-        let history_item = if layout.labels {
-            SegmentItem::new(ui::t!("repo.toolbar.view_history")).with_icon(IconName::Lanes)
-        } else {
-            SegmentItem::icon(IconName::Lanes)
-        };
-        let changes_item = if layout.labels {
-            SegmentItem::new(ui::t!("repo.toolbar.view_changes")).with_icon(IconName::Edit)
-        } else {
-            SegmentItem::icon(IconName::Edit)
-        };
-        let worktrees_item = if layout.labels {
-            SegmentItem::new(ui::t!("repo.toolbar.view_worktrees")).with_icon(IconName::Worktree)
-        } else {
-            SegmentItem::icon(IconName::Worktree)
-        };
-        let switch_view = cx.entity();
-        bar = bar.child(no_shrink(
+        // The sidebar carries the view nav while it is open; collapsing it
+        // keeps the switcher in the titlebar, right beside the toggle, so
+        // navigation is never lost.
+        let view_switch = (!self.sidebar_open).then(|| {
+            let history_item = if layout.labels {
+                SegmentItem::new(ui::t!("repo.toolbar.view_history")).with_icon(IconName::Lanes)
+            } else {
+                SegmentItem::icon(IconName::Lanes)
+            };
+            let changes_item = if layout.labels {
+                SegmentItem::new(ui::t!("repo.toolbar.view_changes")).with_icon(IconName::Edit)
+            } else {
+                SegmentItem::icon(IconName::Edit)
+            };
+            let worktrees_item = if layout.labels {
+                SegmentItem::new(ui::t!("repo.toolbar.view_worktrees"))
+                    .with_icon(IconName::Worktree)
+            } else {
+                SegmentItem::icon(IconName::Worktree)
+            };
+            let switch_view = cx.entity();
             Segmented::new("view-switch")
                 .item(history_item)
                 .item(changes_item.tooltip(ui::t!("repo.toolbar.local_changes")))
@@ -4187,8 +4462,27 @@ impl RepositoryView {
                 .on_select(move |index, window, cx| {
                     let mode = view_for_segment(index);
                     switch_view.update(cx, |view, cx| view.set_view(mode, window, cx));
-                }),
-        ));
+                })
+        });
+
+        let mut bar = window_titlebar(window, cx)
+            .gap(px(layout.gap))
+            .px(px(layout.padding))
+            .child(no_shrink(sidebar_toggle))
+            .when_some(view_switch, |bar, view_switch| {
+                bar.child(no_shrink(view_switch))
+            })
+            .child(repo_switcher)
+            .child(branch_switcher)
+            .when(layout.worktree_button, |bar| bar.child(worktree_switcher))
+            .child(no_shrink(
+                div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(colors.border),
+            ))
+            .child(no_shrink(fetch_button))
+            .child(no_shrink(pull_button))
+            .child(no_shrink(push_button))
+            .child(no_shrink(stash_button))
+            .child(titlebar_fill());
 
         let mut field = SearchField::new("toolbar-search", self.search.clone());
         match self.history.read(cx).search_status() {
@@ -4238,6 +4532,110 @@ impl RepositoryView {
         ));
 
         titlebar_end(bar, client)
+    }
+
+    /// The History / Changes / Worktrees switcher at the very top of the
+    /// sidebar, as a short vertical list (Fork's sidebar header).
+    fn render_view_nav(&self, cx: &mut Context<Self>) -> Div {
+        let colors = cx.theme().colors;
+        let view = cx.entity();
+        let go = |mode: ViewMode| {
+            let view = view.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                view.update(cx, |view, cx| view.set_view(mode, window, cx));
+            }
+        };
+        let worktrees_tip = {
+            let tooltip = Tooltip::new(ui::t!("repo.toolbar.view_worktrees"));
+            match crate::settings_ui::keybindings::key_cap(cx, "worktree_switcher") {
+                Some(cap) => tooltip.kbd(cap),
+                None => tooltip,
+            }
+        };
+        div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .px(px(6.))
+            .pt(px(10.))
+            .pb(px(4.))
+            .child(view_nav_row(
+                "view-nav-history",
+                IconName::Lanes,
+                ui::t!("repo.toolbar.view_history"),
+                self.view == ViewMode::History,
+                None,
+                None,
+                colors,
+                go(ViewMode::History),
+            ))
+            .child(view_nav_row(
+                "view-nav-changes",
+                IconName::Edit,
+                ui::t!("repo.toolbar.view_changes"),
+                self.view == ViewMode::Changes,
+                Some(Tooltip::new(ui::t!("repo.toolbar.local_changes"))),
+                self.change_counters(cx),
+                colors,
+                go(ViewMode::Changes),
+            ))
+            .child(view_nav_row(
+                "view-nav-worktrees",
+                IconName::Worktree,
+                ui::t!("repo.toolbar.view_worktrees"),
+                self.view == ViewMode::Worktrees,
+                Some(worktrees_tip),
+                None,
+                colors,
+                go(ViewMode::Worktrees),
+            ))
+    }
+
+    /// The coloured `+N ~N −N` counters of the Changes row.
+    fn change_counters(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let counts = change_counts(self.changes.read(cx).status());
+        if counts.is_empty() {
+            return None;
+        }
+        let colors = cx.theme().colors;
+        let counter = |id: &'static str, value: String, color: Hsla, tooltip: SharedString| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_owned())
+                .text_size(FS_XS)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color)
+                .tooltip(Tooltip::text(tooltip))
+                .child(value)
+        };
+        let mut group = div().flex().items_center().gap(px(6.));
+        if counts.added > 0 {
+            group = group.child(counter(
+                "view-nav-count-added",
+                format!("+{}", counts.added),
+                colors.st_added,
+                ui::t!("repo.sidebar.nav.added", n = counts.added),
+            ));
+        }
+        if counts.modified > 0 {
+            group = group.child(counter(
+                "view-nav-count-modified",
+                format!("~{}", counts.modified),
+                colors.st_modified,
+                ui::t!("repo.sidebar.nav.modified", n = counts.modified),
+            ));
+        }
+        if counts.deleted > 0 {
+            group = group.child(counter(
+                "view-nav-count-deleted",
+                format!("−{}", counts.deleted),
+                colors.st_deleted,
+                ui::t!("repo.sidebar.nav.deleted", n = counts.deleted),
+            ));
+        }
+        Some(group.into_any_element())
     }
 
     fn render_sidebar(&mut self, width: f32, cx: &mut Context<Self>) -> Div {
@@ -4399,6 +4797,7 @@ impl RepositoryView {
             .bg(colors.sidebar)
             .border_r_1()
             .border_color(colors.border)
+            .child(self.render_view_nav(cx))
             .when_some(tabs, |this, tabs| this.child(tabs))
             .when(!show_prs, |this| {
                 this.child(div().w_full().px(px(10.)).pt(px(12.)).pb(px(8.)).child(
@@ -4783,7 +5182,10 @@ impl RepositoryView {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(ui::t!("repo.details.load_failed")),
                 )
-                .child(div().text_color(colors.error).child(message.clone()))
+                .child(div().text_color(colors.error).child(SelectableText::new(
+                    gpui::ElementId::Name("details-info-error".into()),
+                    message.clone(),
+                )))
                 .into_any_element(),
             DetailsState::Loaded(data) => self.render_loaded_info(&data.details, cx),
         }
@@ -5132,10 +5534,15 @@ impl RepositoryView {
                             )
                         }))
                 }
-                DetailsState::Failed(message) => div()
-                    .p(px(12.))
-                    .text_color(colors.error)
-                    .child(message.clone()),
+                DetailsState::Failed(message) => {
+                    div()
+                        .p(px(12.))
+                        .text_color(colors.error)
+                        .child(SelectableText::new(
+                            gpui::ElementId::Name("details-files-error".into()),
+                            message.clone(),
+                        ))
+                }
                 _ => muted_note(ui::t!("repo.details.no_files"), colors),
             };
         };
@@ -5282,7 +5689,10 @@ impl RepositoryView {
                 .min_h_0()
                 .p(px(12.))
                 .text_color(colors.error)
-                .child(message.clone()),
+                .child(SelectableText::new(
+                    gpui::ElementId::Name("details-diff-error".into()),
+                    message.clone(),
+                )),
             DiffState::Loaded(data) => {
                 if data.diff.binary {
                     diff_note(ui::t!("repo.diff.binary"), colors)
@@ -5709,6 +6119,9 @@ impl RepositoryView {
     /// Asks for the selected commit's checks once the selection has rested for
     /// 300 ms; a newer selection cancels the wait.
     fn schedule_selected_ci(&mut self, cx: &mut Context<Self>) {
+        if !ci_status_enabled(cx) {
+            return;
+        }
         self.ci_debounce = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(300))
@@ -5721,14 +6134,28 @@ impl RepositoryView {
         }));
     }
 
+    /// The history's visible rows changed: ask for their checks without
+    /// waiting for the re-check timer.
+    fn set_visible_ci(&mut self, oids: Vec<Oid>, cx: &mut Context<Self>) {
+        if self.ci_visible == oids {
+            return;
+        }
+        self.ci_visible = oids;
+        self.hosting_fetch_ci(cx);
+    }
+
     /// Starts the 30 s re-check while a commit on screen has pending checks and
     /// the window is active. The loop ends itself when neither holds.
     fn ensure_ci_timer(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.ci_timer.is_some()
+        if !ci_status_enabled(cx)
+            || self.ci_timer.is_some()
             || !window.is_window_active()
-            || !self
-                .hosting
-                .has_pending_ci(self.details_oid, self.head_oid(cx))
+            || !self.hosting.has_pending_ci(
+                self.details_oid,
+                self.head_oid(cx),
+                &self.ci_visible,
+                true,
+            )
         {
             return;
         }
@@ -5748,9 +6175,16 @@ impl RepositoryView {
 
     /// One tick of the re-check; says whether the timer goes on.
     fn ci_timer_tick(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
-        let pending = self
-            .hosting
-            .has_pending_ci(self.details_oid, self.head_oid(cx));
+        if !ci_status_enabled(cx) {
+            self.ci_timer = None;
+            return false;
+        }
+        let pending = self.hosting.has_pending_ci(
+            self.details_oid,
+            self.head_oid(cx),
+            &self.ci_visible,
+            true,
+        );
         if !window.is_window_active() || !pending {
             self.ci_timer = None;
             return false;
@@ -5759,17 +6193,32 @@ impl RepositoryView {
         true
     }
 
-    /// Asks for the checks of the commits that are due: the selected one and
-    /// HEAD when the host has them, and the heads of branches with a pull
-    /// request.
+    /// Asks for the checks of the commits that are due: the selected one,
+    /// HEAD, the pull request tips and the rows visible on screen, when the
+    /// host has them.
     fn hosting_fetch_ci(&mut self, cx: &mut Context<Self>) {
+        if !ci_status_enabled(cx) {
+            return;
+        }
         let Some(target) = self.hosting.target.clone() else {
             return;
         };
         self.refresh_reach(cx);
+        // Keep the shared wanted set current even when nothing is due, so a
+        // batch already running skips rows that scrolled away.
+        let candidates =
+            self.hosting
+                .ci_candidates(self.details_oid, self.head_oid(cx), &self.ci_visible, true);
+        {
+            let mut wanted = self.ci_wanted.lock().unwrap_or_else(|e| e.into_inner());
+            wanted.clear();
+            wanted.extend(candidates.iter().map(Oid::to_string));
+        }
         let due = self.hosting.ci_due(
             self.details_oid,
             self.head_oid(cx),
+            &self.ci_visible,
+            true,
             std::time::Instant::now(),
             hosting_status::unix_now(),
         );
@@ -5780,7 +6229,9 @@ impl RepositoryView {
         for sha in &shas {
             self.hosting.ci.mark_inflight(sha);
         }
-        let request = self.hosting_request(&target, cx);
+        let request = self
+            .hosting_request(&target, cx)
+            .only_wanted(self.ci_wanted.clone());
         cx.spawn(async move |this, cx| {
             let asked = shas.clone();
             let answers = cx
@@ -5876,7 +6327,10 @@ impl RepositoryView {
 
     /// Gives the history rows and the sidebar the current badges and dots.
     fn publish_hosting(&mut self, cx: &mut Context<Self>) {
-        let view = HostingView::from(&self.hosting);
+        let mut view = HostingView::from(&self.hosting);
+        if !self.show_ci_status {
+            view.ci.clear();
+        }
         if view == *self.hosting_view {
             return;
         }
@@ -6090,6 +6544,9 @@ impl RepositoryView {
 
     /// "Try again" under the checks of the selected commit.
     fn retry_checks(&mut self, cx: &mut Context<Self>) {
+        if !ci_status_enabled(cx) {
+            return;
+        }
         if let Some(oid) = self.details_oid {
             self.hosting.ci.forget(&oid.to_string());
         }
@@ -6102,6 +6559,9 @@ impl RepositoryView {
     /// empty and failed state. `None` when the repository has no service with
     /// an API, or nothing was asked yet.
     fn render_checks(&self, oid: Oid, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.show_ci_status {
+            return None;
+        }
         let target = self.hosting.target.as_ref()?;
         if !self.hosting.health.badges_visible() {
             return None;
@@ -6228,6 +6688,22 @@ impl Render for RepositoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let client = inline_window_controls(window);
         let colors = cx.theme().colors;
+        // The settings page may have toggled CI status while this view stayed
+        // open: stop the loop, drop the dots and the checks block, or ask for
+        // the rows again, without a restart.
+        let show_ci = cx
+            .try_global::<crate::AppSettings>()
+            .map(|state| state.settings.show_ci_status)
+            .unwrap_or(true);
+        if show_ci != self.show_ci_status {
+            self.show_ci_status = show_ci;
+            if !show_ci {
+                self.ci_timer = None;
+            }
+            self.publish_hosting(cx);
+            self.hosting_fetch_ci(cx);
+            self.ensure_ci_timer(window, cx);
+        }
         let width = f32::from(window.viewport_size().width);
         let height = f32::from(window.viewport_size().height);
         let layout = toolbar_layout(width, toolbar_label_extra(window));
@@ -6929,6 +7405,63 @@ fn meta_row(label: SharedString, value: impl IntoElement, colors: ThemeColors) -
         .child(div().flex_1().min_w_0().child(value))
 }
 
+/// One row of the sidebar's view nav: icon + label, bold with an accent bar
+/// when active, and an optional trailing element (the change counters).
+#[allow(clippy::too_many_arguments)]
+fn view_nav_row(
+    id: &'static str,
+    icon: IconName,
+    label: SharedString,
+    active: bool,
+    tooltip: Option<Tooltip>,
+    trailing: Option<AnyElement>,
+    colors: ThemeColors,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let mut row = div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .relative()
+        .w_full()
+        .h(px(28.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(10.))
+        .rounded(R_SM)
+        .cursor_pointer()
+        .text_size(FS_SM)
+        .text_color(if active { colors.text } else { colors.muted })
+        .when(active, |row| {
+            row.font_weight(FontWeight::BOLD).child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(5.))
+                    .bottom(px(5.))
+                    .w(px(2.))
+                    .rounded_full()
+                    .bg(colors.accent),
+            )
+        })
+        .hover(move |style| style.bg(colors.hover))
+        .on_click(on_click)
+        .child(
+            Icon::new(icon)
+                .size(px(14.))
+                .color(if active { colors.text } else { colors.muted }),
+        )
+        .child(div().flex_1().min_w_0().truncate().child(label));
+    if let Some(trailing) = trailing {
+        row = row.child(trailing);
+    }
+    if let Some(tooltip) = tooltip {
+        row = row.tooltip(move |_, cx| cx.new(|_| tooltip.clone()).into());
+    }
+    row
+}
+
 /// The toolbar segment that shows `view`: History, Changes, Worktrees.
 fn segment_for_view(view: ViewMode) -> usize {
     match view {
@@ -7354,6 +7887,51 @@ mod tests {
         cx.run_until_parked();
         view.read_with(&cx, |view, _| assert_eq!(view.view, ViewMode::History));
         assert!(cx.debug_bounds("changes-view").is_none());
+    }
+
+    /// The sidebar carries the three view rows; collapsing it moves the
+    /// switcher into the titlebar, beside the sidebar toggle.
+    #[gpui::test]
+    fn the_view_nav_lives_at_the_top_of_the_sidebar(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("view-nav");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+
+        for id in ["view-nav-history", "view-nav-changes", "view-nav-worktrees"] {
+            assert!(cx.debug_bounds(id).is_some(), "{id} was not drawn");
+        }
+        assert!(cx.debug_bounds("view-switch-segment-0").is_none());
+
+        cx.update(|_, cx| view.update(cx, |view, cx| view.toggle_sidebar(cx)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("view-nav-history").is_none());
+        assert!(cx.debug_bounds("view-switch-segment-0").is_some());
+    }
+
+    /// The Changes row shows a coloured counter per changed path, and the
+    /// counters update when the status reloads.
+    #[gpui::test]
+    fn the_changes_row_counts_the_changed_paths(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("view-nav-counts");
+        commit(repo.path(), "a.txt", "one\n");
+        std::fs::write(repo.path().join("a.txt"), "two\n").unwrap();
+        std::fs::write(repo.path().join("new.txt"), "new\n").unwrap();
+        let (mut cx, view) = open_repository_view(&repo, cx);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("view-nav-count-added").is_some());
+        assert!(cx.debug_bounds("view-nav-count-modified").is_some());
+        assert!(cx.debug_bounds("view-nav-count-deleted").is_none());
+
+        std::fs::remove_file(repo.path().join("new.txt")).unwrap();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.changes.update(cx, |changes, cx| changes.refresh(cx));
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("view-nav-count-added").is_none());
+        assert!(cx.debug_bounds("view-nav-count-modified").is_some());
     }
 
     /// The Worktrees page replaces the history pane and lists the repository's
@@ -8015,8 +8593,9 @@ mod tests {
         );
     }
 
-    /// Checking out a branch from the sidebar switcher moves HEAD and reloads
-    /// the history.
+    /// A checkout-like ref operation re-reads HEAD and the refs without
+    /// walking the log: the rows, the selection and the scroll stay, and only
+    /// the HEAD badge moves.
     #[gpui::test]
     fn a_sidebar_checkout_moves_head(cx: &mut gpui::TestAppContext) {
         let repo = crate::test_support::TempRepo::new("sidebar-checkout");
@@ -8034,6 +8613,26 @@ mod tests {
 
         let (mut cx, view) = open_repository_view(&repo, cx);
         cx.run_until_parked();
+        let history = view.read_with(&cx, |view, _| view.history());
+        let (rows, selected, generation, meta_version) = history.read_with(&cx, |history, _| {
+            assert!(matches!(history.state(), LoadState::Loaded));
+            assert_eq!(
+                history.selected_oid(),
+                Some(oid),
+                "the HEAD row is not selected"
+            );
+            (
+                history.commit_count(),
+                history.selected_row(),
+                history.load_generation(),
+                history.meta_version(),
+            )
+        });
+        assert_eq!(
+            history.read_with(&cx, |history, _| history.head_badge(oid).map(str::to_owned)),
+            Some("main".to_owned())
+        );
+
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.run_sidebar_action(
@@ -8050,6 +8649,112 @@ mod tests {
         match repo.head().unwrap() {
             Head::Branch { name, .. } => assert_eq!(name, "feature"),
             Head::Detached(_) => panic!("checkout left a detached HEAD"),
+        }
+        history.read_with(&cx, |history, _| {
+            assert!(
+                matches!(history.state(), LoadState::Loaded),
+                "the checkout restarted the load: {:?}",
+                history.state()
+            );
+            assert_eq!(
+                history.commit_count(),
+                rows,
+                "the checkout changed the rows"
+            );
+            assert_eq!(
+                history.selected_row(),
+                selected,
+                "the checkout lost the selection"
+            );
+            assert_eq!(history.selected_oid(), Some(oid));
+            assert_eq!(
+                history.load_generation(),
+                generation,
+                "the checkout walked the log again"
+            );
+            assert!(
+                history.meta_version() > meta_version,
+                "the checkout did not re-read HEAD and the refs"
+            );
+            assert_eq!(
+                history.head_badge(oid),
+                Some("feature"),
+                "the HEAD badge did not move to the checked-out branch"
+            );
+        });
+    }
+
+    /// Every ref dialog is classified deliberately: checkout-like ones refresh
+    /// the refs, the rest keep the full history walk.
+    #[test]
+    fn only_ref_moving_dialogs_skip_the_history_walk() {
+        let card = CommitCard::bare(Oid::from_hex(&"a".repeat(40)).unwrap());
+        let cases = [
+            (
+                RefDialogKind::CreateBranch { card: card.clone() },
+                RefChange::RefsOnly,
+            ),
+            (
+                RefDialogKind::CreateTag { card: card.clone() },
+                RefChange::RefsOnly,
+            ),
+            (
+                RefDialogKind::RenameBranch {
+                    old: "old".to_owned(),
+                },
+                RefChange::RefsOnly,
+            ),
+            (
+                RefDialogKind::RenameTag {
+                    old: "v1".to_owned(),
+                },
+                RefChange::History,
+            ),
+            (RefDialogKind::Remote { editing: None }, RefChange::History),
+            (
+                RefDialogKind::Reset { card: card.clone() },
+                RefChange::History,
+            ),
+            (
+                RefDialogKind::DeleteBranch {
+                    name: "gone".to_owned(),
+                    force: false,
+                },
+                RefChange::History,
+            ),
+            (
+                RefDialogKind::DeleteTag {
+                    name: "v1".to_owned(),
+                },
+                RefChange::History,
+            ),
+            (
+                RefDialogKind::RemoveRemote {
+                    name: "origin".to_owned(),
+                },
+                RefChange::History,
+            ),
+            (
+                RefDialogKind::DropStash {
+                    index: 0,
+                    label: "stash@{0}".to_owned(),
+                },
+                RefChange::History,
+            ),
+            (
+                RefDialogKind::CherryPick { card: card.clone() },
+                RefChange::History,
+            ),
+            (RefDialogKind::Revert { card }, RefChange::History),
+            (
+                RefDialogKind::RenameWorktree {
+                    from: PathBuf::from("/tmp/wt"),
+                },
+                RefChange::History,
+            ),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(ref_change_for_dialog(&kind), expected, "{kind:?}");
         }
     }
 
@@ -8735,5 +9440,104 @@ mod tests {
         });
         assert!(has_dialog(&cx), "Remove should open for a linked worktree");
         let _ = std::fs::remove_dir_all(linked);
+    }
+
+    #[test]
+    fn push_after_pull_belongs_only_to_that_pull() {
+        assert!(follow_with_push(&Job::Pull, true));
+        assert!(!follow_with_push(&Job::Pull, false));
+        // Any later job, including a plain pull, must not inherit the intent.
+        assert!(!follow_with_push(&Job::Push, true));
+        assert!(!follow_with_push(
+            &Job::Fetch(FetchOptions::default()),
+            true
+        ));
+    }
+
+    #[test]
+    fn only_a_branch_push_offers_pull_then_push() {
+        assert_eq!(
+            error_dialog_remedy(&KnownError::PushRejected, &Job::Push),
+            Some(true)
+        );
+        for job in [
+            Job::PushTag {
+                remote: "origin".into(),
+                tag: "v1".into(),
+            },
+            Job::PushTags {
+                remote: "origin".into(),
+            },
+            Job::DeleteRemoteBranch {
+                remote: "origin".into(),
+                branch: "topic".into(),
+            },
+        ] {
+            assert_eq!(
+                error_dialog_remedy(&KnownError::PushRejected, &job),
+                Some(false),
+                "{job:?} must show the dialog without the pull-then-push remedy"
+            );
+        }
+        assert_eq!(
+            error_dialog_remedy(&KnownError::PullNotFastForward, &Job::Pull),
+            Some(false)
+        );
+        assert_eq!(
+            error_dialog_remedy(&KnownError::PullNotFastForward, &Job::Push),
+            None
+        );
+        assert_eq!(
+            error_dialog_remedy(&KnownError::LocalChangesOverwritten, &Job::Pull),
+            None
+        );
+    }
+
+    fn checkout_failed() -> Error {
+        Error::Git {
+            command: "checkout",
+            code: None,
+            stderr: "fatal: checkout refused".into(),
+        }
+    }
+
+    #[test]
+    fn a_failed_switch_restores_the_stashed_changes() {
+        let tmp = crate::test_support::TempRepo::new("stash-switch");
+        commit(tmp.path(), "seed.txt", "init");
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "unsaved").unwrap();
+        let repo = git_core::Repo::open(crate::test_support::git(), tmp.path()).unwrap();
+
+        let result = stash_then_checkout(&repo, |_| Err(checkout_failed()));
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unsaved");
+        assert!(
+            repo.stashes().unwrap().is_empty(),
+            "the stash was not popped after the failed switch"
+        );
+    }
+
+    #[test]
+    fn a_failed_restore_says_the_changes_are_in_the_stash() {
+        let tmp = crate::test_support::TempRepo::new("stash-switch-pop-fails");
+        commit(tmp.path(), "seed.txt", "init");
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "unsaved").unwrap();
+        let repo = git_core::Repo::open(crate::test_support::git(), tmp.path()).unwrap();
+
+        let result = stash_then_checkout(&repo, |_| {
+            // Recreate the stashed file with other content: popping would
+            // overwrite it, so git refuses.
+            std::fs::write(&file, "changed again").unwrap();
+            Err(checkout_failed())
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains(SWITCH_STASH),
+            "the error does not name the stash: {message}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "changed again");
+        assert_eq!(repo.stashes().unwrap().len(), 1);
     }
 }

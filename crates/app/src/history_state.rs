@@ -254,7 +254,7 @@ mod tests {
         }
 
         let git = Error::Git {
-            command: "log --all --topo-order",
+            command: "log --all --date-order",
             code: Some(128),
             stderr: "fatal: bad object refs/heads/broken\n".into(),
         };
@@ -264,7 +264,7 @@ mod tests {
                 code,
                 stderr,
             } => {
-                assert_eq!(command.as_ref(), "log --all --topo-order");
+                assert_eq!(command.as_ref(), "log --all --date-order");
                 assert_eq!(code, Some(128));
                 // The trailing newline is trimmed for the error box.
                 assert_eq!(stderr.as_ref(), "fatal: bad object refs/heads/broken");
@@ -403,23 +403,23 @@ mod tests {
     #[test]
     fn copy_details_has_the_command_the_exit_code_and_the_stderr() {
         let failure = Failure::Git {
-            command: "log --all --topo-order".into(),
+            command: "log --all --date-order".into(),
             code: Some(128),
             stderr: "fatal: bad object".into(),
         };
         assert_eq!(
             failure.copy_details().as_deref(),
-            Some("git log --all --topo-order\nexit code 128\n\nfatal: bad object")
+            Some("git log --all --date-order\nexit code 128\n\nfatal: bad object")
         );
 
         let stopped = Failure::Git {
-            command: "log --all --topo-order".into(),
+            command: "log --all --date-order".into(),
             code: None,
             stderr: "killed".into(),
         };
         assert_eq!(
             stopped.copy_details().as_deref(),
-            Some("git log --all --topo-order\nstopped\n\nkilled")
+            Some("git log --all --date-order\nstopped\n\nkilled")
         );
 
         assert_eq!(Failure::GitNotFound.copy_details(), None);

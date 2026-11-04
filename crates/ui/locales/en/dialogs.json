@@ -219,5 +219,17 @@
   "dialogs.remote_name.spaces": "Name cannot contain spaces.",
   "dialogs.remote_url.bad": "Not a Git address. Use https://host/user/repo.git or git@host:user/repo.git",
   "dialogs.remote_url.https": "HTTPS · uses your saved account",
-  "dialogs.remote_url.ssh": "SSH · uses your SSH keys"
+  "dialogs.remote_url.ssh": "SSH · uses your SSH keys",
+  "dialogs.error.title_fallback": "Repository operation failed",
+  "dialogs.error.worktree_title": "Branch is in use",
+  "dialogs.error.worktree_body": "Branch {branch} is checked out in another worktree ({path}). Switch to that worktree to use it, or pick another branch.",
+  "dialogs.error.local_changes_title": "Local changes would be overwritten",
+  "dialogs.error.local_changes_body": "Switching would overwrite files with uncommitted changes. Stash or commit them first.",
+  "dialogs.error.push_rejected_title": "Push rejected",
+  "dialogs.error.push_rejected_body": "The remote has commits your branch does not. Pull the remote changes first, then push again.",
+  "dialogs.error.pull_diverged_title": "Branch has diverged",
+  "dialogs.error.pull_diverged_body": "This pull is not a fast-forward, and GitWarp only pulls fast-forward. Merge or rebase the branch, then pull again.",
+  "dialogs.error.open_worktree": "Open that worktree",
+  "dialogs.error.stash_and_switch": "Stash and switch",
+  "dialogs.error.pull_then_push": "Pull, then push"
 }

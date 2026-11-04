@@ -41,19 +41,91 @@ pub(crate) fn checkout_detached(repo: &Repo, oid: Oid) -> Result<()> {
     run(repo, &["switch", "--detach", &oid], "switch --detach")
 }
 
-/// Checks out a remote branch as a local tracking branch.
+/// Checks out a remote branch as its local counterpart.
 ///
-/// When a local branch with the remote's leaf name already exists, that branch
-/// is checked out instead: creating it again would fail. The leaf name is the
-/// part after the remote's first `/`, so `origin/feat/x` becomes `feat/x`.
+/// A missing local branch is created with `git switch --track`. An existing
+/// one is switched to, fast-forwarded to the remote when it is strictly behind,
+/// and gets an upstream only when it has none: an existing upstream and any
+/// local commits are never overwritten.
+///
+/// The local name is the remote ref without its remote prefix. Remotes can be
+/// named anything (`upstream`, …) and branch names may contain `/`, so the
+/// prefix is matched against the configured remotes rather than the first `/`.
 pub(crate) fn checkout_remote(repo: &Repo, remote_ref: &str) -> Result<()> {
-    let local = remote_ref
-        .split_once('/')
-        .map_or(remote_ref, |(_, leaf)| leaf);
-    if has_local_branch(repo, local)? {
-        return checkout_branch(repo, local);
+    let local = remote_branch_leaf(repo, remote_ref)?;
+    if !has_local_branch(repo, &local)? {
+        return run(repo, &["switch", "--track", remote_ref], "switch --track");
     }
-    run(repo, &["switch", "--track", remote_ref], "switch --track")
+    // A branch checked out in another worktree makes git itself fail here; the
+    // shell's "open that worktree" dialog handles the error.
+    checkout_branch(repo, &local)?;
+    let local_ref = format!("refs/heads/{local}");
+    let remote = format!("refs/remotes/{remote_ref}");
+    if is_ancestor(repo, &local_ref, &remote)? && !is_ancestor(repo, &remote, &local_ref)? {
+        run(repo, &["merge", "--ff-only", &remote], "merge --ff-only")?;
+    }
+    if !has_upstream(repo, &local)? {
+        run(
+            repo,
+            &["branch", "--set-upstream-to", &remote, &local],
+            "branch --set-upstream-to",
+        )?;
+    }
+    Ok(())
+}
+
+/// The local branch name of a remote ref: `origin/fix/x` becomes `fix/x`.
+///
+/// The remote prefix is the longest configured remote that matches, so a
+/// remote called `upstream` and branches with `/` in their names both work.
+fn remote_branch_leaf(repo: &Repo, remote_ref: &str) -> Result<String> {
+    let remotes = repo.remotes()?;
+    let remote = remotes
+        .iter()
+        .filter(|remote| {
+            remote_ref
+                .strip_prefix(remote.as_str())
+                .is_some_and(|rest| rest.len() > 1 && rest.starts_with('/'))
+        })
+        .max_by_key(|remote| remote.len());
+    Ok(match remote {
+        Some(remote) => remote_ref[remote.len() + 1..].to_owned(),
+        // Not a configured remote (or still loading): keep the old first-`/`
+        // split so a stale tracking ref still checks out somewhere sensible.
+        None => remote_ref
+            .split_once('/')
+            .map_or(remote_ref, |(_, leaf)| leaf)
+            .to_owned(),
+    })
+}
+
+/// Whether `ancestor` is an ancestor of `descendant` (`git merge-base`).
+fn is_ancestor(repo: &Repo, ancestor: &str, descendant: &str) -> Result<bool> {
+    let out = repo
+        .command()
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .map_err(Error::Spawn)?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(failure("merge-base --is-ancestor", out)),
+    }
+}
+
+/// Whether a local branch has any upstream configured.
+fn has_upstream(repo: &Repo, branch: &str) -> Result<bool> {
+    let out = repo
+        .command()
+        .args([
+            "for-each-ref",
+            "--format=%(upstream)",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "for-each-ref")?;
+    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
 fn has_local_branch(repo: &Repo, name: &str) -> Result<bool> {
@@ -269,6 +341,38 @@ pub(crate) fn stash_apply(repo: &Repo, index: usize) -> Result<()> {
 pub(crate) fn stash_pop(repo: &Repo, index: usize) -> Result<()> {
     let reference = format!("stash@{{{index}}}");
     run(repo, &["stash", "pop", &reference], "stash pop")
+}
+
+/// Whether `git stash pop --index` failed only because it could not rebuild
+/// the index (a conflicting index, or an index with its own changes). Git
+/// says so outright and keeps the stash entry; a plain pop can still apply it.
+fn index_restore_failed(error: &Error) -> bool {
+    let Error::Git { stderr, .. } = error else {
+        return false;
+    };
+    let stderr = stderr.to_lowercase();
+    stderr.contains("conflicts in index")
+        || stderr.contains("try without --index")
+        || stderr.contains("your index contains uncommitted changes")
+}
+
+/// Pops a stash and restores which changes were staged. When the index cannot
+/// be restored, falls back to a plain pop: the changes come back unstaged but
+/// are not lost.
+pub(crate) fn stash_pop_keep_index(repo: &Repo, index: usize) -> Result<()> {
+    let reference = format!("stash@{{{index}}}");
+    let out = repo
+        .command()
+        .args(["stash", "pop", "--index", &reference])
+        .output()
+        .map_err(Error::Spawn)?;
+    match check_output(out, "stash pop") {
+        Ok(_) => Ok(()),
+        Err(error) if index_restore_failed(&error) => {
+            run(repo, &["stash", "pop", &reference], "stash pop")
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn stash_drop(repo: &Repo, index: usize) -> Result<()> {
