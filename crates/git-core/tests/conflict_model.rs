@@ -705,6 +705,8 @@ fn save_goes_through_git_so_eol_attributes_apply() {
     assert!(git(dir, &["ls-files", "-u"]).is_empty());
 }
 
+// Unix file modes (executable bit, read-only dir) have no Windows equivalent.
+#[cfg(unix)]
 #[test]
 fn save_keeps_the_mode_of_the_side_and_creates_a_missing_file() {
     use std::os::unix::fs::PermissionsExt;
@@ -871,6 +873,8 @@ fn one_sided_kinds_keep_or_delete_through_resolve_take() {
     assert_eq!(tracked("both-gone.txt"), "");
 }
 
+// Unix file modes (executable bit, read-only dir) have no Windows equivalent.
+#[cfg(unix)]
 #[test]
 fn save_takes_the_mode_the_way_git_does() {
     use std::os::unix::fs::PermissionsExt;
@@ -897,6 +901,8 @@ fn save_takes_the_mode_the_way_git_does() {
     assert_eq!(meta.permissions().mode() & 0o111, 0o111);
 }
 
+// Unix file modes (executable bit, read-only dir) have no Windows equivalent.
+#[cfg(unix)]
 #[test]
 fn a_failed_checkout_puts_the_conflict_back() {
     use std::os::unix::fs::PermissionsExt;
