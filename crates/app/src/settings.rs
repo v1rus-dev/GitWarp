@@ -180,9 +180,9 @@ pub struct Settings {
     pub language: Language,
     /// What opens when the app starts.
     pub on_launch: OnLaunch,
-    /// Download and offer updates in the background.
+    /// Check GitHub for new releases and show a toast when one is out.
     pub check_updates: bool,
-    /// Stable or beta update channel.
+    /// Which releases the update check reports: stable only, or pre-releases too.
     pub update_channel: UpdateChannel,
     /// Minutes between background fetches.
     pub fetch_interval_minutes: u16,

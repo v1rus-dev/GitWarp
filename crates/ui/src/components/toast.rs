@@ -2,7 +2,8 @@
 //!
 //! Toasts are drawn by [`crate::overlay::render_overlays`] above every layer,
 //! bottom-right and newest last. Errors stay until dismissed; every other kind
-//! hides itself after five seconds.
+//! hides itself after five seconds, except toasts shown with
+//! [`show_persistent`], which stay whatever their kind.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -194,7 +195,7 @@ impl ToastQueue {
         now: Instant,
     ) -> ToastId {
         let id = self.push_with(kind, message, body, now);
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.toast.id == id) {
+        if let Some(entry) = self.entries.last_mut() {
             entry.deadline = None;
         }
         id
