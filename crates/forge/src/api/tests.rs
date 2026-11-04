@@ -847,3 +847,36 @@ fn azure_and_bitbucket_server_cannot_list() {
     );
     assert!(stub.seen.lock().unwrap().is_empty());
 }
+
+// ---- releases ----
+
+#[test]
+fn list_releases_decodes_and_sends_github_headers() {
+    let stub = Stub::start(vec![(
+        // The route names the query: any other query would answer 404.
+        "/repos/o/r/releases?per_page=100",
+        ok(r#"[
+            {"tag_name":"v0.2.0","html_url":"https://example.test/r/v0.2.0","prerelease":false,"draft":false,"id":1},
+            {"tag_name":"v0.3.0-rc.1","html_url":"https://example.test/r/v0.3.0-rc.1","prerelease":true,"draft":true,"name":"x"}
+        ]"#),
+    )]);
+    let releases = Client::for_tests()
+        .list_releases_at(&stub.base, "o", "r")
+        .unwrap();
+    assert_eq!(releases.len(), 2);
+    assert_eq!(releases[0].tag_name, "v0.2.0");
+    assert!(!releases[0].prerelease && !releases[0].draft);
+    assert!(releases[1].prerelease && releases[1].draft);
+    assert_eq!(
+        stub.header("/repos/o/r/releases", "accept").as_deref(),
+        Some("application/vnd.github+json")
+    );
+    assert_eq!(
+        stub.header("/repos/o/r/releases", "x-github-api-version")
+            .as_deref(),
+        Some("2022-11-28")
+    );
+    assert!(stub
+        .header("/repos/o/r/releases", "authorization")
+        .is_none());
+}

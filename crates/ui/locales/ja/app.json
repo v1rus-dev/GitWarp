@@ -1,1 +1,4 @@
-{}
+{
+  "app.update.available": "GitWarp {version} が利用できます",
+  "app.update.view_release": "リリースを表示"
+}

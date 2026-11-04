@@ -45,6 +45,7 @@ mod telemetry;
 mod test_support;
 mod text_runs;
 mod theme;
+mod update_check;
 mod web_links;
 mod welcome;
 mod welcome_activity;
@@ -399,6 +400,7 @@ fn main() {
                 },
             )
             .expect("failed to open the main window");
+            update_check::start(cx);
             cx.activate(true);
         });
 }

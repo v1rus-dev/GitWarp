@@ -56,8 +56,8 @@ Both themes share one geometry and differ only in colour.
 
 - Buttons: primary has an accent border (accent-hover on hover), danger an error@55% border, a
   disabled ghost button has no border. (The prototype's CSS cascade turns them all grey.)
-- Error toasts stay until dismissed; other toasts auto-hide after 5 s. (The prototype hides all
-  toasts after 5 s.)
+- Error toasts and toasts with a button (e.g. Reconnect, the update notice's View release) stay
+  until dismissed; other toasts auto-hide after 5 s. (The prototype hides all toasts after 5 s.)
 - Splitter hover/drag shows a 2px accent line centred in the 5px hit area. (The prototype fills
   the whole 5px strip.)
 - Tooltips use GPUI's built-in tooltip (500 ms delay, placed at the cursor) instead of 350 ms
