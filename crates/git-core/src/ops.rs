@@ -543,6 +543,45 @@ pub(crate) fn operation(repo: &Repo) -> Result<Operation> {
     })
 }
 
+/// The raw `MERGE_MSG` of the per-worktree git dir; `None` when absent.
+fn read_merge_msg(repo: &Repo) -> Result<Option<String>> {
+    match std::fs::read_to_string(repo.git_dir().join("MERGE_MSG")) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(Error::Io(err)),
+    }
+}
+
+/// See [`Repo::merge_heading`].
+pub(crate) fn merge_heading(repo: &Repo) -> Result<Option<String>> {
+    Ok(read_merge_msg(repo)?
+        .as_deref()
+        .and_then(|text| text.lines().next())
+        .and_then(parse_merge_heading))
+}
+
+fn parse_merge_heading(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix("Merge branch '")
+        .or_else(|| line.strip_prefix("Merge remote-tracking branch '"))?;
+    let end = rest.find('\'')?;
+    let name = &rest[..end];
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// See [`Repo::merge_message`].
+pub(crate) fn merge_message(repo: &Repo) -> Result<Option<String>> {
+    if !repo.git_dir().join("MERGE_HEAD").exists() {
+        return Ok(None);
+    }
+    // `git commit -F` keeps `#` lines (it does not strip them like the editor
+    // flow), and git appends a `# Conflicts:` block to MERGE_MSG.
+    Ok(read_merge_msg(repo)?.map(|text| {
+        let kept: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        kept.join("\n").trim_end().to_string()
+    }))
+}
+
 /// Applies one commit on top of HEAD as a new commit.
 ///
 /// A conflict is aborted before it reaches the UI: there is no conflict editor

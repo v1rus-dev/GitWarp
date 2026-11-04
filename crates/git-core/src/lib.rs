@@ -53,7 +53,7 @@ pub use ops::{MergeOutcome, MergePreview, MergeType, Operation, ResetMode};
 pub use refs::{Head, Ref, RefKind};
 pub use runner::{DiscoveredRepo, GitRunner};
 pub use stash::Stash;
-pub use status::{ChangedEntry, HeadCommit, HunkPick, WorkingFile, WorkingStatus};
+pub use status::{ChangedEntry, ConflictSide, HeadCommit, HunkPick, WorkingFile, WorkingStatus};
 pub use submodule::{Submodule, SubmoduleState};
 pub use worktree::Worktree;
 
@@ -407,6 +407,12 @@ impl Repo {
         status::stage(self, paths)
     }
 
+    /// Resolves a conflicted `path` by taking one side of the merge whole and
+    /// staging it (or deleting the file when that side deleted it).
+    pub fn resolve_take(&self, path: &str, side: ConflictSide) -> Result<()> {
+        status::resolve_take(self, path, side)
+    }
+
     /// Removes `paths` from the index, leaving the work tree alone.
     pub fn unstage(&self, paths: &[String]) -> Result<()> {
         status::unstage(self, paths)
@@ -588,6 +594,20 @@ impl Repo {
     /// The merge / rebase / cherry-pick / revert the repository is stopped in.
     pub fn operation(&self) -> Result<Operation> {
         ops::operation(self)
+    }
+
+    /// The name of the branch being merged, from the first line of
+    /// `.git/MERGE_MSG` (`Merge branch 'X'`, `Merge remote-tracking branch
+    /// 'X'`, optionally followed by ` of <url>`/` into <name>`). `None` when
+    /// there is no message or it has another shape.
+    pub fn merge_heading(&self) -> Result<Option<String>> {
+        ops::merge_heading(self)
+    }
+
+    /// The prepared merge commit message (`.git/MERGE_MSG` without its `#`
+    /// comment lines), if a merge is in progress.
+    pub fn merge_message(&self) -> Result<Option<String>> {
+        ops::merge_message(self)
     }
 
     /// Applies `oid` on top of HEAD; a conflict is aborted and returned.

@@ -7,7 +7,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use git_core::{
-    Git, GitChoice, GitVersion, MergeOutcome, MergePreview, MergeType, Operation, Repo,
+    ConflictSide, Git, GitChoice, GitVersion, MergeOutcome, MergePreview, MergeType, Operation,
+    Repo,
 };
 
 fn git_out(dir: &Path, args: &[&str]) -> String {
@@ -319,4 +320,140 @@ fn operation_reports_a_stopped_rebase() {
     ));
     git(dir, &["rebase", "--abort"]);
     assert_eq!(repo.operation().unwrap(), Operation::None);
+}
+
+/// The shape from the bug report: two conflicted files plus one file the merge
+/// added cleanly.
+fn stopped_merge() -> (tempfile::TempDir, Repo) {
+    let (tmp, repo) = base();
+    let dir = tmp.path();
+    commit_file(dir, "graph.rs", "base\n", "graph");
+    commit_file(dir, "sidebar.rs", "base\n", "sidebar");
+    git(dir, &["branch", "-f", "side"]);
+    commit_file(dir, "graph.rs", "main\n", "M graph");
+    commit_file(dir, "sidebar.rs", "main\n", "M sidebar");
+    git(dir, &["switch", "-q", "side"]);
+    commit_file(dir, "graph.rs", "side\n", "S graph");
+    commit_file(dir, "sidebar.rs", "side\n", "S sidebar");
+    commit_file(dir, "new.rs", "new\n", "S new");
+    git(dir, &["switch", "-q", "main"]);
+    let outcome = repo
+        .merge("side", MergeType::FastForwardIfPossible)
+        .unwrap();
+    assert!(matches!(outcome, MergeOutcome::Conflicts { .. }));
+    (tmp, repo)
+}
+
+#[test]
+fn status_lists_each_conflicted_path_once() {
+    let (_tmp, repo) = stopped_merge();
+    let status = repo.working_status().unwrap();
+    let paths =
+        |files: &[git_core::WorkingFile]| files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
+    assert_eq!(paths(&status.conflicted), ["graph.rs", "sidebar.rs"]);
+    assert_eq!(paths(&status.staged), ["new.rs"]);
+    assert!(status.unstaged.is_empty(), "{:?}", status.unstaged);
+}
+
+#[test]
+fn merge_heading_reads_the_branch_name() {
+    let (_tmp, repo) = stopped_merge();
+    assert_eq!(repo.merge_heading().unwrap().as_deref(), Some("side"));
+    let message = repo.merge_message().unwrap().unwrap();
+    assert!(message.starts_with("Merge branch 'side'"));
+    assert!(!message.contains('#'), "{message}");
+}
+
+#[test]
+fn merge_heading_formats() {
+    let (tmp, repo) = base();
+    assert_eq!(repo.merge_heading().unwrap(), None);
+    assert_eq!(repo.merge_message().unwrap(), None);
+    let msg = repo.git_dir().join("MERGE_MSG");
+    for (text, want) in [
+        ("Merge branch 'feature/x'\n", Some("feature/x")),
+        (
+            "Merge remote-tracking branch 'origin/dev'\n",
+            Some("origin/dev"),
+        ),
+        (
+            "Merge branch 'a' of https://host/repo\n\n# Conflicts:\n",
+            Some("a"),
+        ),
+        ("Merge branch 'a' into main\n", Some("a")),
+        ("Merged something\n", None),
+        ("", None),
+    ] {
+        fs::write(&msg, text).unwrap();
+        assert_eq!(repo.merge_heading().unwrap().as_deref(), want, "{text:?}");
+    }
+    drop(tmp);
+}
+
+#[test]
+fn resolve_take_ours_and_theirs_then_commit_finishes_the_merge() {
+    let (tmp, repo) = stopped_merge();
+    repo.resolve_take("graph.rs", ConflictSide::Ours).unwrap();
+    repo.resolve_take("sidebar.rs", ConflictSide::Theirs)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("graph.rs")).unwrap(),
+        "main\n"
+    );
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("sidebar.rs")).unwrap(),
+        "side\n"
+    );
+    let status = repo.working_status().unwrap();
+    assert!(status.conflicted.is_empty());
+    // graph.rs took our side, so it no longer differs from HEAD.
+    assert_eq!(status.staged.len(), 2);
+    assert_eq!(repo.operation().unwrap(), Operation::Merge);
+    let message = repo.merge_message().unwrap().unwrap();
+    repo.commit(&message, false).unwrap();
+    assert_eq!(repo.operation().unwrap(), Operation::None);
+    assert_eq!(
+        git_out(tmp.path(), &["rev-list", "--parents", "-n1", "HEAD"])
+            .split(' ')
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn resolve_take_deletion_side_removes_the_file() {
+    let (tmp, repo) = base();
+    let dir = tmp.path();
+    // main modifies a.txt, side deletes it.
+    commit_file(dir, "a.txt", "main\n", "M");
+    git(dir, &["switch", "-q", "side"]);
+    git(dir, &["rm", "-q", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "S"]);
+    git(dir, &["switch", "-q", "main"]);
+    assert!(matches!(
+        repo.merge("side", MergeType::FastForwardIfPossible)
+            .unwrap(),
+        MergeOutcome::Conflicts { .. }
+    ));
+    assert_eq!(repo.working_status().unwrap().conflicted.len(), 1);
+    repo.resolve_take("a.txt", ConflictSide::Theirs).unwrap();
+    assert!(!dir.join("a.txt").exists());
+    assert!(repo.working_status().unwrap().conflicted.is_empty());
+    repo.commit("Merge side", false).unwrap();
+    assert_eq!(repo.operation().unwrap(), Operation::None);
+}
+
+#[test]
+fn resolve_take_keeps_a_file_the_chosen_side_still_has() {
+    let (tmp, repo) = base();
+    let dir = tmp.path();
+    commit_file(dir, "a.txt", "main\n", "M");
+    git(dir, &["switch", "-q", "side"]);
+    git(dir, &["rm", "-q", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "S"]);
+    git(dir, &["switch", "-q", "main"]);
+    repo.merge("side", MergeType::FastForwardIfPossible)
+        .unwrap();
+    repo.resolve_take("a.txt", ConflictSide::Ours).unwrap();
+    assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "main\n");
 }

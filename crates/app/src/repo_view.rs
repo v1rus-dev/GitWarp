@@ -847,6 +847,8 @@ impl RepositoryView {
                     this.reload_history(cx);
                 }
                 ChangesEvent::PushAfterCommit => this.push_branch(window, cx),
+                // The abort moved HEAD back: history, sidebar and worktrees follow.
+                ChangesEvent::MergeAborted => this.after_ref_change(RefChange::History, cx),
             },
         );
         let changes_redraw = cx.observe(&changes, |_, _, cx| cx.notify());

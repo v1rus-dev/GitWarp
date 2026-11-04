@@ -32,6 +32,8 @@ pub struct Banner {
     plain_list: bool,
     mono_body: bool,
     action: Option<AnyElement>,
+    trailing: Option<AnyElement>,
+    flat: bool,
 }
 
 impl Banner {
@@ -44,6 +46,8 @@ impl Banner {
             plain_list: false,
             mono_body: false,
             action: None,
+            trailing: None,
+            flat: false,
         }
     }
 
@@ -67,6 +71,19 @@ impl Banner {
     /// An action (a button) under the text, inside the banner.
     pub fn action(mut self, action: impl IntoElement) -> Self {
         self.action = Some(action.into_any_element());
+        self
+    }
+
+    /// Controls on the right edge of the banner, vertically centred (an
+    /// operation banner's Abort / Commit buttons).
+    pub fn trailing(mut self, trailing: impl IntoElement) -> Self {
+        self.trailing = Some(trailing.into_any_element());
+        self
+    }
+
+    /// A full-width bar: square corners, only the bottom edge drawn.
+    pub fn flat(mut self) -> Self {
+        self.flat = true;
         self
     }
 
@@ -120,9 +137,10 @@ impl RenderOnce for Banner {
             .pl(px(12.))
             .pr(px(12.))
             .w_full()
-            .border_1()
+            .when(self.flat, |this| this.border_b_1())
+            .when(!self.flat, |this| this.border_1().rounded(R_MD))
+            .when(self.trailing.is_some(), |this| this.items_center())
             .border_color(color.opacity(border_alpha))
-            .rounded(R_MD)
             .bg(color.opacity(background_alpha))
             .text_size(FS_BASE)
             .child(
@@ -182,5 +200,15 @@ impl RenderOnce for Banner {
                         this.child(div().mt(px(4.)).child(action))
                     }),
             )
+            .when_some(self.trailing, |this, trailing| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(trailing),
+                )
+            })
     }
 }

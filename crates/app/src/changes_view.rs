@@ -13,19 +13,22 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, div, px, uniform_list, AnyElement, App, AppContext, Context, Div, Entity,
     EventEmitter, FocusHandle, FontWeight, Hsla, InteractiveElement, IntoElement,
-    ListHorizontalSizingBehavior, ParentElement, Pixels, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, StyledText, Subscription, TextRun, UniformListScrollHandle,
-    Window,
+    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, ParentElement, Pixels, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, StyledText, Subscription,
+    TextRun, UniformListScrollHandle, Window,
 };
 
-use git_core::{ChangeKind, Error, FileDiff, Git, HunkPick, Repo, WorkingFile, WorkingStatus};
+use git_core::{
+    ChangeKind, ConflictSide, Error, FileDiff, Git, HunkPick, Operation, Repo, WorkingFile,
+    WorkingStatus,
+};
 use ui::actions::{key_binding, SelectNext, SelectPrev};
 use ui::components::toast::{self, ToastKind};
 use ui::metrics::{FONT_MONO, FS_SM, FS_XS, MONO};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    Button, ButtonSize, CountPill, FileRow, IconName, ScrollArea, Scrollbar, SegmentItem,
-    Segmented, SelectableText, Skeleton, Switch, TextArea, TextAreaEvent,
+    Banner, BannerKind, Button, ButtonSize, CountPill, FileRow, IconName, ScrollArea, Scrollbar,
+    SegmentItem, Segmented, SelectableText, Skeleton, Switch, TextArea, TextAreaEvent,
 };
 
 use crate::diff_model::{
@@ -50,11 +53,16 @@ pub enum ChangesEvent {
     Committed,
     /// A commit the user asked to push succeeded; the shell starts the push.
     PushAfterCommit,
+    /// The merge in progress was aborted: HEAD, the history and the sidebar
+    /// moved back, so the shell reloads them.
+    MergeAborted,
 }
 
 /// Which side of the index a file row belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
+    /// Unmerged paths of a merge in progress.
+    Conflicted,
     Unstaged,
     Staged,
 }
@@ -97,7 +105,77 @@ pub enum DiffState {
     Empty,
     Loading,
     Loaded(Arc<ChangesDiff>),
+    /// The work-tree file of a conflicted path, markers and all.
+    Conflict(Arc<ConflictFile>),
     Failed(String),
+}
+
+/// How a line of a conflicted file is painted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictKind {
+    Plain,
+    /// `<<<<<<<`, `|||||||`, `=======` or `>>>>>>>`.
+    Marker,
+    /// Between `<<<<<<<` and `=======` (the checked-out side).
+    Ours,
+    /// Between `=======` and `>>>>>>>` (the merged side).
+    Theirs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConflictLine {
+    pub text: String,
+    pub kind: ConflictKind,
+}
+
+/// The work-tree content of a conflicted path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConflictFile {
+    pub lines: Vec<ConflictLine>,
+    /// Longest line, in characters, for the pane width.
+    pub columns: usize,
+    pub binary: bool,
+    /// The path is not in the work tree (both sides deleted it).
+    pub missing: bool,
+}
+
+/// What a stopped merge adds to the view.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MergeInfo {
+    /// The branch being merged, from the merge message.
+    pub branch: Option<String>,
+    /// The prepared merge commit message.
+    pub message: Option<String>,
+}
+
+/// A commit-box prefill from the merge message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Prefill {
+    /// The text the box was given.
+    text: String,
+    /// What the box held before (the user's draft; may be empty).
+    before: String,
+}
+
+/// The text to put back when the merge ended without a commit: the box content
+/// from before the prefill, unless the user edited the prefilled text.
+fn undo_prefill(current: &str, prefill: &Prefill) -> Option<String> {
+    (current.trim_end() == prefill.text.trim_end()).then(|| prefill.before.clone())
+}
+
+/// One consistent read of the work tree.
+#[derive(Debug)]
+pub struct Snapshot {
+    pub status: WorkingStatus,
+    /// `Some` while a merge is in progress.
+    pub merge: Option<MergeInfo>,
+}
+
+/// How a conflicted path is resolved from the row menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Resolve {
+    Take(ConflictSide),
+    MarkResolved,
 }
 
 pub struct ChangesView {
@@ -119,7 +197,17 @@ pub struct ChangesView {
     /// The message the user typed before amend replaced it.
     draft: Option<String>,
     busy: bool,
+    /// The merge in progress, if any; read with every status.
+    merge: Option<MergeInfo>,
+    /// The merge message was put in the commit box for this merge.
+    merge_prefilled: bool,
+    /// What the prefill put in the box, to take it out again if the merge ends
+    /// without a commit.
+    prefill: Option<Prefill>,
+    /// The banner asks to confirm the abort.
+    confirming_abort: bool,
     focus: FocusHandle,
+    conflicts_scroll: ScrollHandle,
     unstaged_scroll: ScrollHandle,
     staged_scroll: ScrollHandle,
     diff_scroll: UniformListScrollHandle,
@@ -176,7 +264,12 @@ impl ChangesView {
             amend: false,
             draft: None,
             busy: false,
+            merge: None,
+            merge_prefilled: false,
+            prefill: None,
+            confirming_abort: false,
             focus: cx.focus_handle().tab_stop(false),
+            conflicts_scroll: ScrollHandle::new(),
             unstaged_scroll: ScrollHandle::new(),
             staged_scroll: ScrollHandle::new(),
             diff_scroll: UniformListScrollHandle::new(),
@@ -198,12 +291,20 @@ impl ChangesView {
         }
     }
 
+    /// Unstaged and conflicted paths: everything the work tree still differs
+    /// by from the index.
     pub fn unstaged_count(&self) -> usize {
-        self.status().map_or(0, WorkingStatus::unstaged_count)
+        self.status().map_or(0, |status| {
+            status.unstaged_count() + status.conflicted_count()
+        })
     }
 
     pub fn staged_count(&self) -> usize {
         self.status().map_or(0, WorkingStatus::staged_count)
+    }
+
+    fn conflicted_count(&self) -> usize {
+        self.status().map_or(0, WorkingStatus::conflicted_count)
     }
 
     pub fn is_loading(&self) -> bool {
@@ -224,11 +325,7 @@ impl ChangesView {
     }
 
     fn file(&self, selection: Selection) -> Option<&WorkingFile> {
-        let status = self.status()?;
-        match selection.side {
-            Side::Unstaged => status.unstaged.get(selection.index),
-            Side::Staged => status.staged.get(selection.index),
-        }
+        files_of(self.status()?, selection.side).get(selection.index)
     }
 
     fn selection_path(&self) -> Option<(Side, String)> {
@@ -256,7 +353,7 @@ impl ChangesView {
                 .background_executor()
                 .spawn(async move {
                     let repo = Repo::open(git, &path).map_err(|error| error.to_string())?;
-                    repo.working_status().map_err(|error| error.to_string())
+                    read_snapshot(&repo)
                 })
                 .await;
             this.update(cx, |view, cx| {
@@ -272,14 +369,14 @@ impl ChangesView {
         &mut self,
         generation: u64,
         previous: Option<(Side, String)>,
-        result: Result<WorkingStatus, String>,
+        result: Result<Snapshot, String>,
         cx: &mut Context<Self>,
     ) {
         if generation != self.generation {
             return;
         }
-        let status = match result {
-            Ok(status) => Arc::new(status),
+        let (status, merge) = match result {
+            Ok(snapshot) => (Arc::new(snapshot.status), snapshot.merge),
             Err(error) => {
                 self.state = StatusState::Failed(error);
                 self.diff = DiffState::Empty;
@@ -289,41 +386,18 @@ impl ChangesView {
         };
         let selection = previous
             .and_then(|(side, path)| {
-                let files = match side {
-                    Side::Unstaged => &status.unstaged,
-                    Side::Staged => &status.staged,
-                };
-                files
-                    .iter()
-                    .position(|file| file.path == path)
-                    .map(|index| Selection { side, index })
-                    .or_else(|| {
-                        // The file may have moved to the other side.
-                        let other = if side == Side::Unstaged {
-                            Side::Staged
-                        } else {
-                            Side::Unstaged
-                        };
-                        let files = match other {
-                            Side::Unstaged => &status.unstaged,
-                            Side::Staged => &status.staged,
-                        };
-                        files
-                            .iter()
-                            .position(|file| file.path == path)
-                            .map(|index| Selection { side: other, index })
-                    })
-            })
-            .or_else(|| {
-                (!status.unstaged.is_empty()).then_some(Selection {
-                    side: Side::Unstaged,
-                    index: 0,
+                // The file may have moved to another list (resolved, staged).
+                let others = SIDES.into_iter().filter(|other| *other != side);
+                std::iter::once(side).chain(others).find_map(|side| {
+                    files_of(&status, side)
+                        .iter()
+                        .position(|file| file.path == path)
+                        .map(|index| Selection { side, index })
                 })
             })
             .or_else(|| {
-                (!status.staged.is_empty()).then_some(Selection {
-                    side: Side::Staged,
-                    index: 0,
+                SIDES.into_iter().find_map(|side| {
+                    (!files_of(&status, side).is_empty()).then_some(Selection { side, index: 0 })
                 })
             });
         self.selection = selection;
@@ -331,8 +405,47 @@ impl ChangesView {
         self.pick_anchor = None;
         self.confirming_discard = None;
         self.state = StatusState::Loaded(status);
+        self.apply_merge(merge, cx);
         self.start_diff(cx);
         cx.notify();
+    }
+
+    /// Takes the merge state of a fresh status: a stopped merge pre-fills the
+    /// commit box once and rules amend out.
+    fn apply_merge(&mut self, merge: Option<MergeInfo>, cx: &mut Context<Self>) {
+        match &merge {
+            Some(info) => {
+                if self.amend {
+                    self.set_amend(false, cx);
+                }
+                let current = self.message.read(cx).text().to_string();
+                if !self.merge_prefilled && current.trim().is_empty() {
+                    if let Some(message) = info.message.clone().filter(|text| !text.is_empty()) {
+                        self.prefill = Some(Prefill {
+                            text: message.clone(),
+                            before: current,
+                        });
+                        self.message
+                            .update(cx, |input, cx| input.set_text(message, cx));
+                    }
+                }
+                self.merge_prefilled = true;
+            }
+            None => {
+                // The merge ended: after a commit the box is already empty; after
+                // an abort (here or outside the app) an untouched prefill goes.
+                if let Some(prefill) = self.prefill.take() {
+                    let current = self.message.read(cx).text().to_string();
+                    if let Some(before) = undo_prefill(&current, &prefill) {
+                        self.message
+                            .update(cx, |input, cx| input.set_text(before, cx));
+                    }
+                }
+                self.merge_prefilled = false;
+                self.confirming_abort = false;
+            }
+        }
+        self.merge = merge;
     }
 
     /// Moves the file selection through both lists with the arrow keys.
@@ -340,15 +453,10 @@ impl ChangesView {
         let Some(status) = self.status() else {
             return;
         };
-        let mut rows = Vec::with_capacity(status.unstaged.len() + status.staged.len());
-        rows.extend((0..status.unstaged.len()).map(|index| Selection {
-            side: Side::Unstaged,
-            index,
-        }));
-        rows.extend((0..status.staged.len()).map(|index| Selection {
-            side: Side::Staged,
-            index,
-        }));
+        let mut rows = Vec::new();
+        for side in SIDES {
+            rows.extend((0..files_of(status, side).len()).map(|index| Selection { side, index }));
+        }
         if rows.is_empty() {
             return;
         }
@@ -399,6 +507,19 @@ impl ChangesView {
         };
         self.diff = DiffState::Loading;
         let path = self.path.clone();
+        if selection.side == Side::Conflicted {
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { read_conflict(git, &path, &file.path) })
+                    .await;
+                this.update(cx, |view, cx| view.set_conflict(generation, result, cx))
+                    .ok();
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
         let staged = selection.side.staged();
         let settings = cx
             .try_global::<crate::AppSettings>()
@@ -434,6 +555,22 @@ impl ChangesView {
         cx.notify();
     }
 
+    fn set_conflict(
+        &mut self,
+        generation: u64,
+        result: Result<ConflictFile, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.diff_generation {
+            return;
+        }
+        self.diff = match result {
+            Ok(data) => DiffState::Conflict(Arc::new(data)),
+            Err(error) => DiffState::Failed(error),
+        };
+        cx.notify();
+    }
+
     fn diff_data(&self) -> Option<Arc<ChangesDiff>> {
         match &self.diff {
             DiffState::Loaded(data) => Some(data.clone()),
@@ -458,7 +595,7 @@ impl ChangesView {
     }
 
     fn set_amend(&mut self, amend: bool, cx: &mut Context<Self>) {
-        if self.amend == amend {
+        if self.amend == amend || (amend && self.merge.is_some()) {
             return;
         }
         self.amend = amend;
@@ -607,12 +744,14 @@ impl ChangesView {
     }
 
     fn stage_file(&mut self, side: Side, index: usize, cx: &mut Context<Self>) {
+        // A conflicted path is only resolved on purpose, from its menu: Space
+        // must not mark it resolved with the markers still in it.
+        if side == Side::Conflicted {
+            return;
+        }
         let Some(file) = self
             .status()
-            .and_then(|status| match side {
-                Side::Unstaged => status.unstaged.get(index),
-                Side::Staged => status.staged.get(index),
-            })
+            .and_then(|status| files_of(status, side).get(index))
             .cloned()
         else {
             return;
@@ -639,14 +778,13 @@ impl ChangesView {
         let Some(status) = self.status() else {
             return;
         };
-        let paths: Vec<String> = match side {
-            Side::Unstaged => status
-                .unstaged
-                .iter()
-                .map(|file| file.path.clone())
-                .collect(),
-            Side::Staged => status.staged.iter().map(|file| file.path.clone()).collect(),
-        };
+        if side == Side::Conflicted {
+            return;
+        }
+        let paths: Vec<String> = files_of(status, side)
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
         if paths.is_empty() {
             return;
         }
@@ -668,12 +806,12 @@ impl ChangesView {
     }
 
     fn discard(&mut self, side: Side, index: usize, cx: &mut Context<Self>) {
+        if side == Side::Conflicted {
+            return;
+        }
         let Some(file) = self
             .status()
-            .and_then(|status| match side {
-                Side::Unstaged => status.unstaged.get(index),
-                Side::Staged => status.staged.get(index),
-            })
+            .and_then(|status| files_of(status, side).get(index))
             .cloned()
         else {
             return;
@@ -697,6 +835,19 @@ impl ChangesView {
     where
         F: FnOnce(&Repo) -> git_core::Result<String> + Send + 'static,
     {
+        self.start_action_emitting(None, cx, action);
+    }
+
+    /// [`Self::start_action`] that also tells the shell what happened once the
+    /// action succeeded.
+    fn start_action_emitting<F>(
+        &mut self,
+        event: Option<ChangesEvent>,
+        cx: &mut Context<Self>,
+        action: F,
+    ) where
+        F: FnOnce(&Repo) -> git_core::Result<String> + Send + 'static,
+    {
         if self.busy {
             return;
         }
@@ -715,12 +866,12 @@ impl ChangesView {
                 .spawn(async move {
                     let repo = Repo::open(git, &path).map_err(|error| error.to_string())?;
                     let notice = action(&repo).map_err(|error| error.to_string())?;
-                    let status = repo.working_status().map_err(|error| error.to_string())?;
-                    Ok::<_, String>((notice, status))
+                    let snapshot = read_snapshot(&repo)?;
+                    Ok::<_, String>((notice, snapshot))
                 })
                 .await;
             this.update_in(cx, |view, window, cx| {
-                view.finish_action(result, window, cx)
+                view.finish_action(result, event, window, cx)
             })
             .ok();
         })
@@ -730,16 +881,20 @@ impl ChangesView {
 
     fn finish_action(
         &mut self,
-        result: Result<(String, WorkingStatus), String>,
+        result: Result<(String, Snapshot), String>,
+        event: Option<ChangesEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.busy = false;
         match result {
-            Ok((notice, status)) => {
+            Ok((notice, snapshot)) => {
                 toast::show(ToastKind::Ok, notice, window, cx);
                 let previous = self.selection_path();
-                self.apply_status(status, previous, cx);
+                self.apply_status(snapshot, previous, cx);
+                if let Some(event) = event {
+                    cx.emit(event);
+                }
             }
             Err(error) => {
                 toast::show(ToastKind::Error, error, window, cx);
@@ -750,13 +905,211 @@ impl ChangesView {
 
     fn apply_status(
         &mut self,
-        status: WorkingStatus,
+        status: Snapshot,
         previous: Option<(Side, String)>,
         cx: &mut Context<Self>,
     ) {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.set_status(generation, previous, Ok(status), cx);
+    }
+
+    /// The label of the checked-out branch, or `HEAD` while detached.
+    fn head_label(&self) -> String {
+        self.status()
+            .and_then(|status| status.branch.clone())
+            .unwrap_or_else(|| "HEAD".to_string())
+    }
+
+    /// The name of the merged side: the branch from the merge message, or a
+    /// neutral phrase when git's message has an unknown shape.
+    fn incoming_label(&self) -> String {
+        self.merge
+            .as_ref()
+            .and_then(|merge| merge.branch.clone())
+            .unwrap_or_else(|| ui::t!("changes.conflict.incoming").to_string())
+    }
+
+    /// Resolves the conflicted row `index` (see the row menu).
+    fn resolve_conflict(&mut self, index: usize, how: Resolve, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .status()
+            .and_then(|status| status.conflicted.get(index))
+            .map(|file| file.path.clone())
+        else {
+            return;
+        };
+        let notice = match how {
+            Resolve::Take(ConflictSide::Ours) => {
+                ui::t!(
+                    "changes.notice.took",
+                    branch = self.head_label(),
+                    path = path
+                )
+            }
+            Resolve::Take(ConflictSide::Theirs) => {
+                ui::t!(
+                    "changes.notice.took",
+                    branch = self.incoming_label(),
+                    path = path
+                )
+            }
+            Resolve::MarkResolved => ui::t!("changes.notice.marked_resolved", path = path),
+        }
+        .to_string();
+        self.start_action(cx, move |repo| {
+            match how {
+                Resolve::Take(side) => repo.resolve_take(&path, side)?,
+                Resolve::MarkResolved => repo.stage(std::slice::from_ref(&path))?,
+            }
+            Ok(notice)
+        });
+    }
+
+    /// Abandons the merge (after the banner's inline confirm).
+    fn abort_merge(&mut self, cx: &mut Context<Self>) {
+        self.confirming_abort = false;
+        let notice = ui::t!("changes.notice.merge_aborted").to_string();
+        self.start_action_emitting(Some(ChangesEvent::MergeAborted), cx, move |repo| {
+            repo.merge_abort()?;
+            Ok(notice)
+        });
+        cx.notify();
+    }
+
+    /// The menu of a conflicted row: take a side, or mark it resolved.
+    fn open_conflict_menu(
+        &mut self,
+        index: usize,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use ui::components::menu::{self, MenuEntry, MenuItem};
+
+        let busy = self.busy;
+        let view = cx.entity();
+        let item =
+            |label: SharedString, icon: IconName, how: Resolve| {
+                let view = view.clone();
+                MenuEntry::Item(MenuItem::new(label).icon(icon).disabled(busy).action(
+                    move |_, cx| {
+                        view.update(cx, |view, cx| view.resolve_conflict(index, how, cx));
+                    },
+                ))
+            };
+        let entries = vec![
+            item(
+                ui::t!("changes.conflict.take", branch = self.head_label()),
+                IconName::Check,
+                Resolve::Take(ConflictSide::Ours),
+            ),
+            item(
+                ui::t!("changes.conflict.take", branch = self.incoming_label()),
+                IconName::Check,
+                Resolve::Take(ConflictSide::Theirs),
+            ),
+            MenuEntry::Separator,
+            item(
+                ui::t!("changes.conflict.mark_resolved"),
+                IconName::Plus,
+                Resolve::MarkResolved,
+            ),
+        ];
+        menu::open_context_menu(position, entries, window, cx);
+    }
+
+    /// The operation banner of a merge in progress.
+    fn render_merge_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let merge = self.merge.as_ref()?;
+        let left = self.conflicted_count();
+        let head = self.head_label();
+        let busy = self.busy;
+        let view = cx.entity();
+        let title = match &merge.branch {
+            Some(branch) => ui::t!("changes.merge.title", branch = branch, head = head),
+            None => ui::t!("changes.merge.title_unknown", head = head),
+        };
+        let kind = merge_banner_kind(left);
+        let actions = if self.confirming_abort {
+            let keep_view = view.clone();
+            div()
+                .flex()
+                .gap(px(8.))
+                .child(
+                    Button::danger("merge-abort-confirm")
+                        .size(ButtonSize::Small)
+                        .label(ui::t!("changes.merge.abort"))
+                        .disabled(busy)
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |view, cx| view.abort_merge(cx));
+                        }),
+                )
+                .child(
+                    Button::new("merge-abort-keep")
+                        .size(ButtonSize::Small)
+                        .label(ui::t!("changes.merge.keep"))
+                        .on_click(move |_, _, cx| {
+                            keep_view.update(cx, |view, cx| {
+                                view.confirming_abort = false;
+                                cx.notify();
+                            });
+                        }),
+                )
+        } else {
+            let abort_view = view.clone();
+            let can = can_commit(true, false, self.staged_count(), left) && !busy;
+            let mut commit = Button::primary("merge-commit")
+                .size(ButtonSize::Small)
+                .label(ui::t!("changes.merge.commit"))
+                .disabled(!can);
+            if left > 0 {
+                commit = commit.tooltip(ui::t!("changes.merge.resolve_first"));
+            }
+            div()
+                .flex()
+                .gap(px(8.))
+                .child(
+                    Button::danger("merge-abort")
+                        .size(ButtonSize::Small)
+                        .label(ui::t!("changes.merge.abort"))
+                        .disabled(busy)
+                        .on_click(move |_, _, cx| {
+                            abort_view.update(cx, |view, cx| {
+                                view.confirming_abort = true;
+                                cx.notify();
+                            });
+                        }),
+                )
+                .child(commit.on_click(move |_, window, cx| {
+                    view.update(cx, |view, cx| view.commit(window, cx));
+                }))
+        };
+        let detail = if self.confirming_abort {
+            match &merge.branch {
+                Some(branch) => {
+                    ui::t!("changes.merge.abort_confirm", branch = branch, head = head)
+                }
+                None => ui::t!("changes.merge.abort_confirm_unknown", head = head),
+            }
+        } else if left == 0 {
+            ui::t!("changes.merge.resolved")
+        } else {
+            ui::i18n::t_count("changes.merge.left", left as u64, &[])
+        };
+        Some(
+            div()
+                .w_full()
+                .flex_none()
+                .debug_selector(|| "merge-banner".to_string())
+                .child(
+                    Banner::new(kind, title)
+                        .body(detail)
+                        .flat()
+                        .trailing(actions),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Commits the index, or amends HEAD, from the commit box.
@@ -785,14 +1138,21 @@ impl ChangesView {
         }
         let staged = self.staged_count();
         let amend = self.amend;
-        if !amend && staged == 0 {
+        if !can_commit(self.merge.is_some(), amend, staged, self.conflicted_count()) {
             return;
         }
         let branch = self
             .status()
             .and_then(|status| status.branch.clone())
             .unwrap_or_else(|| "HEAD".to_string());
-        let notice = if amend {
+        let notice = if let Some(merge) = &self.merge {
+            match &merge.branch {
+                Some(merged) => {
+                    ui::t!("changes.notice.merged", branch = merged, head = branch).to_string()
+                }
+                None => ui::t!("changes.notice.merge_finished").to_string(),
+            }
+        } else if amend {
             ui::t!("changes.notice.amended").to_string()
         } else {
             ui::i18n::t_count(
@@ -818,8 +1178,8 @@ impl ChangesView {
                     let repo = Repo::open(git, &path).map_err(|error| error.to_string())?;
                     repo.commit(&message, amend)
                         .map_err(|error| error.to_string())?;
-                    let status = repo.working_status().map_err(|error| error.to_string())?;
-                    Ok::<_, String>((notice, status))
+                    let snapshot = read_snapshot(&repo)?;
+                    Ok::<_, String>((notice, snapshot))
                 })
                 .await;
             this.update_in(cx, |view, window, cx| {
@@ -833,20 +1193,20 @@ impl ChangesView {
 
     fn finish_commit(
         &mut self,
-        result: Result<(String, WorkingStatus), String>,
+        result: Result<(String, Snapshot), String>,
         push: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.busy = false;
         match result {
-            Ok((notice, status)) => {
+            Ok((notice, snapshot)) => {
                 toast::show(ToastKind::Ok, notice, window, cx);
                 self.message.update(cx, |input, cx| input.set_text("", cx));
                 self.amend = false;
                 self.draft = None;
                 let previous = self.selection_path();
-                self.apply_status(status, previous, cx);
+                self.apply_status(snapshot, previous, cx);
                 cx.emit(ChangesEvent::Committed);
                 if push {
                     cx.emit(ChangesEvent::PushAfterCommit);
@@ -884,6 +1244,7 @@ impl ChangesView {
             .on_action(cx.listener(|view, _: &SelectPrev, _, cx| {
                 view.step_selection(-1, cx);
             }))
+            .children(self.render_merge_banner(cx))
             .child(
                 div()
                     .flex_1()
@@ -959,10 +1320,25 @@ impl ChangesView {
             );
         }
 
-        let (unstaged, staged) = match self.status() {
-            Some(status) => (status.unstaged.clone(), status.staged.clone()),
-            None => (Vec::new(), Vec::new()),
+        let (conflicted, unstaged, staged) = match self.status() {
+            Some(status) => (
+                status.conflicted.clone(),
+                status.unstaged.clone(),
+                status.staged.clone(),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         };
+        if !conflicted.is_empty() {
+            panel = panel.child(self.render_group(
+                Side::Conflicted,
+                ui::t!("changes.group.conflicts"),
+                &conflicted,
+                SharedString::default(),
+                self.conflicts_scroll.clone(),
+                view.clone(),
+                cx,
+            ));
+        }
         panel
             .child(self.render_group(
                 Side::Unstaged,
@@ -997,31 +1373,22 @@ impl ChangesView {
     ) -> Div {
         let colors = cx.theme().colors;
         let busy = self.busy;
+        let has_conflicts = self.conflicted_count() > 0;
         let all_view = view.clone();
         let all_label = match side {
-            Side::Unstaged => ui::t!("changes.group.stage_all"),
+            Side::Unstaged | Side::Conflicted => ui::t!("changes.group.stage_all"),
             Side::Staged => ui::t!("changes.group.unstage_all"),
         };
+        let side_name = side_id(side);
         let mut rows = Vec::with_capacity(files.len());
         for (index, file) in files.iter().enumerate() {
             let selected = self.selection == Some(Selection { side, index });
             let status = status_letter(file);
             let path = file.path.clone();
-            let mut row = FileRow::new(
-                format!(
-                    "changes-{}-{index}",
-                    if side == Side::Unstaged {
-                        "unstaged"
-                    } else {
-                        "staged"
-                    }
-                ),
-                status,
-                path,
-            )
-            .added(file.added)
-            .deleted(file.deleted)
-            .selected(selected);
+            let mut row = FileRow::new(format!("changes-{side_name}-{index}"), status, path)
+                .added(file.added)
+                .deleted(file.deleted)
+                .selected(selected);
             let select_view = view.clone();
             let stage_view = view.clone();
             let discard_view = view.clone();
@@ -1039,16 +1406,34 @@ impl ChangesView {
                 (true, None) => ui::t!("changes.row.stage"),
                 (false, None) => ui::t!("changes.row.unstage"),
             };
-            row = row.action(
-                Button::ghost(format!("stage-{side:?}-{index}"))
-                    .size(ButtonSize::Xs)
-                    .icon_only(stage_icon)
-                    .tooltip(stage_tip)
-                    .disabled(busy)
-                    .on_click(move |_, _, cx| {
-                        stage_view.update(cx, |view, cx| view.stage_file(side, index, cx));
-                    }),
-            );
+            if side == Side::Conflicted {
+                let menu_view = view.clone();
+                row = row.action(
+                    Button::ghost(format!("resolve-{index}"))
+                        .size(ButtonSize::Xs)
+                        // No tooltip: it would stay on top of the menu this opens.
+                        .label("…")
+                        .disabled(busy)
+                        .on_click(move |event, window, cx| {
+                            let position = event.position();
+                            menu_view.update(cx, |view, cx| {
+                                view.select(Side::Conflicted, index, cx);
+                                view.open_conflict_menu(index, position, window, cx);
+                            });
+                        }),
+                );
+            } else {
+                row = row.action(
+                    Button::ghost(format!("stage-{side:?}-{index}"))
+                        .size(ButtonSize::Xs)
+                        .icon_only(stage_icon)
+                        .tooltip(stage_tip)
+                        .disabled(busy)
+                        .on_click(move |_, _, cx| {
+                            stage_view.update(cx, |view, cx| view.stage_file(side, index, cx));
+                        }),
+                );
+            }
             if side == Side::Unstaged {
                 row = row.action(
                     Button::ghost(format!("discard-{side:?}-{index}"))
@@ -1080,18 +1465,24 @@ impl ChangesView {
                         }),
                 );
             }
-            let debug_id = format!(
-                "changes-{}-{index}",
-                if side == Side::Unstaged {
-                    "unstaged"
-                } else {
-                    "staged"
-                }
-            );
+            let debug_id = format!("changes-{side_name}-{index}");
+            let menu_view = view.clone();
             rows.push(
                 div()
                     .debug_selector(move || debug_id.clone())
                     .key_context("changes-file")
+                    .when(side == Side::Conflicted, |this| {
+                        this.on_mouse_down(
+                            MouseButton::Right,
+                            move |event: &MouseDownEvent, window, cx| {
+                                let position = event.position;
+                                menu_view.update(cx, |view, cx| {
+                                    view.select(Side::Conflicted, index, cx);
+                                    view.open_conflict_menu(index, position, window, cx);
+                                });
+                            },
+                        )
+                    })
                     .child(row.on_click(move |_, _, cx| {
                         select_view.update(cx, |view, cx| view.select(side, index, cx));
                     })),
@@ -1115,6 +1506,7 @@ impl ChangesView {
                 .into_any_element()
         };
         let count = files.len();
+        let conflicts = side == Side::Conflicted;
         let stage_all = Button::new(format!("stage-all-{side:?}"))
             .size(ButtonSize::Small)
             .label(all_label)
@@ -1122,15 +1514,19 @@ impl ChangesView {
             .on_click(move |_, _, cx| {
                 all_view.update(cx, |view, cx| view.stage_all(side, cx));
             });
+        // The conflicts group keeps its natural height (up to a few rows, then
+        // it scrolls) so the two lists below stay visible.
+        let conflicts_height = px(34. + count.min(6) as f32 * f32::from(cx.theme().row_height));
         div()
             .w_full()
-            .flex_1()
-            .min_h_0()
+            .when(conflicts, |this| this.flex_none().h(conflicts_height))
+            .when(!conflicts, |this| this.flex_1().min_h_0())
             .flex()
             .flex_col()
-            .when(side == Side::Staged, |this| {
-                this.border_t_1().border_color(colors.border)
-            })
+            .when(
+                side == Side::Staged || (side == Side::Unstaged && has_conflicts),
+                |this| this.border_t_1().border_color(colors.border),
+            )
             .child(
                 div()
                     .w_full()
@@ -1147,7 +1543,7 @@ impl ChangesView {
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
                     .child(CountPill::new(count.to_string()))
                     .child(div().flex_1())
-                    .child(stage_all),
+                    .when(!conflicts, |this| this.child(stage_all)),
             )
             .child(ScrollArea::new(format!("changes-scroll-{side:?}"), scroll).child(list))
     }
@@ -1187,20 +1583,22 @@ impl ChangesView {
                 .child(path.unwrap_or_default()),
         );
         if let Some(selection) = selection {
-            let side = match selection.side {
-                Side::Unstaged => ui::t!("changes.side.unstaged"),
-                Side::Staged => ui::t!("changes.side.staged"),
+            let label = match selection.side {
+                Side::Conflicted => ui::t!("changes.conflict.label"),
+                side => {
+                    let side = match side {
+                        Side::Unstaged => ui::t!("changes.side.unstaged"),
+                        _ => ui::t!("changes.side.staged"),
+                    };
+                    ui::i18n::t_count("changes.diff.side_hunks", hunks as u64, &[("side", &side)])
+                }
             };
             toolbar = toolbar.child(
                 div()
                     .flex_none()
                     .text_size(FS_SM)
                     .text_color(colors.muted)
-                    .child(ui::i18n::t_count(
-                        "changes.diff.side_hunks",
-                        hunks as u64,
-                        &[("side", &side)],
-                    )),
+                    .child(label),
             );
         }
         toolbar = toolbar.child(
@@ -1248,6 +1646,47 @@ impl ChangesView {
                     gpui::ElementId::Name("changes-diff-error".into()),
                     message.clone(),
                 )),
+            DiffState::Conflict(data) => {
+                if data.binary {
+                    diff_note(ui::t!("changes.diff.binary"), colors)
+                } else if data.missing {
+                    diff_note(ui::t!("changes.conflict.no_file"), colors)
+                } else {
+                    let row_width = conflict_width(self.mono_cell, data.columns, pane_width);
+                    let data = data.clone();
+                    let list = uniform_list(
+                        "changes-conflict",
+                        data.lines.len(),
+                        cx.processor(move |view, range, window, cx| {
+                            view.render_conflict_rows(data.clone(), range, row_width, window, cx)
+                        }),
+                    )
+                    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                    .track_scroll(&self.diff_scroll)
+                    .flex_1()
+                    .min_h_0()
+                    .w_full();
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(16.))
+                                .py(px(6.))
+                                .text_size(FS_SM)
+                                .text_color(colors.muted)
+                                .border_b_1()
+                                .border_color(colors.border)
+                                .child(ui::t!("changes.conflict.note")),
+                        )
+                        .child(div().flex_1().min_h_0().flex().child(list).child(
+                            Scrollbar::uniform("changes-diff-bar", self.diff_scroll.clone()),
+                        ))
+                }
+            }
             DiffState::Loaded(data) => {
                 if data.diff.binary {
                     diff_note(ui::t!("changes.diff.binary"), colors)
@@ -1496,6 +1935,63 @@ impl ChangesView {
             .collect()
     }
 
+    /// Rows of a conflicted file: line number, then the text, with the marker
+    /// lines tinted as a warning and the two sides like removed / added lines.
+    fn render_conflict_rows(
+        &mut self,
+        data: Arc<ConflictFile>,
+        range: std::ops::Range<usize>,
+        row_width: Pixels,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let colors = cx.theme().colors;
+        range
+            .filter_map(|index| {
+                let line = data.lines.get(index)?;
+                let (background, color, weight) = match line.kind {
+                    ConflictKind::Marker => (
+                        Some(colors.warning.opacity(0.18)),
+                        colors.warning,
+                        FontWeight::SEMIBOLD,
+                    ),
+                    ConflictKind::Ours => {
+                        (Some(colors.diff_del_bg), colors.text, FontWeight::NORMAL)
+                    }
+                    ConflictKind::Theirs => {
+                        (Some(colors.diff_add_bg), colors.text, FontWeight::NORMAL)
+                    }
+                    ConflictKind::Plain => (None, colors.text, FontWeight::NORMAL),
+                };
+                Some(
+                    div()
+                        .id(SharedString::from(format!("changes-conflict-row-{index}")))
+                        .h(px(DIFF_ROW))
+                        .w(row_width)
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .whitespace_nowrap()
+                        .child(diff_gutter(Some(index as u32 + 1), None, colors))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .px(px(6.))
+                                .when_some(background, |this, background| this.bg(background))
+                                .text_color(color)
+                                .font_weight(weight)
+                                .child(SharedString::from(line.text.clone())),
+                        )
+                        .into_any_element(),
+                )
+            })
+            .collect()
+    }
+
     fn render_split_rows(
         &mut self,
         data: Arc<ChangesDiff>,
@@ -1530,7 +2026,10 @@ impl ChangesView {
             .unwrap_or_else(|| "HEAD".to_string());
         let staged = self.staged_count();
         let busy = self.busy;
-        let commit_label = if self.amend {
+        let merging = self.merge.is_some();
+        let commit_label = if merging {
+            ui::t!("changes.merge.commit")
+        } else if self.amend {
             ui::t!("changes.commit.amend")
         } else {
             ui::i18n::t_count(
@@ -1539,13 +2038,15 @@ impl ChangesView {
                 &[("branch", &branch)],
             )
         };
-        let can_commit = !busy && (!commit_label.is_empty()) && (self.amend || staged > 0);
+        let can_commit = !busy
+            && !commit_label.is_empty()
+            && can_commit(merging, self.amend, staged, self.conflicted_count());
         let commit_view = cx.entity();
         let amend_view = cx.entity();
         let switch = Switch::new("amend-switch")
             .label(ui::t!("changes.commit.amend_switch"))
             .checked(self.amend)
-            .disabled(busy || head.is_none())
+            .disabled(busy || head.is_none() || merging)
             .on_toggle(move |checked, _, cx| {
                 amend_view.update(cx, |view, cx| view.set_amend(checked, cx));
             });
@@ -1757,6 +2258,151 @@ fn read_diff(
     })
 }
 
+/// The lists top to bottom, as the arrow keys walk them.
+const SIDES: [Side; 3] = [Side::Conflicted, Side::Unstaged, Side::Staged];
+
+fn files_of(status: &WorkingStatus, side: Side) -> &[WorkingFile] {
+    match side {
+        Side::Conflicted => &status.conflicted,
+        Side::Unstaged => &status.unstaged,
+        Side::Staged => &status.staged,
+    }
+}
+
+fn side_id(side: Side) -> &'static str {
+    match side {
+        Side::Conflicted => "conflicted",
+        Side::Unstaged => "unstaged",
+        Side::Staged => "staged",
+    }
+}
+
+/// Whether the commit button is live. A merge commit is valid with nothing
+/// newly staged (the merge result is in the index already) but never while a
+/// path is unmerged, and a merge cannot be amended into.
+fn can_commit(merging: bool, amend: bool, staged: usize, conflicts: usize) -> bool {
+    if conflicts > 0 {
+        return false;
+    }
+    if merging {
+        return !amend;
+    }
+    amend || staged > 0
+}
+
+/// A merge banner is a warning while conflicts remain, plain info after.
+fn merge_banner_kind(conflicts: usize) -> BannerKind {
+    if conflicts > 0 {
+        BannerKind::Warn
+    } else {
+        BannerKind::Info
+    }
+}
+
+/// Reads the status and, while a merge is stopped, its branch and message.
+fn read_snapshot(repo: &Repo) -> Result<Snapshot, String> {
+    let status = repo.working_status().map_err(|error| error.to_string())?;
+    let merge = match repo.operation().map_err(|error| error.to_string())? {
+        Operation::Merge => Some(MergeInfo {
+            // A missing or odd message only costs the branch name.
+            branch: repo.merge_heading().ok().flatten(),
+            message: repo.merge_message().ok().flatten(),
+        }),
+        _ => None,
+    };
+    Ok(Snapshot { status, merge })
+}
+
+/// Largest conflicted file shown (as for an untracked file's diff).
+const CONFLICT_FILE_CAP: u64 = 2 * 1024 * 1024;
+
+/// Reads the work-tree file of a conflicted path off the UI thread.
+fn read_conflict(git: Arc<Git>, root: &Path, path: &str) -> Result<ConflictFile, String> {
+    let repo = Repo::open(git, root).map_err(|error| error.to_string())?;
+    let full = repo.root().join(path);
+    let meta = match std::fs::metadata(&full) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConflictFile {
+                missing: true,
+                ..ConflictFile::default()
+            })
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if meta.len() > CONFLICT_FILE_CAP {
+        return Err(Error::TooLarge { what: "diff" }.to_string());
+    }
+    let bytes = std::fs::read(&full).map_err(|error| error.to_string())?;
+    if bytes.contains(&0) {
+        return Ok(ConflictFile {
+            binary: true,
+            ..ConflictFile::default()
+        });
+    }
+    let lines = conflict_lines(&String::from_utf8_lossy(&bytes));
+    let columns = lines
+        .iter()
+        .map(|line| line.text.chars().count())
+        .max()
+        .unwrap_or(0);
+    Ok(ConflictFile {
+        lines,
+        columns,
+        ..ConflictFile::default()
+    })
+}
+
+/// Classifies the lines of a file with conflict markers. A `=======` outside
+/// a `<<<<<<<` block is ordinary text; the diff3 base block (`|||||||` to
+/// `=======`) is left plain.
+fn conflict_lines(text: &str) -> Vec<ConflictLine> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Outside,
+        Ours,
+        Base,
+        Theirs,
+    }
+    let is_marker = |line: &str, marker: &str| {
+        line.strip_prefix(marker)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    };
+    let mut state = State::Outside;
+    text.lines()
+        .map(|line| {
+            let kind = if is_marker(line, "<<<<<<<") && state == State::Outside {
+                state = State::Ours;
+                ConflictKind::Marker
+            } else if is_marker(line, "|||||||") && state == State::Ours {
+                state = State::Base;
+                ConflictKind::Marker
+            } else if is_marker(line, "=======") && matches!(state, State::Ours | State::Base) {
+                state = State::Theirs;
+                ConflictKind::Marker
+            } else if is_marker(line, ">>>>>>>") && state == State::Theirs {
+                state = State::Outside;
+                ConflictKind::Marker
+            } else {
+                match state {
+                    State::Ours => ConflictKind::Ours,
+                    State::Theirs => ConflictKind::Theirs,
+                    State::Outside | State::Base => ConflictKind::Plain,
+                }
+            };
+            ConflictLine {
+                text: line.to_string(),
+                kind,
+            }
+        })
+        .collect()
+}
+
+fn conflict_width(cell: Pixels, columns: usize, pane: f32) -> Pixels {
+    let text = columns as f32 * f32::from(cell) + 24.;
+    px((DIFF_GUTTER + text).max(pane))
+}
+
 /// The glyph a working-tree file shows: untracked and conflicted files keep
 /// git's own letters instead of the change kind.
 fn status_letter(file: &WorkingFile) -> char {
@@ -1797,6 +2443,9 @@ pub fn change_counts(status: Option<&WorkingStatus>) -> ChangeCounts {
         files.insert(file.path.as_str(), file);
     }
     for file in &status.unstaged {
+        files.insert(file.path.as_str(), file);
+    }
+    for file in &status.conflicted {
         files.insert(file.path.as_str(), file);
     }
     let mut counts = ChangeCounts::default();
@@ -2096,6 +2745,69 @@ mod tests {
     }
 
     #[test]
+    fn conflicted_paths_count_once_as_modified() {
+        let status = WorkingStatus {
+            conflicted: vec![working_file("c.txt", ChangeKind::Other('U'), false)],
+            ..WorkingStatus::default()
+        };
+        assert_eq!(
+            change_counts(Some(&status)),
+            ChangeCounts {
+                added: 0,
+                modified: 1,
+                deleted: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn the_merge_banner_warns_until_the_last_conflict_is_gone() {
+        assert_eq!(merge_banner_kind(2), BannerKind::Warn);
+        assert_eq!(merge_banner_kind(1), BannerKind::Warn);
+        assert_eq!(merge_banner_kind(0), BannerKind::Info);
+    }
+
+    #[test]
+    fn an_untouched_prefill_is_undone_but_an_edited_one_is_kept() {
+        let prefill = Prefill {
+            text: "Merge branch 'side'".into(),
+            before: "draft".into(),
+        };
+        assert_eq!(
+            undo_prefill("Merge branch 'side'\n", &prefill).as_deref(),
+            Some("draft")
+        );
+        assert_eq!(undo_prefill("Merge branch 'side' + notes", &prefill), None);
+        assert_eq!(undo_prefill("", &prefill), None);
+    }
+
+    #[test]
+    fn commit_rules_for_plain_amend_and_merge() {
+        // Plain: needs something staged, or an amend.
+        assert!(!can_commit(false, false, 0, 0));
+        assert!(can_commit(false, false, 2, 0));
+        assert!(can_commit(false, true, 0, 0));
+        // A merge commits with nothing newly staged, but not amended.
+        assert!(can_commit(true, false, 0, 0));
+        assert!(!can_commit(true, true, 0, 0));
+        // Unmerged paths block everything.
+        assert!(!can_commit(true, false, 3, 1));
+        assert!(!can_commit(false, false, 3, 1));
+    }
+
+    #[test]
+    fn conflict_markers_and_both_sides_are_classified() {
+        use ConflictKind::*;
+        let text = "top\n<<<<<<< HEAD\nours\n||||||| base\nold\n=======\ntheirs\n>>>>>>> side\nbottom\n=======\n";
+        let kinds: Vec<_> = conflict_lines(text).into_iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            [Plain, Marker, Ours, Marker, Plain, Marker, Theirs, Marker, Plain, Plain]
+        );
+        assert!(conflict_lines("").is_empty());
+    }
+
+    #[test]
     fn a_single_line_diff_is_never_narrower_than_the_pane() {
         assert!(diff_width(px(7.), 4, 400.) >= px(400.));
         assert!(split_width(400.) >= px(400.));
@@ -2293,6 +3005,125 @@ mod tests {
         view.read_with(&cx, |view, _| {
             assert_eq!(view.staged_count(), 0);
             assert_eq!(view.unstaged_count(), 2);
+        });
+    }
+
+    /// A stopped merge: each conflicted path is listed once in its own group,
+    /// the merge message fills the commit box, resolving every path lets the
+    /// merge commit through, and the banner is gone afterwards.
+    #[gpui::test]
+    fn a_stopped_merge_lists_conflicts_once_and_commits_after_resolving(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = crate::test_support::TempRepo::new("changes-merge");
+        let dir = repo.path();
+        write(dir, "a.txt", "base\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        write(dir, "a.txt", "main\n");
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", "side\n");
+        write(dir, "new.txt", "new\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        let outcome = Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::FastForwardIfPossible)
+            .unwrap();
+        assert!(matches!(outcome, git_core::MergeOutcome::Conflicts { .. }));
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.read_with(&cx, |view, cx| {
+            let status = view.status().expect("loaded");
+            let conflicted: Vec<_> = status.conflicted.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(conflicted, ["a.txt"]);
+            assert!(status.unstaged.is_empty(), "{:?}", status.unstaged);
+            let staged: Vec<_> = status.staged.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(staged, ["new.txt"]);
+            assert_eq!(
+                view.selection,
+                Some(Selection {
+                    side: Side::Conflicted,
+                    index: 0
+                })
+            );
+            assert_eq!(
+                view.merge.as_ref().and_then(|m| m.branch.as_deref()),
+                Some("side")
+            );
+            assert!(view
+                .message
+                .read(cx)
+                .text()
+                .starts_with("Merge branch 'side'"));
+            let DiffState::Conflict(file) = &view.diff else {
+                panic!("the conflicted file did not load: {:?}", view.diff);
+            };
+            assert!(file
+                .lines
+                .iter()
+                .any(|line| line.kind == ConflictKind::Marker));
+        });
+        assert!(cx.debug_bounds("merge-banner").is_some(), "no banner");
+        assert!(cx.debug_bounds("changes-conflicted-0").is_some());
+
+        // Space must not mark a conflicted path resolved.
+        view.update(&mut cx, |view, cx| view.stage_selected(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert_eq!(view.conflicted_count(), 1));
+
+        view.update(&mut cx, |view, cx| {
+            view.resolve_conflict(0, Resolve::Take(ConflictSide::Theirs), cx)
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.conflicted_count(), 0);
+            assert!(view.merge.is_some());
+            assert!(can_commit(true, false, view.staged_count(), 0));
+        });
+        view.update_in(&mut cx, |view, window, cx| view.commit(window, cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(view.merge.is_none());
+            assert_eq!(view.staged_count(), 0);
+        });
+        assert!(cx.debug_bounds("merge-banner").is_none());
+        let repo = Repo::open(crate::test_support::git(), dir).unwrap();
+        assert_eq!(repo.operation().unwrap(), Operation::None);
+    }
+
+    /// Aborting a merge removes the untouched prefilled message again.
+    #[gpui::test]
+    fn aborting_a_merge_clears_the_prefilled_message(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-abort");
+        let dir = repo.path();
+        write(dir, "a.txt", "base\n");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+        git(dir, &["branch", "side"]);
+        write(dir, "a.txt", "main\n");
+        git(dir, &["commit", "-q", "-am", "main"]);
+        git(dir, &["switch", "-q", "side"]);
+        write(dir, "a.txt", "side\n");
+        git(dir, &["commit", "-q", "-am", "side"]);
+        git(dir, &["switch", "-q", "main"]);
+        Repo::open(crate::test_support::git(), dir)
+            .unwrap()
+            .merge("side", git_core::MergeType::FastForwardIfPossible)
+            .unwrap();
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.read_with(&cx, |view, cx| {
+            assert!(view.message.read(cx).text().starts_with("Merge branch"));
+        });
+        view.update(&mut cx, |view, cx| view.abort_merge(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert!(view.merge.is_none());
+            assert_eq!(view.message.read(cx).text().to_string(), "");
         });
     }
 

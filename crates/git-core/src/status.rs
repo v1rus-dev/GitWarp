@@ -56,8 +56,13 @@ pub struct WorkingStatus {
     /// Changes between HEAD and the index, in path order.
     pub staged: Vec<WorkingFile>,
     /// Changes between the index and the work tree, in path order. Untracked
-    /// files and conflicts are here too.
+    /// files are here too; conflicts are not (see [`Self::conflicted`]).
     pub unstaged: Vec<WorkingFile>,
+    /// Unmerged paths of a merge/rebase/cherry-pick in progress, in path
+    /// order. Each path is listed here only: `git diff` and `git diff
+    /// --cached` also report an unmerged path (as `U` and as `M`), so those
+    /// entries are dropped from `staged` and `unstaged`.
+    pub conflicted: Vec<WorkingFile>,
 }
 
 impl WorkingStatus {
@@ -67,6 +72,10 @@ impl WorkingStatus {
 
     pub fn unstaged_count(&self) -> usize {
         self.unstaged.len()
+    }
+
+    pub fn conflicted_count(&self) -> usize {
+        self.conflicted.len()
     }
 
     /// The amend hint: `e4f2a91 · feat: …`, or the short id alone.
@@ -196,17 +205,20 @@ pub(crate) fn status(repo: &Repo) -> Result<WorkingStatus> {
     let mut staged = side(repo, true)?;
     let mut unstaged = side(repo, false)?;
 
+    // An unmerged path shows up in both diffs too (`U` unstaged, `U`/`M`
+    // staged); the porcelain's `u` records are the only source for conflicts.
+    staged.retain(|file| !porcelain.conflicted.contains(&file.path));
+    unstaged.retain(|file| !porcelain.conflicted.contains(&file.path));
     for path in porcelain.untracked {
         if unstaged.iter().any(|file| file.path == path) {
             continue;
         }
         unstaged.push(untracked_file(repo, path));
     }
-    for path in porcelain.conflicted {
-        if unstaged.iter().any(|file| file.path == path) {
-            continue;
-        }
-        unstaged.push(WorkingFile {
+    let mut conflicted: Vec<WorkingFile> = porcelain
+        .conflicted
+        .into_iter()
+        .map(|path| WorkingFile {
             kind: ChangeKind::Other('U'),
             old_path: None,
             path,
@@ -214,16 +226,18 @@ pub(crate) fn status(repo: &Repo) -> Result<WorkingStatus> {
             deleted: 0,
             binary: false,
             untracked: false,
-        });
-    }
+        })
+        .collect();
     sort_files(&mut staged);
     sort_files(&mut unstaged);
+    sort_files(&mut conflicted);
 
     Ok(WorkingStatus {
         branch: porcelain.branch,
         head: head_commit(repo)?,
         staged,
         unstaged,
+        conflicted,
     })
 }
 
@@ -264,6 +278,63 @@ pub(crate) fn stage(repo: &Repo, paths: &[String]) -> Result<()> {
     command.args(paths);
     let out = command.output().map_err(Error::Spawn)?;
     check_output(out, "add").map(drop)
+}
+
+/// Which side of a merge wins when a conflicted file is resolved wholesale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictSide {
+    /// The branch being merged into (HEAD): index stage 2.
+    Ours,
+    /// The branch being merged in: index stage 3.
+    Theirs,
+}
+
+/// Resolves a conflicted `path` by taking one side as is.
+///
+/// If the chosen side does not have the file (it deleted it: a modify/delete
+/// conflict), the resolution is the deletion, `git rm`; otherwise
+/// `checkout --ours|--theirs` followed by `git add`.
+pub(crate) fn resolve_take(repo: &Repo, path: &str, side: ConflictSide) -> Result<()> {
+    let (stage, flag) = match side {
+        ConflictSide::Ours => (b'2', "--ours"),
+        ConflictSide::Theirs => (b'3', "--theirs"),
+    };
+    let out = repo
+        .command()
+        .args(["ls-files", "-u", "-z", "--"])
+        .arg(path)
+        .output()
+        .map_err(Error::Spawn)?;
+    let out = check_output(out, "ls-files -u")?;
+    // `<mode> SP <oid> SP <stage> TAB <path> NUL`
+    let has_side = out.stdout.split(|&byte| byte == 0).any(|record| {
+        record
+            .iter()
+            .position(|&b| b == b'\t')
+            .is_some_and(|tab| record[..tab].last() == Some(&stage))
+    });
+    if has_side {
+        let out = repo
+            .command()
+            .args(["checkout", flag, "--", path])
+            .output()
+            .map_err(Error::Spawn)?;
+        check_output(out, "checkout")?;
+        stage_paths(repo, path, "add")
+    } else {
+        stage_paths(repo, path, "rm")
+    }
+}
+
+fn stage_paths(repo: &Repo, path: &str, verb: &'static str) -> Result<()> {
+    let mut command = repo.command();
+    command.arg(verb);
+    if verb == "rm" {
+        command.arg("-q");
+    }
+    command.args(["--", path]);
+    let out = command.output().map_err(Error::Spawn)?;
+    check_output(out, verb).map(drop)
 }
 
 /// Removes `paths` from the index (the work tree is left alone).
