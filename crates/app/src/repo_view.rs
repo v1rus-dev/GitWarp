@@ -1797,11 +1797,7 @@ impl RepositoryView {
             SidebarAction::PushBranch(branch) => {
                 // The checked-out branch goes through the toolbar's path
                 // (`None`) so a rejected push still offers "Pull, then push".
-                let is_head = matches!(
-                    self.history.read(cx).head(),
-                    Some(Head::Branch { name, .. }) if *name == branch
-                );
-                let branch = (!is_head).then_some(branch);
+                let branch = push_target(self.history.read(cx).head(), branch);
                 self.start_network_job(Job::Push { branch }, window, cx);
             }
             SidebarAction::Pull => self.pull_branch(window, cx),
@@ -1901,6 +1897,10 @@ impl RepositoryView {
             }
             SidebarAction::ShowBranchCommits(name) => {
                 self.show_branch_commits(name, window, cx);
+            }
+            SidebarAction::ShowAllCommits => {
+                self.history
+                    .update(cx, |history, cx| history.set_branch_filter(None, cx));
             }
             SidebarAction::ShowWorktrees => {
                 self.set_view(ViewMode::Worktrees, window, cx);
@@ -3629,12 +3629,7 @@ impl RepositoryView {
                 .await;
             cx.update(|cx| match result {
                 Ok(details) => {
-                    let text = if details.body.is_empty() {
-                        details.summary
-                    } else {
-                        format!("{}\n\n{}", details.summary, details.body)
-                    };
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    cx.write_to_clipboard(ClipboardItem::new_string(full_message_text(&details)));
                 }
                 Err(error) => {
                     window_handle
@@ -7033,6 +7028,20 @@ impl Render for RepositoryView {
     }
 }
 
+/// The `Job::Push` branch for a sidebar/menu "Push" on `branch`: the checked-out
+/// branch maps to `None` so it goes through the toolbar's path (a rejected push
+/// still offers "Pull, then push"); any other branch is pushed by name.
+fn push_target(head: Option<&Head>, branch: String) -> Option<String> {
+    let is_head = matches!(head, Some(Head::Branch { name, .. }) if *name == branch);
+    (!is_head).then_some(branch)
+}
+
+/// The text "Copy › Full message" puts on the clipboard: the raw commit message
+/// (`%B`), not `summary + body`, since `%s` joins a wrapped first paragraph.
+fn full_message_text(details: &CommitDetails) -> String {
+    details.message.clone()
+}
+
 /// A toolbar item with rich content: icon · bold name · chevron.
 ///
 /// `Button` has no rich-content variant, and the design's two switchers are
@@ -7690,6 +7699,45 @@ fn node_toggler(
 mod tests {
     use super::*;
     use gpui::px;
+
+    #[test]
+    fn push_target_maps_the_current_branch_to_none() {
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: None,
+        };
+        assert_eq!(push_target(Some(&head), "main".to_owned()), None);
+        assert_eq!(
+            push_target(Some(&head), "feat".to_owned()),
+            Some("feat".to_owned())
+        );
+        assert_eq!(
+            push_target(None, "main".to_owned()),
+            Some("main".to_owned())
+        );
+    }
+
+    #[test]
+    fn full_message_text_is_the_raw_message() {
+        let details = CommitDetails {
+            id: Oid::from_hex(&"a".repeat(40)).unwrap(),
+            parents: Vec::new(),
+            author_name: String::new(),
+            author_email: String::new(),
+            author_time: 0,
+            committer_name: String::new(),
+            committer_email: String::new(),
+            committer_time: 0,
+            // `%s` joins the wrapped first paragraph into one line.
+            summary: "A long subject wrapped over two lines".to_owned(),
+            body: "Body".to_owned(),
+            message: "A long subject wrapped\nover two lines\n\nBody".to_owned(),
+        };
+        assert_eq!(
+            full_message_text(&details),
+            "A long subject wrapped\nover two lines\n\nBody"
+        );
+    }
 
     /// Builds the real window (the workspace frame around the repository
     /// view) in a test window and returns the bounds of the sidebar filter.

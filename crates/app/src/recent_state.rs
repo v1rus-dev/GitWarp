@@ -81,7 +81,7 @@ pub fn classify(path: &Path, probe: PathProbe, open: Option<OpenResult>) -> RowS
 }
 
 /// `a` and `b` name the same folder: equal as written, or equal once symlinks are resolved.
-fn same_folder(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_folder(a: &Path, b: &Path) -> bool {
     a == b
         || matches!(
             (std::fs::canonicalize(a), std::fs::canonicalize(b)),
@@ -146,8 +146,13 @@ pub struct RecentSelection {
     pub cursor: usize,
     /// Where a Shift range starts.
     anchor: Option<usize>,
-    /// The explicit multi-selection. Empty means "just the cursor row".
+    /// The explicit multi-selection. Empty means "just the cursor row" unless
+    /// `none` is set.
     set: BTreeSet<PathBuf>,
+    /// Ctrl-toggling off the last selected row leaves nothing selected: the empty
+    /// `set` then must not fall back to the cursor row. Cleared by any other
+    /// selection change (click, arrows, Shift range, select all, `clear`).
+    none: bool,
 }
 
 impl RecentSelection {
@@ -156,13 +161,14 @@ impl RecentSelection {
         self.cursor = index;
         self.anchor = Some(index);
         self.set.clear();
+        self.none = false;
     }
 
     /// Ctrl/Cmd+click: adds or removes the row. The cursor row counts as
     /// selected before the first toggle, so the click extends it.
     pub fn toggle(&mut self, index: usize, rows: &[PathBuf]) {
         let Some(path) = rows.get(index) else { return };
-        if self.set.is_empty() {
+        if self.set.is_empty() && !self.none {
             if let Some(current) = rows.get(self.cursor) {
                 self.set.insert(current.clone());
             }
@@ -170,6 +176,7 @@ impl RecentSelection {
         if !self.set.remove(path) {
             self.set.insert(path.clone());
         }
+        self.none = self.set.is_empty();
         self.cursor = index;
         self.anchor = Some(index);
     }
@@ -183,6 +190,7 @@ impl RecentSelection {
         let anchor = self.anchor.unwrap_or(self.cursor).min(rows.len() - 1);
         let (from, to) = (anchor.min(index), anchor.max(index));
         self.set = rows[from..=to].iter().cloned().collect();
+        self.none = false;
         self.cursor = index;
         self.anchor = Some(anchor);
     }
@@ -196,12 +204,14 @@ impl RecentSelection {
     /// Ctrl/Cmd+A: every visible row.
     pub fn select_all(&mut self, rows: &[PathBuf]) {
         self.set = rows.iter().cloned().collect();
+        self.none = false;
         self.anchor.get_or_insert(self.cursor);
     }
 
     /// Drops the multi-selection; the cursor row stays selected.
     pub fn clear(&mut self) {
         self.set.clear();
+        self.none = false;
         self.anchor = None;
     }
 
@@ -210,6 +220,9 @@ impl RecentSelection {
     /// explicitly. Rows hidden by the filter are never targeted.
     pub fn targets(&self, rows: &[PathBuf]) -> Vec<PathBuf> {
         if self.set.is_empty() {
+            if self.none {
+                return Vec::new();
+            }
             return rows.get(self.cursor).cloned().into_iter().collect();
         }
         rows.iter()
@@ -226,7 +239,7 @@ impl RecentSelection {
     /// Whether the row at `index` is highlighted as selected.
     pub fn is_selected(&self, index: usize, rows: &[PathBuf]) -> bool {
         if self.set.is_empty() {
-            index == self.cursor
+            !self.none && index == self.cursor
         } else {
             rows.get(index).is_some_and(|path| self.set.contains(path))
         }
@@ -235,7 +248,12 @@ impl RecentSelection {
     /// Forgets selected paths that are no longer in the list (after a removal)
     /// and keeps the cursor inside `len` visible rows.
     pub fn retain(&mut self, existing: &[PathBuf], len: usize) {
+        let had = !self.set.is_empty();
         self.set.retain(|path| existing.contains(path));
+        // Every explicitly selected row was removed: fall back to the cursor row.
+        if had && self.set.is_empty() {
+            self.none = false;
+        }
         self.anchor = None;
         self.cursor = self.cursor.min(len.saturating_sub(1));
     }
@@ -407,6 +425,30 @@ mod tests {
         sel.toggle(0, &rows);
         assert_eq!(sel.targets(&rows), vec![p("c")]);
         assert!(sel.is_selected(2, &rows) && !sel.is_selected(0, &rows));
+    }
+
+    #[test]
+    fn toggling_off_the_last_selected_row_selects_nothing() {
+        let rows = rows(&["a", "b", "c"]);
+        let mut sel = RecentSelection::default();
+        sel.click(1);
+        sel.toggle(1, &rows);
+        assert!(sel.targets(&rows).is_empty());
+        assert_eq!(sel.count(&rows), 0);
+        assert!(!sel.is_selected(1, &rows));
+        // The next Ctrl+click selects only the clicked row, not the stale cursor row.
+        sel.toggle(2, &rows);
+        assert_eq!(sel.targets(&rows), vec![p("c")]);
+        // A plain click (or arrow) brings the cursor selection back.
+        sel.toggle(2, &rows);
+        assert!(sel.targets(&rows).is_empty());
+        sel.click(0);
+        assert_eq!(sel.targets(&rows), vec![p("a")]);
+        assert!(sel.is_selected(0, &rows));
+        // `clear` also restores the cursor row.
+        sel.toggle(0, &rows);
+        sel.clear();
+        assert_eq!(sel.targets(&rows), vec![p("a")]);
     }
 
     #[test]

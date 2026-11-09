@@ -147,6 +147,7 @@
   "welcome.recent.title": "最近のリポジトリ",
   "welcome.recent.toast.locate_failed": "そのフォルダーは使用できません: {error}",
   "welcome.recent.toast.locate_not_repo": "{path} は Git リポジトリではありません",
+  "welcome.recent.toast.locate_worktree": "{path} はリンクされたワークツリーです。代わりにメインリポジトリのフォルダーを選択してください",
   "welcome.recent.toast.path_copied": "パスをコピーしました",
   "welcome.recent.toast.removed_many.other": "{n} 件のリポジトリを最近の一覧から削除しました",
   "welcome.recent.toast.removed_one": "{name} を最近の一覧から削除しました",

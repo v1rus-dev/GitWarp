@@ -291,6 +291,8 @@ pub enum SidebarAction {
     /// Narrows the History list to one branch's own commits (local name or
     /// `<remote>/<name>`).
     ShowBranchCommits(String),
+    /// Drops the History's branch filter (the active filter tool of a ref menu header).
+    ShowAllCommits,
     /// Shows the Worktrees page.
     ShowWorktrees,
     /// Opens the add-worktree dialog.

@@ -160,6 +160,7 @@
   "welcome.recent.title": "Dépôts récents",
   "welcome.recent.toast.locate_failed": "Impossible d’utiliser ce dossier : {error}",
   "welcome.recent.toast.locate_not_repo": "{path} n’est pas un dépôt Git",
+  "welcome.recent.toast.locate_worktree": "{path} est un worktree lié ; choisissez plutôt le dossier du dépôt principal",
   "welcome.recent.toast.path_copied": "Chemin copié",
   "welcome.recent.toast.removed_many.one": "{n} dépôt retiré des récents",
   "welcome.recent.toast.removed_many.other": "{n} dépôts retirés des récents",

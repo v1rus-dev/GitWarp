@@ -5,7 +5,7 @@
 //! the background, one repository at a time, and arrives after the list is
 //! already on screen.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use crate::clone_dialog::CloneDialog;
 use crate::format::{display_path, expand_home, home_dir, relative_time};
 use crate::history_view::unix_now;
 use crate::init_flow::{banner_body, details, DialogKind, InitFlow, StatusKind};
-use crate::recent_state::{classify, OpenResult, RecentSelection, RowState};
+use crate::recent_state::{classify, same_folder, OpenResult, RecentSelection, RowState};
 use crate::settings::RecentRepo;
 use crate::welcome_activity::WelcomeActivity;
 use crate::workspace::{
@@ -100,6 +100,15 @@ pub struct WelcomeView {
     only_unavailable: bool,
     /// What the background check found for each recent path.
     states: HashMap<PathBuf, RowState>,
+    /// Recent entries the background check found to be linked worktrees. They
+    /// are never listed (older versions recorded them; startup prunes them from
+    /// the settings in the background), so they are hidden once known.
+    worktrees: HashSet<PathBuf>,
+    /// Paths with a background check in flight.
+    probing: HashSet<PathBuf>,
+    /// Enter / double click on a row that was still being checked or was
+    /// unavailable: it opens as soon as its (re-)check says it is available.
+    open_when_ready: Option<PathBuf>,
     list_scroll: UniformListScrollHandle,
     /// The list's focus: the screen starts here so ↑/↓ work at once.
     focus: FocusHandle,
@@ -114,6 +123,8 @@ pub struct WelcomeView {
     /// The "Your activity" card above the recent list.
     activity: Entity<WelcomeActivity>,
     _filter_events: Subscription,
+    /// Re-checks every row when the window becomes active again.
+    _activation: Subscription,
 }
 
 impl WelcomeView {
@@ -141,6 +152,13 @@ impl WelcomeView {
             let (git, workspace) = (git.clone(), workspace.clone());
             cx.new(|cx| WelcomeActivity::new(git, workspace, cx))
         };
+        // A mount that came back (or a share that went away) while the window was
+        // in the background shows up without a restart.
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.reprobe_all(window, cx);
+            }
+        });
         Self {
             git,
             workspace,
@@ -152,6 +170,9 @@ impl WelcomeView {
             undo_toast: None,
             only_unavailable: false,
             states: HashMap::new(),
+            worktrees: HashSet::new(),
+            probing: HashSet::new(),
+            open_when_ready: None,
             list_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle().tab_stop(true),
             open_focus: cx.focus_handle().tab_stop(true),
@@ -162,6 +183,7 @@ impl WelcomeView {
             clone_dialog: None,
             activity,
             _filter_events: filter_events,
+            _activation: activation,
         }
     }
 
@@ -201,7 +223,11 @@ impl WelcomeView {
     fn sync_activity(&self, cx: &mut Context<Self>) {
         // Most recently opened first: worktrees of one repository are listed
         // under the newest entry.
-        let mut by_recency: Vec<&RecentRepo> = self.recent.iter().collect();
+        let mut by_recency: Vec<&RecentRepo> = self
+            .recent
+            .iter()
+            .filter(|repo| !self.worktrees.contains(&repo.path))
+            .collect();
         by_recency.sort_by_key(|repo| std::cmp::Reverse(repo.last_opened));
         let paths = by_recency.iter().map(|repo| repo.path.clone()).collect();
         let selected = self
@@ -216,14 +242,7 @@ impl WelcomeView {
 
     /// Starts one background check per row that has none yet. The file-system
     /// probe needs no git, so it runs even when git could not be found.
-    fn ensure_states(&mut self, cx: &mut Context<Self>) {
-        let git = match &self.git {
-            Ok(git) => Some(git.clone()),
-            Err(error) => {
-                log::debug!("recent branches are unavailable: {error}");
-                None
-            }
-        };
+    fn ensure_states(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let missing: Vec<PathBuf> = self
             .recent
             .iter()
@@ -232,20 +251,71 @@ impl WelcomeView {
             .collect();
         for path in missing {
             self.states.insert(path.clone(), RowState::Checking);
-            let git = git.clone();
-            cx.spawn(async move |this, cx| {
-                let read_path = path.clone();
-                let state = cx
-                    .background_executor()
-                    .spawn(async move { check_recent(git, &read_path) })
-                    .await;
-                this.update(cx, |view, cx| {
-                    view.states.insert(path, state);
-                    cx.notify();
-                })
-                .ok();
+            self.start_probe(path, window, cx);
+        }
+    }
+
+    /// Checks one row in the background and stores the result. A check already
+    /// running for the path is not doubled. The row keeps its current state
+    /// meanwhile, so re-checking does not flicker.
+    fn start_probe(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.probing.insert(path.clone()) {
+            return;
+        }
+        let git = match &self.git {
+            Ok(git) => Some(git.clone()),
+            Err(error) => {
+                log::debug!("recent branches are unavailable: {error}");
+                None
+            }
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let read_path = path.clone();
+            let (state, linked) = cx
+                .background_executor()
+                .spawn(async move { check_recent(git, &read_path) })
+                .await;
+            this.update_in(cx, |view, window, cx| {
+                view.finish_probe(path, state, linked, window, cx)
             })
-            .detach();
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_probe(
+        &mut self,
+        path: PathBuf,
+        state: RowState,
+        linked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.probing.remove(&path);
+        if linked {
+            self.worktrees.insert(path.clone());
+        } else {
+            self.worktrees.remove(&path);
+        }
+        let available = matches!(state, RowState::Available { .. });
+        self.states.insert(path.clone(), state);
+        // An Enter / double click waited for this result. Unavailable: the row
+        // stays selected, showing its chip and inline actions.
+        if self.open_when_ready.as_ref() == Some(&path) {
+            self.open_when_ready = None;
+            if available {
+                self.open_path(path, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Re-checks every row (window activation): an unmounted share may be back,
+    /// a repository may have been deleted meanwhile.
+    fn reprobe_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self.recent.iter().map(|repo| repo.path.clone()).collect();
+        for path in paths {
+            self.start_probe(path, window, cx);
         }
     }
 
@@ -260,13 +330,14 @@ impl WelcomeView {
     fn unavailable_paths(&self) -> Vec<PathBuf> {
         self.recent
             .iter()
-            .filter(|repo| self.is_unavailable(&repo.path))
+            .filter(|repo| !self.worktrees.contains(&repo.path) && self.is_unavailable(&repo.path))
             .map(|repo| repo.path.clone())
             .collect()
     }
 
     fn matches(&self, repo: &RecentRepo) -> bool {
-        (!self.only_unavailable || self.is_unavailable(&repo.path))
+        !self.worktrees.contains(&repo.path)
+            && (!self.only_unavailable || self.is_unavailable(&repo.path))
             && matches_filter(
                 &recent_name(&repo.path),
                 &display_path(&repo.path, self.home.as_deref()),
@@ -327,6 +398,7 @@ impl WelcomeView {
         if index >= paths.len() {
             return;
         }
+        self.open_when_ready = None;
         if range {
             self.selection.extend_to(index, &paths);
         } else if toggle {
@@ -343,7 +415,8 @@ impl WelcomeView {
             return;
         }
         let next = (self.selection.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
-        if next != self.selection.cursor || self.selection.count(&self.visible_paths()) > 1 {
+        if next != self.selection.cursor || self.selection.count(&self.visible_paths()) != 1 {
+            self.open_when_ready = None;
             self.selection.click(next);
             self.list_scroll
                 .scroll_to_item(next, ScrollStrategy::Nearest);
@@ -351,8 +424,14 @@ impl WelcomeView {
         }
     }
 
-    /// Shift+↑/↓: grows the selection one row at a time.
-    fn extend_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+    /// Shift+↑/↓: grows the selection one row at a time. Only while the list has
+    /// the focus: with the filter field focused the keys are left to the field
+    /// (they must not change the list's selection behind it).
+    fn extend_selection(&mut self, delta: isize, window: &Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
         let paths = self.visible_paths();
         if paths.is_empty() {
             return;
@@ -390,13 +469,23 @@ impl WelcomeView {
         let Some(row) = rows.get(index) else {
             return;
         };
-        // An unavailable row is only selected: opening it would fail (or,
-        // worse, open a parent repository).
-        if row.state.unavailable().is_some() {
-            self.select_row(index, cx);
-            return;
-        }
         let path = row.path.clone();
+        match row.state {
+            RowState::Available { .. } => self.open_path(path, window, cx),
+            // A row that is still being checked, or is unavailable, is only
+            // selected: opening an unverified path could fail (or, worse, open a
+            // parent repository). It opens once its check says it is available;
+            // an unavailable row is re-checked now, since it may have come back
+            // (a remounted share, a transient git failure).
+            RowState::Checking | RowState::Unavailable(_) => {
+                self.select_row(index, cx);
+                self.open_when_ready = Some(path.clone());
+                self.start_probe(path, window, cx);
+            }
+        }
+    }
+
+    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(workspace) = self.workspace.upgrade() {
             workspace.update(cx, |workspace, cx| {
                 workspace.open_repository(path, window, cx);
@@ -434,9 +523,15 @@ impl WelcomeView {
         };
         let view = cx.entity().downgrade();
         let undo = ToastAction::new(ui::t!("welcome.recent.toast.undo"), move |_, cx| {
-            let removed = removed.clone();
-            view.update(cx, |view, cx| view.restore_removed(removed, cx))
-                .ok();
+            // The toast outlives the view (a repository opened within the
+            // lifetime replaces the welcome screen), so the entries go back
+            // through the settings global; the view is refreshed only if alive.
+            restore_recent(cx, removed.clone());
+            view.update(cx, |view, cx| {
+                view.sync_recent(cx);
+                cx.notify();
+            })
+            .ok();
         });
         // One Undo at a time: a newer removal replaces the older toast.
         if let Some(previous) = self.undo_toast.take() {
@@ -453,13 +548,6 @@ impl WelcomeView {
             window,
             cx,
         ));
-    }
-
-    /// Undo of [`Self::remove_paths`]: the entries return to their old positions.
-    fn restore_removed(&mut self, removed: Vec<(usize, RecentRepo)>, cx: &mut Context<Self>) {
-        crate::update_settings(cx, |settings| settings.restore_recent(removed));
-        self.sync_recent(cx);
-        cx.notify();
     }
 
     /// Right click on a row: selects it unless it is already part of the
@@ -576,13 +664,12 @@ impl WelcomeView {
                 .spawn({
                     let picked = picked.clone();
                     async move {
-                        let git = git.map_err(|error| error.to_string())?;
-                        Repo::open(git, &picked)
-                            .map(|repo| repo.root().to_path_buf())
-                            .map_err(|error| match error {
-                                Error::NotARepository { .. } => String::new(),
-                                other => other.to_string(),
-                            })
+                        let git = match git {
+                            Ok(git) => git,
+                            Err(error) => return LocateOutcome::Failed(error.to_string()),
+                        };
+                        let opened = Repo::open(git, &picked).map(|repo| repo.root().to_path_buf());
+                        locate_outcome(&picked, opened, git_core::is_linked_worktree)
                     }
                 })
                 .await;
@@ -594,19 +681,18 @@ impl WelcomeView {
         .detach();
     }
 
-    /// The end of [`Self::locate`]. `opened` is the repository root, or the
-    /// error text (empty for "not a repository").
+    /// The end of [`Self::locate`].
     fn finish_locate(
         &mut self,
         old: PathBuf,
         picked: PathBuf,
-        opened: Result<PathBuf, String>,
+        outcome: LocateOutcome,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let root = match opened {
-            Ok(root) => root,
-            Err(error) if error.is_empty() => {
+        let root = match outcome {
+            LocateOutcome::Repository(root) => root,
+            LocateOutcome::NotRepository => {
                 toast::show(
                     ToastKind::Error,
                     ui::t!(
@@ -618,7 +704,19 @@ impl WelcomeView {
                 );
                 return;
             }
-            Err(error) => {
+            LocateOutcome::LinkedWorktree => {
+                toast::show(
+                    ToastKind::Error,
+                    ui::t!(
+                        "welcome.recent.toast.locate_worktree",
+                        path = display_path(&picked, self.home.as_deref())
+                    ),
+                    window,
+                    cx,
+                );
+                return;
+            }
+            LocateOutcome::Failed(error) => {
                 toast::show(
                     ToastKind::Error,
                     ui::t!("welcome.recent.toast.locate_failed", error = error),
@@ -1053,7 +1151,7 @@ impl Render for WelcomeView {
         self.activity
             .update(cx, |activity, cx| activity.set_enabled(show_activity, cx));
         self.sync_activity(cx);
-        self.ensure_states(cx);
+        self.ensure_states(window, cx);
 
         let client = inline_window_controls(window);
         let colors = cx.theme().colors;
@@ -1093,8 +1191,16 @@ impl Render for WelcomeView {
                 }),
             )
             .on_action(cx.listener(|view, _: &SelectAllRecent, _, cx| view.select_all(cx)))
-            .on_action(cx.listener(|view, _: &ExtendNext, _, cx| view.extend_selection(1, cx)))
-            .on_action(cx.listener(|view, _: &ExtendPrev, _, cx| view.extend_selection(-1, cx)))
+            .on_action(
+                cx.listener(|view, _: &ExtendNext, window, cx| {
+                    view.extend_selection(1, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|view, _: &ExtendPrev, window, cx| {
+                    view.extend_selection(-1, window, cx)
+                }),
+            )
             // Esc drops a multi-selection; otherwise it goes on to whatever
             // handles it behind the list.
             .on_action(cx.listener(|view, _: &ui::actions::Cancel, _, cx| {
@@ -2128,6 +2234,41 @@ fn row_menu_entries(kind: RowMenu, run: impl Fn(MenuCommand) -> MenuRun) -> Vec<
     }
 }
 
+/// Undo of [`WelcomeView::remove_paths`]: the entries return to their old positions.
+fn restore_recent(cx: &mut App, removed: Vec<(usize, RecentRepo)>) {
+    crate::update_settings(cx, |settings| settings.restore_recent(removed));
+}
+
+/// What the background check of a Locate… pick found.
+#[derive(Debug, PartialEq, Eq)]
+enum LocateOutcome {
+    /// The picked folder is itself a repository root.
+    Repository(PathBuf),
+    /// Not a repository, or only inside one (a parent dotfiles repository).
+    NotRepository,
+    /// The pick is a linked worktree; Recent lists main repositories only.
+    LinkedWorktree,
+    /// Git could not be started or failed; carries the error text.
+    Failed(String),
+}
+
+/// Classifies the result of `Repo::open(picked)`: the picked folder itself must be
+/// the repository root (the same rule as [`classify`]), because `Repo::open` searches
+/// upward and would accept an enclosing repository.
+fn locate_outcome(
+    picked: &Path,
+    opened: Result<PathBuf, Error>,
+    is_worktree: impl Fn(&Path) -> bool,
+) -> LocateOutcome {
+    match opened {
+        Ok(root) if !same_folder(&root, picked) => LocateOutcome::NotRepository,
+        Ok(root) if is_worktree(&root) => LocateOutcome::LinkedWorktree,
+        Ok(root) => LocateOutcome::Repository(root),
+        Err(Error::NotARepository { .. }) => LocateOutcome::NotRepository,
+        Err(other) => LocateOutcome::Failed(other.to_string()),
+    }
+}
+
 /// What Locate… does with the repository the user picked.
 #[derive(Debug, PartialEq, Eq)]
 enum Relocation {
@@ -2240,7 +2381,10 @@ fn cleanup_bar(
 /// The background check of one recent entry: the file-system probe first,
 /// then (only for a plausible repository, and only when git is available)
 /// opening it and reading HEAD.
-fn check_recent(git: Option<Arc<Git>>, path: &Path) -> RowState {
+///
+/// The flag says the entry is a linked worktree (never listed in Recent).
+fn check_recent(git: Option<Arc<Git>>, path: &Path) -> (RowState, bool) {
+    let linked = git_core::is_linked_worktree(path);
     let probe = git_core::probe_repo_path(path);
     let open: Option<OpenResult> = match (&probe, git) {
         (git_core::PathProbe::Candidate, Some(git)) => {
@@ -2248,7 +2392,7 @@ fn check_recent(git: Option<Arc<Git>>, path: &Path) -> RowState {
         }
         _ => None,
     };
-    classify(path, probe, open)
+    (classify(path, probe, open), linked)
 }
 
 fn read_recent(cx: &App) -> Vec<RecentRepo> {
@@ -2495,6 +2639,13 @@ mod tests {
         cx: &mut gpui::TestAppContext,
         paths: &[PathBuf],
     ) -> gpui::VisualTestContext {
+        open_with_paths_in_workspace(cx, paths).0
+    }
+
+    fn open_with_paths_in_workspace(
+        cx: &mut gpui::TestAppContext,
+        paths: &[PathBuf],
+    ) -> (gpui::VisualTestContext, gpui::Entity<Workspace>) {
         let settings = crate::settings::Settings {
             recent: paths
                 .iter()
@@ -2514,8 +2665,7 @@ mod tests {
                 dirty: false,
             });
         });
-        let (cx, _workspace) = crate::test_support::open_workspace(crate::test_support::git(), cx);
-        cx
+        crate::test_support::open_workspace(crate::test_support::git(), cx)
     }
 
     fn click_selector(cx: &mut gpui::VisualTestContext, selector: &'static str) {
@@ -2798,6 +2948,45 @@ mod tests {
     }
 
     #[test]
+    fn locate_requires_the_picked_folder_to_be_the_root_and_not_a_worktree() {
+        let picked = Path::new("/work/proj/sub");
+        let never = |_: &Path| false;
+        assert_eq!(
+            locate_outcome(picked, Ok(picked.to_path_buf()), never),
+            LocateOutcome::Repository(picked.to_path_buf())
+        );
+        // `Repo::open` found an enclosing repository (a parent dotfiles repo).
+        assert_eq!(
+            locate_outcome(picked, Ok(PathBuf::from("/work")), never),
+            LocateOutcome::NotRepository
+        );
+        assert_eq!(
+            locate_outcome(
+                picked,
+                Err(Error::NotARepository {
+                    path: picked.to_path_buf()
+                }),
+                never
+            ),
+            LocateOutcome::NotRepository
+        );
+        assert_eq!(
+            locate_outcome(picked, Ok(picked.to_path_buf()), |_| true),
+            LocateOutcome::LinkedWorktree
+        );
+        assert!(matches!(
+            locate_outcome(
+                picked,
+                Err(Error::PathNotFound {
+                    path: picked.to_path_buf()
+                }),
+                never
+            ),
+            LocateOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
     fn relocate_target_follows_the_picked_repository_root() {
         let recent = |paths: &[&str]| -> Vec<RecentRepo> {
             paths
@@ -2838,5 +3027,159 @@ mod tests {
         let mut expected = paths.clone();
         expected.remove(1);
         assert_eq!(recent_paths(&mut cx), expected);
+    }
+
+    /// A row cached as unavailable opens with Enter once the folder is back: the
+    /// key re-checks it instead of staying dead for the session.
+    #[gpui::test]
+    fn enter_on_an_unavailable_row_rechecks_and_opens_it_when_it_came_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = crate::test_support::TempRepo::new("recent-recheck");
+        let path = repo.path().to_path_buf();
+        let away = path.with_extension("away");
+        std::fs::rename(&path, &away).unwrap();
+        let (mut cx, workspace) = open_with_paths_in_workspace(cx, std::slice::from_ref(&path));
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("recent-chip-0").is_some(),
+            "not unavailable"
+        );
+
+        // Still gone: Enter keeps the row selected and the screen open.
+        cx.update(|window, cx| window.dispatch_action(Box::new(ui::actions::Confirm), cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("recent-chip-0").is_some());
+        assert!(workspace.read_with(&cx, |w, _| w.repository_for_test().is_none()));
+
+        // The folder comes back (a remounted share).
+        std::fs::rename(&away, &path).unwrap();
+        cx.update(|window, cx| window.dispatch_action(Box::new(ui::actions::Confirm), cx));
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(workspace.read_with(&cx, |w, _| w.repository_for_test().is_some()));
+    }
+
+    /// Activating the window again re-checks every row without a click.
+    #[gpui::test]
+    fn window_activation_rechecks_the_rows(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("recent-activate");
+        let path = repo.path().to_path_buf();
+        let away = path.with_extension("away");
+        std::fs::rename(&path, &away).unwrap();
+        let (mut cx, _workspace) = open_with_paths_in_workspace(cx, std::slice::from_ref(&path));
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("recent-chip-0").is_some());
+
+        // Another window takes the activation, so re-activating this one is a change.
+        struct Blank;
+        impl Render for Blank {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        let other = cx.update(|_, cx| {
+            cx.open_window(gpui::WindowOptions::default(), |_, cx| cx.new(|_| Blank))
+                .expect("open the second window")
+        });
+        other
+            .update(&mut cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+
+        std::fs::rename(&away, &path).unwrap();
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("recent-chip-0").is_none(),
+            "the row stayed unavailable after the window was activated"
+        );
+    }
+
+    /// A linked worktree recorded by an older version is hidden once the
+    /// background check has seen it, without any blocking work at startup.
+    #[gpui::test]
+    fn linked_worktree_entries_are_not_listed(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("recent-worktree");
+        let wt = repo.path().join("wt");
+        let gitdir = repo.path().join(".git/worktrees/wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        let paths = vec![wt, repo.path().to_path_buf()];
+        let mut cx = open_with_paths(cx, &paths);
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("recent-row-0").is_some());
+        assert!(
+            cx.debug_bounds("recent-row-1").is_none(),
+            "the linked worktree is still listed"
+        );
+    }
+
+    /// Undo still restores the entries after the welcome view is gone (a
+    /// repository opened within the toast's lifetime).
+    #[gpui::test]
+    fn undo_works_after_the_welcome_view_is_gone(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("recent-undo-gone");
+        let (mut cx, paths) = open_mixed(cx, &repo);
+        cx.run_until_parked();
+        cx.run_until_parked();
+        click_selector(&mut cx, "recent-cleanup-remove");
+        assert_eq!(recent_paths(&mut cx), vec![paths[0].clone()]);
+        let action = cx.update(|window, cx| {
+            toast::toasts(window, cx)[0]
+                .body
+                .as_ref()
+                .and_then(|body| body.action.clone())
+                .expect("the toast has an Undo button")
+        });
+
+        // Opening the repository replaces the welcome screen.
+        click_row(&mut cx, 0, gpui::Modifiers::default());
+        cx.update(|window, cx| window.dispatch_action(Box::new(ui::actions::Confirm), cx));
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("recent-filter").is_none(),
+            "the welcome screen is still up"
+        );
+
+        cx.update(|window, cx| (action.on_click)(window, cx));
+        cx.run_until_parked();
+        let restored = recent_paths(&mut cx);
+        assert!(
+            paths[1..].iter().all(|path| restored.contains(path)),
+            "Undo did nothing: {restored:?}"
+        );
+    }
+
+    /// Shift+↓ extends the list's selection only while the list is focused; in
+    /// the filter field it must leave the selection alone.
+    #[gpui::test]
+    fn shift_arrows_in_the_filter_field_do_not_change_the_selection(cx: &mut gpui::TestAppContext) {
+        let (mut cx, _paths) = open_with_recent(cx);
+        cx.run_until_parked();
+        let filter = cx.debug_bounds("recent-filter").expect("filter");
+        cx.simulate_click(filter.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.dispatch_action(Box::new(ExtendNext), cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("recent-footer-selected").is_none(),
+            "Shift+Down in the filter extended the list selection"
+        );
+
+        click_row(&mut cx, 0, gpui::Modifiers::default());
+        cx.update(|window, cx| window.dispatch_action(Box::new(ExtendNext), cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("recent-footer-selected").is_some(),
+            "Shift+Down in the list did not extend the selection"
+        );
     }
 }

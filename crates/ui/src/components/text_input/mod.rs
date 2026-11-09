@@ -98,6 +98,11 @@ impl TextInput {
         &self.focus_handle
     }
 
+    /// The caret's byte offset, or `None` while a range is selected.
+    pub fn caret(&self) -> Option<usize> {
+        self.model.selection.is_empty().then(|| self.model.cursor())
+    }
+
     pub fn text(&self) -> &str {
         &self.model.text
     }

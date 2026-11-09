@@ -173,6 +173,7 @@
   "welcome.recent.title": "Недавние репозитории",
   "welcome.recent.toast.locate_failed": "Не удалось использовать эту папку: {error}",
   "welcome.recent.toast.locate_not_repo": "{path} не является репозиторием Git",
+  "welcome.recent.toast.locate_worktree": "{path} — связанный рабочий каталог (worktree); выберите вместо него папку основного репозитория",
   "welcome.recent.toast.path_copied": "Путь скопирован",
   "welcome.recent.toast.removed_many.one": "{n} репозиторий удалён из недавних",
   "welcome.recent.toast.removed_many.few": "{n} репозитория удалены из недавних",

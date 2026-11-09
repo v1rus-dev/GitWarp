@@ -88,6 +88,9 @@ const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(15
 
 /// The gap between the history table's columns.
 const COL_GAP: f32 = 18.;
+/// How many frames a keyboard-opened row menu waits for its row to be painted
+/// after scrolling it into view.
+const MENU_WAIT_FRAMES: u8 = 4;
 /// The pane widths where the table drops a column, as the design's container
 /// queries do: 560 px loses Hash, 460 px loses Author.
 const PANE_MEDIUM: f32 = 560.;
@@ -960,9 +963,15 @@ pub struct HistoryView {
     /// The virtualized list's scroll state, so a selection moved by the
     /// keyboard can be scrolled minimally into view.
     scroll: UniformListScrollHandle,
-    /// Where the selected row's graph cell was last painted: the row menu
-    /// opened from the keyboard anchors to it (left of the summary, below).
+    /// Where the selected row's graph cell was painted in the latest frame: the
+    /// row menu opened from the keyboard anchors to it (left of the summary,
+    /// below). Cleared every frame before the rows are built, so `None` means
+    /// the selected row is not on screen.
     selected_cell: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    /// Frames left to wait for the selected row to be painted so the row menu
+    /// asked for from the keyboard can open on it (the row was scrolled into
+    /// view first). 0 when no menu is waiting.
+    menu_wait_frames: u8,
     /// Whether the user picked a row themselves. Until then the selection
     /// follows the HEAD row as it arrives instead of staying on row 0.
     user_selected: bool,
@@ -1278,8 +1287,8 @@ impl RowMenu {
                 ui::t!("history.refmenu.copy_subject"),
                 self.summary.clone(),
             )),
-            // The body is not loaded with the row: the shell reads it in the
-            // background and copies subject + body.
+            // The message is not loaded with the row: the shell reads it in the
+            // background and copies it as written (`%B`).
             MenuEntry::Item(
                 MenuItem::new(ui::t!("history.refmenu.copy_message")).action(move |window, cx| {
                     if let Some(handler) = &handler {
@@ -1422,6 +1431,7 @@ impl HistoryView {
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             selected_cell: Rc::default(),
+            menu_wait_frames: 0,
             user_selected: false,
             pending_reveal: PendingReveal::default(),
             commit_graph_task: None,
@@ -2372,11 +2382,38 @@ impl HistoryView {
     /// Shift+F10 / the Menu key: the row menu of the selected row, anchored
     /// below it, left of the summary cell. Nothing when the row is not drawn.
     fn open_selected_row_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(index), Some(cell)) = (self.selected, self.selected_cell.get()) else {
+        let Some(index) = self.selected else {
+            return;
+        };
+        let Some(cell) = self.selected_cell.get() else {
+            // Not on screen: scroll it into view and open the menu once the next
+            // frames have painted it and its position is known.
+            self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+            self.menu_wait_frames = MENU_WAIT_FRAMES;
+            cx.notify();
             return;
         };
         let position = point(cell.right() + px(COL_GAP), cell.bottom());
         self.open_row_menu(index, position, window, cx);
+    }
+
+    /// Continues a row menu that is waiting for its row to be painted: opens it
+    /// once the position is known, gives up after [`MENU_WAIT_FRAMES`] frames.
+    fn poll_pending_row_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu_wait_frames == 0 {
+            return;
+        }
+        if self.selected_cell.get().is_some() {
+            self.menu_wait_frames = 0;
+            cx.defer_in(window, |view, window, cx| {
+                view.open_selected_row_menu(window, cx)
+            });
+            return;
+        }
+        self.menu_wait_frames -= 1;
+        if self.menu_wait_frames > 0 {
+            window.request_animation_frame();
+        }
     }
 
     /// Installs how the shell finds the service "Create pull request…" names
@@ -2406,7 +2443,7 @@ impl HistoryView {
             .map(|target| target.name.clone());
         RefMenuCtx {
             head: self.head().cloned(),
-            refs: self.refs().unwrap_or(&[]).to_vec(),
+            refs: self.refs().unwrap_or(&[]).into(),
             links: self.host_links(cx),
             targets: self.remote_targets.clone(),
             operation: self.operation,
@@ -3591,6 +3628,8 @@ impl HistoryView {
         let hosting = self.hosting.clone();
         let badge_widths = &mut self.badge_widths;
         let selected_cell = self.selected_cell.clone();
+        // Painted again below only when the selected row is on screen.
+        selected_cell.set(None);
         let search_matches = &self.search_matches;
         range
             .map(|ix| {
@@ -4628,7 +4667,8 @@ impl Drop for HistoryView {
 }
 
 impl Render for HistoryView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.poll_pending_row_menu(window, cx);
         // The pane's own width is only known after layout. A container query
         // hands it back in prepaint, so the table is rebuilt for the width the
         // pane really got — no measure-and-notify round trip, no stale frame.
@@ -5009,7 +5049,7 @@ mod tests {
         };
         let ctx = RefMenuCtx {
             head,
-            refs,
+            refs: refs.into(),
             links: links.clone(),
             targets,
             operation: Operation::None,
@@ -6249,6 +6289,52 @@ mod tests {
         cx.update(|window, cx| {
             let focused = history.read(cx).focus.is_focused(window);
             assert!(focused, "the list lost focus after the submenu action");
+        });
+    }
+
+    /// With the selected row scrolled off screen, Shift+F10 scrolls it into
+    /// view and opens the menu on it, not at the row's last painted position.
+    #[gpui::test]
+    fn shift_f10_on_an_offscreen_row_scrolls_it_into_view_first(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-row-menu-offscreen");
+        for n in 0..40 {
+            commit(repo.path(), &format!("f{n}.txt"), "x");
+        }
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update_in(&mut cx, |view, window, cx| {
+            window.focus(&view.focus, cx);
+            view.select_row(0, cx);
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("history-row-0").is_some());
+
+        // Scroll the selected row (the newest commit) off the top.
+        history.update_in(&mut cx, |view, _, cx| {
+            view.scroll.scroll_to_item(39, ScrollStrategy::Bottom);
+            cx.notify();
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("history-row-0").is_none(),
+            "the row is still on screen; the test needs more commits"
+        );
+        history.read_with(&cx, |view, _| {
+            assert!(view.selected_cell.get().is_none(), "a stale cell survived");
+        });
+
+        cx.simulate_keystrokes("shift-f10");
+        for _ in 0..4 {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("history-row-0").is_some(),
+            "the selected row was not scrolled into view"
+        );
+        cx.update(|window, cx| {
+            assert_eq!(ui::overlay::layer_count(window, cx), 1, "no menu opened");
         });
     }
 

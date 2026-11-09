@@ -25,7 +25,7 @@ both themes are in `screens/` (`<page>.dark.png` and `<page>.light.png`).
 | `components.html` | Component set: buttons, inputs, tabs, tree, rows, menus, tooltips, dialogs, toasts — with states. | 1 — UI foundation |
 | `main-1200.html` | Main window 1200×800: history + details docked bottom, unified diff. Interactive. | 2 — window shell, welcome, states |
 | `main-1600.html` | Main window 1600×1000: details docked right, side-by-side diff. Interactive. | 2 — window shell, welcome, states |
-| `welcome.html` | Welcome / repo picker: "Your activity" card, unavailable recent entries with bulk removal and Undo (Planned), recent repos, Open, Clone, Init dialogs. | 2 — window shell, welcome, states |
+| `welcome.html` | Welcome / repo picker: "Your activity" card, unavailable recent entries with bulk removal and Undo (shipped; linked worktrees are never listed in Recent), recent repos, Open, Clone, Init dialogs. | 2 — window shell, welcome, states |
 | `history-states.html` | History states: loading, empty repo, not a repo, git missing / too old, generic git error. | 2 — window shell, welcome, states |
 | `dialogs-repo.html` | Dialogs: clone / open — clone from URL (HTTPS/SSH, progress, errors) and open from folder, with all states. | 2 — Open tab; 8 — Clone tab |
 | `graph.html` | Commit graph spec: geometry, golden-angle lanes on both themes, clipping, widening, idle-lane collapse. | 3 — history |

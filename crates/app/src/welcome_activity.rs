@@ -448,12 +448,20 @@ fn head_stamp(path: &Path) -> Option<SystemTime> {
 }
 
 /// The chip wording of why `path` is skipped, or `None` when it is a usable repository.
+/// "Can't read" carries the underlying error ("Can't read — <error>"): that text is
+/// what tells the user how to fix it, and the chip label alone hides it.
 fn unavailable_reason(
     path: &Path,
     probe: PathProbe,
     open: Option<crate::recent_state::OpenResult>,
 ) -> Option<String> {
     match crate::recent_state::classify(path, probe, open) {
+        RowState::Unavailable(crate::recent_state::Unavailable::Unreadable(error)) => {
+            Some(format!(
+                "{} — {error}",
+                crate::recent_state::Unavailable::Unreadable(String::new()).chip_label()
+            ))
+        }
         RowState::Unavailable(reason) => Some(reason.chip_label().to_string()),
         _ => None,
     }
@@ -954,6 +962,29 @@ mod tests {
             count_repo(git.clone(), &gone, "me@x.io", None)
                 .err()
                 .as_deref(),
+            Some("Folder not found")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_repository_keeps_its_error_text() {
+        let path = Path::new("/r/locked");
+        assert_eq!(
+            unavailable_reason(
+                path,
+                PathProbe::Unreadable("Permission denied".into()),
+                None
+            )
+            .as_deref(),
+            Some("Can't read — Permission denied")
+        );
+        let boom = git_core::Error::Spawn(std::io::Error::other("boom"));
+        let reason = unavailable_reason(path, PathProbe::Candidate, Some(Err(boom))).unwrap();
+        assert!(reason.starts_with("Can't read — "), "{reason}");
+        assert!(reason.contains("boom"), "{reason}");
+        // The other reasons stay the bare chip label.
+        assert_eq!(
+            unavailable_reason(path, PathProbe::Missing, None).as_deref(),
             Some("Folder not found")
         );
     }

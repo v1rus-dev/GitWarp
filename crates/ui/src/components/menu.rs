@@ -18,7 +18,7 @@ use crate::actions::{
     Cancel, Confirm, FocusNext, FocusPrev, MenuCloseSubmenu, MenuOpenSubmenu, SelectNext,
     SelectPrev,
 };
-use crate::components::text_input::{TextInput, TextInputEvent};
+use crate::components::text_input::{Left, Right, TextInput, TextInputEvent};
 use crate::components::{SearchField, Tooltip};
 use crate::focus::{self, RingOffset};
 use crate::icon::{Icon, IconName};
@@ -710,6 +710,58 @@ impl MenuView {
         }
     }
 
+    /// The active level's filter input, when it has the focus.
+    fn focused_filter(&self, window: &Window, cx: &App) -> Option<Entity<TextInput>> {
+        let input = self.levels[self.active_level]
+            .filter
+            .as_ref()?
+            .input
+            .clone();
+        input
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+            .then_some(input)
+    }
+
+    /// → in the focused filter field: opens the highlighted row's submenu when the
+    /// caret is at the end of the text (the field's own → has nowhere to go there).
+    /// Returns whether it was taken; otherwise the field moves its caret.
+    fn filter_right(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(input) = self.focused_filter(window, cx) else {
+            return false;
+        };
+        let input = input.read(cx);
+        if input.caret() != Some(input.text().len()) {
+            return false;
+        }
+        let level = &self.levels[self.active_level];
+        let Some(index) = level.nav.highlight() else {
+            return false;
+        };
+        if !level
+            .item(index)
+            .is_some_and(|item| item.submenu.is_some() && !item.disabled)
+        {
+            return false;
+        }
+        self.open_highlighted(window, cx);
+        true
+    }
+
+    /// ← in the focused filter field of a submenu: closes the level when the caret
+    /// is at position 0 (nothing left to move over). Returns whether it was taken.
+    fn filter_left(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(input) = self.focused_filter(window, cx) else {
+            return false;
+        };
+        if input.read(cx).caret() != Some(0) || self.active_level == 0 {
+            return false;
+        }
+        self.close_active(window, cx);
+        true
+    }
+
     /// ← : closes the active level, unless it is the root.
     fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.keyboard = true;
@@ -1050,6 +1102,19 @@ impl Render for MenuView {
                 cx.listener(|this, _: &MenuCloseSubmenu, window, cx| this.close_active(window, cx)),
             )
             .on_action(cx.listener(|this, _: &Cancel, window, cx| this.cancel(window, cx)))
+            // The filter field binds ←/→ itself (deeper context), so the menu's own
+            // arrow bindings never fire there. Intercept in the capture phase, before
+            // the field, and only where the caret has nowhere to go.
+            .capture_action(cx.listener(|this, _: &Right, window, cx| {
+                if this.filter_right(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &Left, window, cx| {
+                if this.filter_left(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             // An open menu absorbs Tab so focus cannot escape behind it: a
             // menu that is no longer focused cannot handle Esc any more.
             .on_action(cx.listener(|_, _: &FocusNext, _, _| {}))

@@ -202,23 +202,13 @@ fn main() {
         };
 
     let config_path = settings::config_dir().map(|dir| dir.join("settings.json"));
-    let mut loaded = match &config_path {
+    let loaded = match &config_path {
         Some(path) => SettingsStore::new(path.clone()).load(),
         None => {
             log::warn!("no configuration directory found; using default settings");
             Settings::default()
         }
     };
-    // Linked worktrees are never listed in Recent: drop the ones recorded by
-    // older versions so they stop taking slots of RECENT_LIMIT. At most
-    // RECENT_LIMIT small file reads, before any window exists.
-    if loaded.prune_recent_worktrees(git_core::is_linked_worktree) {
-        if let Some(path) = &config_path {
-            if let Err(e) = SettingsStore::new(path.clone()).save(&loaded) {
-                log::warn!("failed to save the pruned recent list: {e}");
-            }
-        }
-    }
     // Kept alive until `main` returns: dropping the guard flushes queued events.
     let _sentry = telemetry::init(loaded.telemetry);
     // Before the first window renders, so every view reads the chosen language.
@@ -354,8 +344,9 @@ fn main() {
                     Some("welcome"),
                 ),
                 KeyBinding::new("delete", welcome::RemoveSelected, Some("welcome")),
-                // Multi-select in the recent list. A focused filter input has
-                // its own Ctrl+A / Shift+arrows in a deeper context.
+                // Multi-select in the recent list. Shift+arrows act on the list only
+                // while it has the focus (the handler checks it); a focused filter
+                // input keeps its own Ctrl+A in a deeper context.
                 ui::actions::key_binding(
                     cx,
                     "secondary-a",
@@ -422,9 +413,48 @@ fn main() {
                 },
             )
             .expect("failed to open the main window");
+            prune_recent_worktrees(cx);
             update_check::start(cx);
             cx.activate(true);
         });
+}
+
+/// Linked worktrees are never listed in Recent: drops the ones recorded by older
+/// versions so they stop taking slots of RECENT_LIMIT. The probes read files, which
+/// can hang on a dead network mount, so they run on the background executor after
+/// the first window is up; the settings are updated (and saved) from the
+/// foreground once they finish. Until then the Welcome list hides such rows itself
+/// from its own background check.
+fn prune_recent_worktrees(cx: &mut App) {
+    let recent: Vec<PathBuf> = match cx.try_global::<AppSettings>() {
+        Some(state) => state
+            .settings
+            .recent
+            .iter()
+            .map(|r| r.path.clone())
+            .collect(),
+        None => return,
+    };
+    cx.spawn(async move |cx| {
+        let linked: Vec<PathBuf> = cx
+            .background_executor()
+            .spawn(async move {
+                recent
+                    .into_iter()
+                    .filter(|path| git_core::is_linked_worktree(path))
+                    .collect()
+            })
+            .await;
+        if linked.is_empty() {
+            return;
+        }
+        cx.update(|cx| {
+            update_settings(cx, |settings| {
+                settings.prune_recent_worktrees(|path| linked.iter().any(|l| l == path));
+            })
+        });
+    })
+    .detach();
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -160,6 +160,7 @@
   "welcome.recent.title": "Recent repositories",
   "welcome.recent.toast.locate_failed": "Couldn't use that folder: {error}",
   "welcome.recent.toast.locate_not_repo": "{path} is not a git repository",
+  "welcome.recent.toast.locate_worktree": "{path} is a linked worktree; pick the main repository folder instead",
   "welcome.recent.toast.path_copied": "Path copied",
   "welcome.recent.toast.removed_many.one": "Removed {n} repository from Recent",
   "welcome.recent.toast.removed_many.other": "Removed {n} repositories from Recent",

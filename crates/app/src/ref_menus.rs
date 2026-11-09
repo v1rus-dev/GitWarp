@@ -270,7 +270,9 @@ pub enum RefMenuEntry {
 #[derive(Clone, Debug)]
 pub struct RefMenuCtx {
     pub head: Option<Head>,
-    pub refs: Vec<Ref>,
+    /// Shared, so a submenu opening does not deep-copy every ref when it
+    /// clones the context to set `pr_kind`.
+    pub refs: std::rc::Rc<[Ref]>,
     /// The hosts the remotes lead to (see [`web_links::host_links`]); empty
     /// hides "Open on <Service>" and "Open release".
     pub links: Vec<HostLink>,
@@ -326,12 +328,23 @@ impl RefMenuCtx {
         )
     }
 
-    /// The filter tool of a branch header: narrows the History to the branch.
+    /// The filter tool of a branch header: narrows the History to the branch, or,
+    /// when that filter is already active, clears it (re-applying it would reset
+    /// the rows, selection and scroll for nothing).
     fn filter_tool(&self, name: &str) -> RefMenuTool {
+        let selected = self.filter.as_deref() == Some(name);
+        if selected {
+            return RefMenuTool {
+                icon: IconName::Filter,
+                tooltip: ui::t!("history.action.show_all_commits").into(),
+                selected,
+                action: SidebarAction::ShowAllCommits,
+            };
+        }
         RefMenuTool {
             icon: IconName::Filter,
             tooltip: ui::t!("history.refmenu.show_only_tip", name = name).into(),
-            selected: self.filter.as_deref() == Some(name),
+            selected,
             action: SidebarAction::ShowBranchCommits(name.to_owned()),
         }
     }
@@ -695,7 +708,7 @@ mod tests {
     fn ctx(refs: Vec<Ref>) -> RefMenuCtx {
         RefMenuCtx {
             head: Some(head_of("main")),
-            refs,
+            refs: refs.into(),
             links: vec![github_link()],
             targets: targets(&["origin"]),
             operation: Operation::None,
@@ -947,7 +960,7 @@ mod tests {
     fn the_head_branch_section_switches_off_and_pulls() {
         let mut main = local("main", oid(1));
         main.upstream = Some("origin/main".to_owned());
-        let mut ctx = ctx(vec![main]);
+        let ctx = ctx(vec![main.clone()]);
         let section = local_section(&ctx, "main");
         let switch = item(&section, "Switch to main");
         assert!(!switch.enabled);
@@ -960,7 +973,11 @@ mod tests {
         assert_eq!(pull.action, SidebarAction::Pull);
         assert!(has(&section, "Push main to origin"));
         // Without an upstream there is nothing to pull from.
-        ctx.refs[0].upstream = None;
+        main.upstream = None;
+        let ctx = RefMenuCtx {
+            refs: vec![main].into(),
+            ..ctx
+        };
         assert!(!has(&local_section(&ctx, "main"), "Pull"));
     }
 
@@ -1027,7 +1044,7 @@ mod tests {
         assert!(tag_labels.iter().all(|l| !l.starts_with("Push")));
         // A remote-only ref whose remote is not configured has nothing to fetch.
         let ctx = RefMenuCtx {
-            refs: vec![remote("gone/x", c)],
+            refs: vec![remote("gone/x", c)].into(),
             ..ctx
         };
         assert!(labels(&remote_section(&ctx, "gone/x"))
@@ -1085,6 +1102,9 @@ mod tests {
             panic!("a section starts with its header");
         };
         assert!(tools[0].selected);
+        // Already filtered: the tool clears the filter instead of re-applying it.
+        assert_eq!(tools[0].action, SidebarAction::ShowAllCommits);
+        assert_eq!(tools[0].tooltip, "Show all commits");
         let RefMenuEntry::Header { tools, .. } = &local_section(&ctx, "main")[0] else {
             panic!("a section starts with its header");
         };

@@ -271,6 +271,74 @@ fn menu_filter_arrows_skip_hidden_rows(cx: &mut TestAppContext) {
     );
 }
 
+/// In a level with a filter the focus is in the text field, which binds ←/→ itself:
+/// → opens the highlighted row's submenu when the caret is at the end of the text,
+/// ← closes the level when the caret is at 0; otherwise they move the caret.
+#[gpui::test]
+fn menu_filter_arrows_open_and_close_submenus_at_the_caret_edges(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    let leaf = hits.clone();
+    let entries = vec![
+        MenuEntry::Filter {
+            placeholder: "Filter".into(),
+        },
+        MenuEntry::Item(MenuItem::new("Branches").submenu(move || {
+            vec![
+                MenuEntry::Filter {
+                    placeholder: "Filter branches".into(),
+                },
+                menu_item("feature", true, &leaf),
+                menu_item("other", true, &leaf),
+            ]
+        })),
+        menu_item("Plain", true, &hits),
+    ];
+    cx.update(|window, app| {
+        menu::open_context_menu(point(px(40.), px(40.)), entries, window, app);
+    });
+    cx.run_until_parked();
+
+    // "bra" highlights "Branches"; the caret is at the end, so → opens its submenu.
+    cx.simulate_input("bra");
+    cx.simulate_keystrokes("left");
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("menu-1-0").is_none(),
+        "→ with the caret before the end opened the submenu instead of moving it"
+    );
+    cx.simulate_keystrokes("right");
+    settle(cx, Duration::from_millis(50));
+    assert!(
+        cx.debug_bounds("menu-1-0").is_some(),
+        "→ at the end of the text did not open the submenu"
+    );
+
+    // The submenu's field has the focus now: ← with text moves the caret, and at
+    // position 0 it closes the level.
+    cx.simulate_input("fe");
+    cx.simulate_keystrokes("left");
+    settle(cx, Duration::from_millis(50));
+    assert!(
+        cx.debug_bounds("menu-1-0").is_some(),
+        "← in the middle of the text closed the level"
+    );
+    cx.simulate_keystrokes("left");
+    settle(cx, Duration::from_millis(50));
+    assert!(
+        cx.debug_bounds("menu-1-0").is_some(),
+        "← that only reached position 0 closed the level"
+    );
+    cx.simulate_keystrokes("left");
+    settle(cx, Duration::from_millis(50));
+    assert!(
+        cx.debug_bounds("menu-1-0").is_none(),
+        "← at position 0 did not close the submenu"
+    );
+    assert_eq!(layer_count(cx), 1, "the whole menu closed");
+}
+
 #[gpui::test]
 fn menu_header_tool_runs_its_action_and_closes_the_menu(cx: &mut TestAppContext) {
     let (_, cx) = start(cx);

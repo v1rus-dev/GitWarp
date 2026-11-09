@@ -160,6 +160,7 @@
   "welcome.recent.title": "Letzte Repositories",
   "welcome.recent.toast.locate_failed": "Dieser Ordner kann nicht verwendet werden: {error}",
   "welcome.recent.toast.locate_not_repo": "{path} ist kein Git-Repository",
+  "welcome.recent.toast.locate_worktree": "{path} ist ein verknüpftes Worktree; wähle stattdessen den Ordner des Haupt-Repositorys",
   "welcome.recent.toast.path_copied": "Pfad kopiert",
   "welcome.recent.toast.removed_many.one": "{n} Repository aus den letzten entfernt",
   "welcome.recent.toast.removed_many.other": "{n} Repositories aus den letzten entfernt",
