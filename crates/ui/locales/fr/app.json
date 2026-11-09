@@ -1,5 +1,6 @@
 {
   "app.menu.about": "À propos de GitWarp",
+  "app.menu.check_updates": "Rechercher les mises à jour…",
   "app.menu.clone": "Cloner…",
   "app.menu.close_repository": "Fermer le dépôt",
   "app.menu.close_window": "Fermer la fenêtre",
@@ -7,6 +8,7 @@
   "app.menu.fetch_all": "Tout récupérer",
   "app.menu.file": "Fichier",
   "app.menu.help": "Aide",
+  "app.menu.issue_tracker": "Suivi des tickets",
   "app.menu.minimize": "Réduire",
   "app.menu.new_repository": "Nouveau dépôt…",
   "app.menu.open_repository": "Ouvrir un dépôt…",
@@ -15,9 +17,11 @@
   "app.menu.push": "Push",
   "app.menu.quit_app": "Quitter GitWarp",
   "app.menu.refresh": "Actualiser",
+  "app.menu.release_notes": "Notes de version",
   "app.menu.repository": "Dépôt",
   "app.menu.search": "Rechercher",
   "app.menu.settings": "Réglages…",
+  "app.menu.shortcuts": "Raccourcis clavier",
   "app.menu.stash": "Mettre les modifications de côté",
   "app.menu.switch_branch": "Changer de branche…",
   "app.menu.switch_worktree": "Changer de worktree…",
@@ -28,7 +32,9 @@
   "app.menu.zoom": "Agrandir",
   "app.update.apply_failed": "Impossible d’installer la mise à jour : {reason}",
   "app.update.available": "GitWarp {version} est disponible",
+  "app.update.check_failed": "Impossible de rechercher les mises à jour : {reason}",
   "app.update.ready": "GitWarp {version} est prêt à être installé",
   "app.update.restart": "Redémarrer pour mettre à jour",
+  "app.update.up_to_date": "GitWarp est à jour (v{version})",
   "app.update.view_release": "Voir la version"
 }

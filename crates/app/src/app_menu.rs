@@ -10,8 +10,9 @@ use crate::repo_view::{
     Refresh, StashChanges, ToggleDetails, ToggleSidebar,
 };
 use crate::workspace::{
-    CloseRepository, CloseWindow, MinimizeWindow, OpenCloneDialog, OpenRepositoryDialog,
-    OpenSettings, ShowAbout, ZoomWindow,
+    CheckForUpdates, CloseRepository, CloseWindow, MinimizeWindow, OpenCloneDialog,
+    OpenIssueTracker, OpenReleaseNotes, OpenRepositoryDialog, OpenSettings, ShowAbout,
+    ShowKeyboardShortcuts, ZoomWindow,
 };
 
 /// One row of a menu.
@@ -100,13 +101,23 @@ pub(crate) fn menus(mac: bool) -> Vec<MenuSpec> {
             ],
         },
     ];
-    // macOS keeps About in the app menu.
+    let mut help = vec![
+        item(ui::t!("app.menu.shortcuts"), ShowKeyboardShortcuts),
+        item(ui::t!("app.menu.release_notes"), OpenReleaseNotes),
+        item(ui::t!("app.menu.issue_tracker"), OpenIssueTracker),
+    ];
+    // macOS keeps About and Check for Updates in the app menu.
     if !mac {
-        menus.push(MenuSpec {
-            name: ui::t!("app.menu.help"),
-            entries: vec![item(ui::t!("app.menu.about"), ShowAbout)],
-        });
+        help.extend([
+            Separator,
+            item(ui::t!("app.menu.check_updates"), CheckForUpdates),
+            item(ui::t!("app.menu.about"), ShowAbout),
+        ]);
     }
+    menus.push(MenuSpec {
+        name: ui::t!("app.menu.help"),
+        entries: help,
+    });
     menus
 }
 
@@ -162,13 +173,46 @@ mod tests {
     }
 
     #[test]
-    fn help_with_about_only_off_mac() {
-        assert!(!menus(true).iter().any(|m| has_action(m, "ShowAbout")));
+    fn help_content_and_order_per_platform() {
+        fn names(spec: &MenuSpec) -> Vec<String> {
+            spec.entries
+                .iter()
+                .map(|e| match e {
+                    Entry::Separator => "-".to_string(),
+                    Entry::Item { action, .. } => action.name().rsplit("::").next().unwrap().into(),
+                    Entry::Submenu(_) => "submenu".to_string(),
+                })
+                .collect()
+        }
+        let mac = menus(true);
+        let help = mac.last().unwrap();
+        assert_eq!(&*help.name, &*ui::t!("app.menu.help"));
+        assert_eq!(
+            names(help),
+            [
+                "ShowKeyboardShortcuts",
+                "OpenReleaseNotes",
+                "OpenIssueTracker"
+            ]
+        );
+        // About and Check for Updates live in the macOS app menu.
+        assert!(!mac.iter().any(|m| has_action(m, "ShowAbout")));
+        assert!(!mac.iter().any(|m| has_action(m, "CheckForUpdates")));
+
         let all = menus(false);
         let help = all.last().unwrap();
         assert_eq!(&*help.name, &*ui::t!("app.menu.help"));
-        assert_eq!(help.entries.len(), 1);
-        assert!(has_action(help, "ShowAbout"));
+        assert_eq!(
+            names(help),
+            [
+                "ShowKeyboardShortcuts",
+                "OpenReleaseNotes",
+                "OpenIssueTracker",
+                "-",
+                "CheckForUpdates",
+                "ShowAbout"
+            ]
+        );
         assert_eq!(all.iter().filter(|m| has_action(m, "ShowAbout")).count(), 1);
     }
 

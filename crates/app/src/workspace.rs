@@ -46,6 +46,10 @@ actions!(
         OpenCloneDialog,
         OpenSettings,
         ShowAbout,
+        ShowKeyboardShortcuts,
+        OpenReleaseNotes,
+        OpenIssueTracker,
+        CheckForUpdates,
         OpenGitSettings,
         CloseWindow,
         MinimizeWindow,
@@ -847,6 +851,18 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ShowAbout, window, cx| {
                 crate::about_dialog::open(git_label(&this.git), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShowKeyboardShortcuts, window, cx| {
+                this.open_settings_at(Page::Keybindings, window, cx);
+            }))
+            .on_action(cx.listener(|_, _: &OpenReleaseNotes, _, cx| {
+                cx.open_url(&crate::update_check::release_notes_url());
+            }))
+            .on_action(cx.listener(|_, _: &OpenIssueTracker, _, cx| {
+                cx.open_url(&crate::update_check::issue_tracker_url());
+            }))
+            .on_action(cx.listener(|_, _: &CheckForUpdates, window, cx| {
+                crate::update_check::check_now(window.window_handle(), cx);
             }))
             .on_action(cx.listener(|this, _: &OpenGitSettings, window, cx| {
                 this.open_settings_at(Page::Git, window, cx);

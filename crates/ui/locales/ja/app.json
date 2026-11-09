@@ -1,5 +1,6 @@
 {
   "app.menu.about": "GitWarp について",
+  "app.menu.check_updates": "アップデートを確認…",
   "app.menu.clone": "クローン…",
   "app.menu.close_repository": "リポジトリを閉じる",
   "app.menu.close_window": "ウインドウを閉じる",
@@ -7,6 +8,7 @@
   "app.menu.fetch_all": "すべてフェッチ",
   "app.menu.file": "ファイル",
   "app.menu.help": "ヘルプ",
+  "app.menu.issue_tracker": "課題トラッカー",
   "app.menu.minimize": "しまう",
   "app.menu.new_repository": "新規リポジトリ…",
   "app.menu.open_repository": "リポジトリを開く…",
@@ -15,9 +17,11 @@
   "app.menu.push": "プッシュ",
   "app.menu.quit_app": "GitWarp を終了",
   "app.menu.refresh": "更新",
+  "app.menu.release_notes": "リリースノート",
   "app.menu.repository": "リポジトリ",
   "app.menu.search": "検索",
   "app.menu.settings": "設定…",
+  "app.menu.shortcuts": "キーボードショートカット",
   "app.menu.stash": "変更をスタッシュ",
   "app.menu.switch_branch": "ブランチを切り替え…",
   "app.menu.switch_worktree": "ワークツリーを切り替え…",
@@ -28,7 +32,9 @@
   "app.menu.zoom": "拡大/縮小",
   "app.update.apply_failed": "更新をインストールできませんでした: {reason}",
   "app.update.available": "GitWarp {version} が利用できます",
+  "app.update.check_failed": "アップデートを確認できませんでした: {reason}",
   "app.update.ready": "GitWarp {version} をインストールする準備ができました",
   "app.update.restart": "再起動して更新",
+  "app.update.up_to_date": "GitWarp は最新です (v{version})",
   "app.update.view_release": "リリースを表示"
 }

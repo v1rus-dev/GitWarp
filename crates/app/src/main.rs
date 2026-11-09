@@ -97,6 +97,7 @@ fn macos_menus() -> Vec<Menu> {
     }
     let mut menus = vec![Menu::new("GitWarp").items([
         MenuItem::action(ui::t!("app.menu.about"), workspace::ShowAbout),
+        MenuItem::action(ui::t!("app.menu.check_updates"), workspace::CheckForUpdates),
         MenuItem::separator(),
         MenuItem::action(ui::t!("app.menu.settings"), workspace::OpenSettings),
         MenuItem::separator(),

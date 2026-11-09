@@ -4,7 +4,7 @@
 //! shortly after the main window opens, then once a day while the app runs.
 
 use std::cmp::Ordering;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, SystemTime};
 
 use forge::api::{Client, Release, ReleaseAsset};
@@ -161,6 +161,136 @@ fn update_to_announce(
     })
 }
 
+/// The outcome of a manual check.
+#[derive(Debug, PartialEq, Eq)]
+enum ManualResult {
+    /// No newer release on the channel.
+    UpToDate,
+    Newer {
+        version: Version,
+        tag: String,
+    },
+}
+
+/// Like [`update_to_announce`] but without the "announced once" rule.
+fn manual_result(running: &Version, channel: UpdateChannel, releases: &[Release]) -> ManualResult {
+    match update_to_announce(running, None, latest_on_channel(channel, releases)) {
+        Some((version, tag)) => ManualResult::Newer { version, tag },
+        None => ManualResult::UpToDate,
+    }
+}
+
+/// The release page of `tag`. Only a tag that passed `parse_version` is safe here.
+fn release_url(tag: &str) -> String {
+    format!("https://github.com/{OWNER}/{REPO}/releases/tag/{tag}")
+}
+
+/// The release notes page of the running version.
+pub fn release_notes_url() -> String {
+    release_url(&format!("v{}", env!("CARGO_PKG_VERSION")))
+}
+
+/// The issue tracker page.
+pub fn issue_tracker_url() -> String {
+    format!("https://github.com/{OWNER}/{REPO}/issues")
+}
+
+/// Set while a manual check runs, so repeated clicks do not stack requests.
+static MANUAL_BUSY: AtomicBool = AtomicBool::new(false);
+
+fn toast_in(window: AnyWindowHandle, cx: &mut App, kind: ToastKind, text: String) {
+    let _ = window.update(cx, |_, window, cx| toast::show(kind, text, window, cx));
+}
+
+/// Checks for an update now, whatever the "check automatically" setting says
+/// (the update channel is respected), and reports in a toast in `window`.
+pub fn check_now(window: AnyWindowHandle, cx: &mut App) {
+    let Some(running) = parse_version(env!("CARGO_PKG_VERSION")) else {
+        return;
+    };
+    let Some(channel) = read_settings(cx).map(|s| s.channel) else {
+        return;
+    };
+    if MANUAL_BUSY.swap(true, AtomicOrdering::SeqCst) {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        let fetched = cx
+            .background_executor()
+            .spawn(async move { Client::new().list_releases(OWNER, REPO) })
+            .await;
+        let releases = match fetched {
+            Ok(releases) => releases,
+            Err(e) => {
+                log::warn!("manual update check failed: {e}");
+                MANUAL_BUSY.store(false, AtomicOrdering::SeqCst);
+                cx.update(|cx| {
+                    let text = ui::t!("app.update.check_failed", reason = e.to_string());
+                    toast_in(window, cx, ToastKind::Error, text.to_string());
+                });
+                return;
+            }
+        };
+        match manual_result(&running, channel, &releases) {
+            ManualResult::UpToDate => {
+                MANUAL_BUSY.store(false, AtomicOrdering::SeqCst);
+                cx.update(|cx| {
+                    let text = ui::t!("app.update.up_to_date", version = running.to_string());
+                    toast_in(window, cx, ToastKind::Ok, text.to_string());
+                });
+            }
+            ManualResult::Newer { version, tag } => {
+                let assets = releases
+                    .iter()
+                    .find(|r| r.tag_name == tag)
+                    .map(|release| release.assets.clone())
+                    .unwrap_or_default();
+                let staged = cx
+                    .background_executor()
+                    .spawn(async { updater::find_staged() })
+                    .await
+                    .filter(|s| parse_version(&s.version).as_ref() == Some(&version));
+                let ready = staged.is_some();
+                let toast_id =
+                    cx.update(|cx| show_update_toast(cx, window, None, staged, &version, &tag));
+                if !ready {
+                    let kind = updater::detect_install_kind();
+                    if updater::can_apply(kind)
+                        && updater::asset_for(kind, &version.to_string(), &assets).is_some()
+                    {
+                        let stage_tag = tag.clone();
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move {
+                                let cancel = AtomicBool::new(false);
+                                updater::stage(&stage_tag, &assets, kind, |_, _| {}, &cancel)
+                            })
+                            .await;
+                        match result {
+                            Ok(staged) => {
+                                cx.update(|cx| {
+                                    let previous = toast_id.map(|id| (window, id));
+                                    show_update_toast(
+                                        cx,
+                                        window,
+                                        previous,
+                                        Some(staged),
+                                        &version,
+                                        &tag,
+                                    );
+                                });
+                            }
+                            Err(e) => log::warn!("staging update {version} failed: {e}"),
+                        }
+                    }
+                }
+                MANUAL_BUSY.store(false, AtomicOrdering::SeqCst);
+            }
+        }
+    })
+    .detach();
+}
+
 /// A check that failed: when, and on which channel.
 type Failure = (UpdateChannel, SystemTime);
 
@@ -261,7 +391,7 @@ fn show_update_toast(
     }
     // Built here, not taken from the API response: only a tag that passed
     // `parse_version` is put into the URL.
-    let url = format!("https://github.com/{OWNER}/{REPO}/releases/tag/{tag}");
+    let url = release_url(tag);
     let shown_version = format!("v{version}");
     let ready = staged.is_some();
     let apply = staged.filter(|staged| updater::can_apply(staged.kind));
@@ -657,6 +787,57 @@ mod tests {
         assert!(check_due(None, failed, Stable, t0 + RETRY_AFTER_FAILURE));
         // Another channel is checked at the next tick.
         assert!(check_due(None, failed, Beta, t0 + Duration::from_secs(60)));
+    }
+
+    fn manual(running: &str, channel: UpdateChannel, releases: &[Release]) -> ManualResult {
+        manual_result(&v(running), channel, releases)
+    }
+
+    #[test]
+    fn manual_result_table() {
+        use UpdateChannel::{Beta, Stable};
+        let newer = |version: &str, tag: &str| ManualResult::Newer {
+            version: v(version),
+            tag: tag.to_string(),
+        };
+        // Empty list, equal and older-only releases are up to date.
+        assert_eq!(manual("0.4.0", Stable, &[]), ManualResult::UpToDate);
+        let equal = [release("v0.4.0", false, false)];
+        assert_eq!(manual("0.4.0", Stable, &equal), ManualResult::UpToDate);
+        let older = [release("v0.3.0", false, false)];
+        assert_eq!(manual("0.4.0", Stable, &older), ManualResult::UpToDate);
+        // Newer on stable.
+        let releases = [
+            release("v0.4.0", false, false),
+            release("v0.5.0", false, false),
+        ];
+        assert_eq!(manual("0.4.0", Stable, &releases), newer("0.5.0", "v0.5.0"));
+        // A pre-release is hidden on stable and visible on beta.
+        let pre = [release("v0.5.0-rc.1", true, false)];
+        assert_eq!(manual("0.4.0", Stable, &pre), ManualResult::UpToDate);
+        assert_eq!(
+            manual("0.4.0", Beta, &pre),
+            newer("0.5.0-rc.1", "v0.5.0-rc.1")
+        );
+    }
+
+    #[test]
+    fn help_urls() {
+        assert_eq!(
+            release_url("v1.2.3"),
+            "https://github.com/v1rus-dev/GitWarp/releases/tag/v1.2.3"
+        );
+        assert_eq!(
+            release_notes_url(),
+            format!(
+                "https://github.com/v1rus-dev/GitWarp/releases/tag/v{}",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert_eq!(
+            issue_tracker_url(),
+            "https://github.com/v1rus-dev/GitWarp/issues"
+        );
     }
 
     #[test]
