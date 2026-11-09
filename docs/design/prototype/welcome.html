@@ -16,7 +16,7 @@
   .act:hover { background: var(--hover); } .act .kbd { margin-left: auto; }
   .wl main { padding: 20px 24px; display: flex; flex-direction: column; min-height: 0; gap: 12px; }
   .recent { overflow: auto; flex: 1; min-height: 0; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); outline: none; }
-  .rrow { display: grid; grid-template-columns: 24px minmax(0, 1fr) 150px 110px; gap: 12px; align-items: center; height: 44px; padding: 0 12px; cursor: default; border-bottom: 1px solid var(--border); }
+  .rrow { display: grid; grid-template-columns: 24px minmax(0, 1fr) 150px 110px 20px; gap: 12px; align-items: center; height: 44px; padding: 0 12px; cursor: default; border-bottom: 1px solid var(--border); }
   .rrow:last-child { border-bottom: 0; }
   .rrow:hover { background: var(--hover); } .rrow.sel { background: var(--selection); }
   .rrow .n { font-weight: 600; } .rrow .p { color: var(--muted); font-size: var(--fs-sm); }
@@ -33,6 +33,21 @@
   .wact-foot .heat-total .mono { color: var(--text); }
   .wact .heat-wd { color: var(--muted); }
   .kbd.arr { min-width: 22px; }
+  /* R2 (planned): unavailable recent repositories, removal, multi-select. Page-local styles. */
+  .rrow.bad .n, .rrow.bad .p, .rrow.bad > span:first-child { color: var(--muted); }
+  .rrow.bad .n { font-weight: 500; }
+  .rico { position: relative; display: inline-flex; }
+  .rbadge { position: absolute; right: -4px; bottom: -3px; width: 11px; height: 11px; border-radius: 50%; display: grid; place-items: center; background: var(--error); color: var(--bg); box-shadow: 0 0 0 1.5px var(--bg); }
+  .rbadge.w { background: var(--warning); }
+  .rbadge .od-icon { --od-icon-size: 7px; }
+  .rrow.sel .rbadge { box-shadow: 0 0 0 1.5px var(--selection); }
+  .rx { width: 20px; height: 20px; padding: 0; border: 0; background: none; color: var(--muted); border-radius: var(--r-sm); display: grid; place-items: center; visibility: hidden; cursor: default; }
+  .rrow:hover .rx, .rrow.cur .rx { visibility: visible; } .rx:hover { background: var(--active); color: var(--text); }
+  .ract { grid-column: 4 / 6; display: flex; gap: 4px; justify-content: flex-end; }
+  .cbar { flex: none; display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 6px 0 10px; border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent); border-radius: var(--r-md); background: color-mix(in srgb, var(--warning) 12%, transparent); font-size: var(--fs-sm); }
+  .cbar[hidden] { display: none; } .cbar > .od-icon { color: var(--warning); }
+  .lnk { border: 0; background: none; padding: 0; color: var(--accent); font: inherit; cursor: default; } .lnk:hover { text-decoration: underline; }
+  .rrow .chip { max-width: 100%; }
   .tip { white-space: pre-line; }
 </style>
 <link rel="stylesheet" href="dialogs.css">
@@ -47,7 +62,7 @@
   const GIT = [['system', 'git 2.56.0 · system'], ['ok', 'git 2.56.0 · bundled'], ['old', 'git 2.19.1 too old'], ['none', 'git not found']];
   const ACT = [['ok', 'Counted · 5 of 6 repositories'], ['clean', 'Counted · all repositories'], ['counting', 'Counting…'], ['loading', 'Counting · nothing yet'], ['none', 'No commits by me'], ['noemail', 'No global user.email'], ['unavail', 'Selected repo unreachable'], ['off', 'Setting off (card hidden)']];
   const sel = (id, label, opts) => `<label style="display:inline-flex;gap:8px;align-items:center;font-size:12px">${label}<select id="${id}" aria-label="${label}" style="height:24px;background:var(--bg);color:var(--text);border:1px solid var(--border-strong);border-radius:var(--r-sm)">${opts.map((o, k) => `<option value="${o[0]}">${esc(o[1])}</option>`).join('')}</select></label>`;
-  G.stagebar(sel('act', 'Activity', ACT) + sel('lst', 'Recent list', [['full', 'With recents'], ['none', 'No recent repositories']]) + sel('git', 'Git', GIT) + sel('scn', 'Dialog state', SC));
+  G.stagebar(sel('act', 'Activity', ACT) + sel('lst', 'Recent list', [['full', 'With recents'], ['none', 'No recent repositories'], ['real', 'With unavailable (realistic) · Planned'], ['checking', 'Checking · Planned'], ['onlybad', 'Only unavailable shown · Planned'], ['multi', 'Multi-select (5) · Planned'], ['undo', 'After Remove all + Undo toast · Planned'], ['ctx', 'Context menu on an unavailable row · Planned'], ['selbad', 'Selected unavailable row (inline actions) · Planned']]) + sel('git', 'Git', GIT) + sel('scn', 'Dialog state', SC));
   const stage = G.h('<div class="stage"><div class="winwrap"></div></div>'); document.body.appendChild(stage);
   const R = [['gitwarp', '~/develop/gitwarp', 'main', '12 min ago'], ['open-design', '~/develop/open-design', 'feat/prompt-bundle', '2 h ago'], ['zed-themes', '~/projects/zed-themes', 'main', 'yesterday'], ['dotfiles', '~/.dotfiles', 'master', '3 d ago'], ['tree-sitter-rust', '~/src/tree-sitter-rust', 'master', '2 weeks ago'], ['notes', '/mnt/data/notes', '—', '3 weeks ago']];
   const win = G.h(`<div class="win" style="width:960px;height:620px;grid-template-rows:var(--bar) minmax(0,1fr) var(--status)">
@@ -59,27 +74,117 @@
       <span class="od-fill"></span>
       <button class="act" id="settings" data-tip="Open Settings">${ic('gear', 16)}Settings<span class="kbd">Ctrl+,</span></button></aside>
     <main><section class="wact-sec" id="wact" aria-label="Your activity"></section>
-      <div class="od-row"><h2 style="margin:0;font-size:var(--fs-lg)" class="od-fill">Recent repositories</h2><label class="input-wrap" style="width:240px">${ic('search', 14)}<input class="input" id="flt" placeholder="Filter recent…" aria-label="Filter recent repositories"></label></div>
+      <div class="od-row"><h2 style="margin:0;font-size:var(--fs-lg)" class="od-fill">Recent repositories <span class="planned-tag" style="margin-left:6px;vertical-align:2px">Planned</span></h2><label class="input-wrap" style="width:240px">${ic('search', 14)}<input class="input" id="flt" placeholder="Filter recent…" aria-label="Filter recent repositories"></label></div>
+      <div class="cbar" id="cbar" hidden></div>
       <div class="recent" id="recent" role="listbox" tabindex="0" aria-label="Recent repositories"></div>
-      <div class="muted" style="font-size:12px"><span class="kbd arr"><svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-label="Up" style="vertical-align:-1px"><path d="M6 10.2V1.8M2.6 5.2L6 1.8l3.4 3.4"/></svg></span> <span class="kbd arr"><svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-label="Down" style="vertical-align:-1px"><path d="M6 1.8v8.4M2.6 6.8L6 10.2l3.4-3.4"/></svg></span> select · <span class="kbd">Enter</span> open · <span class="kbd">Del</span> remove from list</div></main></div>
+      <div class="muted" id="hint" style="font-size:12px"><span class="kbd arr"><svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-label="Up" style="vertical-align:-1px"><path d="M6 10.2V1.8M2.6 5.2L6 1.8l3.4 3.4"/></svg></span> <span class="kbd arr"><svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-label="Down" style="vertical-align:-1px"><path d="M6 1.8v8.4M2.6 6.8L6 10.2l3.4-3.4"/></svg></span> select · <span class="kbd">Enter</span> open · <span class="kbd">Del</span> remove from list</div></main></div>
     <footer class="statusbar"><span class="sb-btn" id="appver" data-tip="GitWarp version">GitWarp v0.2.1</span><span class="od-fill"></span><span class="sb-btn" id="gitlabel"></span></footer></div>`);
   stage.firstChild.appendChild(win);
   G.initTips(win);
-  const list = win.querySelector('#recent'); let sel_ = 0, rec = R.slice();
+  const list = win.querySelector('#recent');
+  /* ---- R2 (planned): unavailable recents. Row = [name, path, branch, time, state, extra]; state: ok | checking | missing | notrepo | wt | unread (undefined = ok) ---- */
+  const REAL = [['gitwarp', '~/Projects/Personal/RustProjects/gitwarp', 'main', '12 min ago'], ['SystemLab', '~/Projects/Work/SystemLab', 'develop', '1 h ago'],
+    ['agent-a41f92', '~/Projects/Work/SystemLab/.claude/worktrees/agent-a41f92', '—', '2 h ago', 'missing'], ['open-design', '~/develop/open-design', 'feat/prompt-bundle', '3 h ago'],
+    ['agent-7c03de', '~/Projects/Work/SystemLab/.claude/worktrees/agent-7c03de', '—', 'yesterday', 'missing'], ['gitwarp-demo', '/tmp/gitwarp-demo', '—', 'yesterday', 'missing'],
+    ['some_improvements', '~/orca/workspaces/gitwarp/some_improvements', '—', '2 d ago', 'wt', '~/Projects/Personal/RustProjects/gitwarp'], ['zed-themes', '~/Projects/Personal/zed-themes', 'main', '3 d ago'],
+    ['fix-login', '~/orca/workspaces/systemlab/fix-login', '—', '4 d ago', 'wt', '~/Projects/Work/SystemLab'], ['tmp.k3Jd8s', '/tmp/tmp.k3Jd8s', '—', '5 d ago', 'missing'],
+    ['dotfiles', '~/.dotfiles', 'master', '1 week ago'], ['scratch', '~/scratch', '—', '1 week ago', 'notrepo'],
+    ['notes', '/mnt/data/notes', '—', '2 weeks ago', 'unread', 'Permission denied (os error 13)'], ['tree-sitter-rust', '~/src/tree-sitter-rust', 'master', '2 weeks ago'],
+    ['agent-19be0a', '~/Projects/Work/SystemLab/.claude/worktrees/agent-19be0a', '—', '3 weeks ago', 'missing'], ['old-prototype', '~/Projects/Personal/old-prototype', '—', '1 month ago', 'missing']];
+  const ST = { missing: ['Folder not found', 'err', (r) => `${r[1]} no longer exists`], notrepo: ['Not a repository', 'warn', (r) => `${r[1]} exists but is not a git repository any more`], wt: ['Worktree removed', 'warn', (r) => `The worktree was removed from its repository (${r[5]})`], unread: ["Can't read", 'warn', (r) => r[5]] };
+  const bad = (r) => !!ST[r[4]];
+  window.__reason = (r) => (ST[r[4]] ? ST[r[4]][0] : 'Folder not found'); /* same wording as the row chip, reused by the Activity "skipped" tooltip */
+  let sel_ = 0, rec = R.slice(), onlyBad = false, S = new Set(), cp = null, anchor = null, snapshot = null;
   const rows = () => G.$$('.rrow', list);
-  const draw = () => {
-    const f = win.querySelector('#flt').value.trim().toLowerCase(), v = rec.filter((r) => !f || (r[0] + ' ' + r[1]).toLowerCase().includes(f));
-    list.innerHTML = !rec.length ? `<div class="empty" style="height:100%;align-content:center">${ic('folder', 24)}<b>No recent repositories</b><span>Open or clone a repository to see it here.</span></div>`
-      : !v.length ? `<div class="empty" style="height:100%;align-content:center">${ic('folder', 24)}<b>No matches</b><span>No recent repository matches “${esc(win.querySelector('#flt').value.trim())}”.</span></div>`
-      : v.map((r, i) => `<div class="rrow${i === 0 ? ' sel' : ''}" role="option" aria-selected="${i === 0}" data-n="${esc(r[0])}"><span>${ic('folder', 16)}</span><div style="min-width:0"><div class="n">${esc(r[0])}</div><div class="p od-truncate mono">${esc(r[1])}</div></div><span class="od-truncate muted" style="font-size:12px">${r[2] === '—' ? '—' : ic('branch', 12) + ' ' + esc(r[2])}</span><span class="muted" style="font-size:12px;text-align:right">${r[3]}</span></div>`).join('');
-    sel_ = 0; if (window.__wact) window.__wact();
+  const view = () => { const f = win.querySelector('#flt').value.trim().toLowerCase(); return rec.filter((r) => (!f || (r[0] + ' ' + r[1]).toLowerCase().includes(f)) && (!onlyBad || bad(r))); };
+  const rowHTML = (r) => {
+    const b = bad(r), st = r[4], on = S.has(r[1]), single = on && S.size === 1;
+    const icon = b ? `<span class="rico">${ic('folder', 16)}<span class="rbadge${st === 'missing' ? '' : ' w'}">${ic(st === 'missing' ? 'x' : 'warn', 8)}</span></span>` : ic('folder', 16);
+    const branch = st === 'checking' ? '<span class="skel" style="width:60px;height:10px;display:inline-block"></span>' : b ? `<span class="chip ${ST[st][1]}">${ST[st][0]}</span>` : r[2] === '—' ? '—' : ic('branch', 12) + ' ' + esc(r[2]);
+    const tail = b && single ? `<span class="ract"><button class="btn btn-sm" data-rm>Remove</button><button class="btn btn-sm btn-ghost" data-loc>Locate…</button></span>`
+      : `<span class="muted" style="font-size:12px;text-align:right">${r[3]}</span><button class="rx" data-x aria-label="Remove from list" data-tip="Remove from list · Del">${ic('x', 12)}</button>`;
+    return `<div class="rrow${on ? ' sel' : ''}${cp === r[1] ? ' cur' : ''}${b ? ' bad' : ''}" role="option" aria-selected="${on}" data-n="${esc(r[0])}" data-p="${esc(r[1])}"${b ? ` data-tip="${esc(ST[st][2](r))}"` : ''}><span>${icon}</span><div style="min-width:0"><div class="n">${esc(r[0])}</div><div class="p od-truncate mono">${esc(r[1])}</div></div><span class="od-truncate muted" style="font-size:12px">${branch}</span>${tail}</div>`;
   };
-  const pick = (i) => { sel_ = Math.max(0, Math.min(rows().length - 1, i)); rows().forEach((r, k) => { r.classList.toggle('sel', k === sel_); r.setAttribute('aria-selected', k === sel_); }); if (window.__wact) window.__wact(); };
+  const chrome = () => {
+    const nb = rec.filter(bad).length, cb = win.querySelector('#cbar'), h = win.querySelector('#hint');
+    cb.hidden = !nb;
+    if (nb) cb.innerHTML = `${ic('warn', 14)}<span>${esc(plural(nb, '{n} repository is no longer available', '{n} repositories are no longer available'))}</span><span class="od-fill"></span><button class="btn btn-sm" id="conly">${onlyBad ? 'Show all' : 'Show only these'}</button><button class="btn btn-sm btn-danger" id="crm">${esc('Remove ' + nb)}</button>`;
+    if (!h.dataset.def) h.dataset.def = h.innerHTML;
+    h.innerHTML = S.size >= 2 ? `${S.size} selected · <button class="lnk" data-hrm>Remove ${S.size}</button> · <button class="lnk" data-hclr>Clear selection</button>` : h.dataset.def;
+  };
+  const draw = () => {
+    const v = view(), f = win.querySelector('#flt').value.trim(), top = list.scrollTop;
+    S = new Set([...S].filter((p) => v.some((r) => r[1] === p))); if (!v.some((r) => r[1] === cp)) { cp = v[0] ? v[0][1] : null; if (cp && !S.size) { S.add(cp); anchor = cp; } }
+    list.innerHTML = !rec.length ? `<div class="empty" style="height:100%;align-content:center">${ic('folder', 24)}<b>No recent repositories</b><span>Open or clone a repository to see it here.</span></div>`
+      : !v.length ? `<div class="empty" style="height:100%;align-content:center">${ic('folder', 24)}<b>No matches</b><span>No recent repository matches “${esc(f)}”.</span></div>` : v.map(rowHTML).join('');
+    list.scrollTop = top; const c = list.querySelector('.rrow.cur'); if (c) c.scrollIntoView({ block: 'nearest' });
+    sel_ = Math.max(0, v.findIndex((r) => r[1] === cp)); chrome(); if (window.__wact) window.__wact();
+  };
+  const pick = (i, mode) => {
+    const v = view(); if (!v.length) return; i = Math.max(0, Math.min(v.length - 1, i)); const p = v[i][1];
+    if (mode === 'range' && anchor) { const a = Math.max(0, v.findIndex((r) => r[1] === anchor)); S = new Set(v.slice(Math.min(a, i), Math.max(a, i) + 1).map((r) => r[1])); }
+    else if (mode === 'toggle') { if (S.has(p) && S.size > 1) S.delete(p); else S.add(p); anchor = p; }
+    else { S = new Set([p]); anchor = p; }
+    cp = p; draw();
+  };
+  const toastUndo = (msg, undo, sticky) => {
+    G.layer(win).querySelectorAll('.toast').forEach((x) => x.remove());
+    const t = G.toast(win, msg, 'info', { action: { label: 'Undo', onClick: undo } });
+    /* 8 s lifetime, held while hovered (toast.rs: an action toast has no timer of its own here) */
+    if (!sticky && t) { let h = false, tm; const arm = () => { clearTimeout(tm); tm = setTimeout(() => { if (!h) t.remove(); }, 8000); }; t.onmouseenter = () => { h = true; }; t.onmouseleave = () => { h = false; arm(); }; arm(); }
+  };
+  const remove = (paths, sticky) => {
+    if (!paths.length) return; const gone = rec.map((r, i) => [r, i]).filter(([r]) => paths.includes(r[1])); if (!gone.length) return;
+    const v0 = view(), first = v0.findIndex((r) => paths.includes(r[1]));
+    rec = rec.filter((r) => !paths.includes(r[1])); S = new Set(); if (onlyBad && !rec.some(bad)) onlyBad = false;
+    const nv = view(), nx = nv[Math.min(Math.max(first, 0), nv.length - 1)]; cp = nx ? nx[1] : null; if (nx) { S.add(cp); anchor = cp; }
+    draw();
+    toastUndo(gone.length === 1 ? `Removed ${gone[0][0][0]} from Recent` : `Removed ${gone.length} repositories from Recent`, () => { gone.forEach(([r, i]) => rec.splice(Math.min(i, rec.length), 0, r)); draw(); }, sticky);
+  };
+  const locate = (p) => { const r = rec.find((x) => x[1] === p); G.toast(win, `Choose the new location of ${r ? r[0] : p} in the folder picker`, 'info'); };
+  const openRow = (p) => { const r = rec.find((x) => x[1] === p); if (r && bad(r)) return; location.href = 'main-1200.html'; };
+  const ctxMenu = (e, at) => {
+    const row = e.target.closest('.rrow'); if (!row) return; const p = row.dataset.p, r = rec.find((x) => x[1] === p);
+    if (!S.has(p)) { pick(view().findIndex((x) => x[1] === p)); }
+    const n = S.size, copy = { label: 'Copy path', icon: 'copy', onClick: () => G.toast(win, 'Path copied', 'ok') };
+    const rm = { label: n > 1 ? `Remove ${n} from list` : 'Remove from list', icon: 'trash', key: 'Del', onClick: () => remove([...S]) };
+    const items = n > 1 ? [rm] : bad(r) ? [{ label: 'Locate…', icon: 'search', onClick: () => locate(p) }, copy, { sep: true }, rm]
+      : [{ label: 'Open', icon: 'folder', key: 'Enter', onClick: () => openRow(p) }, { label: 'Open in new window', icon: 'panelR', onClick: () => G.toast(win, `Opened ${r[0]} in a new window`, 'ok') }, { label: 'Reveal in file manager', icon: 'link', onClick: () => G.toast(win, 'Revealed in the file manager', 'ok') }, copy, { sep: true }, rm];
+    G.menu(win, e, items, at ? { at } : undefined);
+  };
+  /* scenarios for the "Recent list" switcher */
+  const setList = (k) => {
+    const lay = G.layer(win); lay.querySelectorAll('.toasts,.menu').forEach((x) => x.remove());
+    onlyBad = false; S = new Set(); cp = null; anchor = null;
+    rec = k === 'none' ? [] : k === 'full' ? R.slice() : REAL.map((r) => r.slice());
+    if (k === 'checking') rec = rec.map((r, i) => (i < 6 && !bad(r) ? r : r.slice(0, 4).concat('checking')));
+    if (k === 'onlybad') onlyBad = true;
+    draw();
+    const at = (p) => view().findIndex((r) => r[1] === p);
+    if (k === 'multi') { pick(at(REAL[2][1])); ['open-design', 'agent-7c03de', 'gitwarp-demo', 'some_improvements'].forEach((n) => pick(at(rec.find((r) => r[0] === n)[1]), 'toggle')); }
+    if (k === 'selbad') pick(at(REAL[2][1]));
+    if (k === 'undo') remove(rec.filter(bad).map((r) => r[1]), true);
+    if (k === 'ctx') { pick(at(REAL[2][1])); const el = list.querySelector('.rrow.cur'), rc = el.getBoundingClientRect(); ctxMenu({ target: el, preventDefault() {} }, G.pos(win, { clientX: rc.left + 300, clientY: rc.top + 30 })); }
+  };
   win.querySelector('#flt').addEventListener('input', draw);
-  document.getElementById('lst').addEventListener('change', (e) => { rec = e.target.value === 'none' ? [] : R.slice(); draw(); });
-  list.addEventListener('click', (e) => { const r = e.target.closest('.rrow'); if (r) pick(rows().indexOf(r)); });
-  list.addEventListener('dblclick', (e) => { if (e.target.closest('.rrow')) location.href = 'main-1200.html'; });
-  list.addEventListener('keydown', (e) => { if (e.key === 'ArrowDown') { pick(sel_ + 1); e.preventDefault(); } else if (e.key === 'ArrowUp') { pick(sel_ - 1); e.preventDefault(); } else if (e.key === 'Enter' && rows().length) location.href = 'main-1200.html'; else if (e.key === 'Delete' && rows().length) { rec.splice(sel_, 1); draw(); } });
+  document.getElementById('lst').addEventListener('change', (e) => setList(e.target.value));
+  win.querySelector('#cbar').addEventListener('click', (e) => { if (e.target.closest('#conly')) { onlyBad = !onlyBad; draw(); } else if (e.target.closest('#crm')) remove(rec.filter(bad).map((r) => r[1])); });
+  win.querySelector('#hint').addEventListener('click', (e) => { if (e.target.closest('[data-hrm]')) remove([...S]); else if (e.target.closest('[data-hclr]')) pick(sel_); });
+  list.addEventListener('click', (e) => {
+    const r = e.target.closest('.rrow'); if (!r) return; const p = r.dataset.p;
+    if (e.target.closest('[data-x],[data-rm]')) { remove([p]); return; } if (e.target.closest('[data-loc]')) { locate(p); return; }
+    pick(view().findIndex((x) => x[1] === p), e.shiftKey ? 'range' : e.ctrlKey || e.metaKey ? 'toggle' : null);
+  });
+  list.addEventListener('contextmenu', (e) => ctxMenu(e));
+  list.addEventListener('dblclick', (e) => { const r = e.target.closest('.rrow'); if (r && !e.target.closest('button')) openRow(r.dataset.p); });
+  list.addEventListener('keydown', (e) => {
+    const n = view().length;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { pick(sel_ + (e.key === 'ArrowDown' ? 1 : -1), e.shiftKey ? 'range' : null); e.preventDefault(); }
+    else if (e.key === 'Enter' && n) openRow(cp);
+    else if (e.key === 'Delete' && n) remove([...S]);
+    else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') { S = new Set(view().map((r) => r[1])); draw(); e.preventDefault(); }
+    else if (e.key === 'Escape' && S.size > 1) pick(sel_);
+  });
   /* status-bar git label: text + tooltip (the tooltip carries the path, or the failure title when git is unusable) */
   const gl = () => { const g = document.getElementById('git').value, l = win.querySelector('#gitlabel'); const t = { system: ['git 2.56.0 · system', 'git 2.56.0 · system · /usr/bin/git'], ok: ['git 2.56.0 · bundled', 'git 2.56.0 · bundled · /opt/gitwarp/git/bin/git'], old: ['git 2.19.1 too old', 'Git is too old: 2.19.1 found, 2.30 or newer is required'], none: ['git not found', 'Git was not found on this machine'] }[g]; l.innerHTML = ic('git', 12) + t[0]; l.dataset.tip = t[1]; };
   document.getElementById('git').addEventListener('change', gl);
@@ -160,11 +265,11 @@
     const cr = cell.getBoundingClientRect(), at = { clientX: cr.left, clientY: cr.bottom + 4 };
     G.menu(win, at, [{ label: `${dateLong(t)} — open with History filtered to this day`, disabled: true }].concat(parts.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([n, k]) => ({ label: `${n} · ${plural(k, '{n} commit', '{n} commits')}`, icon: 'folder', onClick: () => G.toast(win, `Opened ${n} · History filtered to ${dateLong(t)}`, 'ok') }))));
   }
-  const cur = () => { const r = G.$$('.rrow', win.querySelector('#recent'))[sel_]; return r ? { name: r.dataset.n } : null; };
+  const cur = () => { const r = G.$$('.rrow', win.querySelector('#recent')).find((x) => x.dataset.p === cp); return r ? { name: r.dataset.n } : null; };
   function actDraw() {
     const mode = document.getElementById('act').value;
     if (mode === 'off') { wact.hidden = true; return; } wact.hidden = false;
-    const paths = rec.map((r) => r[0]), skipped = mode === 'ok' || mode === 'unavail' ? rec.filter((r) => r[1] === HOME_NOTES) : [];
+    const paths = rec.map((r) => r[0]), skipped = mode === 'ok' || mode === 'unavail' ? rec.filter((r) => r[4] !== 'checking' && (r[1] === HOME_NOTES || bad(r))) : [];
     const sc = cur(); if (!sc && scope === 'sel') scope = 'all';
     let selName = sc ? sc.name : null;
     if (mode === 'unavail' && sc && rec.some((r) => r[0] === sc.name)) { /* the selected row is the unreachable one */ }
@@ -195,7 +300,7 @@
         left = `By <span class="mono">${ME}</span>`;
         if (scope === 'all' && !counting) {
           if (!skipped.length) left += ' ' + plural(paths.length, '· {n} repository', '· {n} repositories');
-          else left += ' ' + plural(paths.length, '· {counted} of {n} repository', '· {counted} of {n} repositories').replace('{counted}', paths.length - skipped.length) + ` <span data-tip="${esc(plural(skipped.length, '{n} repository skipped:', '{n} repositories skipped:') + '\n' + skipped.map((r) => r[1] + ' — the folder does not exist').join('\n'))}" style="display:inline-flex">${ic('warn', 12)}</span>`;
+          else left += ' ' + plural(paths.length, '· {counted} of {n} repository', '· {counted} of {n} repositories').replace('{counted}', paths.length - skipped.length) + ` <span data-tip="${esc(plural(skipped.length, '{n} repository skipped:', '{n} repositories skipped:') + '\n' + skipped.map((r) => r[1] + ' — ' + window.__reason(r)).join('\n'))}" style="display:inline-flex">${ic('warn', 12)}</span>`;
         }
       }
     }

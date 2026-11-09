@@ -1,0 +1,17 @@
+/* Ref menus page (R1): prototype-only chrome around the real main-window shell. */
+.rm-banner { display: flex; align-items: center; gap: 12px; margin: 12px 0 16px; padding: 10px 14px; border: 1px dashed var(--warning); border-radius: var(--r-md); color: var(--text); }
+.rm-banner b { color: var(--warning); text-transform: uppercase; letter-spacing: .04em; font-size: var(--fs-sm); white-space: nowrap; }
+.rm-banner span { color: var(--muted); font-size: var(--fs-sm); }
+.rm-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.rm-tabs .btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+.rm-cap { margin: 0 0 8px; max-width: 110ch; color: var(--muted); font-size: var(--fs-sm); min-height: 36px; }
+.rm-cap b { color: var(--text); }
+.rm-stage { padding: 0; }
+.rm-ba { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
+.rm-pane h3 { margin: 0 0 8px; }
+.rm-box { position: relative; height: 760px; overflow: hidden; background: var(--bg); border: 1px solid var(--border-strong); border-radius: 8px; }
+.rm-box .rm-fake { position: absolute; inset: 0; background: repeating-linear-gradient(0deg, var(--bg) 0 25px, var(--border) 25px 26px); opacity: .5; }
+.rm-notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 24px; margin-top: 24px; }
+.rm-notes h3 { margin: 0 0 8px; }
+.rm-notes ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: var(--fs-sm); line-height: 1.6; }
+.rm-notes li b, .rm-notes li code { color: var(--text); }

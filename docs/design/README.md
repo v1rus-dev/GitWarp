@@ -25,7 +25,7 @@ both themes are in `screens/` (`<page>.dark.png` and `<page>.light.png`).
 | `components.html` | Component set: buttons, inputs, tabs, tree, rows, menus, tooltips, dialogs, toasts — with states. | 1 — UI foundation |
 | `main-1200.html` | Main window 1200×800: history + details docked bottom, unified diff. Interactive. | 2 — window shell, welcome, states |
 | `main-1600.html` | Main window 1600×1000: details docked right, side-by-side diff. Interactive. | 2 — window shell, welcome, states |
-| `welcome.html` | Welcome / repo picker: "Your activity" card, recent repos, Open, Clone, Init dialogs. | 2 — window shell, welcome, states |
+| `welcome.html` | Welcome / repo picker: "Your activity" card, unavailable recent entries with bulk removal and Undo (Planned), recent repos, Open, Clone, Init dialogs. | 2 — window shell, welcome, states |
 | `history-states.html` | History states: loading, empty repo, not a repo, git missing / too old, generic git error. | 2 — window shell, welcome, states |
 | `dialogs-repo.html` | Dialogs: clone / open — clone from URL (HTTPS/SSH, progress, errors) and open from folder, with all states. | 2 — Open tab; 8 — Clone tab |
 | `graph.html` | Commit graph spec: geometry, golden-angle lanes on both themes, clipping, widening, idle-lane collapse. | 3 — history |
@@ -46,6 +46,7 @@ both themes are in `screens/` (`<page>.dark.png` and `<page>.light.png`).
 | `hosting-features.html` | Open on host, Clone From account, PR badges and popover, CI status and checks, Create PR, PR panel. | H7–H10 — hosting features |
 | `settings-ssh.html` | Settings → SSH keys: key list, generate / import / delete, connection test, trusted hosts. | 10 — settings |
 | `palette.html` | Command palette: Ctrl+P launcher with the app's full command list, branches, commits, files, prefixes `>` `@` `#`. | 11 — command palette |
+| `menus-refs.html` | Planned: cascading ref menus — each ref of a commit is a row with a hover submenu (local, remote, tag sections; merged `main +origin` row), commit actions, Copy submenu, badge right-click, overflow, flip, keyboard. | Planned |
 | `dialogs-errors.html` | Errors and notices: error-fix dialogs with a remedy button, confirmations, update notice, error toast with Copy, account and multi-target push toasts. | 7–8, post-10 |
 | `dialogs-checkout.html` | Checkout with uncommitted changes: stash / bring changes / discard, for branch, remote branch, tag and commit. | 7 — ref operations |
 | `dialogs-merge.html` | Dialogs: merge / rebase — merge dialog with conflict preview and merge types, rebase dialog, new branch-menu items; the Merge / Rebase in progress banner and Conflicts group are states of `changes.html` (Operation switcher, `?op=`). | 12 — merge / rebase |

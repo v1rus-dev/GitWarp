@@ -475,3 +475,27 @@ textarea.input { height: auto; padding: 6px 8px; resize: none; line-height: 1.5;
 .ci.passed { color: var(--success); } .ci.failed { color: var(--error); } .ci.running { color: var(--warning); } .ci.pending, .ci.cancelled { color: var(--muted); }
 .wt-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--warning); flex: none; }
 .toast .toast-act { flex: none; }
+
+/* ---------- cascading menus and ref menus (R1, planned; owner: G.menu in app.js) ---------- */
+.menu { overflow-y: auto; }
+.menu.sub { min-width: 240px; }
+.menu-item .menu-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-item.has-sub .menu-label { flex: 0 1 auto; max-width: 220px; margin-right: auto; }
+.menu-hint { margin-left: 12px; color: var(--muted); font-size: var(--fs-sm); white-space: nowrap; flex: none; }
+.menu-item:hover .menu-hint, .menu-item.hi .menu-hint { color: var(--selection-sub); }
+.menu-item.disabled .menu-hint, .menu-item.disabled:hover .menu-hint { color: var(--disabled); }
+.menu-item .menu-chev { width: 12px; margin-left: 4px; }
+.menu-item .od-icon.acc { color: var(--accent); }
+.menu-item:hover .od-icon.acc, .menu-item.hi .od-icon.acc { color: var(--selection-sub); }
+/* a row whose submenu is open keeps the "open" fill and a bright chevron */
+.menu-item.open, .menu-item.open:hover, .menu-item.hi.open { background: var(--active); color: var(--text); }
+.menu-item.open .od-icon, .menu-item.open:hover .od-icon, .menu-item.open .menu-hint { color: var(--muted); }
+.menu-item.open .od-icon.acc, .menu-item.open:hover .od-icon.acc { color: var(--accent); }
+.menu-item.open .menu-chev, .menu-item.open:hover .menu-chev { color: var(--text); }
+.menu.kb .menu-item.hi { outline: 2px solid var(--focus); outline-offset: -2px; }
+.menu-head { display: flex; align-items: center; gap: 4px; padding: 6px 10px 4px; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.menu-head .mh-t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-head .btn { margin-right: -4px; text-transform: none; }
+.menu-head .btn.planned-ico { outline: 1px dashed var(--warning); outline-offset: -1px; color: var(--warning); }
+.menu-field { padding: 2px 4px 6px; }
+.menu-field .input-wrap { height: 28px; }
