@@ -441,8 +441,6 @@ impl Settings {
 
     /// Removes every path in `paths` from the recent list and returns what was
     /// removed with the original indices, ascending, for [`Self::restore_recent`].
-    // Wired by the welcome removal UX (step B5a).
-    #[allow(dead_code)]
     pub fn remove_recent_many(&mut self, paths: &[PathBuf]) -> Vec<(usize, RecentRepo)> {
         let mut removed = Vec::new();
         let mut kept = Vec::with_capacity(self.recent.len());
@@ -461,8 +459,6 @@ impl Settings {
     /// original positions (ascending order, so each index is valid once the
     /// earlier ones are back). A path that was opened again in the meantime is
     /// not duplicated, and the list is cut back to [`RECENT_LIMIT`].
-    // Wired by the welcome removal UX (step B5a).
-    #[allow(dead_code)]
     pub fn restore_recent(&mut self, removed: Vec<(usize, RecentRepo)>) {
         for (index, repo) in removed {
             if self
@@ -480,8 +476,6 @@ impl Settings {
     /// Points the entry `old` at `new` (the folder was moved), keeping its
     /// position and `last_opened`. Another entry already stored for `new` is
     /// dropped so the list has no duplicates.
-    // Wired by the Locate flow (step B5b).
-    #[allow(dead_code)]
     pub fn relocate_recent(&mut self, old: &Path, new: PathBuf) {
         if !self.recent.iter().any(|repo| repo.path == old) {
             return;

@@ -2,10 +2,6 @@
 //! (available / checking / unavailable and why), which rows are selected, and
 //! the wording shared by the welcome list and the Activity card.
 
-// `RecentSelection` and a few helpers are not used outside the tests until
-// the removal UX (B5a) is wired to them.
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

@@ -13,20 +13,21 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, div, px, transparent_black, uniform_list, App, AppContext, ClickEvent, Context,
-    ElementId, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    PathPromptOptions, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, UniformListScrollHandle, WeakEntity, Window,
+    actions, div, px, transparent_black, uniform_list, App, AppContext, ClickEvent, ClipboardItem,
+    Context, ElementId, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, PathPromptOptions, Render, ScrollStrategy,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle,
+    WeakEntity, Window,
 };
 
 use git_core::{Error, Git, Repo};
 use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_LG, FS_SM, FS_XL, MONO, R_MD, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    dialog, focus, overlay, toast, Banner, BannerKind, Button, ButtonSize, Checkbox, Chip, Dialog,
-    DialogFocus, DialogHost, EmptyState, Icon, IconName, Kbd, Scrollbar, SearchField, Skeleton,
-    TextInput, TextInputEvent, TextInputSubmit, ToastAction, ToastBody, ToastId, ToastKind,
-    Tooltip,
+    dialog, focus, menu, overlay, toast, Banner, BannerKind, Button, ButtonSize, Checkbox, Chip,
+    Dialog, DialogFocus, DialogHost, EmptyState, Icon, IconName, Kbd, MenuEntry, MenuItem,
+    Scrollbar, SearchField, Skeleton, TextInput, TextInputEvent, TextInputSubmit, ToastAction,
+    ToastBody, ToastId, ToastKind, Tooltip,
 };
 
 use crate::clone_dialog::CloneDialog;
@@ -95,6 +96,8 @@ pub struct WelcomeView {
     selection: RecentSelection,
     /// The Undo toast of the last removal, replaced by the next one.
     undo_toast: Option<ToastId>,
+    /// The cleanup bar's "Show only these": the list shows unavailable rows only.
+    only_unavailable: bool,
     /// What the background check found for each recent path.
     states: HashMap<PathBuf, RowState>,
     list_scroll: UniformListScrollHandle,
@@ -147,6 +150,7 @@ impl WelcomeView {
             filter_text: String::new(),
             selection: RecentSelection::default(),
             undo_toast: None,
+            only_unavailable: false,
             states: HashMap::new(),
             list_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle().tab_stop(true),
@@ -245,12 +249,29 @@ impl WelcomeView {
         }
     }
 
+    fn is_unavailable(&self, path: &Path) -> bool {
+        self.states
+            .get(path)
+            .is_some_and(|state| state.unavailable().is_some())
+    }
+
+    /// Every unavailable entry of the whole list, filter or not: what the
+    /// cleanup bar counts and removes.
+    fn unavailable_paths(&self) -> Vec<PathBuf> {
+        self.recent
+            .iter()
+            .filter(|repo| self.is_unavailable(&repo.path))
+            .map(|repo| repo.path.clone())
+            .collect()
+    }
+
     fn matches(&self, repo: &RecentRepo) -> bool {
-        matches_filter(
-            &recent_name(&repo.path),
-            &display_path(&repo.path, self.home.as_deref()),
-            &self.filter_text,
-        )
+        (!self.only_unavailable || self.is_unavailable(&repo.path))
+            && matches_filter(
+                &recent_name(&repo.path),
+                &display_path(&repo.path, self.home.as_deref()),
+                &self.filter_text,
+            )
     }
 
     fn filtered_len(&self) -> usize {
@@ -437,6 +458,184 @@ impl WelcomeView {
     /// Undo of [`Self::remove_paths`]: the entries return to their old positions.
     fn restore_removed(&mut self, removed: Vec<(usize, RecentRepo)>, cx: &mut Context<Self>) {
         crate::update_settings(cx, |settings| settings.restore_recent(removed));
+        self.sync_recent(cx);
+        cx.notify();
+    }
+
+    /// Right click on a row: selects it unless it is already part of the
+    /// selection, then opens the row's menu at the pointer.
+    fn open_row_menu(
+        &mut self,
+        index: usize,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = self.visible_paths();
+        let Some(path) = paths.get(index).cloned() else {
+            return;
+        };
+        if !self.selection.is_selected(index, &paths) {
+            self.selection.click(index);
+        }
+        let targets = self.selection.targets(&paths);
+        let kind = if targets.len() > 1 {
+            RowMenu::Many(targets.len())
+        } else if self.is_unavailable(&path) {
+            RowMenu::Unavailable
+        } else {
+            RowMenu::Available
+        };
+        let weak = cx.entity().downgrade();
+        let entries = row_menu_entries(kind, |command| {
+            let (weak, path, targets) = (weak.clone(), path.clone(), targets.clone());
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                weak.update(cx, |view, cx| {
+                    view.run_menu_command(command, &path, &targets, window, cx)
+                })
+                .ok();
+            })
+        });
+        cx.notify();
+        menu::open_context_menu(position, entries, window, cx);
+    }
+
+    fn run_menu_command(
+        &mut self,
+        command: MenuCommand,
+        path: &Path,
+        targets: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            MenuCommand::Open => {
+                if let Some(index) = self.visible_paths().iter().position(|p| p == path) {
+                    self.open_row(index, window, cx);
+                }
+            }
+            MenuCommand::OpenWindow => {
+                if let Some(workspace) = self.workspace.upgrade() {
+                    let path = path.to_path_buf();
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.open_repository_window(path, window, cx);
+                    });
+                }
+            }
+            MenuCommand::Reveal => cx.reveal_path(path),
+            MenuCommand::CopyPath => {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+                toast::show(
+                    ToastKind::Ok,
+                    ui::t!("welcome.recent.toast.path_copied"),
+                    window,
+                    cx,
+                );
+            }
+            MenuCommand::Locate => self.locate(path.to_path_buf(), window, cx),
+            MenuCommand::Remove => self.remove_paths(targets.to_vec(), window, cx),
+        }
+    }
+
+    /// Locate…: a folder picker, then a background `Repo::open` on the pick;
+    /// a repository replaces the entry, anything else is an error toast.
+    fn locate(&mut self, old: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(ui::t!(
+                "welcome.recent.picker_prompt",
+                name = recent_name(&old)
+            )),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let picked = match receiver.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) => None,
+                Ok(Err(error)) => {
+                    this.update_in(cx, |_, window, cx| locate_picker_failed(&error, window, cx))
+                        .ok();
+                    return;
+                }
+                Err(error) => {
+                    this.update_in(cx, |_, window, cx| locate_picker_failed(&error, window, cx))
+                        .ok();
+                    return;
+                }
+            };
+            let Some(picked) = picked else {
+                return;
+            };
+            let git = this.read_with(cx, |view, _| view.git.clone()).ok();
+            let Some(git) = git else {
+                return;
+            };
+            let opened = cx
+                .background_executor()
+                .spawn({
+                    let picked = picked.clone();
+                    async move {
+                        let git = git.map_err(|error| error.to_string())?;
+                        Repo::open(git, &picked)
+                            .map(|repo| repo.root().to_path_buf())
+                            .map_err(|error| match error {
+                                Error::NotARepository { .. } => String::new(),
+                                other => other.to_string(),
+                            })
+                    }
+                })
+                .await;
+            this.update_in(cx, |view, window, cx| {
+                view.finish_locate(old, picked, opened, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The end of [`Self::locate`]. `opened` is the repository root, or the
+    /// error text (empty for "not a repository").
+    fn finish_locate(
+        &mut self,
+        old: PathBuf,
+        picked: PathBuf,
+        opened: Result<PathBuf, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let root = match opened {
+            Ok(root) => root,
+            Err(error) if error.is_empty() => {
+                toast::show(
+                    ToastKind::Error,
+                    ui::t!(
+                        "welcome.recent.toast.locate_not_repo",
+                        path = display_path(&picked, self.home.as_deref())
+                    ),
+                    window,
+                    cx,
+                );
+                return;
+            }
+            Err(error) => {
+                toast::show(
+                    ToastKind::Error,
+                    ui::t!("welcome.recent.toast.locate_failed", error = error),
+                    window,
+                    cx,
+                );
+                return;
+            }
+        };
+        let relocation = relocate_target(&old, &root, &self.recent);
+        if let Relocation::Moved(new) | Relocation::Merged(new) = relocation {
+            crate::update_settings(cx, |settings| settings.relocate_recent(&old, new));
+        }
+        // Check the entry again: it may be available now (and the new path
+        // has not been probed yet).
+        self.states.remove(&old);
+        self.states.remove(&root);
         self.sync_recent(cx);
         cx.notify();
     }
@@ -633,6 +832,7 @@ impl WelcomeView {
                             &rows[index],
                             RowPlace {
                                 selected: selection.is_selected(index, &paths),
+                                alone: selection.count(&paths) == 1,
                                 cursor: index == selection.cursor,
                                 last: index + 1 == count,
                             },
@@ -657,6 +857,12 @@ impl WelcomeView {
                     self.list_scroll.clone(),
                 )))
         };
+
+        let unavailable = self.unavailable_paths();
+        let cleanup = (!unavailable.is_empty()).then(|| {
+            let weak = cx.entity().downgrade();
+            cleanup_bar(unavailable, self.only_unavailable, weak, colors)
+        });
 
         let selected_count = self.selection.count(&self.visible_paths());
         let hint = div()
@@ -726,6 +932,7 @@ impl WelcomeView {
             .py(px(20.))
             .children(crate::activity_strip::enabled(cx).then(|| self.activity.clone()))
             .child(header)
+            .children(cleanup)
             .child(panel)
             .child(hint)
     }
@@ -838,6 +1045,10 @@ impl Render for WelcomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prune_dialog(window, cx);
         self.sync_recent(cx);
+        // Nothing unavailable is left (removed, relocated): leave the filtered view.
+        if self.only_unavailable && self.unavailable_paths().is_empty() {
+            self.only_unavailable = false;
+        }
         let show_activity = crate::activity_strip::enabled(cx);
         self.activity
             .update(cx, |activity, cx| activity.set_enabled(show_activity, cx));
@@ -1494,6 +1705,8 @@ fn action_row(
 struct RowPlace {
     /// Part of the selection (highlighted).
     selected: bool,
+    /// The only selected row: an unavailable one shows its inline actions.
+    alone: bool,
     /// The keyboard cursor row: its remove button stays visible.
     cursor: bool,
     /// The last row has no bottom border.
@@ -1511,6 +1724,7 @@ fn render_recent_row(
 ) -> impl IntoElement {
     let RowPlace {
         selected,
+        alone,
         cursor,
         last,
     } = place;
@@ -1535,6 +1749,8 @@ fn render_recent_row(
         .cursor_pointer();
 
     let unavailable = row.state.unavailable().cloned();
+    // A selected unavailable row offers Remove and Locate… instead of the time.
+    let inline = unavailable.is_some() && selected && alone;
     if let Some(tip) = row.tooltip.clone() {
         element = element.tooltip(Tooltip::text(tip));
     }
@@ -1548,6 +1764,20 @@ fn render_recent_row(
     }
 
     let weak_remove = weak.clone();
+    let weak_menu = weak.clone();
+    let weak_inline = weak.clone();
+    element = element.on_mouse_down(MouseButton::Right, {
+        let focus = focus.clone();
+        move |event: &MouseDownEvent, window, cx| {
+            window.focus(&focus, cx);
+            let position = event.position;
+            weak_menu
+                .update(cx, |view, cx| {
+                    view.open_row_menu(index, position, window, cx)
+                })
+                .ok();
+        }
+    });
     element = element.on_click(move |event: &ClickEvent, window, cx| {
         window.focus(&focus, cx);
         let modifiers = event.modifiers();
@@ -1615,40 +1845,93 @@ fn render_recent_row(
                 .text_color(colors.muted)
                 .child(branch_cell(index, row, unavailable.as_ref(), colors)),
         )
+        .when(inline, |element| {
+            element.child(inline_actions(index, row.path.clone(), weak_inline.clone()))
+        })
+        .when(!inline, |element| {
+            element.child(
+                div()
+                    .w(px(TIME_W))
+                    .flex_none()
+                    .text_size(FS_SM)
+                    .text_color(colors.muted)
+                    .text_right()
+                    .child(row.time.clone()),
+            )
+        })
+        .when(!inline, |element| {
+            element.child(
+                // The slot is always reserved; the button shows on hover and on
+                // the cursor row. Hidden by opacity, not removed, so it keeps its
+                // size and never moves the columns.
+                div()
+                    .debug_selector(move || format!("recent-remove-{index}"))
+                    .w(px(REMOVE_SLOT_W))
+                    .flex_none()
+                    .when(!cursor, |slot| {
+                        slot.opacity(0.)
+                            .group_hover(group, |style| style.opacity(1.))
+                    })
+                    .child(
+                        Button::ghost(("recent-remove", index))
+                            .size(ButtonSize::Xs)
+                            .icon_only(IconName::X)
+                            .tooltip(ui::t!("welcome.recent.remove_tip"))
+                            .on_click(move |_, window, cx| {
+                                // The row behind it would otherwise treat this as a click on itself.
+                                cx.stop_propagation();
+                                weak_remove
+                                    .update(cx, |view, cx| {
+                                        let path = view.visible_paths().get(index).cloned();
+                                        view.remove_paths(path.into_iter().collect(), window, cx);
+                                    })
+                                    .ok();
+                            }),
+                    ),
+            )
+        })
+}
+
+/// The inline actions of a selected unavailable row, in place of the time
+/// and the remove slot.
+fn inline_actions(index: usize, path: PathBuf, weak: WeakEntity<WelcomeView>) -> impl IntoElement {
+    let locate_path = path.clone();
+    let weak_locate = weak.clone();
+    div()
+        .w(px(TIME_W + 12. + REMOVE_SLOT_W))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_end()
+        .gap(px(4.))
         .child(
             div()
-                .w(px(TIME_W))
-                .flex_none()
-                .text_size(FS_SM)
-                .text_color(colors.muted)
-                .text_right()
-                .child(row.time.clone()),
-        )
-        .child(
-            // The slot is always reserved; the button shows on hover and on
-            // the cursor row. Hidden by opacity, not removed, so it keeps its
-            // size and never moves the columns.
-            div()
-                .debug_selector(move || format!("recent-remove-{index}"))
-                .w(px(REMOVE_SLOT_W))
-                .flex_none()
-                .when(!cursor, |slot| {
-                    slot.opacity(0.)
-                        .group_hover(group, |style| style.opacity(1.))
-                })
+                .debug_selector(move || format!("recent-inline-remove-{index}"))
                 .child(
-                    Button::ghost(("recent-remove", index))
-                        .size(ButtonSize::Xs)
-                        .icon_only(IconName::X)
-                        .tooltip(ui::t!("welcome.recent.remove_tip"))
+                    Button::new(("recent-inline-remove", index))
+                        .size(ButtonSize::Small)
+                        .label(ui::t!("welcome.recent.remove"))
                         .on_click(move |_, window, cx| {
                             // The row behind it would otherwise treat this as a click on itself.
                             cx.stop_propagation();
-                            weak_remove
-                                .update(cx, |view, cx| {
-                                    let path = view.visible_paths().get(index).cloned();
-                                    view.remove_paths(path.into_iter().collect(), window, cx);
-                                })
+                            let paths = vec![path.clone()];
+                            weak.update(cx, |view, cx| view.remove_paths(paths, window, cx))
+                                .ok();
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .debug_selector(move || format!("recent-inline-locate-{index}"))
+                .child(
+                    Button::ghost(("recent-inline-locate", index))
+                        .size(ButtonSize::Small)
+                        .label(ui::t!("welcome.recent.locate"))
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            let path = locate_path.clone();
+                            weak_locate
+                                .update(cx, |view, cx| view.locate(path, window, cx))
                                 .ok();
                         }),
                 ),
@@ -1757,6 +2040,201 @@ fn branch_cell(
             .into_any_element(),
         _ => div().child("—").into_any_element(),
     }
+}
+
+/// What a row's context menu offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowMenu {
+    Available,
+    Unavailable,
+    /// Two or more selected rows: only the bulk removal.
+    Many(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuCommand {
+    Open,
+    OpenWindow,
+    Reveal,
+    CopyPath,
+    Locate,
+    Remove,
+}
+
+/// What a menu command does when picked.
+type MenuRun = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// The menu's rows; `run` supplies the action behind each command. The
+/// commands that do not apply to an unavailable row (Open, new window,
+/// Reveal) are left out, not disabled.
+fn row_menu_entries(kind: RowMenu, run: impl Fn(MenuCommand) -> MenuRun) -> Vec<MenuEntry> {
+    let item = |label: SharedString, icon: IconName, command: MenuCommand| {
+        MenuItem::new(label).icon(icon).action({
+            let action = run(command);
+            move |window, cx| action(window, cx)
+        })
+    };
+    let copy = item(
+        ui::t!("welcome.recent.menu.copy_path"),
+        IconName::Copy,
+        MenuCommand::CopyPath,
+    );
+    let remove = |label: SharedString| {
+        MenuEntry::Item(
+            item(label, IconName::Trash, MenuCommand::Remove)
+                .shortcut("Del")
+                .danger(),
+        )
+    };
+    match kind {
+        RowMenu::Many(n) => vec![remove(ui::i18n::t_count(
+            "welcome.recent.menu.remove_n",
+            n as u64,
+            &[],
+        ))],
+        RowMenu::Unavailable => vec![
+            MenuEntry::Item(item(
+                ui::t!("welcome.recent.menu.locate"),
+                IconName::Search,
+                MenuCommand::Locate,
+            )),
+            MenuEntry::Item(copy),
+            MenuEntry::Separator,
+            remove(ui::t!("welcome.recent.menu.remove")),
+        ],
+        RowMenu::Available => vec![
+            MenuEntry::Item(
+                item(
+                    ui::t!("welcome.recent.menu.open"),
+                    IconName::Folder,
+                    MenuCommand::Open,
+                )
+                .shortcut("Enter"),
+            ),
+            MenuEntry::Item(item(
+                ui::t!("welcome.recent.menu.open_window"),
+                IconName::PanelR,
+                MenuCommand::OpenWindow,
+            )),
+            MenuEntry::Item(item(
+                ui::t!("welcome.recent.menu.reveal"),
+                IconName::Link,
+                MenuCommand::Reveal,
+            )),
+            MenuEntry::Item(copy),
+            MenuEntry::Separator,
+            remove(ui::t!("welcome.recent.menu.remove")),
+        ],
+    }
+}
+
+/// What Locate… does with the repository the user picked.
+#[derive(Debug, PartialEq, Eq)]
+enum Relocation {
+    /// The pick is the entry's own path: only check it again.
+    Unchanged,
+    /// The entry moves to the picked repository root.
+    Moved(PathBuf),
+    /// Like `Moved`, and the list already had an entry for the root: that
+    /// one is dropped so the list has no duplicates.
+    Merged(PathBuf),
+}
+
+/// Where the entry `old` points after Locate…, given the root of the picked
+/// repository. A pick inside a repository relocates to that repository's root.
+fn relocate_target(old: &Path, picked_root: &Path, recent: &[RecentRepo]) -> Relocation {
+    if picked_root == old {
+        Relocation::Unchanged
+    } else if recent.iter().any(|repo| repo.path == picked_root) {
+        Relocation::Merged(picked_root.to_path_buf())
+    } else {
+        Relocation::Moved(picked_root.to_path_buf())
+    }
+}
+
+/// No xdg portal, no picker: the same toast as the Open dialog.
+fn locate_picker_failed(error: &dyn std::fmt::Display, window: &mut Window, cx: &mut App) {
+    toast::show(
+        ToastKind::Error,
+        ui::t!("welcome.open.picker_failed", message = error.to_string()),
+        window,
+        cx,
+    );
+}
+
+/// The strip above the list while some recent entry is unavailable: how many,
+/// a toggle that narrows the list to them, and one-click removal of all of
+/// them (undoable, so no confirmation).
+fn cleanup_bar(
+    unavailable: Vec<PathBuf>,
+    only: bool,
+    weak: WeakEntity<WelcomeView>,
+    colors: ThemeColors,
+) -> impl IntoElement {
+    let count = unavailable.len();
+    let toggle = weak.clone();
+    div()
+        .debug_selector(|| "recent-cleanup".to_string())
+        .w_full()
+        .h(px(32.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .pl(px(10.))
+        .pr(px(6.))
+        .border_1()
+        .border_color(colors.warning.opacity(0.4))
+        .rounded(R_MD)
+        .bg(colors.warning.opacity(0.12))
+        .text_size(FS_SM)
+        .child(
+            Icon::new(IconName::Warn)
+                .size(px(14.))
+                .color(colors.warning),
+        )
+        .child(ui::i18n::t_count(
+            "welcome.recent.cleanup.text",
+            count as u64,
+            &[],
+        ))
+        .child(div().flex_1())
+        .child(
+            div()
+                .debug_selector(|| "recent-cleanup-only".to_string())
+                .child(
+                    Button::new("recent-cleanup-only")
+                        .size(ButtonSize::Small)
+                        .label(if only {
+                            ui::t!("welcome.recent.cleanup.show_all")
+                        } else {
+                            ui::t!("welcome.recent.cleanup.show_only")
+                        })
+                        .on_click(move |_, _, cx| {
+                            toggle
+                                .update(cx, |view, cx| {
+                                    view.only_unavailable = !view.only_unavailable;
+                                    view.selection.click(0);
+                                    cx.notify();
+                                })
+                                .ok();
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .debug_selector(|| "recent-cleanup-remove".to_string())
+                .child(
+                    Button::danger("recent-cleanup-remove")
+                        .size(ButtonSize::Small)
+                        .label(ui::t!("welcome.recent.cleanup.remove", n = count))
+                        .on_click(move |_, window, cx| {
+                            let paths = unavailable.clone();
+                            weak.update(cx, |view, cx| view.remove_paths(paths, window, cx))
+                                .ok();
+                        }),
+                ),
+        )
 }
 
 /// The background check of one recent entry: the file-system probe first,
@@ -2008,6 +2486,15 @@ mod tests {
             .iter()
             .map(|name| PathBuf::from(format!("/nonexistent-recent/{name}")))
             .collect();
+        let cx = open_with_paths(cx, &paths);
+        (cx, paths)
+    }
+
+    /// The real welcome window with `paths` as the recent list, most recent first.
+    fn open_with_paths(
+        cx: &mut gpui::TestAppContext,
+        paths: &[PathBuf],
+    ) -> gpui::VisualTestContext {
         let settings = crate::settings::Settings {
             recent: paths
                 .iter()
@@ -2028,7 +2515,13 @@ mod tests {
             });
         });
         let (cx, _workspace) = crate::test_support::open_workspace(crate::test_support::git(), cx);
-        (cx, paths)
+        cx
+    }
+
+    fn click_selector(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let bounds = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
     }
 
     fn recent_paths(cx: &mut gpui::VisualTestContext) -> Vec<PathBuf> {
@@ -2124,6 +2617,210 @@ mod tests {
         cx.simulate_click(link.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         assert_eq!(recent_paths(&mut cx), paths[2..].to_vec());
+    }
+
+    /// One real repository and two missing folders, in that order.
+    fn open_mixed(
+        cx: &mut gpui::TestAppContext,
+        repo: &crate::test_support::TempRepo,
+    ) -> (gpui::VisualTestContext, Vec<PathBuf>) {
+        let paths = vec![
+            repo.path().to_path_buf(),
+            repo.path().join("gone-1"),
+            repo.path().join("gone-2"),
+        ];
+        let cx = open_with_paths(cx, &paths);
+        (cx, paths)
+    }
+
+    /// The cleanup bar exists only while something is unavailable; "Show only
+    /// these" narrows the list and "Remove 2" clears the dead entries in one click.
+    #[gpui::test]
+    fn the_cleanup_bar_filters_and_removes_every_unavailable_row(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("recent-cleanup");
+        let (mut cx, paths) = open_mixed(cx, &repo);
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("recent-cleanup").is_some(),
+            "no cleanup bar with two unavailable rows"
+        );
+        assert!(cx.debug_bounds("recent-row-2").is_some());
+
+        click_selector(&mut cx, "recent-cleanup-only");
+        assert!(cx.debug_bounds("recent-row-1").is_some());
+        assert!(
+            cx.debug_bounds("recent-row-2").is_none(),
+            "Show only these kept the available row"
+        );
+        click_selector(&mut cx, "recent-cleanup-only");
+        assert!(
+            cx.debug_bounds("recent-row-2").is_some(),
+            "Show all did not bring the rows back"
+        );
+
+        click_selector(&mut cx, "recent-cleanup-remove");
+        assert_eq!(recent_paths(&mut cx), vec![paths[0].clone()]);
+        assert!(
+            cx.debug_bounds("recent-cleanup").is_none(),
+            "the cleanup bar outlived the unavailable rows"
+        );
+        // One Undo restores them all.
+        let action = cx.update(|window, cx| {
+            toast::toasts(window, cx)[0]
+                .body
+                .as_ref()
+                .and_then(|body| body.action.clone())
+                .expect("the toast has an Undo button")
+        });
+        cx.update(|window, cx| (action.on_click)(window, cx));
+        cx.run_until_parked();
+        assert_eq!(recent_paths(&mut cx), paths);
+    }
+
+    #[gpui::test]
+    fn there_is_no_cleanup_bar_when_every_row_is_available(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("recent-all-good");
+        let paths = vec![repo.path().to_path_buf()];
+        let mut cx = open_with_paths(cx, &paths);
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("recent-row-0").is_some());
+        assert!(cx.debug_bounds("recent-cleanup").is_none());
+    }
+
+    /// A selected unavailable row swaps its time for Remove and Locate…; an
+    /// available one does not. Remove acts on the row alone.
+    #[gpui::test]
+    fn a_selected_unavailable_row_shows_inline_actions(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("recent-inline");
+        let (mut cx, paths) = open_mixed(cx, &repo);
+        cx.run_until_parked();
+        cx.run_until_parked();
+        // Row 0 (the cursor) is the available repository.
+        assert!(cx.debug_bounds("recent-inline-remove-0").is_none());
+        click_row(&mut cx, 1, gpui::Modifiers::default());
+        assert!(cx.debug_bounds("recent-inline-locate-1").is_some());
+        assert!(
+            cx.debug_bounds("recent-inline-remove-0").is_none(),
+            "an unselected row shows inline actions"
+        );
+        // Two selected rows: no inline actions, the footer takes over.
+        let modifiers = ctrl(&mut cx);
+        click_row(&mut cx, 2, modifiers);
+        assert!(cx.debug_bounds("recent-inline-locate-1").is_none());
+
+        click_row(&mut cx, 2, gpui::Modifiers::default());
+        click_selector(&mut cx, "recent-inline-remove-2");
+        assert_eq!(recent_paths(&mut cx), paths[..2].to_vec());
+    }
+
+    /// Right click selects a row that is not part of the selection and opens
+    /// a menu; on a row inside a multi-selection the selection stays.
+    #[gpui::test]
+    fn right_click_opens_the_row_menu_and_selects_the_row(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("recent-menu");
+        let (mut cx, _paths) = open_mixed(cx, &repo);
+        cx.run_until_parked();
+        cx.run_until_parked();
+        let center = |cx: &mut gpui::VisualTestContext, index: usize| {
+            let selector: &'static str = Box::leak(format!("recent-row-{index}").into_boxed_str());
+            cx.debug_bounds(selector).expect(selector).center()
+        };
+
+        let at = center(&mut cx, 2);
+        cx.simulate_mouse_down(at, gpui::MouseButton::Right, gpui::Modifiers::default());
+        assert_eq!(cx.update(|window, cx| overlay::layer_count(window, cx)), 1);
+        assert!(
+            cx.debug_bounds("recent-inline-locate-2").is_some(),
+            "the right-clicked row was not selected"
+        );
+        // The scrim swallows the next press and closes the menu.
+        let at = center(&mut cx, 0);
+        cx.simulate_mouse_down(at, gpui::MouseButton::Right, gpui::Modifiers::default());
+        assert_eq!(cx.update(|window, cx| overlay::layer_count(window, cx)), 0);
+
+        cx.update(|window, cx| window.dispatch_action(Box::new(SelectAllRecent), cx));
+        cx.run_until_parked();
+        let at = center(&mut cx, 1);
+        cx.simulate_mouse_down(at, gpui::MouseButton::Right, gpui::Modifiers::default());
+        assert_eq!(cx.update(|window, cx| overlay::layer_count(window, cx)), 1);
+        assert!(
+            cx.debug_bounds("recent-footer-selected").is_some(),
+            "right click inside the selection dropped it"
+        );
+    }
+
+    fn labels(entries: &[MenuEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                MenuEntry::Item(item) => item.label.to_string(),
+                MenuEntry::Separator => "—".to_string(),
+            })
+            .collect()
+    }
+
+    fn noop_run(_: MenuCommand) -> MenuRun {
+        Rc::new(|_, _| {})
+    }
+
+    #[gpui::test]
+    fn the_row_menu_matches_the_row(cx: &mut gpui::TestAppContext) {
+        cx.update(ui::init).expect("ui::init");
+        assert_eq!(
+            labels(&row_menu_entries(RowMenu::Available, noop_run)),
+            [
+                "Open",
+                "Open in new window",
+                "Reveal in file manager",
+                "Copy path",
+                "—",
+                "Remove from list"
+            ]
+        );
+        assert_eq!(
+            labels(&row_menu_entries(RowMenu::Unavailable, noop_run)),
+            ["Locate…", "Copy path", "—", "Remove from list"]
+        );
+        assert_eq!(
+            labels(&row_menu_entries(RowMenu::Many(3), noop_run)),
+            ["Remove 3 from list"]
+        );
+        let entries = row_menu_entries(RowMenu::Available, noop_run);
+        let MenuEntry::Item(remove) = entries.last().unwrap() else {
+            panic!("the last entry is the Remove item");
+        };
+        assert!(remove.danger);
+        assert_eq!(remove.shortcut.as_deref(), Some("Del"));
+    }
+
+    #[test]
+    fn relocate_target_follows_the_picked_repository_root() {
+        let recent = |paths: &[&str]| -> Vec<RecentRepo> {
+            paths
+                .iter()
+                .map(|path| RecentRepo {
+                    path: PathBuf::from(path),
+                    last_opened: 1,
+                })
+                .collect()
+        };
+        let list = recent(&["/old/app", "/other/app"]);
+        let old = Path::new("/old/app");
+        assert_eq!(
+            relocate_target(old, Path::new("/old/app"), &list),
+            Relocation::Unchanged
+        );
+        assert_eq!(
+            relocate_target(old, Path::new("/moved/app"), &list),
+            Relocation::Moved(PathBuf::from("/moved/app"))
+        );
+        // The list already has the target: the entry merges into it.
+        assert_eq!(
+            relocate_target(old, Path::new("/other/app"), &list),
+            Relocation::Merged(PathBuf::from("/other/app"))
+        );
     }
 
     /// The × button of a row removes just that row.
