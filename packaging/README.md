@@ -75,6 +75,13 @@ blocks the non-notarized app when the `.dmg` is downloaded in a browser. It depe
 `release-notes.md` holds the install instructions that the release workflow
 puts in front of the generated GitHub release notes.
 
+## Update signing
+
+The release workflow signs `SHA256SUMS.txt` with minisign and uploads the signature as `SHA256SUMS.txt.minisig`
+next to the artifacts. The in-app updater only installs a download whose checksum file verifies against
+`packaging/update-key.pub`, the single place that holds the public key (the app embeds it at compile time and CI
+verifies against it before publishing). Key setup and rotation are described in `RELEASING.md`.
+
 ## Signing
 
 The macOS and Windows builds are not signed with a developer certificate. The

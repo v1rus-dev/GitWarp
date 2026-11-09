@@ -18,11 +18,33 @@ use sha2::{Digest, Sha256};
 
 use crate::update_check::{parse_version, Version};
 
-/// Minisign public key (the base64 line of `minisign.pub`) the release checksums
-/// must be signed with.
-// TODO(U4): PLACEHOLDER. Replace with the real release public key when CI
-// signing lands; until then no signature verifies, so nothing is ever staged.
-const UPDATE_PUBLIC_KEY: &str = "RWQ/3TShtH3rLS1xFkK3JrBEAWJ8qfusMvXIUw+xkDzE2wIlhxeSGkiB";
+/// The minisign public key file; the single source of truth shared with CI
+/// (see RELEASING.md, "Update signing").
+const UPDATE_KEY_FILE: &str = include_str!("../../../packaging/update-key.pub");
+
+/// The last non-empty line of `text`, whitespace-trimmed (the base64 key line of a
+/// minisign `.pub` file).
+const fn last_line(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && bytes[start - 1] != b'\n' {
+        start -= 1;
+    }
+    let (head, _) = bytes.split_at(end);
+    let (_, line) = head.split_at(start);
+    match std::str::from_utf8(line) {
+        Ok(line) => line,
+        Err(_) => panic!("update key line is not UTF-8"),
+    }
+}
+
+/// Minisign public key (the base64 line of `packaging/update-key.pub`) the release
+/// checksums must be signed with.
+const UPDATE_PUBLIC_KEY: &str = last_line(UPDATE_KEY_FILE);
 
 const SUMS_NAME: &str = "SHA256SUMS.txt";
 const SUMS_SIG_NAME: &str = "SHA256SUMS.txt.minisig";
@@ -826,6 +848,27 @@ mod tests {
     const SIG_A: &str = "untrusted comment: signature from minisign secret key\nRUQBAgMEBQYHCG3fbBFRnjf08tjXAVDhR0ZhYdhPMiKclzoNOBK4wtZYI1aJdPIWWoDRDkMykykdp5RviwKHEU7ub5g7FermTQc=\ntrusted comment: timestamp:1\tfile:SHA256SUMS.txt\nqZa3lTipNLDerUMFjDVrvwJoJyW6HV/n/VNR+P09zIRcw6cPl+s1USDj4hKVMyO+5oJw2Q57g8UC3ee3wl/UCg==\n";
     /// `SUMS` signed by key B.
     const SIG_B: &str = "untrusted comment: signature from minisign secret key\nRUQyMzQ1Njc4OXnccB1Xaw+lAUZYT4jkF2qukEVDf9XZey29CPeqzHKFrmfG/3dFD9RQXL3qKSfBqkF1Y8wmaiurmHUrfLj/ZgU=\ntrusted comment: timestamp:1\tfile:SHA256SUMS.txt\nNU25Y33ad9NuH9G4HMRG6y2lMyvDyR731qLwLBET0fAXAe+7qtY7e0Mt8V//wSTxbzN6cph5QlorSWEOifYbBQ==\n";
+
+    #[test]
+    fn embedded_update_key_is_a_valid_minisign_key() {
+        minisign_verify::PublicKey::from_base64(UPDATE_PUBLIC_KEY)
+            .expect("embedded key parses as a minisign public key");
+        minisign_verify::PublicKey::decode(UPDATE_KEY_FILE).expect("whole .pub file decodes");
+    }
+
+    #[test]
+    fn update_key_file_has_the_two_line_format() {
+        let lines: Vec<&str> = UPDATE_KEY_FILE.lines().collect();
+        assert_eq!(lines.len(), 2, "comment line + key line only");
+        assert!(lines[0].starts_with("untrusted comment:"));
+        assert_eq!(lines[1], UPDATE_PUBLIC_KEY);
+        assert!(
+            !lines[1].is_empty()
+                && lines[1]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+        );
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir =

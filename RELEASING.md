@@ -4,6 +4,8 @@
 
 - Add the repository secret `SENTRY_DSN` (Settings -> Secrets and variables -> Actions). It is compiled into the
   release binaries as `GITWARP_SENTRY_DSN`; without it the builds ship with crash reporting disabled.
+- Set up update signing (see "Update signing" below): secret `MINISIGN_SECRET_KEY` and the real
+  `packaging/update-key.pub`. Without them the `publish` job fails on purpose.
 - The repository must be public for the release downloads to be visible to everyone.
 
 ## Cutting a release
@@ -43,6 +45,37 @@ git push origin :refs/tags/v0.2.0
 
 If the release commit itself needs to change, also revert or amend it on `main` before re-running `scripts/release.sh`.
 If the failure was only in the workflow, a dry run is the cheapest way to verify the fix.
+
+## Update signing
+
+The in-app updater installs a download only if `SHA256SUMS.txt` has a valid
+[minisign](https://jedisct1.github.io/minisign/) signature (`SHA256SUMS.txt.minisig`) made with the key
+compiled into the app. That key lives in one file, `packaging/update-key.pub`; the app embeds it at build
+time and the release workflow verifies the fresh signature against it before publishing.
+
+**Current state: `packaging/update-key.pub` holds a PLACEHOLDER whose secret key nobody has.** Until the real
+key is committed, the `publish` job fails at "Verify signature" on purpose (and at "Sign checksums" while
+`MINISIGN_SECRET_KEY` is unset), so nothing unsigned or unverifiable is ever released.
+
+One-time setup (do this on your own machine; the secret key never goes into the repo or chat):
+
+1. Install minisign and generate the pair:
+   `minisign -G -p packaging/update-key.pub -s ~/.minisign/gitwarp.key`
+   You may protect the key with a password. minisign writes the `.pub` with its own comment line; keep the file
+   at exactly two lines (comment line + base64 key line).
+2. Add the repository secret `MINISIGN_SECRET_KEY` with the full contents of `~/.minisign/gitwarp.key`
+   (both lines). If you set a password, also add `MINISIGN_PASSWORD`; leave it unset for an unencrypted key.
+3. Commit the new `packaging/update-key.pub` to `main` and release as usual. Apps built from that commit
+   trust the new key.
+4. Back up the secret key (and its password) offline, e.g. in a password manager. Without it you cannot sign.
+
+Key rotation: every installed app embeds exactly one key. To rotate, first ship a release that contains the NEW
+public key but is still signed with the OLD secret key (so installed apps accept it), wait until users have
+updated, and only then switch the CI secrets to the new key. Switching earlier strands installed apps.
+
+If the secret key is lost or leaked, installed apps cannot be moved to a new key by an update: they stop
+accepting updates signed with anything else, so users must reinstall once from a fresh download. After a leak,
+revoke by publishing a new key this way as soon as possible and treat old releases as untrusted.
 
 ## Unsigned builds
 
