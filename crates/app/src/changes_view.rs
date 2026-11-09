@@ -154,6 +154,19 @@ pub struct MergeInfo {
     pub message: Option<String>,
 }
 
+/// Whether the merge info of a fresh quiet read matches the shown one. The
+/// commit message is only read for the first status of a merge (the later reads
+/// carry `None`), so it counts only when the new read has one.
+fn merge_unchanged(shown: &Option<MergeInfo>, new: &Option<MergeInfo>) -> bool {
+    match (shown, new) {
+        (None, None) => true,
+        (Some(shown), Some(new)) => {
+            shown.branch == new.branch && (new.message.is_none() || shown.message == new.message)
+        }
+        _ => false,
+    }
+}
+
 /// Whether the box still holds the untouched prefill text, so it can be
 /// cleared when the merge ended without a commit. A prefill only goes into an
 /// empty box, so "undo" is always "empty it".
@@ -417,11 +430,33 @@ impl ChangesView {
             .map(|file| (selection.side, file.path.clone()))
     }
 
+    /// Whether an operation of this view (stage, commit, discard...) is running.
+    pub fn is_busy(&self) -> bool {
+        self.busy
+    }
+
+    /// [`Self::refresh`] for changes made outside the app: the loaded state
+    /// stays on screen (no `Loading` flash, no empty list) and a status equal
+    /// to the shown one is dropped. Skipped while an operation of this view is
+    /// running (it reads the status itself when it finishes).
+    pub fn refresh_quiet(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.start_status_with(true, cx);
+    }
+
     fn start_status(&mut self, cx: &mut Context<Self>) {
+        self.start_status_with(false, cx);
+    }
+
+    fn start_status_with(&mut self, quiet: bool, cx: &mut Context<Self>) {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let previous = self.selection_path();
-        self.state = StatusState::Loading(self.last_arc());
+        if !quiet {
+            self.state = StatusState::Loading(self.last_arc());
+        }
         let git = match &self.git {
             Ok(git) => git.clone(),
             Err(error) => {
@@ -441,12 +476,44 @@ impl ChangesView {
                 })
                 .await;
             this.update(cx, |view, cx| {
-                view.set_status(generation, previous, result, cx)
+                if quiet {
+                    view.set_status_quiet(generation, previous, result, cx)
+                } else {
+                    view.set_status(generation, previous, result, cx)
+                }
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        if !quiet {
+            cx.notify();
+        }
+    }
+
+    /// [`Self::set_status`] that leaves the list alone when the read equals the
+    /// status on screen, so a no-op refresh does not reset the selection or the
+    /// picked rows. The selected file's diff is still re-read quietly.
+    fn set_status_quiet(
+        &mut self,
+        generation: u64,
+        previous: Option<(Side, String)>,
+        result: Result<Snapshot, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation == self.generation {
+            if let (Ok(snapshot), StatusState::Loaded(shown)) = (&result, &self.state) {
+                if **shown == snapshot.status
+                    && self.operation == snapshot.operation
+                    && merge_unchanged(&self.merge, &snapshot.merge)
+                {
+                    // Same list, but a file can change under the same counts (one line
+                    // swapped for another), so the open diff is re-read, in place.
+                    self.start_diff_with(true, cx);
+                    return;
+                }
+            }
+        }
+        self.set_status(generation, previous, result, cx);
     }
 
     fn set_status(
@@ -582,6 +649,12 @@ impl ChangesView {
     }
 
     fn start_diff(&mut self, cx: &mut Context<Self>) {
+        self.start_diff_with(false, cx);
+    }
+
+    /// `quiet` keeps the shown diff and its scroll position until the new one
+    /// arrives (a refresh for an outside change, not a new selection).
+    fn start_diff_with(&mut self, quiet: bool, cx: &mut Context<Self>) {
         // The conflict editor covers the diff pane: leave the hidden pane alone
         // (the editor's close reloads it).
         if self.editor.is_some() {
@@ -589,7 +662,9 @@ impl ChangesView {
         }
         self.diff_generation = self.diff_generation.wrapping_add(1);
         let generation = self.diff_generation;
-        self.diff_scroll = UniformListScrollHandle::new();
+        if !quiet {
+            self.diff_scroll = UniformListScrollHandle::new();
+        }
         let Some(selection) = self.selection else {
             self.diff = DiffState::Empty;
             return;
@@ -606,7 +681,9 @@ impl ChangesView {
                 return;
             }
         };
-        self.diff = DiffState::Loading;
+        if !quiet {
+            self.diff = DiffState::Loading;
+        }
         let path = self.path.clone();
         if selection.side == Side::Conflicted {
             cx.spawn(async move |this, cx| {
@@ -618,7 +695,9 @@ impl ChangesView {
                     .ok();
             })
             .detach();
-            cx.notify();
+            if !quiet {
+                cx.notify();
+            }
             return;
         }
         let staged = selection.side.staged();
@@ -637,7 +716,9 @@ impl ChangesView {
                 .ok();
         })
         .detach();
-        cx.notify();
+        if !quiet {
+            cx.notify();
+        }
     }
 
     fn set_diff(
@@ -3324,6 +3405,98 @@ mod tests {
             cx.debug_bounds("changes-unstaged-0").is_none(),
             "the file list showed rows after a failed read"
         );
+    }
+
+    /// A quiet refresh never shows the `Loading` state, and picks up a change
+    /// made outside the app.
+    #[gpui::test]
+    fn quiet_refresh_keeps_the_list_and_applies_changes(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-quiet");
+        write(repo.path(), "a.txt", "one\n");
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "one"]);
+        write(repo.path(), "a.txt", "two\n");
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        view.update(&mut cx, |view, cx| view.refresh_quiet(cx));
+        view.read_with(&cx, |view, _| {
+            assert!(!view.is_loading());
+            assert!(
+                view.status().is_some(),
+                "the list blanked during a quiet refresh"
+            );
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert_eq!(view.unstaged_count(), 1));
+
+        git(repo.path(), &["add", "a.txt"]);
+        view.update(&mut cx, |view, cx| view.refresh_quiet(cx));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.staged_count(), 1);
+            assert_eq!(view.unstaged_count(), 0);
+        });
+    }
+
+    /// An outside edit that keeps a file's line counts must still reload the
+    /// open diff on a quiet refresh.
+    #[gpui::test]
+    fn quiet_refresh_reloads_the_diff_when_the_status_is_equal(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("changes-quiet-diff");
+        write(repo.path(), "a.txt", "one\n");
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "one"]);
+        write(repo.path(), "a.txt", "two\n");
+
+        let (mut cx, view) = open_changes(&repo, cx);
+        let added = |view: &ChangesView| {
+            let data = view.diff_data().expect("the diff loaded");
+            data.diff.hunks[0]
+                .lines
+                .iter()
+                .filter(|line| line.kind == git_core::LineKind::Added)
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+        };
+        view.read_with(&cx, |view, _| assert_eq!(added(view), ["two"]));
+
+        // Still one added and one removed line: the status is equal.
+        write(repo.path(), "a.txt", "three\n");
+        view.update(&mut cx, |view, cx| view.refresh_quiet(cx));
+        view.read_with(&cx, |view, _| {
+            assert!(
+                view.diff_data().is_some(),
+                "the diff blanked during a quiet reload"
+            );
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert_eq!(added(view), ["three"]));
+    }
+
+    #[test]
+    fn merge_info_comparison_ignores_a_message_that_was_not_read() {
+        let info = |branch: Option<&str>, message: Option<&str>| {
+            Some(MergeInfo {
+                branch: branch.map(str::to_string),
+                message: message.map(str::to_string),
+            })
+        };
+        assert!(merge_unchanged(&None, &None));
+        assert!(!merge_unchanged(&None, &info(Some("x"), None)));
+        assert!(!merge_unchanged(&info(Some("x"), None), &None));
+        // Later reads of a merge carry no message.
+        assert!(merge_unchanged(
+            &info(Some("x"), Some("m")),
+            &info(Some("x"), None)
+        ));
+        assert!(!merge_unchanged(
+            &info(Some("x"), Some("m")),
+            &info(Some("y"), None)
+        ));
+        assert!(!merge_unchanged(
+            &info(Some("x"), Some("m")),
+            &info(Some("x"), Some("n"))
+        ));
     }
 
     /// Space on a focused file row stages the selected file; Ctrl+Shift+Z asks

@@ -61,8 +61,8 @@ pub use refs::{Head, Ref, RefKind};
 pub use runner::{DiscoveredRepo, GitRunner};
 pub use stash::Stash;
 pub use status::{
-    ChangedEntry, ConflictSide, HeadCommit, HunkPick, WorkingFile, WorkingStatus, WorktreeFile,
-    WorktreeText,
+    set_warning_sink, ChangedEntry, ConflictSide, HeadCommit, HunkPick, WorkingFile, WorkingStatus,
+    WorktreeFile, WorktreeText,
 };
 pub use submodule::{Submodule, SubmoduleState};
 pub use worktree::Worktree;
@@ -204,6 +204,25 @@ impl Repo {
         let mut cmd = self.git.command();
         cmd.arg("-C").arg(&self.root);
         cmd
+    }
+
+    /// [`Repo::command`] for read-only queries that may run in the background
+    /// (status, work-tree diffs): `GIT_OPTIONAL_LOCKS=0` stops git taking
+    /// `index.lock` just to refresh the index's stat cache, which would make a
+    /// `git commit` in the user's terminal fail with "index.lock: File exists".
+    pub(crate) fn read_command(&self) -> Command {
+        let mut cmd = self.command();
+        cmd.env("GIT_OPTIONAL_LOCKS", "0");
+        cmd
+    }
+
+    /// Removes scratch index copies a crashed run left in the git dir (see
+    /// `status::ScratchIndex`). Touches the file system: call off the UI thread.
+    pub fn remove_stale_scratch_files(&self) -> usize {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        status::remove_stale_scratch_indexes(&self.git_dir, now)
     }
 
     /// Whether this is a bare repository (no work tree).

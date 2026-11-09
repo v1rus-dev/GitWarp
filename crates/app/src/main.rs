@@ -39,6 +39,7 @@ mod ref_menus;
 mod ref_ops;
 mod remote_accounts;
 mod repo_view;
+mod repo_watch;
 mod settings;
 mod settings_ui;
 mod sidebar;
