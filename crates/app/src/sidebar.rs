@@ -250,19 +250,13 @@ pub enum SidebarAction {
     DropStash(usize),
     /// Opens "Create tag" at HEAD.
     CreateTag,
-    // The next four variants are handled in `repo_view` but constructed only by
-    // the cascading ref menus (a later step), hence the `dead_code` allowance.
     /// Opens "Create tag" at this commit.
-    #[allow(dead_code)]
     CreateTagAt(Oid),
     /// Pushes a local branch (checked out or not) to its upstream remote.
-    #[allow(dead_code)]
     PushBranch(String),
     /// Pulls the current branch.
-    #[allow(dead_code)]
     Pull,
     /// Copies the full message (subject and body) of a commit.
-    #[allow(dead_code)]
     CopyCommitMessage(Oid),
     /// Opens the add-remote dialog.
     AddRemote,

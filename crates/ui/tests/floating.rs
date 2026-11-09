@@ -196,65 +196,6 @@ fn menu_skips_disabled_items(cx: &mut TestAppContext) {
     assert_eq!(last.get(), 1, "down did not skip the disabled item");
 }
 
-/// The root rows of the in-place test: "Open" swaps in a page whose "Back" swaps the root back.
-fn submenu_root(root_hits: &Rc<Cell<u32>>, inner_hits: &Rc<Cell<u32>>) -> Vec<MenuEntry> {
-    let root = root_hits.clone();
-    let inner = inner_hits.clone();
-    let page_root = root_hits.clone();
-    let page_inner = inner_hits.clone();
-    vec![
-        MenuEntry::Item(MenuItem::new("Open").replace_rows(move || {
-            let root = page_root.clone();
-            let inner = page_inner.clone();
-            vec![
-                MenuEntry::Item(
-                    MenuItem::new("Back").replace_rows(move || submenu_root(&root, &inner)),
-                ),
-                MenuEntry::Separator,
-                menu_item("Inner", true, &page_inner),
-            ]
-        })),
-        menu_item("Root item", true, &root),
-        menu_item("Unused", true, &inner),
-    ]
-}
-
-#[gpui::test]
-fn menu_replace_rows_swaps_the_rows_in_place_and_back_restores_them(cx: &mut TestAppContext) {
-    let (_, cx) = start(cx);
-    let root_hits = Rc::new(Cell::new(0));
-    let inner_hits = Rc::new(Cell::new(0));
-    let entries = submenu_root(&root_hits, &inner_hits);
-
-    cx.update(|window, app| {
-        menu::open_context_menu(point(px(40.), px(40.)), entries, window, app);
-    });
-    cx.run_until_parked();
-
-    // "Open" keeps the menu open and shows the page: Back, then Inner.
-    cx.simulate_keystrokes("down enter");
-    assert_eq!(layer_count(cx), 1, "the submenu closed the menu");
-
-    // Back returns to the root rows, where the second item is "Root item".
-    cx.simulate_keystrokes("down enter");
-    assert_eq!(layer_count(cx), 1, "Back closed the menu");
-    cx.simulate_keystrokes("down down enter");
-    assert_eq!(root_hits.get(), 1, "Back did not restore the root rows");
-    assert_eq!(inner_hits.get(), 0);
-    assert_eq!(layer_count(cx), 0);
-
-    // The page's own item runs and closes the menu.
-    let entries = submenu_root(&root_hits, &inner_hits);
-    cx.update(|window, app| {
-        menu::open_context_menu(point(px(40.), px(40.)), entries, window, app);
-    });
-    cx.run_until_parked();
-    cx.simulate_keystrokes("down enter down down enter");
-    assert_eq!(inner_hits.get(), 1, "the page item did not run");
-    assert_eq!(root_hits.get(), 1);
-    assert_eq!(layer_count(cx), 0);
-}
-
 #[gpui::test]
 fn menu_filter_hides_non_matching_rows_and_enter_runs_the_first_match(cx: &mut TestAppContext) {
     let (_, cx) = start(cx);

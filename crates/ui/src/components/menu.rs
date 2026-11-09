@@ -44,9 +44,6 @@ pub struct MenuItem {
     /// When set, the item opens a cascading child panel (hover for 200 ms,
     /// click, Enter or →) instead of running `action`.
     pub submenu: Option<MenuSubmenu>,
-    /// When set, activating the item swaps the open menu's rows for these
-    /// in place instead of closing it and running `action`.
-    pub replace_rows: Option<MenuSubmenu>,
     /// Muted text right-aligned before the shortcut ("HEAD +origin", "↑2 ↓1").
     pub hint: Option<SharedString>,
     /// Draws the icon in the accent colour (the checked-out branch).
@@ -65,7 +62,6 @@ impl MenuItem {
             disabled: false,
             action: Rc::new(|_, _| {}),
             submenu: None,
-            replace_rows: None,
             hint: None,
             accent_icon: false,
             filter_text: None,
@@ -100,14 +96,6 @@ impl MenuItem {
     /// Makes the item open a cascading child panel beside its row.
     pub fn submenu(mut self, entries: impl Fn() -> Vec<MenuEntry> + 'static) -> Self {
         self.submenu = Some(Rc::new(entries));
-        self
-    }
-
-    /// Makes the item replace the open menu's rows in place (same position,
-    /// same focus) instead of closing it. A "Back" row is just another such
-    /// item that returns the parent's rows.
-    pub fn replace_rows(mut self, entries: impl Fn() -> Vec<MenuEntry> + 'static) -> Self {
-        self.replace_rows = Some(Rc::new(entries));
         self
     }
 
@@ -650,16 +638,6 @@ impl MenuView {
         let Some(item) = self.levels.get(level).and_then(|l| l.item(index)) else {
             return;
         };
-        if let Some(rows) = item.replace_rows.clone() {
-            self.cancel_hover();
-            self.levels.truncate(level + 1);
-            self.active_level = level;
-            self.levels[level] = Level::new(rows(), level, window, cx);
-            // The old field may have held focus; its replacement is not focused.
-            window.focus(&self.entry_focus(cx), cx);
-            cx.notify();
-            return;
-        }
         if item.submenu.is_some() {
             self.open_child(level, index, true, window, cx);
             return;

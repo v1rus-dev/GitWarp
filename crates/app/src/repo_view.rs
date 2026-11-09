@@ -22,7 +22,7 @@ use gpui::{
 };
 
 use git_core::network::{FetchOptions, Progress};
-use git_core::{ChangedFile, CommitDetails, CommitInfo, Error, Git, Head, Oid, RefKind, Repo};
+use git_core::{ChangedFile, CommitDetails, CommitInfo, Error, Git, Head, Oid, Ref, RefKind, Repo};
 use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
 use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, FS_XS, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
@@ -786,6 +786,17 @@ impl RepositoryView {
                 pr_view.update(cx, |view, cx| {
                     view.open_pr_popover(&branch, position, window, cx)
                 });
+            }));
+        });
+        let service_view = cx.entity();
+        history.update(cx, |history, _| {
+            // The History asks while it is itself being updated, so it hands
+            // over its own HEAD and refs instead of being read back.
+            history.set_pr_service(Rc::new(move |branch, head, refs, cx| {
+                let view = service_view.read(cx);
+                let targets = view.pr_targets_in(head, refs, cx);
+                let upstream = view.branch_upstream_remote_in(branch, refs);
+                pr_logic::default_target(&targets, upstream.as_deref()).map(|target| target.kind())
             }));
         });
         let history_events =
@@ -3362,16 +3373,18 @@ impl RepositoryView {
     /// The remotes that can take a pull request, the current branch's
     /// upstream first. Pure: no network, no keychain.
     fn pr_targets(&self, cx: &App) -> Vec<PrTarget> {
+        let history = self.history.read(cx);
+        self.pr_targets_in(history.head(), history.refs().unwrap_or(&[]), cx)
+    }
+
+    /// [`Self::pr_targets`] over a given HEAD and refs, for callers that run
+    /// inside an update of the history (which cannot be read then).
+    fn pr_targets_in(&self, head: Option<&Head>, refs: &[Ref], cx: &App) -> Vec<PrTarget> {
         let Some(extras) = self.sidebar_extras.as_ref() else {
             return Vec::new();
         };
         let (accounts, remembered) = self.account_settings(cx);
-        let history = self.history.read(cx);
-        let preferred = web_links::upstream_remote(
-            history.head(),
-            history.refs().unwrap_or(&[]),
-            &extras.remote_targets,
-        );
+        let preferred = web_links::upstream_remote(head, refs, &extras.remote_targets);
         pr_logic::pr_targets(
             &accounts,
             &extras.remote_targets,
@@ -3462,15 +3475,16 @@ impl RepositoryView {
 
     /// The remote the local branch `branch` tracks, if it is a configured one.
     fn branch_upstream_remote(&self, branch: &str, cx: &App) -> Option<String> {
+        self.branch_upstream_remote_in(branch, self.history.read(cx).refs().unwrap_or(&[]))
+    }
+
+    /// [`Self::branch_upstream_remote`] over a given list of refs.
+    fn branch_upstream_remote_in(&self, branch: &str, refs: &[Ref]) -> Option<String> {
         let remote_targets: &[remote_accounts::RemoteTargets] = self
             .sidebar_extras
             .as_ref()
             .map_or(&[], |extras| &extras.remote_targets);
-        self.history
-            .read(cx)
-            .refs()
-            .unwrap_or(&[])
-            .iter()
+        refs.iter()
             .find(|r| r.kind == RefKind::LocalBranch && r.name == branch)
             .and_then(|r| r.upstream.as_deref())
             .and_then(|upstream| web_links::split_remote_ref(upstream, remote_targets))

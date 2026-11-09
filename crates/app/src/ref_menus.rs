@@ -1,16 +1,12 @@
 //! The pure model of the cascading ref menus of the History: which ref rows a
 //! commit gets, how many of them show before "More refs (N)", and what each
 //! ref's submenu section holds. No GPUI here, so the shape (order, labels,
-//! enabled state, hidden items) is unit-testable; a later step converts the
-//! entries to the UI kit's menu entries.
+//! enabled state, hidden items) is unit-testable; `history_view` converts the
+//! entries to the UI kit's menu entries (`ref_menu_entries`).
 //!
 //! Design: `docs/design/prototype/menus-refs.html`. Items the design marks
 //! "Planned" (Rebase onto, Fast-forward, Compare with HEAD, Hide from graph,
 //! Interactive rebase) are not part of the model.
-
-// The model is constructed by the History menus in a later step; until then
-// only the tests use it.
-#![allow(dead_code)]
 
 use forge::{ServiceKind, WebTarget};
 use git_core::{Head, Oid, Operation, Ref, RefKind};
