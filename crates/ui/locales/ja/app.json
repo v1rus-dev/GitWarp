@@ -24,7 +24,9 @@
   "app.menu.view": "表示",
   "app.menu.window": "ウインドウ",
   "app.menu.zoom": "拡大/縮小",
+  "app.update.apply_failed": "更新をインストールできませんでした: {reason}",
   "app.update.available": "GitWarp {version} が利用できます",
   "app.update.ready": "GitWarp {version} をインストールする準備ができました",
+  "app.update.restart": "再起動して更新",
   "app.update.view_release": "リリースを表示"
 }

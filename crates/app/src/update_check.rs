@@ -12,7 +12,7 @@ use gpui::{AnyWindowHandle, App};
 use ui::toast::{self, ToastAction, ToastBody, ToastId, ToastKind};
 
 use crate::settings::UpdateChannel;
-use crate::updater;
+use crate::updater::{self, StagedUpdate};
 use crate::workspace::Workspace;
 use crate::AppSettings;
 
@@ -211,14 +211,43 @@ fn read_settings(cx: &App) -> Option<UpdateSettings> {
     })
 }
 
+/// The "Restart to update" toast button: applies `staged` off the UI thread,
+/// then quits (the installer helper or the new AppImage starts the app again).
+fn restart_action(staged: StagedUpdate) -> ToastAction {
+    ToastAction::new(ui::t!("app.update.restart"), move |_, cx| {
+        let staged = staged.clone();
+        cx.spawn(async move |cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { updater::apply(&staged, true) })
+                .await;
+            cx.update(|cx| match result {
+                Ok(()) => cx.quit(),
+                Err(e) => {
+                    log::warn!("applying the update failed: {e}");
+                    let text = ui::t!("app.update.apply_failed", reason = e.to_string());
+                    if let Some(window) = live_workspace_window(cx) {
+                        let _ = window.update(cx, |_, window, cx| {
+                            toast::show_with(ToastKind::Error, text, None, window, cx)
+                        });
+                    }
+                }
+            });
+        })
+        .detach();
+    })
+}
+
 /// Shows the update toast in `window`, replacing `previous` (the earlier update
-/// toast; its window may be gone). `ready` is the "downloaded, ready to install"
-/// variant. Returns the new toast.
+/// toast; its window may be gone). With `staged` it is the "downloaded, ready to
+/// install" variant, which offers "Restart to update" when this installation can
+/// apply the update (the toast has room for one button, so "View release" is
+/// left out then; the earlier "available" toast had it). Returns the new toast.
 fn show_update_toast(
     cx: &mut App,
     window: AnyWindowHandle,
     previous: Option<(AnyWindowHandle, ToastId)>,
-    ready: bool,
+    staged: Option<StagedUpdate>,
     version: &Version,
     tag: &str,
 ) -> Option<ToastId> {
@@ -234,11 +263,16 @@ fn show_update_toast(
     // `parse_version` is put into the URL.
     let url = format!("https://github.com/{OWNER}/{REPO}/releases/tag/{tag}");
     let shown_version = format!("v{version}");
+    let ready = staged.is_some();
+    let apply = staged.filter(|staged| updater::can_apply(staged.kind));
     window
         .update(cx, |_, window, cx| {
-            let action = ToastAction::new(ui::t!("app.update.view_release"), move |_, cx| {
-                cx.open_url(&url);
-            });
+            let action = match apply {
+                Some(staged) => restart_action(staged),
+                None => ToastAction::new(ui::t!("app.update.view_release"), move |_, cx| {
+                    cx.open_url(&url);
+                }),
+            };
             let text = if ready {
                 ui::t!("app.update.ready", version = shown_version)
             } else {
@@ -272,6 +306,23 @@ fn live_workspace_window(cx: &App) -> Option<AnyWindowHandle> {
     })
 }
 
+/// Applies a staged update when the app quits (if the settings allow it), so
+/// the next start runs the new version. Called from the quit hook; the apply
+/// itself is quick (a copy or spawning the installer helper).
+pub fn apply_on_quit(cx: &mut App) {
+    let Some(settings) = cx.try_global::<AppSettings>().map(|g| &g.settings) else {
+        return;
+    };
+    if !(settings.check_updates && settings.auto_install_updates) {
+        return;
+    }
+    match updater::apply_newest_staged() {
+        Ok(Some(version)) => log::info!("update {version} handed over to be installed on quit"),
+        Ok(None) => {}
+        Err(e) => log::warn!("installing the update on quit failed: {e}"),
+    }
+}
+
 /// Starts the update schedule for the lifetime of the app. The first tick is
 /// ten seconds after the call, then it wakes up every minute. On each tick it
 /// reads the current settings and does nothing when `check_updates` is off;
@@ -280,7 +331,11 @@ fn live_workspace_window(cx: &App) -> Option<AnyWindowHandle> {
 /// passed since it. A failed request is retried after 15 minutes (at once on
 /// a channel change or after the checks were switched off and on). A newer
 /// version than the one last announced (stored in the settings) is shown in a
-/// live workspace window, waiting for one if there is none.
+/// live workspace window, waiting for one if there is none. A newer version
+/// is downloaded and verified whenever none is staged for it yet (also when it
+/// was announced in an earlier session) if this installation can apply it, and
+/// an update staged by an earlier session is found at start; either gets a
+/// "ready" toast once per launch.
 pub fn start(cx: &mut App) {
     let Some(running) = parse_version(env!("CARGO_PKG_VERSION")) else {
         log::warn!("update check disabled: the running version is not SemVer");
@@ -292,8 +347,19 @@ pub fn start(cx: &mut App) {
         // An update to announce as soon as a window is available, with the
         // channel it was found on.
         let mut pending: Option<(UpdateChannel, Version, String)> = None;
-        // The files of the pending release, for staging the update.
-        let mut pending_assets: Vec<ReleaseAsset> = Vec::new();
+        // The newest release on the channel to download, with its files.
+        let mut to_stage: Option<(Version, String, Vec<ReleaseAsset>)> = None;
+        // A staged update whose "ready" toast is still to be shown.
+        let mut ready_pending: Option<StagedUpdate> = cx
+            .background_executor()
+            .spawn(async { updater::find_staged() })
+            .await;
+        // The version that is staged (found at start or downloaded), and the
+        // one a "ready" toast was shown for in this launch.
+        let mut staged_version: Option<Version> = ready_pending
+            .as_ref()
+            .and_then(|staged| parse_version(&staged.version));
+        let mut ready_shown: Option<Version> = None;
         let mut last_toast: Option<(AnyWindowHandle, ToastId)> = None;
         let mut delay = FIRST_CHECK_DELAY;
         loop {
@@ -334,64 +400,86 @@ pub fn start(cx: &mut App) {
                         .as_ref()
                         .map_or_else(|| "none".to_string(), |(v, _)| v.to_string())
                 );
+                let assets_of = |tag: &str| {
+                    releases
+                        .iter()
+                        .find(|r| r.tag_name == tag)
+                        .map(|release| release.assets.clone())
+                        .unwrap_or_default()
+                };
+                to_stage = latest
+                    .as_ref()
+                    .filter(|(version, _)| {
+                        *version > running && staged_version.as_ref() != Some(version)
+                    })
+                    .map(|(version, tag)| (version.clone(), tag.clone(), assets_of(tag)));
                 pending = update_to_announce(&running, notified.as_ref(), latest)
                     .map(|(version, tag)| (channel, version, tag));
-                pending_assets = pending
-                    .as_ref()
-                    .and_then(|(_, _, tag)| releases.iter().find(|r| &r.tag_name == tag))
-                    .map(|release| release.assets.clone())
-                    .unwrap_or_default();
             }
 
-            let Some((pending_channel, version, tag)) = pending.clone() else {
-                continue;
-            };
-            // Read again: the settings may have changed while the request ran.
-            let Some(now) = cx.update(|cx| read_settings(cx)) else {
-                continue;
-            };
-            if !now.enabled {
-                continue;
-            }
-            if now.channel != pending_channel {
-                // Found on another channel; the next tick checks this one.
-                pending = None;
-                continue;
-            }
-            let Some((version, tag)) =
-                update_to_announce(&running, now.notified.as_ref(), Some((version, tag)))
-            else {
-                pending = None;
-                continue;
-            };
+            'announce: {
+                let Some((pending_channel, version, tag)) = pending.clone() else {
+                    break 'announce;
+                };
+                // Read again: the settings may have changed while the request ran.
+                let Some(now) = cx.update(|cx| read_settings(cx)) else {
+                    break 'announce;
+                };
+                if !now.enabled {
+                    break 'announce;
+                }
+                if now.channel != pending_channel {
+                    // Found on another channel; the next tick checks this one.
+                    pending = None;
+                    break 'announce;
+                }
+                let Some((version, tag)) =
+                    update_to_announce(&running, now.notified.as_ref(), Some((version, tag)))
+                else {
+                    pending = None;
+                    break 'announce;
+                };
 
-            let previous = last_toast;
-            let shown = cx.update(|cx| {
-                let window = live_workspace_window(cx)?;
-                let id = show_update_toast(cx, window, previous, false, &version, &tag)?;
-                // Announced once: later launches skip this version.
-                let announced = version.to_string();
-                crate::update_settings(cx, |settings| {
-                    settings.update_notified_version = Some(announced);
+                let previous = last_toast;
+                // A "ready" toast for this version already says more.
+                let already_ready = ready_shown.as_ref() == Some(&version);
+                let shown = cx.update(|cx| {
+                    let window = live_workspace_window(cx)?;
+                    let id = if already_ready {
+                        None
+                    } else {
+                        Some(show_update_toast(
+                            cx, window, previous, None, &version, &tag,
+                        )?)
+                    };
+                    // Announced once: later launches skip this version.
+                    let announced = version.to_string();
+                    crate::update_settings(cx, |settings| {
+                        settings.update_notified_version = Some(announced);
+                    });
+                    Some((window, id))
                 });
-                Some((window, id))
-            });
-            // With no live workspace window the update stays pending.
-            if let Some(toast) = shown {
-                last_toast = Some(toast);
-                pending = None;
+                // With no live workspace window the update stays pending.
+                if let Some((window, id)) = shown {
+                    if let Some(id) = id {
+                        last_toast = Some((window, id));
+                    }
+                    pending = None;
+                }
+            }
 
-                // Download and verify the update when this installation can
-                // apply one; on success the toast says it is ready.
-                let assets = std::mem::take(&mut pending_assets);
+            // Download and verify the update when this installation can apply
+            // one.
+            if let Some((version, tag, assets)) = to_stage.take() {
                 let kind = updater::detect_install_kind();
-                if updater::asset_for(kind, &version.to_string(), &assets).is_some() {
-                    let stage_tag = tag.clone();
+                if updater::can_apply(kind)
+                    && updater::asset_for(kind, &version.to_string(), &assets).is_some()
+                {
                     let staged = cx
                         .background_executor()
                         .spawn(async move {
                             let cancel = AtomicBool::new(false);
-                            updater::stage(&stage_tag, &assets, kind, |_, _| {}, &cancel)
+                            updater::stage(&tag, &assets, kind, |_, _| {}, &cancel)
                         })
                         .await;
                     match staged {
@@ -401,20 +489,43 @@ pub fn start(cx: &mut App) {
                                 staged.version,
                                 staged.path.display()
                             );
-                            let previous = last_toast;
-                            let ready = cx.update(|cx| {
-                                let window = live_workspace_window(cx)?;
-                                let id =
-                                    show_update_toast(cx, window, previous, true, &version, &tag)?;
-                                Some((window, id))
-                            });
-                            if ready.is_some() {
-                                last_toast = ready;
-                            }
+                            staged_version = Some(version);
+                            ready_pending = Some(staged);
                         }
                         // The "available" toast stays.
                         Err(e) => log::warn!("staging update {version} failed: {e}"),
                     }
+                }
+            }
+
+            // The "ready" toast, once per version and launch.
+            if let Some(staged) = ready_pending.take() {
+                match parse_version(&staged.version) {
+                    Some(version) if ready_shown.as_ref() != Some(&version) => {
+                        let previous = last_toast;
+                        let tag = format!("v{version}");
+                        let shown = cx.update(|cx| {
+                            let window = live_workspace_window(cx)?;
+                            let id = show_update_toast(
+                                cx,
+                                window,
+                                previous,
+                                Some(staged.clone()),
+                                &version,
+                                &tag,
+                            )?;
+                            Some((window, id))
+                        });
+                        match shown {
+                            Some(toast) => {
+                                last_toast = Some(toast);
+                                ready_shown = Some(version);
+                            }
+                            // No live window yet: try again on the next tick.
+                            None => ready_pending = Some(staged),
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

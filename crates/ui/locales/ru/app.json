@@ -24,7 +24,9 @@
   "app.menu.view": "Вид",
   "app.menu.window": "Окно",
   "app.menu.zoom": "Масштаб",
+  "app.update.apply_failed": "Не удалось установить обновление: {reason}",
   "app.update.available": "Доступен GitWarp {version}",
   "app.update.ready": "GitWarp {version} готов к установке",
+  "app.update.restart": "Перезапустить и обновить",
   "app.update.view_release": "Открыть релиз"
 }

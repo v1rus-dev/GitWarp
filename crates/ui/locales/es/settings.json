@@ -213,6 +213,8 @@
   "settings.form.increase": "Aumentar",
   "settings.general.activity.desc": "El mapa de calor de commits en la pantalla de bienvenida y sobre el historial. Ocultarlo no elimina ningún dato.",
   "settings.general.activity.title": "Mostrar estadísticas de actividad",
+  "settings.general.auto_install.desc": "Una actualización descargada se instala al cerrar GitWarp.",
+  "settings.general.auto_install.title": "Instalar actualizaciones al salir",
   "settings.general.channel.beta": "Beta",
   "settings.general.channel.desc_off": "Activa la búsqueda de actualizaciones para elegir un canal.",
   "settings.general.channel.desc_on": "Beta también avisa de las versiones preliminares, que pueden tener regresiones.",

@@ -24,7 +24,9 @@
   "app.menu.view": "Ver",
   "app.menu.window": "Ventana",
   "app.menu.zoom": "Zoom",
+  "app.update.apply_failed": "No se pudo instalar la actualización: {reason}",
   "app.update.available": "GitWarp {version} está disponible",
   "app.update.ready": "GitWarp {version} está listo para instalar",
+  "app.update.restart": "Reiniciar para actualizar",
   "app.update.view_release": "Ver la versión"
 }

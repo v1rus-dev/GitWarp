@@ -24,7 +24,9 @@
   "app.menu.view": "View",
   "app.menu.window": "Window",
   "app.menu.zoom": "Zoom",
+  "app.update.apply_failed": "Could not install the update: {reason}",
   "app.update.available": "GitWarp {version} is available",
   "app.update.ready": "GitWarp {version} is ready to install",
+  "app.update.restart": "Restart to update",
   "app.update.view_release": "View release"
 }

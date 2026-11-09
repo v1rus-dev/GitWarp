@@ -452,6 +452,7 @@ fn main() {
             // closing the last window does reach `on_app_quit` on Linux, so
             // this is the one place that has to write the last change.
             cx.on_app_quit(|cx| {
+                update_check::apply_on_quit(cx);
                 flush_settings(cx);
                 async {}
             })

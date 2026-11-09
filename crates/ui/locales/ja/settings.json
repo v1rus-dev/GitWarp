@@ -211,6 +211,8 @@
   "settings.form.increase": "増やす",
   "settings.general.activity.desc": "ウェルカム画面と履歴の上にコミットのヒートマップを表示します。非表示にしてもデータは削除されません。",
   "settings.general.activity.title": "アクティビティ統計を表示",
+  "settings.general.auto_install.desc": "ダウンロード済みの更新は GitWarp の終了時にインストールされます。",
+  "settings.general.auto_install.title": "終了時に更新をインストール",
   "settings.general.channel.beta": "ベータ",
   "settings.general.channel.desc_off": "更新の確認をオンにすると、チャネルを選べます。",
   "settings.general.channel.desc_on": "ベータ版はプレリリースビルドも通知します。不具合を含む場合があります。",

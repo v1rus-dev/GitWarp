@@ -183,6 +183,8 @@ pub struct Settings {
     pub check_updates: bool,
     /// Which releases the update check reports: stable only, or pre-releases too.
     pub update_channel: UpdateChannel,
+    /// Apply a downloaded update when the app quits.
+    pub auto_install_updates: bool,
     /// The last version an update toast was shown for; a version is announced
     /// only if it is newer than this.
     pub update_notified_version: Option<String>,
@@ -269,6 +271,7 @@ impl Default for Settings {
             on_launch: OnLaunch::default(),
             check_updates: true,
             update_channel: UpdateChannel::default(),
+            auto_install_updates: true,
             update_notified_version: None,
             fetch_interval_minutes: 5,
             confirm_force_push: true,
@@ -961,6 +964,11 @@ fn settings_from_value(value: Value) -> Settings {
         on_launch: take(&mut object, "on_launch", defaults.on_launch),
         check_updates: take(&mut object, "check_updates", defaults.check_updates),
         update_channel: take(&mut object, "update_channel", defaults.update_channel),
+        auto_install_updates: take(
+            &mut object,
+            "auto_install_updates",
+            defaults.auto_install_updates,
+        ),
         update_notified_version: take(
             &mut object,
             "update_notified_version",
@@ -1478,6 +1486,21 @@ mod tests {
     }
 
     #[test]
+    fn auto_install_updates_is_on_by_default_and_round_trips() {
+        assert!(Settings::default().auto_install_updates);
+        let dir = TempDir::new("auto-install-updates");
+        assert!(load_json(dir.path(), r#"{"theme":"dark"}"#).auto_install_updates);
+        assert!(!load_json(dir.path(), r#"{"auto_install_updates":false}"#).auto_install_updates);
+        let store = SettingsStore::new(settings_path(dir.path()));
+        let off = Settings {
+            auto_install_updates: false,
+            ..Settings::default()
+        };
+        store.save(&off).unwrap();
+        assert!(!store.load().auto_install_updates);
+    }
+
+    #[test]
     fn ci_status_is_shown_by_default_and_remember_hiding() {
         assert!(Settings::default().show_ci_status);
         let dir = TempDir::new("show-ci-status");
@@ -1636,6 +1659,7 @@ mod tests {
             on_launch: OnLaunch::Welcome,
             check_updates: false,
             update_channel: UpdateChannel::Beta,
+            auto_install_updates: false,
             update_notified_version: Some("0.2.0".to_string()),
             fetch_interval_minutes: 15,
             confirm_force_push: false,
