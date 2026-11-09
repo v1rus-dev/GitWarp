@@ -1,0 +1,760 @@
+//! Pure logic of the repository file watcher: where a repository keeps its git data
+//! ([`GitLayout`]), which kind of change a touched path stands for ([`classify`]) and which
+//! folders have to be watched ([`watch_plan`]). No GPUI and no real watcher here; the watcher
+//! itself is added in step S4 and its wiring into the repository view in S5.
+
+// Nothing calls this module yet: S4 (the watcher) and S5 (the view wiring) are its users.
+#![allow(dead_code)]
+
+use std::ffi::{OsStr, OsString};
+use std::ops::{BitOr, BitOrAssign};
+use std::path::{Component, Path, PathBuf};
+
+use notify_debouncer_full::notify::RecursiveMode;
+
+/// A set of change kinds, a hand-written bitmask (nine kinds, so `u16`).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct Kinds(u16);
+
+impl Kinds {
+    pub const NONE: Kinds = Kinds(0);
+    /// The checked-out `HEAD` of this work tree.
+    pub const HEAD: Kinds = Kinds(1);
+    /// Any branch, tag or remote ref, or `packed-refs`.
+    pub const REFS: Kinds = Kinds(1 << 1);
+    /// The index (staging area).
+    pub const INDEX: Kinds = Kinds(1 << 2);
+    /// A merge / rebase / cherry-pick / revert / bisect state file appeared, changed or went.
+    pub const OPERATION: Kinds = Kinds(1 << 3);
+    /// The stash (its ref or its reflog).
+    pub const STASH: Kinds = Kinds(1 << 4);
+    /// The repository config (remotes, upstreams).
+    pub const CONFIG: Kinds = Kinds(1 << 5);
+    /// A linked worktree was added, removed, locked or moved its HEAD.
+    pub const WORKTREES: Kinds = Kinds(1 << 6);
+    /// A file of the work tree (or of a submodule) changed.
+    pub const WORKTREE_FILES: Kinds = Kinds(1 << 7);
+    /// The backend lost events (queue overflow): everything may have changed.
+    pub const RESCAN: Kinds = Kinds(1 << 8);
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// True when every bit of `other` is set.
+    pub fn contains(self, other: Kinds) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub fn intersects(self, other: Kinds) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// `self` without the bits of `other`.
+    pub fn without(self, other: Kinds) -> Kinds {
+        Kinds(self.0 & !other.0)
+    }
+}
+
+impl BitOr for Kinds {
+    type Output = Kinds;
+    fn bitor(self, rhs: Kinds) -> Kinds {
+        Kinds(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for Kinds {
+    fn bitor_assign(&mut self, rhs: Kinds) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// Where one repository keeps its data, in raw and canonical form.
+///
+/// For a normal repository `git_dir == common_dir`. For a linked worktree `git_dir` is
+/// `<main>/.git/worktrees/<name>` (HEAD, index) and `common_dir` is `<main>/.git` (refs,
+/// config). A bare repository has no `root`.
+#[derive(Clone, Debug)]
+pub struct GitLayout {
+    root: Option<Roots>,
+    git_dir: Roots,
+    common_dir: Roots,
+}
+
+/// One folder as given and as canonicalized. Events carry either form depending on the
+/// platform (macOS reports `/private/var/...` for `/var/...`), so both are matched.
+#[derive(Clone, Debug)]
+struct Roots {
+    raw: PathBuf,
+    canonical: PathBuf,
+}
+
+impl Roots {
+    fn new(raw: &Path) -> Self {
+        let raw = raw.to_path_buf();
+        // A folder that cannot be canonicalized (gone, no access) still matches by its raw form.
+        let canonical = std::fs::canonicalize(&raw)
+            .map(|p| strip_verbatim(&p))
+            .unwrap_or_else(|_| raw.clone());
+        Roots { raw, canonical }
+    }
+
+    /// The part of `path` below this folder (raw form first, then canonical), if any.
+    fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        path.strip_prefix(&self.raw)
+            .ok()
+            .or_else(|| path.strip_prefix(&self.canonical).ok())
+    }
+}
+
+impl GitLayout {
+    /// `root` is the work tree (`None` for a bare repository).
+    pub fn new(root: Option<&Path>, git_dir: &Path, common_dir: &Path) -> Self {
+        GitLayout {
+            root: root.map(Roots::new),
+            git_dir: Roots::new(git_dir),
+            common_dir: Roots::new(common_dir),
+        }
+    }
+
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_ref().map(|r| r.raw.as_path())
+    }
+
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir.raw
+    }
+
+    pub fn common_dir(&self) -> &Path {
+        &self.common_dir.raw
+    }
+
+    fn is_linked(&self) -> bool {
+        self.git_dir.raw != self.common_dir.raw
+    }
+}
+
+/// `std::fs::canonicalize` returns `\\?\C:\x` (or `\\?\UNC\srv\x`) on Windows while events
+/// carry the plain form, so the verbatim prefix is dropped before comparing. A no-op for
+/// every other path.
+fn strip_verbatim(path: &Path) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Which kinds of change touching `path` stands for; [`Kinds::NONE`] for paths nobody
+/// reads (objects, hooks, lock files, `logs/HEAD`, ...).
+pub fn classify(layout: &GitLayout, path: &Path) -> Kinds {
+    let path = strip_verbatim(path);
+    let path = path.as_path();
+
+    // The linked worktree's own git dir sits inside the common dir, so it is tried first.
+    if let Some(rel) = layout.git_dir.relative(path).filter(|r| has_components(r)) {
+        let mut kinds = classify_git_dir(rel);
+        if !layout.is_linked() {
+            kinds |= classify_common_dir(rel);
+        }
+        return kinds;
+    }
+    if layout.is_linked() {
+        if let Some(rel) = layout
+            .common_dir
+            .relative(path)
+            .filter(|r| has_components(r))
+        {
+            return classify_common_dir(rel);
+        }
+    }
+    if layout.git_dir.relative(path).is_some() || layout.common_dir.relative(path).is_some() {
+        // The git dir itself (e.g. its mode changed): nothing anybody reads.
+        return Kinds::NONE;
+    }
+    if let Some(root) = &layout.root {
+        // Everything else below the work tree, a nested `.git` of a submodule included.
+        if root.relative(path).is_some() {
+            return Kinds::WORKTREE_FILES;
+        }
+    }
+    Kinds::NONE
+}
+
+fn has_components(rel: &Path) -> bool {
+    rel.components().next().is_some()
+}
+
+fn names(rel: &Path) -> Vec<&OsStr> {
+    rel.components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A git lock file (`index.lock`, `HEAD.lock`, `refs/heads/x.lock`, `packed-refs.lock`).
+/// It is only the first half of an atomic update: the final name shows up as its own event
+/// or as the second path of a rename event, and that one is what counts.
+fn is_lock(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|n| n.ends_with(".lock"))
+}
+
+/// Files and folders of the per-worktree git dir that mark a running operation.
+const OPERATION_FILES: &[&str] = &[
+    "MERGE_HEAD",
+    "MERGE_MSG",
+    "SQUASH_MSG",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "REBASE_HEAD",
+    "BISECT_LOG",
+];
+const OPERATION_DIRS: &[&str] = &["rebase-merge", "rebase-apply", "sequencer"];
+
+/// `rel` is relative to the per-worktree git dir.
+fn classify_git_dir(rel: &Path) -> Kinds {
+    let c = names(rel);
+    if c.iter().any(|n| is_lock(n)) {
+        return Kinds::NONE;
+    }
+    let Some(first) = c.first().and_then(|n| n.to_str()) else {
+        return Kinds::NONE;
+    };
+    match (first, c.len()) {
+        ("HEAD", 1) => Kinds::HEAD,
+        ("index", 1) => Kinds::INDEX,
+        (name, 1) if OPERATION_FILES.contains(&name) => Kinds::OPERATION,
+        (name, _) if OPERATION_DIRS.contains(&name) => Kinds::OPERATION,
+        _ => Kinds::NONE,
+    }
+}
+
+/// `rel` is relative to the common git dir.
+fn classify_common_dir(rel: &Path) -> Kinds {
+    let c = names(rel);
+    if c.iter().any(|n| is_lock(n)) {
+        return Kinds::NONE;
+    }
+    let Some(first) = c.first().and_then(|n| n.to_str()) else {
+        return Kinds::NONE;
+    };
+    match first {
+        "refs" if c.len() == 2 && c[1] == "stash" => Kinds::STASH | Kinds::REFS,
+        "refs" | "packed-refs" => Kinds::REFS,
+        // `git stash list` reads the reflog, and dropping a stash entry other than the top
+        // one changes only the reflog. Every other reflog is noise.
+        "logs" if c.len() == 3 && c[1] == "refs" && c[2] == "stash" => Kinds::STASH,
+        "config" if c.len() == 1 => Kinds::CONFIG,
+        // `worktrees/<name>` added or removed, or its HEAD / lock marker changed.
+        "worktrees" if c.len() <= 2 => Kinds::WORKTREES,
+        "worktrees" if c[2] == "HEAD" || c[2] == "locked" => Kinds::WORKTREES,
+        // A submodule's git dir: its commit shows up in the parent's status.
+        "modules" => Kinds::WORKTREE_FILES,
+        _ => Kinds::NONE,
+    }
+}
+
+/// How much of the repository is watched.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// Git folders and the work tree.
+    Normal,
+    /// Git folders only. Used after the OS watch limit was hit; the window-activation check
+    /// then covers the work tree.
+    Reduced,
+}
+
+/// The folders to watch for `layout`. `pruned_dirs` are names of top-level work-tree folders
+/// that git ignores (`target`, `node_modules`, ...); they are skipped where a recursive watch
+/// costs a watch per directory (Linux). Folders that do not exist are left out.
+pub fn watch_plan(
+    layout: &GitLayout,
+    mode: Mode,
+    pruned_dirs: &[OsString],
+) -> Vec<(PathBuf, RecursiveMode)> {
+    watch_plan_impl(layout, mode, pruned_dirs, cfg!(target_os = "linux"))
+}
+
+/// `per_dir` is the Linux strategy: inotify watches directories one by one, so the work tree
+/// gets a non-recursive watch on its root plus a recursive one per top-level folder that is
+/// not pruned. Elsewhere a single recursive watch on the root covers everything cheaply.
+fn watch_plan_impl(
+    layout: &GitLayout,
+    mode: Mode,
+    pruned_dirs: &[OsString],
+    per_dir: bool,
+) -> Vec<(PathBuf, RecursiveMode)> {
+    let mut plan: Vec<(PathBuf, RecursiveMode)> = Vec::new();
+    let mut add = |path: PathBuf, recursive: RecursiveMode| {
+        if path.exists() && !plan.iter().any(|(p, _)| *p == path) {
+            plan.push((path, recursive));
+        }
+    };
+
+    let gd = layout.git_dir().to_path_buf();
+    let cd = layout.common_dir().to_path_buf();
+    add(gd, RecursiveMode::NonRecursive);
+    if layout.is_linked() {
+        add(cd.clone(), RecursiveMode::NonRecursive);
+    }
+    add(cd.join("refs"), RecursiveMode::Recursive);
+    add(cd.join("logs").join("refs"), RecursiveMode::NonRecursive);
+    add(cd.join("worktrees"), RecursiveMode::Recursive);
+
+    if mode == Mode::Normal {
+        // A bare repository has no root and so no work-tree entries.
+        if let Some(root) = layout.root() {
+            if per_dir {
+                add(root.to_path_buf(), RecursiveMode::NonRecursive);
+                for dir in top_level_dirs(root, pruned_dirs) {
+                    add(dir, RecursiveMode::Recursive);
+                }
+            } else {
+                add(root.to_path_buf(), RecursiveMode::Recursive);
+            }
+        }
+    }
+    plan
+}
+
+/// Direct child folders of `root` other than `.git` and the pruned ones, sorted. Symlinks
+/// are not followed.
+fn top_level_dirs(root: &Path, pruned_dirs: &[OsString]) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| {
+            let name = e.file_name();
+            name != ".git" && !pruned_dirs.contains(&name)
+        })
+        .map(|e| e.path())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout() -> GitLayout {
+        GitLayout::new(
+            Some(Path::new("/r")),
+            Path::new("/r/.git"),
+            Path::new("/r/.git"),
+        )
+    }
+
+    /// Main repo `/m`, linked worktree `/w`.
+    fn linked() -> GitLayout {
+        GitLayout::new(
+            Some(Path::new("/w")),
+            Path::new("/m/.git/worktrees/w"),
+            Path::new("/m/.git"),
+        )
+    }
+
+    fn bare() -> GitLayout {
+        GitLayout::new(None, Path::new("/b.git"), Path::new("/b.git"))
+    }
+
+    fn c(l: &GitLayout, p: &str) -> Kinds {
+        classify(l, Path::new(p))
+    }
+
+    #[test]
+    fn normal_repo_table() {
+        let l = layout();
+        let cases: &[(&str, Kinds)] = &[
+            ("/r/.git/HEAD", Kinds::HEAD),
+            ("/r/.git/refs/heads/main", Kinds::REFS),
+            ("/r/.git/refs/remotes/origin/x", Kinds::REFS),
+            ("/r/.git/refs/tags/v1", Kinds::REFS),
+            ("/r/.git/refs/stash", Kinds::STASH | Kinds::REFS),
+            ("/r/.git/packed-refs", Kinds::REFS),
+            ("/r/.git/index", Kinds::INDEX),
+            ("/r/.git/MERGE_HEAD", Kinds::OPERATION),
+            ("/r/.git/MERGE_MSG", Kinds::OPERATION),
+            ("/r/.git/SQUASH_MSG", Kinds::OPERATION),
+            ("/r/.git/CHERRY_PICK_HEAD", Kinds::OPERATION),
+            ("/r/.git/REVERT_HEAD", Kinds::OPERATION),
+            ("/r/.git/REBASE_HEAD", Kinds::OPERATION),
+            ("/r/.git/BISECT_LOG", Kinds::OPERATION),
+            ("/r/.git/rebase-merge", Kinds::OPERATION),
+            ("/r/.git/rebase-merge/done", Kinds::OPERATION),
+            ("/r/.git/rebase-apply/patch", Kinds::OPERATION),
+            ("/r/.git/sequencer/todo", Kinds::OPERATION),
+            ("/r/.git/logs/refs/stash", Kinds::STASH),
+            ("/r/.git/logs/HEAD", Kinds::NONE),
+            ("/r/.git/logs/refs/heads/main", Kinds::NONE),
+            ("/r/.git/objects/ab/cdef", Kinds::NONE),
+            ("/r/.git/FETCH_HEAD", Kinds::NONE),
+            ("/r/.git/ORIG_HEAD", Kinds::NONE),
+            ("/r/.git/AUTO_MERGE", Kinds::NONE),
+            ("/r/.git/COMMIT_EDITMSG", Kinds::NONE),
+            ("/r/.git/hooks/pre-commit", Kinds::NONE),
+            ("/r/.git/info/exclude", Kinds::NONE),
+            ("/r/.git/gc.pid", Kinds::NONE),
+            ("/r/.git/gc.log", Kinds::NONE),
+            ("/r/.git/shallow", Kinds::NONE),
+            ("/r/.git/config", Kinds::CONFIG),
+            ("/r/.git/worktrees", Kinds::WORKTREES),
+            ("/r/.git/worktrees/w", Kinds::WORKTREES),
+            ("/r/.git/worktrees/w/HEAD", Kinds::WORKTREES),
+            ("/r/.git/worktrees/w/locked", Kinds::WORKTREES),
+            ("/r/.git/worktrees/w/index", Kinds::NONE),
+            ("/r/.git/modules/sub/HEAD", Kinds::WORKTREE_FILES),
+            ("/r/.git/modules/sub/refs/heads/x", Kinds::WORKTREE_FILES),
+            ("/r/.git/unknown", Kinds::NONE),
+            // The git dir itself, and a work-tree path.
+            ("/r/.git", Kinds::NONE),
+            ("/r/src/main.rs", Kinds::WORKTREE_FILES),
+            ("/r/Cargo.lock", Kinds::WORKTREE_FILES),
+            ("/r/sub/.git", Kinds::WORKTREE_FILES),
+            ("/r/sub/.git/HEAD", Kinds::WORKTREE_FILES),
+            // Outside the repository.
+            ("/elsewhere/file", Kinds::NONE),
+            ("/rx/file", Kinds::NONE),
+        ];
+        for (path, want) in cases {
+            assert_eq!(c(&l, path), *want, "{path}");
+        }
+    }
+
+    #[test]
+    fn lock_files_are_ignored() {
+        let l = layout();
+        for p in [
+            "/r/.git/index.lock",
+            "/r/.git/HEAD.lock",
+            "/r/.git/refs/heads/x.lock",
+            "/r/.git/refs/stash.lock",
+            "/r/.git/packed-refs.lock",
+            "/r/.git/config.lock",
+            "/r/.git/MERGE_HEAD.lock",
+            "/r/.git/worktrees/w/HEAD.lock",
+        ] {
+            assert_eq!(c(&l, p), Kinds::NONE, "{p}");
+        }
+    }
+
+    #[test]
+    fn rename_of_a_lock_file_counts_through_its_final_name() {
+        // The debouncer can report `x.lock -> x` as one event with both paths; the caller
+        // ORs `classify` over every path, so the final name must carry the kind.
+        let l = layout();
+        let both = c(&l, "/r/.git/refs/heads/x.lock") | c(&l, "/r/.git/refs/heads/x");
+        assert_eq!(both, Kinds::REFS);
+        let both = c(&l, "/r/.git/index.lock") | c(&l, "/r/.git/index");
+        assert_eq!(both, Kinds::INDEX);
+        let both = c(&l, "/r/.git/HEAD.lock") | c(&l, "/r/.git/HEAD");
+        assert_eq!(both, Kinds::HEAD);
+    }
+
+    #[test]
+    fn linked_worktree_table() {
+        let l = linked();
+        let cases: &[(&str, Kinds)] = &[
+            // Per-worktree git dir: HEAD, index, operations.
+            ("/m/.git/worktrees/w/HEAD", Kinds::HEAD),
+            ("/m/.git/worktrees/w/index", Kinds::INDEX),
+            ("/m/.git/worktrees/w/MERGE_HEAD", Kinds::OPERATION),
+            ("/m/.git/worktrees/w/rebase-merge/done", Kinds::OPERATION),
+            ("/m/.git/worktrees/w/logs/HEAD", Kinds::NONE),
+            ("/m/.git/worktrees/w/index.lock", Kinds::NONE),
+            // Refs and config are shared and live in the common dir.
+            ("/m/.git/refs/heads/main", Kinds::REFS),
+            ("/m/.git/refs/stash", Kinds::STASH | Kinds::REFS),
+            ("/m/.git/packed-refs", Kinds::REFS),
+            ("/m/.git/config", Kinds::CONFIG),
+            ("/m/.git/logs/refs/stash", Kinds::STASH),
+            // The main worktree's HEAD and index are not this window's business.
+            ("/m/.git/HEAD", Kinds::NONE),
+            ("/m/.git/index", Kinds::NONE),
+            // Other linked worktrees and the folder of this one.
+            ("/m/.git/worktrees", Kinds::WORKTREES),
+            ("/m/.git/worktrees/w", Kinds::WORKTREES),
+            ("/m/.git/worktrees/other", Kinds::WORKTREES),
+            ("/m/.git/worktrees/other/HEAD", Kinds::WORKTREES),
+            ("/m/.git/worktrees/other/index", Kinds::NONE),
+            ("/m/.git/modules/sub/HEAD", Kinds::WORKTREE_FILES),
+            // Work tree.
+            ("/w/src/lib.rs", Kinds::WORKTREE_FILES),
+            ("/w/.git", Kinds::WORKTREE_FILES),
+            ("/m/src/lib.rs", Kinds::NONE),
+        ];
+        for (path, want) in cases {
+            assert_eq!(c(&l, path), *want, "{path}");
+        }
+    }
+
+    #[test]
+    fn bare_repo_has_no_worktree_files() {
+        let l = bare();
+        assert_eq!(c(&l, "/b.git/HEAD"), Kinds::HEAD);
+        assert_eq!(c(&l, "/b.git/refs/heads/main"), Kinds::REFS);
+        assert_eq!(c(&l, "/b.git/config"), Kinds::CONFIG);
+        assert_eq!(c(&l, "/b.git/objects/aa/bb"), Kinds::NONE);
+        assert_eq!(c(&l, "/other/file"), Kinds::NONE);
+    }
+
+    /// Raw and canonical forms differ when the repository path goes through a symlink
+    /// (`/var -> /private/var` on macOS); events may carry either.
+    #[cfg(unix)]
+    #[test]
+    fn raw_and_canonical_prefixes_both_match() {
+        let base = TempDir::new("classify-canon");
+        let real = base.path().join("real");
+        std::fs::create_dir_all(real.join(".git")).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let raw_root = link.clone();
+        let l = GitLayout::new(
+            Some(&raw_root),
+            &raw_root.join(".git"),
+            &raw_root.join(".git"),
+        );
+        let canon_root = std::fs::canonicalize(&real).unwrap();
+        assert_ne!(raw_root, canon_root);
+        for root in [&raw_root, &canon_root] {
+            assert_eq!(classify(&l, &root.join(".git/HEAD")), Kinds::HEAD);
+            assert_eq!(classify(&l, &root.join(".git/refs/heads/x")), Kinds::REFS);
+            assert_eq!(classify(&l, &root.join("src/a.rs")), Kinds::WORKTREE_FILES);
+        }
+    }
+
+    #[test]
+    fn verbatim_prefix_is_stripped() {
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\repo\.git")),
+            PathBuf::from(r"C:\repo\.git")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\UNC\srv\share\r")),
+            PathBuf::from(r"\\srv\share\r")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new("/r/.git")),
+            PathBuf::from("/r/.git")
+        );
+        assert_eq!(strip_verbatim(Path::new(r"C:\r")), PathBuf::from(r"C:\r"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_event_paths_match_plain_layout() {
+        let l = GitLayout::new(
+            Some(Path::new(r"C:\r")),
+            Path::new(r"C:\r\.git"),
+            Path::new(r"C:\r\.git"),
+        );
+        assert_eq!(classify(&l, Path::new(r"\\?\C:\r\.git\HEAD")), Kinds::HEAD);
+    }
+
+    #[test]
+    fn kinds_bit_operations() {
+        let k = Kinds::HEAD | Kinds::REFS;
+        assert!(k.contains(Kinds::HEAD));
+        assert!(!k.contains(Kinds::INDEX));
+        assert!(k.intersects(Kinds::REFS | Kinds::INDEX));
+        assert_eq!(k.without(Kinds::HEAD), Kinds::REFS);
+        assert!(Kinds::NONE.is_empty());
+        let mut m = Kinds::NONE;
+        m |= Kinds::STASH;
+        assert_eq!(m, Kinds::STASH);
+    }
+
+    /// A unique temp folder removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("gitwarp-watch-{name}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn mkdirs(base: &Path, rels: &[&str]) {
+        for r in rels {
+            std::fs::create_dir_all(base.join(r)).unwrap();
+        }
+    }
+
+    use RecursiveMode::{NonRecursive as NR, Recursive as R};
+
+    #[test]
+    fn plan_normal_repo_linux_strategy() {
+        let t = TempDir::new("plan-normal");
+        let root = t.path();
+        mkdirs(
+            root,
+            &[".git/refs", ".git/logs/refs", "src", "target", "docs"],
+        );
+        std::fs::write(root.join("file.txt"), "x").unwrap();
+        let l = GitLayout::new(Some(root), &root.join(".git"), &root.join(".git"));
+        let plan = watch_plan_impl(&l, Mode::Normal, &[OsString::from("target")], true);
+        assert_eq!(
+            plan,
+            vec![
+                (root.join(".git"), NR),
+                (root.join(".git/refs"), R),
+                (root.join(".git/logs/refs"), NR),
+                (root.to_path_buf(), NR),
+                (root.join("docs"), R),
+                (root.join("src"), R),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_normal_repo_recursive_root_strategy() {
+        let t = TempDir::new("plan-recursive");
+        let root = t.path();
+        mkdirs(root, &[".git/refs", "src", "target"]);
+        let l = GitLayout::new(Some(root), &root.join(".git"), &root.join(".git"));
+        // The pruned list is a Linux-only optimisation: elsewhere the root is watched as a whole.
+        let plan = watch_plan_impl(&l, Mode::Normal, &[OsString::from("target")], false);
+        assert_eq!(
+            plan,
+            vec![
+                (root.join(".git"), NR),
+                (root.join(".git/refs"), R),
+                (root.to_path_buf(), R),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_missing_folders_are_skipped() {
+        let t = TempDir::new("plan-missing");
+        let root = t.path();
+        // No refs, logs or worktrees folders at all.
+        mkdirs(root, &[".git"]);
+        let l = GitLayout::new(Some(root), &root.join(".git"), &root.join(".git"));
+        let plan = watch_plan_impl(&l, Mode::Reduced, &[], true);
+        assert_eq!(plan, vec![(root.join(".git"), NR)]);
+
+        // A root that is gone is skipped too.
+        let gone = GitLayout::new(
+            Some(&root.join("nope")),
+            &root.join(".git"),
+            &root.join(".git"),
+        );
+        let plan = watch_plan_impl(&gone, Mode::Normal, &[], true);
+        assert_eq!(plan, vec![(root.join(".git"), NR)]);
+    }
+
+    #[test]
+    fn plan_reduced_mode_has_git_dirs_only() {
+        let t = TempDir::new("plan-reduced");
+        let root = t.path();
+        mkdirs(
+            root,
+            &[".git/refs", ".git/logs/refs", ".git/worktrees", "src"],
+        );
+        let l = GitLayout::new(Some(root), &root.join(".git"), &root.join(".git"));
+        for per_dir in [true, false] {
+            let plan = watch_plan_impl(&l, Mode::Reduced, &[], per_dir);
+            assert_eq!(
+                plan,
+                vec![
+                    (root.join(".git"), NR),
+                    (root.join(".git/refs"), R),
+                    (root.join(".git/logs/refs"), NR),
+                    (root.join(".git/worktrees"), R),
+                ],
+                "per_dir = {per_dir}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_linked_worktree() {
+        let t = TempDir::new("plan-linked");
+        let base = t.path();
+        let main = base.join("m");
+        let work = base.join("w");
+        mkdirs(
+            &main,
+            &[".git/refs", ".git/logs/refs", ".git/worktrees/w", "src"],
+        );
+        mkdirs(&work, &["src", "target"]);
+        // `.git` of a linked worktree is a file, never a folder.
+        std::fs::write(work.join(".git"), "gitdir: x").unwrap();
+        let gd = main.join(".git/worktrees/w");
+        let cd = main.join(".git");
+        let l = GitLayout::new(Some(&work), &gd, &cd);
+        let plan = watch_plan_impl(&l, Mode::Normal, &[OsString::from("target")], true);
+        assert_eq!(
+            plan,
+            vec![
+                (gd.clone(), NR),
+                (cd.clone(), NR),
+                (cd.join("refs"), R),
+                (cd.join("logs/refs"), NR),
+                (cd.join("worktrees"), R),
+                (work.clone(), NR),
+                (work.join("src"), R),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_bare_repo_has_no_worktree_entries() {
+        let t = TempDir::new("plan-bare");
+        let b = t.path();
+        mkdirs(b, &["refs", "objects"]);
+        let l = GitLayout::new(None, b, b);
+        for per_dir in [true, false] {
+            let plan = watch_plan_impl(&l, Mode::Normal, &[], per_dir);
+            assert_eq!(plan, vec![(b.to_path_buf(), NR), (b.join("refs"), R)]);
+        }
+    }
+
+    #[test]
+    fn plan_top_level_files_and_symlinks_are_not_watched_recursively() {
+        let t = TempDir::new("plan-files");
+        let root = t.path();
+        mkdirs(root, &[".git", "real"]);
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        let l = GitLayout::new(Some(root), &root.join(".git"), &root.join(".git"));
+        let plan = watch_plan_impl(&l, Mode::Normal, &[], true);
+        assert_eq!(
+            plan,
+            vec![
+                (root.join(".git"), NR),
+                (root.to_path_buf(), NR),
+                (root.join("real"), R),
+            ]
+        );
+    }
+}
