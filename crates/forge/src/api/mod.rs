@@ -32,7 +32,7 @@ pub use pulls::{
     list_pull_requests, pull_request_review, pull_requests_for_branches, PrFilter, PrState,
     PrStateFilter, PullPage, PullRequest, ReviewState,
 };
-pub use releases::Release;
+pub use releases::{Release, ReleaseAsset};
 pub use repos_write::{
     create_pull_request, pull_request_head_ref, CreatedPullRequest, NewPullRequest,
 };

@@ -51,6 +51,7 @@ mod test_support;
 mod text_runs;
 mod theme;
 mod update_check;
+mod updater;
 mod web_links;
 mod welcome;
 mod welcome_activity;

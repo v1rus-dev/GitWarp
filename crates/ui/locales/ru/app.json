@@ -25,5 +25,6 @@
   "app.menu.window": "Окно",
   "app.menu.zoom": "Масштаб",
   "app.update.available": "Доступен GitWarp {version}",
+  "app.update.ready": "GitWarp {version} готов к установке",
   "app.update.view_release": "Открыть релиз"
 }

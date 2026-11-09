@@ -25,5 +25,6 @@
   "app.menu.window": "ウインドウ",
   "app.menu.zoom": "拡大/縮小",
   "app.update.available": "GitWarp {version} が利用できます",
+  "app.update.ready": "GitWarp {version} をインストールする準備ができました",
   "app.update.view_release": "リリースを表示"
 }

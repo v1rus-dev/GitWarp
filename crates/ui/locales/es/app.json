@@ -25,5 +25,6 @@
   "app.menu.window": "Ventana",
   "app.menu.zoom": "Zoom",
   "app.update.available": "GitWarp {version} está disponible",
+  "app.update.ready": "GitWarp {version} está listo para instalar",
   "app.update.view_release": "Ver la versión"
 }

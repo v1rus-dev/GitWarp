@@ -25,5 +25,6 @@
   "app.menu.window": "Fenster",
   "app.menu.zoom": "Zoomen",
   "app.update.available": "GitWarp {version} ist verfügbar",
+  "app.update.ready": "GitWarp {version} ist bereit zur Installation",
   "app.update.view_release": "Release ansehen"
 }
