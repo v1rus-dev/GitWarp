@@ -53,9 +53,10 @@ The in-app updater installs a download only if `SHA256SUMS.txt` has a valid
 compiled into the app. That key lives in one file, `packaging/update-key.pub`; the app embeds it at build
 time and the release workflow verifies the fresh signature against it before publishing.
 
-**Current state: `packaging/update-key.pub` holds a PLACEHOLDER whose secret key nobody has.** Until the real
-key is committed, the `publish` job fails at "Verify signature" on purpose (and at "Sign checksums" while
-`MINISIGN_SECRET_KEY` is unset), so nothing unsigned or unverifiable is ever released.
+**Current state: `packaging/update-key.pub` holds the real release key (id `798F1D95D6984FDD`).** The `publish`
+job needs the repository secret `MINISIGN_SECRET_KEY` (and `MINISIGN_PASSWORD` if the key has a password). It fails
+at "Sign checksums" while the secret is unset and at "Verify signature" if the secret does not belong to this key,
+so nothing unsigned or unverifiable is ever released.
 
 One-time setup (do this on your own machine; the secret key never goes into the repo or chat):
 

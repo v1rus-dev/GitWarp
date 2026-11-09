@@ -1066,8 +1066,8 @@ mod tests {
     }
 
     #[test]
-    fn the_embedded_placeholder_key_verifies_nothing() {
-        let dir = temp_dir("verify-placeholder");
+    fn the_embedded_key_rejects_files_signed_by_other_keys() {
+        let dir = temp_dir("verify-embedded-key");
         let file = payload_file(&dir, b"payload");
         assert!(verify(&file, NAME, SUMS, SIG_A).is_err());
         let _ = fs::remove_dir_all(&dir);
@@ -1382,7 +1382,7 @@ mod tests {
         write_version(&root, "1.2.3", NAME, b"tampered");
         assert!(find_staged_with_key(&root, &running, kind, KEY_A).is_none());
         assert!(!root.join("1.2.3").exists());
-        // Good file, but the embedded (placeholder) key does not match.
+        // Good file, but the fixtures are signed by a test key, not the embedded one.
         write_version(&root, "1.2.3", NAME, b"payload");
         assert!(find_staged_with_key(&root, &running, kind, UPDATE_PUBLIC_KEY).is_none());
         // A kind without a release file finds nothing.
