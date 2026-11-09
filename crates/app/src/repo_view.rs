@@ -1337,6 +1337,13 @@ impl RepositoryView {
         let started = cx.background_executor().spawn(async move {
             let repo =
                 Repo::open(git.clone(), &root).map_err(|e| StartError::Other(e.to_string()))?;
+            // git-core has no logger of its own: route its recoverable-problem warnings here.
+            git_core::set_warning_sink(|message| log::warn!("{message}"));
+            // Scratch index copies a crashed run left behind (we are off the UI thread).
+            let stale = repo.remove_stale_scratch_files();
+            if stale > 0 {
+                log::info!("removed {stale} stale scratch index file(s)");
+            }
             let common =
                 git_core::common_dir(&repo).map_err(|e| StartError::Other(e.to_string()))?;
             let layout = GitLayout::new(Some(repo.root()), repo.git_dir(), &common);

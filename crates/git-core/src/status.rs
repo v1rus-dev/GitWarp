@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use crate::conflict::IndexStage;
@@ -290,26 +290,102 @@ pub(crate) fn literal_command(repo: &Repo) -> std::process::Command {
 /// a split index finds its `sharedindex.*` files there. Dropped after the run.
 struct ScratchIndex(PathBuf);
 
+/// File-name prefix of the scratch copies; the name is
+/// `index.gitwarp-<pid>-<n>-<unix seconds>`, so a stale one can be recognised
+/// by age (process liveness is not portable).
+const SCRATCH_PREFIX: &str = "index.gitwarp-";
+/// A scratch copy older than this is a leftover of a crashed run.
+const SCRATCH_STALE_SECS: u64 = 3600;
+
+type WarningSink = fn(&str);
+static WARNING_SINK: std::sync::OnceLock<WarningSink> = std::sync::OnceLock::new();
+
+/// Where the crate reports problems it recovers from (git-core has no logger
+/// of its own and takes no logging dependency). The first call wins.
+pub fn set_warning_sink(sink: WarningSink) {
+    let _ = WARNING_SINK.set(sink);
+}
+
+/// Reports `message` once per git dir.
+fn warn_once(git_dir: &Path, message: &str) {
+    static SEEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut seen) = SEEN.lock() else { return };
+    if seen.iter().any(|dir| dir == git_dir) {
+        return;
+    }
+    seen.push(git_dir.to_path_buf());
+    if let Some(sink) = WARNING_SINK.get() {
+        sink(message);
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 impl ScratchIndex {
     /// `None` when there is no index to copy (a fresh repository): nothing
     /// to refresh then, so the plain command is already read-only.
+    ///
+    /// Also `None` when making the copy fails (warned once per repository).
+    /// The diff then runs on the real index, still with `GIT_OPTIONAL_LOCKS=0`
+    /// (which `git diff` ignores): residual risk is that it briefly holds
+    /// `index.lock` and rewrites the stat cache, so a `git commit` started in
+    /// the same instant can fail with "index.lock: File exists". Rare (needs a
+    /// full disk, a permission problem or a filesystem without `set_modified`),
+    /// and preferable to showing no diff.
     fn copy_of(repo: &Repo) -> Option<Self> {
+        let original = repo.git_dir().join("index");
+        match fs::metadata(&original) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                Self::warn_failed(repo, &error);
+                return None;
+            }
+        }
+        match Self::try_copy(repo, &original) {
+            Ok(scratch) => Some(scratch),
+            Err(error) => {
+                Self::warn_failed(repo, &error);
+                None
+            }
+        }
+    }
+
+    fn warn_failed(repo: &Repo, error: &std::io::Error) {
+        warn_once(
+            repo.git_dir(),
+            &format!(
+                "cannot copy the index for a read-only diff ({error}); diffing the real index, \
+                 which may briefly take index.lock"
+            ),
+        );
+    }
+
+    fn try_copy(repo: &Repo, original: &Path) -> std::io::Result<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let copy = repo
-            .git_dir()
-            .join(format!("index.gitwarp-{}-{n}", std::process::id()));
-        let original = repo.git_dir().join("index");
-        fs::copy(&original, &copy).ok()?;
+        let copy = repo.git_dir().join(format!(
+            "{SCRATCH_PREFIX}{}-{n}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        // The guard exists before the copy, so Drop removes a partly written one.
         let scratch = Self(copy);
+        fs::copy(original, &scratch.0)?;
         // Keep the original's mtime: git decides which entries are "racily clean" (same
         // second as the index was written, so their stat data proves nothing) by comparing
         // against the index file's mtime. A fresh mtime on the copy makes such entries look
         // clean and a same-size edit made right after a `git add`/`commit` would be missed.
-        let mtime = fs::metadata(&original).and_then(|m| m.modified()).ok()?;
-        let file = fs::OpenOptions::new().write(true).open(&scratch.0).ok()?;
-        file.set_modified(mtime).ok()?;
-        Some(scratch)
+        let mtime = fs::metadata(original)?.modified()?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&scratch.0)?
+            .set_modified(mtime)?;
+        Ok(scratch)
     }
 
     fn apply(&self, command: &mut std::process::Command) {
@@ -321,6 +397,35 @@ impl Drop for ScratchIndex {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
+}
+
+/// Removes scratch index copies (and their git lock files) that a crashed run
+/// left in the git dir: those whose embedded timestamp is over an hour old.
+/// Age rather than process liveness because the latter is not portable.
+/// Returns how many files were removed. Call off the UI thread.
+pub(crate) fn remove_stale_scratch_indexes(git_dir: &Path, now_secs: u64) -> usize {
+    let Ok(entries) = fs::read_dir(git_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix(SCRATCH_PREFIX) else {
+            continue;
+        };
+        let stamp = rest
+            .trim_end_matches(".lock")
+            .rsplit('-')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok());
+        if stamp.is_some_and(|t| now_secs.saturating_sub(t) > SCRATCH_STALE_SECS)
+            && fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Adds `paths` to the index, including deletions and new files.
@@ -994,6 +1099,38 @@ fn apply_patch(repo: &Repo, patch: &str, cached: bool, reverse: bool) -> Result<
 mod tests {
     use super::*;
     use crate::{DiffLine, Hunk, LineKind};
+
+    #[test]
+    fn stale_scratch_indexes_are_removed_and_fresh_ones_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_000_000;
+        let names = [
+            ("index.gitwarp-1-0-100", true),
+            ("index.gitwarp-1-0-100.lock", true),
+            (&*format!("index.gitwarp-2-0-{}", now - 10), false),
+            (&*format!("index.gitwarp-2-1-{}.lock", now - 10), false),
+            // Not ours, or unparsable: never touched.
+            ("index", false),
+            ("index.lock", false),
+            ("index.gitwarp-x", false),
+        ];
+        for (name, _) in names {
+            fs::write(dir.path().join(name), "x").unwrap();
+        }
+        assert_eq!(remove_stale_scratch_indexes(dir.path(), now), 2);
+        for (name, removed) in names {
+            assert_eq!(dir.path().join(name).exists(), !removed, "{name}");
+        }
+    }
+
+    #[test]
+    fn dropping_the_guard_removes_a_partly_written_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = ScratchIndex(dir.path().join("probe"));
+        fs::write(&guard.0, "partial").unwrap();
+        drop(guard);
+        assert!(!dir.path().join("probe").exists());
+    }
 
     fn file(kind: ChangeKind, path: &str) -> WorkingFile {
         WorkingFile {

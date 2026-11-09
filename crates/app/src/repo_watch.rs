@@ -195,6 +195,9 @@ pub fn classify(layout: &GitLayout, path: &Path) -> Kinds {
         // Everything else below the work tree, a nested `.git` of a submodule included.
         if let Some(rel) = root.relative(path) {
             let top = rel.components().next();
+            // `ignored_dirs` is computed once, when the watcher starts. A file force-added
+            // (`git add -f`) inside an ignored folder, or an edited `.gitignore`, is therefore
+            // not reported by the watcher; only the window-focus check picks those up.
             if let Some(Component::Normal(top)) = top {
                 if layout.ignored_dirs.iter().any(|d| d == top) {
                     return Kinds::NONE;
@@ -339,8 +342,16 @@ fn watch_plan_impl(
     add(cd.join("refs"), RecursiveMode::Recursive);
     add(cd.join("logs").join("refs"), RecursiveMode::NonRecursive);
     add(cd.join("worktrees"), RecursiveMode::Recursive);
-    // Submodule git dirs: a commit made inside a submodule moves its HEAD/refs here.
-    add(cd.join("modules"), RecursiveMode::Recursive);
+    // Submodule git dirs: a commit made inside a submodule moves its HEAD/refs here. Not
+    // recursive over the whole folder: that would watch every `objects/xx` directory of every
+    // submodule and could exhaust the inotify limit. Per submodule only its own folder (HEAD,
+    // a new submodule appearing) and `refs` are watched.
+    let modules = cd.join("modules");
+    add(modules.clone(), RecursiveMode::NonRecursive);
+    for git_dir in submodule_git_dirs(&modules) {
+        add(git_dir.clone(), RecursiveMode::NonRecursive);
+        add(git_dir.join("refs"), RecursiveMode::Recursive);
+    }
     // Only the reftable ref backend has this folder; it then holds every ref.
     add(cd.join("reftable"), RecursiveMode::NonRecursive);
 
@@ -358,6 +369,35 @@ fn watch_plan_impl(
         }
     }
     plan
+}
+
+/// The git dirs below `<common>/modules`: a folder is one when it has a `HEAD` file. Nested
+/// submodule names (`a/b`) are folders inside folders, and a found git dir's own `modules` is
+/// searched too; its `objects`, `refs`, `logs` and the like are not. Symlinks are not followed.
+fn submodule_git_dirs(modules: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path())
+            .collect();
+        dirs.sort();
+        for path in dirs {
+            if path.join("HEAD").is_file() {
+                // A submodule of a submodule keeps its git dir in this one's `modules`.
+                walk(&path.join("modules"), out, depth + 1);
+                out.push(path);
+            } else if depth < 8 {
+                walk(&path, out, depth + 1);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(modules, &mut out, 0);
+    out
 }
 
 fn same_folder(a: &Path, b: &Path) -> bool {
@@ -978,10 +1018,37 @@ mod tests {
     fn plan_watches_submodule_git_dirs_and_reftable_when_present() {
         let t = TempDir::new("plan-modules");
         let root = t.path();
-        mkdirs(root, &[".git/refs", ".git/modules/sub", ".git/reftable"]);
+        mkdirs(
+            root,
+            &[
+                ".git/refs",
+                ".git/modules/sub/refs/heads",
+                ".git/modules/sub/objects/ab",
+                ".git/modules/outer/modules/inner/refs",
+                ".git/reftable",
+            ],
+        );
+        for head in ["sub", "outer", "outer/modules/inner"] {
+            std::fs::write(root.join(".git/modules").join(head).join("HEAD"), "ref: x").unwrap();
+        }
         let l = GitLayout::new(Some(root), &root.join(".git"), &root.join(".git"));
         let plan = watch_plan_impl(&l, Mode::Reduced, &[], true);
-        assert!(plan.contains(&(root.join(".git/modules"), RecursiveMode::Recursive)));
+        let m = root.join(".git/modules");
+        // Never recursive over the whole folder (objects/ of every submodule).
+        assert!(plan.contains(&(m.clone(), RecursiveMode::NonRecursive)));
+        assert!(!plan.contains(&(m.clone(), RecursiveMode::Recursive)));
+        for name in ["sub", "outer", "outer/modules/inner"] {
+            assert!(
+                plan.contains(&(m.join(name), RecursiveMode::NonRecursive)),
+                "{name}"
+            );
+        }
+        assert!(plan.contains(&(m.join("sub/refs"), RecursiveMode::Recursive)));
+        assert!(plan.contains(&(m.join("outer/modules/inner/refs"), RecursiveMode::Recursive)));
+        // Object stores are not watched.
+        assert!(!plan
+            .iter()
+            .any(|(p, _)| p.components().any(|c| c.as_os_str() == "objects")));
         assert!(plan.contains(&(root.join(".git/reftable"), RecursiveMode::NonRecursive)));
         let t = TempDir::new("plan-no-modules");
         mkdirs(t.path(), &[".git/refs"]);
