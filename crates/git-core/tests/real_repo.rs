@@ -1300,6 +1300,22 @@ fn keeps_the_no_newline_marker_and_marks_a_huge_diff_too_large() {
 }
 
 #[test]
+fn clean_tracked_repo_reports_nothing_through_the_private_index() {
+    // If the private index copy were not read, git would see an empty index and list the
+    // tracked file as untracked.
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "a.txt", "one\n");
+    commit_all(d, "one");
+
+    let status = open(d).unwrap().working_status().unwrap();
+    assert!(status.unstaged.is_empty(), "{status:?}");
+    assert_eq!(status.staged_count(), 0);
+    assert!(status.conflicted.is_empty());
+}
+
+#[test]
 fn reads_the_working_status_and_moves_files_between_the_sides() {
     let tmp = tempfile::tempdir().unwrap();
     let d = tmp.path();
@@ -1747,4 +1763,59 @@ fn heat_levels_follow_the_counts_in_view() {
     // Few distinct values: linear, ceil(4n / max).
     let t = levels(&[1, 2, 4]);
     assert_eq!([1, 2, 3, 4].map(|c| level(c, &t)), [1, 2, 3, 4]);
+}
+
+/// Background status/diff reads must not take `index.lock` or rewrite the index
+/// (`GIT_OPTIONAL_LOCKS=0`), or a `git commit` in the user's terminal can fail.
+#[test]
+fn read_only_status_leaves_the_index_and_its_lock_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    std::fs::write(d.join("a.txt"), "one\n").unwrap();
+    git(d, &["add", "a.txt"]);
+    commit(d, "A");
+    let repo = open(d).unwrap();
+
+    // Touch the file without changing its content: the index stat cache is
+    // now stale, so a plain `git status` would try to refresh (rewrite) it.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(d.join("a.txt"), "one\n").unwrap();
+    let index = d.join(".git/index");
+    let before = std::fs::read(&index).unwrap();
+
+    repo.working_status().unwrap();
+    repo.changed_paths().unwrap();
+    repo.unstaged_diff("a.txt", None).unwrap();
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        before,
+        "index was rewritten"
+    );
+
+    // With a lock already present (another git running) the reads still work
+    // and leave the lock untouched.
+    let lock = d.join(".git/index.lock");
+    std::fs::write(&lock, "held").unwrap();
+    repo.working_status().unwrap();
+    repo.unstaged_diff("a.txt", None).unwrap();
+    assert_eq!(std::fs::read_to_string(&lock).unwrap(), "held");
+}
+
+/// A same-size edit made right after the index was written is "racily clean" to
+/// git's stat check; the private index copy used for work-tree diffs must keep
+/// the original's mtime or that edit is not reported.
+#[test]
+fn a_same_size_edit_right_after_a_commit_still_shows_as_unstaged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    std::fs::write(d.join("a.txt"), "one\n").unwrap();
+    git(d, &["add", "a.txt"]);
+    commit(d, "A");
+    std::fs::write(d.join("a.txt"), "two\n").unwrap();
+    // The copy is made a second later than the index was written.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let status = open(d).unwrap().working_status().unwrap();
+    assert_eq!(status.unstaged.len(), 1, "the edit was missed");
 }

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -53,6 +53,9 @@ use crate::pr_panel::{PrEvent, PrModel, PrPanel};
 use crate::ref_dialog::{self, RefDialog, RefDialogContext, RefDialogKind, RemoteEdit};
 use crate::ref_ops::{CommitCard, RefAction};
 use crate::remote_accounts::{self, AccountAction, RemoteResolution};
+use crate::repo_watch::{
+    GitLayout, Kinds, Mode as WatchMode, RepoWatcher, StartError, WatchSignal, OPERATION_MARKERS,
+};
 use crate::settings::{
     sidebar_width_limit, DiffLayout, Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX,
     SIDEBAR_WIDTH_MIN,
@@ -565,14 +568,46 @@ pub struct RepositoryView {
     network: Option<NetworkActivity>,
     /// Bumped per network job; an older poll loop stops.
     network_generation: u64,
-    /// Whether the background fetch is on, mirrored in the settings.
-    background_fetch: bool,
-    /// Pause between background fetches, from the settings.
-    background_fetch_interval: Duration,
+    /// When the last fetch (background, or a Fetch/Pull the user started)
+    /// began; activation fetches only once the interval has passed.
+    last_fetch: Option<Instant>,
     /// The repeating background-fetch task.
     background_fetch_task: Option<Task<()>>,
     /// A background fetch is in flight; the next tick skips while it runs.
     background_fetch_running: bool,
+    /// What the repository looked like when the views were last known to be
+    /// current; `None` until the first read. See [`Fingerprint`].
+    fingerprint: Option<Fingerprint>,
+    /// Bumped by every re-baseline, so only the newest one is applied.
+    fingerprint_generation: u64,
+    /// A re-baseline (the app's own change was just reloaded) is being read. A check
+    /// that starts meanwhile would take that change for an outside one, so it waits.
+    baseline_in_flight: bool,
+    /// Bumped by every check, so only the newest result is applied. Separate from
+    /// `fingerprint_generation`: a re-baseline must not discard a check, nor the reverse.
+    check_generation: u64,
+    /// A check was asked for while a re-baseline was in flight; it runs when that ends.
+    check_wanted: bool,
+    /// When Changes was last re-read quietly on window activation.
+    last_quiet_changes: Option<Instant>,
+    /// The running file watcher; `None` until started (and in tests).
+    watcher: Option<RepoWatcher>,
+    /// The root the watcher was started for, so it is rebuilt when the root changes.
+    watch_root: Option<PathBuf>,
+    /// The watcher was rebuilt in [`WatchMode::Reduced`] after the OS watch limit was hit.
+    watch_reduced: bool,
+    /// Bumped per watcher start; a start that finishes later is dropped.
+    watch_generation: u64,
+    /// Drains the watcher's channel (replaced together with the watcher).
+    watch_task: Option<Task<()>>,
+    /// Change kinds reported but not yet applied (merged, or held while an operation runs).
+    watch_pending: Kinds,
+    /// The pending flush after [`WATCH_FLUSH`].
+    watch_flush: Option<Task<()>>,
+    /// When Changes was last re-read because work-tree files changed.
+    last_watch_changes: Option<Instant>,
+    /// The trailing quiet Changes refresh of a throttled burst of file changes.
+    watch_changes_trailing: Option<Task<()>>,
     /// Pull request badges and CI status of the primary remote's repository.
     hosting: HostingState,
     /// What the rows were last given, to skip a redraw that changes nothing.
@@ -644,9 +679,19 @@ struct NetworkRun<'a> {
     then_push: bool,
 }
 
-/// The first background fetch waits a little, so opening a repository is not
-/// immediately followed by network traffic.
-const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(30);
+/// The first background fetch waits a little (for the history to load), so a
+/// repository opened after a while away shows remote changes soon.
+const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(3);
+/// Window activation fetches at most this often.
+const ACTIVATION_FETCH_MIN: Duration = Duration::from_secs(60);
+/// How often the UI drains the watcher's channel. Well under the 1 s Changes throttle, and the
+/// channel is a std `mpsc` polled from a timer (as the network job does) because no async
+/// channel dependency is approved. 250 ms keeps an idle window's wake-ups low.
+const WATCH_POLL: Duration = Duration::from_millis(250);
+/// Signals arriving within this window are merged into one reload.
+const WATCH_FLUSH: Duration = Duration::from_millis(200);
+/// Work-tree file changes re-read Changes at most this often.
+const WATCH_CHANGES_MIN: Duration = Duration::from_secs(1);
 /// How often the UI drains the job's progress channel.
 const NETWORK_POLL: Duration = Duration::from_millis(80);
 
@@ -655,6 +700,75 @@ const NETWORK_POLL: Duration = Duration::from_millis(80);
 fn ci_status_enabled(cx: &App) -> bool {
     cx.try_global::<crate::AppSettings>()
         .is_none_or(|state| state.settings.show_ci_status)
+}
+
+/// Whether the settings ask for the background fetch. Read fresh, so a toggle
+/// in Settings applies to windows that are already open.
+fn background_fetch_enabled(cx: &App) -> bool {
+    cx.try_global::<crate::AppSettings>()
+        .is_none_or(|state| state.settings.background_fetch)
+}
+
+/// Pause between background fetches, read fresh from the settings.
+fn background_fetch_interval(cx: &App) -> Duration {
+    let minutes = cx.try_global::<crate::AppSettings>().map_or(
+        crate::settings::Settings::default().fetch_interval_minutes,
+        |state| state.settings.fetch_interval_minutes,
+    );
+    Duration::from_secs(u64::from(minutes) * 60)
+}
+
+/// What a requested external-change check does right now.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckStart {
+    /// The app is itself changing refs or talking to a remote: it re-baselines when done.
+    Skip,
+    /// A re-baseline is being read: wait for it and compare against its result.
+    Defer,
+    Run,
+}
+
+fn check_start(app_busy: bool, baseline_in_flight: bool) -> CheckStart {
+    if app_busy {
+        CheckStart::Skip
+    } else if baseline_in_flight {
+        CheckStart::Defer
+    } else {
+        CheckStart::Run
+    }
+}
+
+/// What to do with a finished check, given the generations of checks and re-baselines when
+/// it started and now.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckOutcome {
+    /// A newer check superseded it.
+    Discard,
+    /// A re-baseline began meanwhile: this read may hold the app's own change, so ask again
+    /// once the new baseline is recorded.
+    Rerun,
+    Apply,
+}
+
+fn check_outcome(
+    check_started: u64,
+    check_now: u64,
+    baseline_started: u64,
+    baseline_now: u64,
+) -> CheckOutcome {
+    if check_started != check_now {
+        CheckOutcome::Discard
+    } else if baseline_started != baseline_now {
+        CheckOutcome::Rerun
+    } else {
+        CheckOutcome::Apply
+    }
+}
+
+/// Whether something throttled is due: it has not run yet, or its last run began `min` ago or
+/// more. Used for fetches and for the quiet Changes refreshes.
+fn fetch_due(last: Option<Instant>, now: Instant, min: Duration) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= min)
 }
 
 /// Whether a finished network job is followed by a push: only the pull that
@@ -764,12 +878,17 @@ impl RepositoryView {
         let name = repo_name(&path);
         let git_label = git_label(&git);
         let git_tooltip = git_tooltip(&git);
-        let action_view = cx.entity();
+        // The history is owned by this view, so its callbacks hold the view weakly: a
+        // strong handle would be a cycle and keep the view (with its watcher and fetch
+        // loop) alive after the window moved on to another repository or the welcome screen.
+        let action_view = cx.weak_entity();
         let on_history_action = Rc::new(
             move |action: RefAction, window: &mut Window, cx: &mut App| {
-                action_view.update(cx, |view, cx| {
-                    view.handle_history_action(action, window, cx);
-                });
+                action_view
+                    .update(cx, |view, cx| {
+                        view.handle_history_action(action, window, cx);
+                    })
+                    .ok();
             },
         );
         let history = cx.new(|cx| {
@@ -781,29 +900,38 @@ impl RepositoryView {
                 cx,
             )
         });
-        let sidebar_view = cx.entity();
+        let sidebar_view = cx.weak_entity();
         history.update(cx, |history, _| {
             history.set_sidebar_action_handler(Rc::new(move |action, window, cx| {
-                sidebar_view.update(cx, |view, cx| view.run_sidebar_action(action, window, cx));
+                sidebar_view
+                    .update(cx, |view, cx| view.run_sidebar_action(action, window, cx))
+                    .ok();
             }));
         });
-        let pr_view = cx.entity();
+        let pr_view = cx.weak_entity();
         history.update(cx, |history, _| {
             history.set_pr_click_handler(Rc::new(move |branch, position, window, cx| {
-                pr_view.update(cx, |view, cx| {
-                    view.open_pr_popover(&branch, position, window, cx)
-                });
+                pr_view
+                    .update(cx, |view, cx| {
+                        view.open_pr_popover(&branch, position, window, cx)
+                    })
+                    .ok();
             }));
         });
-        let service_view = cx.entity();
+        let service_view = cx.weak_entity();
         history.update(cx, |history, _| {
             // The History asks while it is itself being updated, so it hands
             // over its own HEAD and refs instead of being read back.
             history.set_pr_service(Rc::new(move |branch, head, refs, cx| {
-                let view = service_view.read(cx);
-                let targets = view.pr_targets_in(head, refs, cx);
-                let upstream = view.branch_upstream_remote_in(branch, refs);
-                pr_logic::default_target(&targets, upstream.as_deref()).map(|target| target.kind())
+                service_view
+                    .read_with(cx, |view, cx| {
+                        let targets = view.pr_targets_in(head, refs, cx);
+                        let upstream = view.branch_upstream_remote_in(branch, refs);
+                        pr_logic::default_target(&targets, upstream.as_deref())
+                            .map(|target| target.kind())
+                    })
+                    .ok()
+                    .flatten()
             }));
         });
         let history_events =
@@ -830,6 +958,7 @@ impl RepositoryView {
                 // The sidebar's own lists need the root: load them once, when
                 // the history first reports it.
                 this.ensure_sidebar(cx);
+                this.ensure_watcher(root, cx);
             }
             // HEAD and the refs were read again: the branches that track the
             // primary remote may have changed.
@@ -863,6 +992,7 @@ impl RepositoryView {
             |this, _, event: &ChangesEvent, window, cx| match event {
                 ChangesEvent::Committed => {
                     this.reload_history(cx);
+                    this.rebaseline_fingerprint(cx);
                 }
                 ChangesEvent::PushAfterCommit => this.push_branch(window, cx),
                 // `merge --abort` does not move HEAD: the sidebar, the worktree
@@ -878,6 +1008,8 @@ impl RepositoryView {
             let operation = changes.read(cx).operation();
             this.history
                 .update(cx, |history, _| history.set_operation(operation));
+            // Changes finishing its own work releases held watcher signals.
+            this.retry_watch_flush(cx);
             cx.notify();
         });
         let worktrees_model =
@@ -959,8 +1091,7 @@ impl RepositoryView {
         let focus = cx.focus_handle().tab_stop(false);
         let window_activation = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
-                this.hosting_sync(PrTrigger::Focus, cx);
-                this.ensure_ci_timer(window, cx);
+                this.on_window_activated(window, cx);
             }
         });
 
@@ -1043,12 +1174,24 @@ impl RepositoryView {
             ref_action_running: false,
             network: None,
             network_generation: 0,
-            background_fetch: settings.background_fetch,
-            background_fetch_interval: Duration::from_secs(
-                u64::from(settings.fetch_interval_minutes) * 60,
-            ),
+            last_fetch: None,
             background_fetch_task: None,
             background_fetch_running: false,
+            fingerprint: None,
+            fingerprint_generation: 0,
+            baseline_in_flight: false,
+            check_generation: 0,
+            check_wanted: false,
+            last_quiet_changes: None,
+            watcher: None,
+            watch_root: None,
+            watch_reduced: false,
+            watch_generation: 0,
+            watch_task: None,
+            watch_pending: Kinds::NONE,
+            watch_flush: None,
+            last_watch_changes: None,
+            watch_changes_trailing: None,
             hosting: HostingState::default(),
             hosting_view: Arc::default(),
             ci_visible: Vec::new(),
@@ -1062,7 +1205,346 @@ impl RepositoryView {
             ci_timer: None,
         };
         view.start_background_fetch(cx);
+        view.rebaseline_fingerprint(cx);
         view
+    }
+
+    /// The window became active: besides the hosting and CI state, pick up
+    /// whatever changed in the repository while the user was in a terminal or
+    /// another tool. The file watcher normally reports those changes already;
+    /// this focus check is the fallback for where it cannot (watch limit, a
+    /// network file system, a failed start).
+    fn on_window_activated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hosting_sync(PrTrigger::Focus, cx);
+        self.ensure_ci_timer(window, cx);
+        self.check_external_changes(cx);
+        self.fetch_on_activation(cx);
+        let now = Instant::now();
+        // A busy Changes view re-reads the status itself; don't spend the interval on it.
+        if !self.changes.read(cx).is_busy()
+            && fetch_due(self.last_quiet_changes, now, QUIET_CHANGES_MIN)
+        {
+            self.last_quiet_changes = Some(now);
+            self.changes
+                .update(cx, |changes, cx| changes.refresh_quiet(cx));
+        }
+    }
+
+    /// Fetches on activation when the background fetch is on and the last
+    /// fetch is at least [`ACTIVATION_FETCH_MIN`] old. Returns whether a fetch
+    /// tick was attempted (the tick itself still skips while a job runs).
+    fn fetch_on_activation(&mut self, cx: &mut Context<Self>) -> bool {
+        if !background_fetch_enabled(cx)
+            || !fetch_due(self.last_fetch, Instant::now(), ACTIVATION_FETCH_MIN)
+        {
+            return false;
+        }
+        self.background_fetch_tick(cx);
+        true
+    }
+
+    /// Reads the repository's fingerprint off the UI thread and reloads the
+    /// parts [`decide_reload`] names when it differs from the last known one.
+    /// Skipped while the app itself is changing refs or talking to a remote:
+    /// those paths re-baseline when they finish. While such a re-baseline is
+    /// still being read the check waits for it, so the app's own change is not
+    /// mistaken for an outside one.
+    fn check_external_changes(&mut self, cx: &mut Context<Self>) {
+        let app_busy =
+            self.ref_action_running || self.network.is_some() || self.background_fetch_running;
+        match check_start(app_busy, self.baseline_in_flight) {
+            CheckStart::Skip => return,
+            CheckStart::Defer => {
+                self.check_wanted = true;
+                return;
+            }
+            CheckStart::Run => {}
+        }
+        let Ok(git) = self.git.clone() else {
+            return;
+        };
+        self.check_generation = self.check_generation.wrapping_add(1);
+        let generation = self.check_generation;
+        let baseline_generation = self.fingerprint_generation;
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let new = cx
+                .background_executor()
+                .spawn(async move { read_fingerprint(git, &root) })
+                .await;
+            let Some(new) = new else {
+                return;
+            };
+            this.update(cx, |view, cx| {
+                match check_outcome(
+                    generation,
+                    view.check_generation,
+                    baseline_generation,
+                    view.fingerprint_generation,
+                ) {
+                    CheckOutcome::Discard => return,
+                    CheckOutcome::Rerun => {
+                        // A re-baseline began while this was read: the baseline it will
+                        // record is the one to compare with, so ask again after it.
+                        view.check_wanted = true;
+                        if !view.baseline_in_flight {
+                            view.check_wanted = false;
+                            view.check_external_changes(cx);
+                        }
+                        return;
+                    }
+                    CheckOutcome::Apply => {}
+                }
+                let decision = decide_reload(view.fingerprint.as_ref(), &new);
+                view.fingerprint = Some(new);
+                if let Some(change) = decision.refs {
+                    // The Changes status is re-read quietly below, not through
+                    // the `Loading` state the in-app paths use.
+                    view.after_ref_change_with(change, false, cx);
+                }
+                if decision.changes {
+                    view.changes
+                        .update(cx, |changes, cx| changes.refresh_quiet(cx));
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Starts the file watcher for `root` once per root (never in tests: the
+    /// wiring is tested by calling [`Self::on_watch_signal`] directly).
+    fn ensure_watcher(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if cfg!(test) || self.watch_root.as_ref() == Some(&root) {
+            return;
+        }
+        self.watch_root = Some(root.clone());
+        self.watch_reduced = false;
+        self.start_watcher(root, WatchMode::Normal, cx);
+    }
+
+    /// Replaces the watcher and its channel. Starting walks directories, so it
+    /// runs on the background executor; a start that is superseded meanwhile is
+    /// dropped when it finishes.
+    fn start_watcher(&mut self, root: PathBuf, mode: WatchMode, cx: &mut Context<Self>) {
+        let Ok(git) = self.git.clone() else {
+            return;
+        };
+        self.watcher = None;
+        self.watch_generation = self.watch_generation.wrapping_add(1);
+        let generation = self.watch_generation;
+        let (tx, rx) = mpsc::channel::<WatchSignal>();
+        let started = cx.background_executor().spawn(async move {
+            let repo =
+                Repo::open(git.clone(), &root).map_err(|e| StartError::Other(e.to_string()))?;
+            // git-core has no logger of its own: route its recoverable-problem warnings here.
+            git_core::set_warning_sink(|message| log::warn!("{message}"));
+            // Scratch index copies a crashed run left behind (we are off the UI thread).
+            let stale = repo.remove_stale_scratch_files();
+            if stale > 0 {
+                log::info!("removed {stale} stale scratch index file(s)");
+            }
+            let common =
+                git_core::common_dir(&repo).map_err(|e| StartError::Other(e.to_string()))?;
+            let layout = GitLayout::new(Some(repo.root()), repo.git_dir(), &common);
+            let start = |mode| {
+                let tx = tx.clone();
+                RepoWatcher::start_in(&layout, mode, git.path(), move |signal| {
+                    let _ = tx.send(signal);
+                })
+            };
+            match start(mode) {
+                // Out of OS watches: the work tree is left to the activation check.
+                Err(StartError::Limit) if mode == WatchMode::Normal => {
+                    log::warn!("file watcher hit the OS watch limit, watching git folders only");
+                    start(WatchMode::Reduced)
+                }
+                other => other,
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = started.await;
+            this.update(cx, |view, _| {
+                if generation != view.watch_generation {
+                    return;
+                }
+                match result {
+                    Ok(watcher) => {
+                        log::info!("file watcher started ({:?} mode)", watcher.mode());
+                        view.watch_reduced = watcher.mode() == WatchMode::Reduced;
+                        view.watcher = Some(watcher);
+                    }
+                    Err(error) => {
+                        log::warn!("file watcher not started, relying on window focus: {error}");
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+        self.watch_task = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(WATCH_POLL).await;
+            let mut signals = Vec::new();
+            // Every sender lives in the watcher's sink: once it is gone (the start failed or
+            // the watcher was dropped) nothing can arrive any more, so the loop ends.
+            let senders_gone = loop {
+                match rx.try_recv() {
+                    Ok(signal) => signals.push(signal),
+                    Err(mpsc::TryRecvError::Empty) => break false,
+                    Err(mpsc::TryRecvError::Disconnected) => break true,
+                }
+            };
+            let alive = this.update(cx, |view, cx| {
+                for signal in signals {
+                    view.on_watch_signal(signal, cx);
+                }
+            });
+            if alive.is_err() || senders_gone {
+                break;
+            }
+        }));
+    }
+
+    /// Merges a watcher signal into the pending kinds and schedules the flush;
+    /// a reported watch-limit overflow rebuilds the watcher in reduced mode.
+    fn on_watch_signal(&mut self, signal: WatchSignal, cx: &mut Context<Self>) {
+        self.watch_pending |= signal.kinds;
+        if signal.limit_hit && !self.watch_reduced {
+            log::warn!("file watcher hit the OS watch limit, rebuilding in git-folders-only mode");
+            self.watch_reduced = true;
+            if let Some(root) = self.watch_root.clone() {
+                self.start_watcher(root, WatchMode::Reduced, cx);
+            }
+        }
+        self.retry_watch_flush(cx);
+    }
+
+    /// Schedules a flush of the pending kinds after [`WATCH_FLUSH`], unless one
+    /// is already scheduled or nothing is pending. Also called when an
+    /// operation that held the signals finishes.
+    fn retry_watch_flush(&mut self, cx: &mut Context<Self>) {
+        if self.watch_pending.is_empty() || self.watch_flush.is_some() {
+            return;
+        }
+        self.watch_flush = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(WATCH_FLUSH).await;
+            this.update(cx, |view, cx| {
+                // Let the task finish; dropping the handle would cancel it midway.
+                if let Some(task) = view.watch_flush.take() {
+                    task.detach();
+                }
+                view.flush_watch(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Whether the app itself is changing the repository or the status.
+    fn operation_running(&self, cx: &App) -> bool {
+        self.ref_action_running
+            || self.network.is_some()
+            || self.background_fetch_running
+            || self.changes.read(cx).is_busy()
+    }
+
+    /// Applies the pending kinds. Held (kept pending) while an operation runs:
+    /// the code paths that finish one call [`Self::retry_watch_flush`].
+    fn flush_watch(&mut self, cx: &mut Context<Self>) {
+        if self.operation_running(cx) {
+            return;
+        }
+        let kinds = std::mem::take(&mut self.watch_pending);
+        if kinds.is_empty() {
+            return;
+        }
+        if kinds.contains(Kinds::RESCAN) {
+            // The backend lost events: everything may have changed.
+            self.after_ref_change(RefChange::History, cx);
+            return;
+        }
+        if kinds.intersects(Kinds::STASH | Kinds::CONFIG) {
+            self.refresh_with(hosting_status::INTERNAL_RELOAD, cx);
+        }
+        if kinds.intersects(Kinds::WORKTREES) {
+            self.worktrees
+                .update(cx, |worktrees, cx| worktrees.refresh(cx));
+        }
+        if kinds.intersects(Kinds::HEAD | Kinds::REFS | Kinds::OPERATION) {
+            // The fingerprint says whether anything the views show really changed.
+            self.check_external_changes(cx);
+        }
+        if kinds.intersects(Kinds::INDEX) {
+            // Straight to Changes: the fingerprint's coarse (mtime, length) index stamp must
+            // not veto a staging change (it stays the focus fallback's tool). The refresh
+            // drops a status equal to the shown one, so the app's own staging costs a read.
+            self.changes
+                .update(cx, |changes, cx| changes.refresh_quiet(cx));
+        }
+        if kinds.intersects(Kinds::WORKTREE_FILES) {
+            self.refresh_changes_for_files(cx);
+        }
+    }
+
+    /// Quiet Changes refresh for work-tree file changes: at most once per
+    /// [`WATCH_CHANGES_MIN`], with one trailing refresh for a throttled burst.
+    fn refresh_changes_for_files(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if fetch_due(self.last_watch_changes, now, WATCH_CHANGES_MIN) {
+            self.last_watch_changes = Some(now);
+            self.changes
+                .update(cx, |changes, cx| changes.refresh_quiet(cx));
+            return;
+        }
+        if self.watch_changes_trailing.is_some() {
+            return;
+        }
+        let wait = self.last_watch_changes.map_or(Duration::ZERO, |last| {
+            WATCH_CHANGES_MIN.saturating_sub(now.duration_since(last))
+        });
+        self.watch_changes_trailing = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |view, cx| {
+                if let Some(task) = view.watch_changes_trailing.take() {
+                    task.detach();
+                }
+                view.watch_pending |= Kinds::WORKTREE_FILES;
+                view.retry_watch_flush(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Records the repository's current state as the one the views show. Called
+    /// after the app's own reloads, so what it just did is not mistaken for an
+    /// outside change at the next check.
+    fn rebaseline_fingerprint(&mut self, cx: &mut Context<Self>) {
+        let Ok(git) = self.git.clone() else {
+            return;
+        };
+        self.fingerprint_generation = self.fingerprint_generation.wrapping_add(1);
+        self.baseline_in_flight = true;
+        let generation = self.fingerprint_generation;
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let new = cx
+                .background_executor()
+                .spawn(async move { read_fingerprint(git, &root) })
+                .await;
+            this.update(cx, |view, cx| {
+                if generation != view.fingerprint_generation {
+                    return;
+                }
+                if new.is_some() {
+                    view.fingerprint = new;
+                }
+                view.baseline_in_flight = false;
+                if std::mem::take(&mut view.check_wanted) {
+                    view.check_external_changes(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The focus handle of the repository root; the workspace focuses it after
@@ -2650,6 +3132,7 @@ impl RepositoryView {
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.refresh(cx));
         self.refresh_with(hosting_status::INTERNAL_RELOAD, cx);
+        self.rebaseline_fingerprint(cx);
         cx.notify();
     }
 
@@ -2721,6 +3204,7 @@ impl RepositoryView {
                 .await;
             this.update_in(cx, |view, window, cx| {
                 view.ref_action_running = false;
+                view.retry_watch_flush(cx);
                 match result {
                     Ok((kind, notice)) => {
                         toast::show(kind, notice, window, cx);
@@ -2795,14 +3279,18 @@ impl RepositoryView {
 
     /// Starts the repeating, quiet fetch of every remote.
     fn start_background_fetch(&mut self, cx: &mut Context<Self>) {
-        let interval = self.background_fetch_interval;
         self.background_fetch_task = Some(cx.spawn(async move |this, cx| {
             let mut first = true;
             loop {
+                // The interval is read each round, so a change in Settings
+                // applies without reopening the repository.
                 let delay = if first {
                     BACKGROUND_FETCH_FIRST
                 } else {
-                    interval
+                    match this.update(cx, |_, cx| background_fetch_interval(cx)) {
+                        Ok(interval) => interval,
+                        Err(_) => break,
+                    }
                 };
                 first = false;
                 cx.background_executor().timer(delay).await;
@@ -2818,7 +3306,8 @@ impl RepositoryView {
 
     /// One background fetch, skipped while another network action runs.
     fn background_fetch_tick(&mut self, cx: &mut Context<Self>) {
-        if !self.background_fetch || self.network.is_some() || self.background_fetch_running {
+        if !background_fetch_enabled(cx) || self.network.is_some() || self.background_fetch_running
+        {
             return;
         }
         let Some(root) = self
@@ -2850,6 +3339,7 @@ impl RepositoryView {
             None => Default::default(),
         };
         self.background_fetch_running = true;
+        self.last_fetch = Some(Instant::now());
         cx.spawn(async move |this, cx| {
             let changed = cx
                 .background_executor()
@@ -2888,6 +3378,7 @@ impl RepositoryView {
                 if changed {
                     view.reload_after_network(cx);
                 }
+                view.retry_watch_flush(cx);
             })
             .ok();
         })
@@ -2896,7 +3387,6 @@ impl RepositoryView {
 
     /// Turns the background fetch on or off and remembers it in the settings.
     fn set_background_fetch(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.background_fetch = enabled;
         crate::update_settings(cx, |settings| settings.background_fetch = enabled);
         cx.notify();
     }
@@ -2953,6 +3443,9 @@ impl RepositoryView {
         let root = self.root.clone();
         self.network_generation = self.network_generation.wrapping_add(1);
         let generation = self.network_generation;
+        if matches!(job, Job::Fetch(_) | Job::Pull) {
+            self.last_fetch = Some(Instant::now());
+        }
         self.network = Some(NetworkActivity {
             verb: job.verb(),
             detail: ui::t!("repo.network.connecting"),
@@ -3066,6 +3559,7 @@ impl RepositoryView {
         }
         if let Some(result) = finished {
             self.network = None;
+            self.retry_watch_flush(cx);
             match result {
                 Ok(outcome) if !outcome.targets.is_empty() => {
                     self.show_push_result(&outcome, meta, window, cx);
@@ -3579,6 +4073,7 @@ impl RepositoryView {
         self.reload_history(cx);
         self.changes.update(cx, |changes, cx| changes.refresh(cx));
         self.refresh_with(PrTrigger::AfterNetwork, cx);
+        self.rebaseline_fingerprint(cx);
         cx.notify();
     }
 
@@ -4304,7 +4799,7 @@ impl RepositoryView {
                 }),
         ));
         entries.push(MenuEntry::Separator);
-        let enabled = self.background_fetch;
+        let enabled = background_fetch_enabled(cx);
         let view = cx.entity();
         entries.push(MenuEntry::Item(
             MenuItem::new(if enabled {
@@ -7201,6 +7696,72 @@ fn ref_snapshot(repo: &Repo) -> Vec<(String, Oid)> {
         .unwrap_or_default()
 }
 
+/// Re-read Changes on window activation at most this often.
+const QUIET_CHANGES_MIN: Duration = Duration::from_secs(2);
+
+/// Everything cheap to read that tells the views are stale: HEAD, every ref,
+/// the index's (mtime, length) and which operation files exist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fingerprint {
+    head: Option<Head>,
+    refs: Vec<(String, Oid)>,
+    /// `None` when there is no index file (a fresh repository).
+    index: Option<(SystemTime, u64)>,
+    markers: u16,
+}
+
+/// Reads the fingerprint of the repository at `root`; `None` when it cannot be
+/// opened. Runs `git for-each-ref` and `rev-parse`, so call it off the UI thread.
+fn read_fingerprint(git: Arc<Git>, root: &Path) -> Option<Fingerprint> {
+    let repo = Repo::open(git, root).ok()?;
+    let git_dir = repo.git_dir();
+    let index = std::fs::metadata(git_dir.join("index"))
+        .ok()
+        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+    let markers = OPERATION_MARKERS
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| git_dir.join(name).exists())
+        .fold(0u16, |bits, (bit, _)| bits | (1 << bit));
+    Some(Fingerprint {
+        head: repo.head().ok(),
+        refs: ref_snapshot(&repo),
+        index,
+        markers,
+    })
+}
+
+/// What to reload after comparing two fingerprints.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReloadDecision {
+    /// Reload HEAD/refs (and the history, for [`RefChange::History`]).
+    refs: Option<RefChange>,
+    /// Re-read the Changes status.
+    changes: bool,
+}
+
+/// Decides what an outside change requires. Without a previous fingerprint
+/// there is nothing to compare: the new one becomes the baseline.
+fn decide_reload(old: Option<&Fingerprint>, new: &Fingerprint) -> ReloadDecision {
+    let Some(old) = old.filter(|old| *old != new) else {
+        return ReloadDecision::default();
+    };
+    let refs_moved = old.refs != new.refs;
+    let head_or_operation = old.head != new.head || old.markers != new.markers;
+    ReloadDecision {
+        refs: if refs_moved {
+            // A ref was added, removed or moved: commits may have changed.
+            Some(RefChange::History)
+        } else if head_or_operation {
+            // e.g. a checkout of an existing branch: only HEAD moved.
+            Some(RefChange::RefsOnly)
+        } else {
+            None
+        },
+        changes: refs_moved || head_or_operation || old.index != new.index,
+    }
+}
+
 /// One diff row and its cells, in pixels.
 const DIFF_ROW: f32 = 22.;
 const DIFF_GUTTER: f32 = 44.;
@@ -9749,5 +10310,378 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "changed again");
         assert_eq!(repo.stashes().unwrap().len(), 1);
+    }
+
+    fn fp(head: &str, refs: &[(&str, u8)], index: u64, markers: u16) -> Fingerprint {
+        let oid = |n: u8| Oid::from_hex(&format!("{n:02x}").repeat(20)).unwrap();
+        Fingerprint {
+            head: Some(Head::Branch {
+                name: head.to_owned(),
+                target: None,
+            }),
+            refs: refs
+                .iter()
+                .map(|(n, o)| ((*n).to_owned(), oid(*o)))
+                .collect(),
+            index: Some((SystemTime::UNIX_EPOCH, index)),
+            markers,
+        }
+    }
+
+    #[test]
+    fn decide_reload_compares_fingerprints() {
+        let base = fp("main", &[("refs/heads/main", 1)], 10, 0);
+        let none = ReloadDecision::default();
+        // No baseline yet, or nothing changed: nothing to reload.
+        assert_eq!(decide_reload(None, &base), none);
+        assert_eq!(decide_reload(Some(&base), &base.clone()), none);
+        // Only the index changed (an external `git add`): just Changes.
+        assert_eq!(
+            decide_reload(Some(&base), &fp("main", &[("refs/heads/main", 1)], 11, 0)),
+            ReloadDecision {
+                refs: None,
+                changes: true
+            }
+        );
+        // Only HEAD moved (checkout of an existing branch): refs, not the log.
+        assert_eq!(
+            decide_reload(Some(&base), &fp("dev", &[("refs/heads/main", 1)], 10, 0)),
+            ReloadDecision {
+                refs: Some(RefChange::RefsOnly),
+                changes: true
+            }
+        );
+        // An operation started or finished.
+        assert_eq!(
+            decide_reload(Some(&base), &fp("main", &[("refs/heads/main", 1)], 10, 1)),
+            ReloadDecision {
+                refs: Some(RefChange::RefsOnly),
+                changes: true
+            }
+        );
+        // A moved ref (external commit) and a new ref: the history.
+        for refs in [
+            &[("refs/heads/main", 2)][..],
+            &[("refs/heads/main", 1), ("refs/tags/v1", 1)],
+        ] {
+            assert_eq!(
+                decide_reload(Some(&base), &fp("main", refs, 10, 0)),
+                ReloadDecision {
+                    refs: Some(RefChange::History),
+                    changes: true
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_is_due_after_a_minute() {
+        let now = Instant::now();
+        let min = Duration::from_secs(60);
+        assert!(fetch_due(None, now, min));
+        assert!(!fetch_due(Some(now), now + Duration::from_secs(59), min));
+        assert!(fetch_due(Some(now), now + min, min));
+    }
+
+    /// Activation ticks a fetch only when the background fetch is on and the
+    /// last fetch is old enough. The test repository has no remote, so the
+    /// fetch itself does nothing and touches no network.
+    #[gpui::test]
+    fn activation_fetches_only_when_due_and_enabled(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("activation-fetch");
+        commit(repo.path(), "a.txt", "one\n");
+        cx.update(|cx| {
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings: crate::settings::Settings {
+                    background_fetch: false,
+                    ..crate::settings::Settings::default()
+                },
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+        let (mut cx, view) = open_repo_view(&repo, cx);
+        let activate = |cx: &mut gpui::VisualTestContext| {
+            let ticked =
+                cx.update(|_, cx| view.update(cx, |view, cx| view.fetch_on_activation(cx)));
+            cx.run_until_parked();
+            ticked
+        };
+        assert!(!activate(&mut cx), "disabled in the settings");
+        cx.update(|_, cx| crate::update_settings(cx, |settings| settings.background_fetch = true));
+        assert!(activate(&mut cx), "enabled and never fetched");
+        assert!(view.read_with(&cx, |view, _| view.last_fetch.is_some()));
+        assert!(!activate(&mut cx), "fetched a moment ago");
+        view.update(&mut cx, |view, _| {
+            view.last_fetch = Some(Instant::now() - Duration::from_secs(61));
+        });
+        assert!(activate(&mut cx), "the last fetch is over a minute old");
+    }
+
+    #[test]
+    fn a_check_waits_for_an_in_flight_baseline_and_never_discards_it() {
+        assert_eq!(check_start(true, true), CheckStart::Skip);
+        assert_eq!(check_start(true, false), CheckStart::Skip);
+        assert_eq!(check_start(false, true), CheckStart::Defer);
+        assert_eq!(check_start(false, false), CheckStart::Run);
+        // Newest check wins; one that overlapped a re-baseline is redone, not applied and
+        // not dropped (dropping it would lose an outside change made meanwhile).
+        assert_eq!(check_outcome(2, 3, 5, 5), CheckOutcome::Discard);
+        assert_eq!(check_outcome(3, 3, 5, 6), CheckOutcome::Rerun);
+        assert_eq!(check_outcome(3, 3, 5, 5), CheckOutcome::Apply);
+    }
+
+    #[test]
+    fn throttle_helper_limits_to_once_per_interval() {
+        let now = Instant::now();
+        let min = Duration::from_secs(2);
+        assert!(fetch_due(None, now, min));
+        assert!(!fetch_due(
+            Some(now),
+            now + Duration::from_millis(1999),
+            min
+        ));
+        assert!(fetch_due(Some(now), now + min, min));
+    }
+
+    /// Opens `repo` in the real window and waits for the history and the
+    /// Changes status to load.
+    fn open_repo_view(
+        repo: &crate::test_support::TempRepo,
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::VisualTestContext, Entity<RepositoryView>) {
+        let (mut cx, workspace) =
+            crate::test_support::open_workspace(crate::test_support::git(), cx);
+        let path = repo.path().to_path_buf();
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_repository(path, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        let view = cx.update(|_, cx| {
+            workspace
+                .read(cx)
+                .repository_for_test()
+                .expect("the repository is open")
+        });
+        (cx, view)
+    }
+
+    /// Runs `git` in `repo`, panicking on failure.
+    fn run_git(repo: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A commit made in a terminal while the window is open shows up when the
+    /// window becomes active again.
+    #[gpui::test]
+    fn an_external_commit_appears_on_window_activation(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("external-commit");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repo_view(&repo, cx);
+        let history = view.read_with(&cx, |view, _| view.history());
+        assert_eq!(history.read_with(&cx, |h, _| h.commit_count()), 1);
+
+        run_git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "two"]);
+        cx.update(|window, cx| view.update(cx, |view, cx| view.on_window_activated(window, cx)));
+        cx.run_until_parked();
+        assert_eq!(
+            history.read_with(&cx, |h, _| h.commit_count()),
+            2,
+            "the commit made outside the app did not appear after activation"
+        );
+    }
+
+    /// A file staged in a terminal is counted by Changes after activation,
+    /// without visiting the Changes tab.
+    #[gpui::test]
+    fn an_external_stage_appears_on_window_activation(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("external-stage");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repo_view(&repo, cx);
+        let changes = view.read_with(&cx, |view, _| view.changes.clone());
+        assert_eq!(changes.read_with(&cx, |c, _| c.staged_count()), 0);
+
+        std::fs::write(repo.path().join("b.txt"), "new\n").unwrap();
+        run_git(repo.path(), &["add", "b.txt"]);
+        cx.update(|window, cx| view.update(cx, |view, cx| view.on_window_activated(window, cx)));
+        cx.run_until_parked();
+        assert_eq!(
+            changes.read_with(&cx, |c, _| c.staged_count()),
+            1,
+            "the file staged outside the app did not show up after activation"
+        );
+    }
+
+    /// A watcher signal reloads the views after the merge delay.
+    #[gpui::test]
+    fn a_watch_signal_reloads_after_the_flush_delay(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("watch-signal");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repo_view(&repo, cx);
+        let history = view.read_with(&cx, |view, _| view.history());
+        assert_eq!(history.read_with(&cx, |h, _| h.commit_count()), 1);
+
+        run_git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "two"]);
+        let signal = WatchSignal {
+            kinds: Kinds::HEAD | Kinds::REFS,
+            limit_hit: false,
+        };
+        view.update(&mut cx, |view, cx| view.on_watch_signal(signal, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            history.read_with(&cx, |h, _| h.commit_count()),
+            1,
+            "the reload must wait for the merge delay"
+        );
+        cx.executor().advance_clock(WATCH_FLUSH * 2);
+        cx.run_until_parked();
+        assert_eq!(history.read_with(&cx, |h, _| h.commit_count()), 2);
+    }
+
+    /// An INDEX signal re-reads Changes directly: the fingerprint's index stamp
+    /// is not asked, so a stamp that did not change cannot veto the refresh.
+    #[gpui::test]
+    fn an_index_signal_refreshes_changes_without_the_fingerprint(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("watch-index");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repo_view(&repo, cx);
+        let changes = view.read_with(&cx, |view, _| view.changes.clone());
+
+        std::fs::write(repo.path().join("a.txt"), "two\n").unwrap();
+        run_git(repo.path(), &["add", "a.txt"]);
+        view.update(&mut cx, |view, cx| {
+            // Pretend the baseline already holds the new index stamp: the fingerprint
+            // comparison alone would see no change.
+            view.fingerprint = read_fingerprint(view.git.clone().unwrap(), &view.root);
+            let signal = WatchSignal {
+                kinds: Kinds::INDEX,
+                limit_hit: false,
+            };
+            view.on_watch_signal(signal, cx);
+        });
+        cx.executor().advance_clock(WATCH_FLUSH * 2);
+        cx.run_until_parked();
+        assert_eq!(changes.read_with(&cx, |c, _| c.staged_count()), 1);
+    }
+
+    /// Signals are held while the app runs a ref action and applied after it.
+    #[gpui::test]
+    fn watch_signals_are_held_while_a_ref_action_runs(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("watch-held");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repo_view(&repo, cx);
+        let history = view.read_with(&cx, |view, _| view.history());
+
+        run_git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "two"]);
+        view.update(&mut cx, |view, cx| {
+            view.ref_action_running = true;
+            let signal = WatchSignal {
+                kinds: Kinds::REFS,
+                limit_hit: false,
+            };
+            view.on_watch_signal(signal, cx);
+        });
+        cx.executor().advance_clock(WATCH_FLUSH * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            history.read_with(&cx, |h, _| h.commit_count()),
+            1,
+            "applied while a ref action was running"
+        );
+        assert!(!view.read_with(&cx, |view, _| view.watch_pending.is_empty()));
+
+        view.update(&mut cx, |view, cx| {
+            view.ref_action_running = false;
+            view.retry_watch_flush(cx);
+        });
+        cx.executor().advance_clock(WATCH_FLUSH * 2);
+        cx.run_until_parked();
+        assert_eq!(history.read_with(&cx, |h, _| h.commit_count()), 2);
+        assert!(view.read_with(&cx, |view, _| view.watch_pending.is_empty()));
+    }
+
+    /// Only an open repository is watched and fetched: once its window shows the welcome
+    /// screen, the view (with its watcher, fetch loop and tasks) is dropped.
+    #[gpui::test]
+    fn a_repository_view_is_released_when_the_workspace_shows_welcome(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = crate::test_support::TempRepo::new("release-welcome");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, workspace) =
+            crate::test_support::open_workspace(crate::test_support::git(), cx);
+        let path = repo.path().to_path_buf();
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_repository(path, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        let weak = cx.update(|_, cx| {
+            workspace
+                .read(cx)
+                .repository_for_test()
+                .expect("the repository is open")
+                .downgrade()
+        });
+        assert!(weak.upgrade().is_some());
+
+        cx.update(|window, cx| workspace.update(cx, |ws, cx| ws.show_welcome(window, cx)));
+        cx.run_until_parked();
+        assert!(
+            weak.upgrade().is_none(),
+            "the repository view outlived the switch to Welcome"
+        );
+    }
+
+    /// Opening another repository in the same window drops the previous view too.
+    #[gpui::test]
+    fn a_repository_view_is_released_when_another_repository_opens(cx: &mut gpui::TestAppContext) {
+        let first = crate::test_support::TempRepo::new("release-first");
+        commit(first.path(), "a.txt", "one\n");
+        let second = crate::test_support::TempRepo::new("release-second");
+        commit(second.path(), "b.txt", "two\n");
+        let (mut cx, workspace) =
+            crate::test_support::open_workspace(crate::test_support::git(), cx);
+        let mut weak = None;
+        for path in [first.path(), second.path()] {
+            let path = path.to_path_buf();
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.open_repository(path, window, cx)
+                });
+            });
+            cx.run_until_parked();
+            if weak.is_none() {
+                weak = cx.update(|_, cx| {
+                    workspace
+                        .read(cx)
+                        .repository_for_test()
+                        .map(|view| view.downgrade())
+                });
+            }
+        }
+        let weak = weak.expect("the first view");
+        assert!(
+            weak.upgrade().is_none(),
+            "the first repository view outlived opening another repository"
+        );
     }
 }
