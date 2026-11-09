@@ -3,6 +3,7 @@
 // still work: piped stdout/stdin handles are inherited either way.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod about_dialog;
 mod accounts;
 mod activity_strip;
 mod app_icon;
@@ -95,6 +96,8 @@ fn macos_menus() -> Vec<Menu> {
         }))
     }
     let mut menus = vec![Menu::new("GitWarp").items([
+        MenuItem::action(ui::t!("app.menu.about"), workspace::ShowAbout),
+        MenuItem::separator(),
         MenuItem::action(ui::t!("app.menu.settings"), workspace::OpenSettings),
         MenuItem::separator(),
         MenuItem::os_submenu("Services", SystemMenuType::Services),

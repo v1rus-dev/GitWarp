@@ -1,10 +1,12 @@
 {
+  "app.menu.about": "О GitWarp",
   "app.menu.clone": "Клонировать…",
   "app.menu.close_repository": "Закрыть репозиторий",
   "app.menu.close_window": "Закрыть окно",
   "app.menu.exit": "Выход",
   "app.menu.fetch_all": "Получить всё",
   "app.menu.file": "Файл",
+  "app.menu.help": "Справка",
   "app.menu.minimize": "Свернуть",
   "app.menu.new_repository": "Новый репозиторий…",
   "app.menu.open_repository": "Открыть репозиторий…",

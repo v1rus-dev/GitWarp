@@ -1,10 +1,12 @@
 {
+  "app.menu.about": "GitWarp について",
   "app.menu.clone": "クローン…",
   "app.menu.close_repository": "リポジトリを閉じる",
   "app.menu.close_window": "ウインドウを閉じる",
   "app.menu.exit": "終了",
   "app.menu.fetch_all": "すべてフェッチ",
   "app.menu.file": "ファイル",
+  "app.menu.help": "ヘルプ",
   "app.menu.minimize": "しまう",
   "app.menu.new_repository": "新規リポジトリ…",
   "app.menu.open_repository": "リポジトリを開く…",

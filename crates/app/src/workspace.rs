@@ -45,6 +45,7 @@ actions!(
         OpenRepositoryDialog,
         OpenCloneDialog,
         OpenSettings,
+        ShowAbout,
         OpenGitSettings,
         CloseWindow,
         MinimizeWindow,
@@ -843,6 +844,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShowAbout, window, cx| {
+                crate::about_dialog::open(git_label(&this.git), window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenGitSettings, window, cx| {
                 this.open_settings_at(Page::Git, window, cx);

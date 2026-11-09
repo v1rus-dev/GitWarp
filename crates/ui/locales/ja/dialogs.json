@@ -1,4 +1,10 @@
 {
+  "dialogs.about.close": "閉じる",
+  "dialogs.about.copied": "コピーしました",
+  "dialogs.about.copy": "詳細をコピー",
+  "dialogs.about.legal": "法的情報",
+  "dialogs.about.title": "GitWarp について",
+  "dialogs.about.version": "バージョン {version}",
   "dialogs.account_picker.detail": "@{login} · {method}",
   "dialogs.account_picker.fallback_title": "アカウント",
   "dialogs.account_picker.help": "このリポジトリで記憶されます。後からリモートのメニュー「アカウント…」で変更できます。",

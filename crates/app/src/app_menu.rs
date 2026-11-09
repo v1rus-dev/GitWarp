@@ -11,7 +11,7 @@ use crate::repo_view::{
 };
 use crate::workspace::{
     CloseRepository, CloseWindow, MinimizeWindow, OpenCloneDialog, OpenRepositoryDialog,
-    OpenSettings, ZoomWindow,
+    OpenSettings, ShowAbout, ZoomWindow,
 };
 
 /// One row of a menu.
@@ -62,7 +62,7 @@ pub(crate) fn menus(mac: bool) -> Vec<MenuSpec> {
             item(ui::t!("app.menu.exit"), crate::Quit),
         ]);
     }
-    vec![
+    let mut menus = vec![
         MenuSpec {
             name: ui::t!("app.menu.file"),
             entries: file,
@@ -99,7 +99,15 @@ pub(crate) fn menus(mac: bool) -> Vec<MenuSpec> {
                 item(ui::t!("app.menu.zoom"), ZoomWindow),
             ],
         },
-    ]
+    ];
+    // macOS keeps About in the app menu.
+    if !mac {
+        menus.push(MenuSpec {
+            name: ui::t!("app.menu.help"),
+            entries: vec![item(ui::t!("app.menu.about"), ShowAbout)],
+        });
+    }
+    menus
 }
 
 #[cfg(test)]
@@ -151,6 +159,17 @@ mod tests {
                 check(&m.entries);
             }
         }
+    }
+
+    #[test]
+    fn help_with_about_only_off_mac() {
+        assert!(!menus(true).iter().any(|m| has_action(m, "ShowAbout")));
+        let all = menus(false);
+        let help = all.last().unwrap();
+        assert_eq!(&*help.name, &*ui::t!("app.menu.help"));
+        assert_eq!(help.entries.len(), 1);
+        assert!(has_action(help, "ShowAbout"));
+        assert_eq!(all.iter().filter(|m| has_action(m, "ShowAbout")).count(), 1);
     }
 
     #[test]

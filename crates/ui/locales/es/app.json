@@ -1,10 +1,12 @@
 {
+  "app.menu.about": "Acerca de GitWarp",
   "app.menu.clone": "Clonar…",
   "app.menu.close_repository": "Cerrar repositorio",
   "app.menu.close_window": "Cerrar ventana",
   "app.menu.exit": "Salir",
   "app.menu.fetch_all": "Obtener todo",
   "app.menu.file": "Archivo",
+  "app.menu.help": "Ayuda",
   "app.menu.minimize": "Minimizar",
   "app.menu.new_repository": "Nuevo repositorio…",
   "app.menu.open_repository": "Abrir repositorio…",
