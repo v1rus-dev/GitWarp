@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -573,6 +573,13 @@ pub struct RepositoryView {
     background_fetch_task: Option<Task<()>>,
     /// A background fetch is in flight; the next tick skips while it runs.
     background_fetch_running: bool,
+    /// What the repository looked like when the views were last known to be
+    /// current; `None` until the first read. See [`Fingerprint`].
+    fingerprint: Option<Fingerprint>,
+    /// Bumped by every fingerprint read, so only the newest result is applied.
+    fingerprint_generation: u64,
+    /// When Changes was last re-read quietly on window activation.
+    last_quiet_changes: Option<Instant>,
     /// Pull request badges and CI status of the primary remote's repository.
     hosting: HostingState,
     /// What the rows were last given, to skip a redraw that changes nothing.
@@ -863,6 +870,7 @@ impl RepositoryView {
             |this, _, event: &ChangesEvent, window, cx| match event {
                 ChangesEvent::Committed => {
                     this.reload_history(cx);
+                    this.rebaseline_fingerprint(cx);
                 }
                 ChangesEvent::PushAfterCommit => this.push_branch(window, cx),
                 // `merge --abort` does not move HEAD: the sidebar, the worktree
@@ -959,8 +967,7 @@ impl RepositoryView {
         let focus = cx.focus_handle().tab_stop(false);
         let window_activation = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
-                this.hosting_sync(PrTrigger::Focus, cx);
-                this.ensure_ci_timer(window, cx);
+                this.on_window_activated(window, cx);
             }
         });
 
@@ -1049,6 +1056,9 @@ impl RepositoryView {
             ),
             background_fetch_task: None,
             background_fetch_running: false,
+            fingerprint: None,
+            fingerprint_generation: 0,
+            last_quiet_changes: None,
             hosting: HostingState::default(),
             hosting_view: Arc::default(),
             ci_visible: Vec::new(),
@@ -1062,7 +1072,94 @@ impl RepositoryView {
             ci_timer: None,
         };
         view.start_background_fetch(cx);
+        view.rebaseline_fingerprint(cx);
         view
+    }
+
+    /// The window became active: besides the hosting and CI state, pick up
+    /// whatever changed in the repository while the user was in a terminal or
+    /// another tool (nothing watches the files; this is the focus check).
+    fn on_window_activated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hosting_sync(PrTrigger::Focus, cx);
+        self.ensure_ci_timer(window, cx);
+        self.check_external_changes(cx);
+        let now = Instant::now();
+        // A busy Changes view re-reads the status itself; don't spend the interval on it.
+        if !self.changes.read(cx).is_busy()
+            && quiet_refresh_due(self.last_quiet_changes, now, QUIET_CHANGES_MIN)
+        {
+            self.last_quiet_changes = Some(now);
+            self.changes
+                .update(cx, |changes, cx| changes.refresh_quiet(cx));
+        }
+    }
+
+    /// Reads the repository's fingerprint off the UI thread and reloads the
+    /// parts [`decide_reload`] names when it differs from the last known one.
+    /// Skipped while the app itself is changing refs or talking to a remote:
+    /// those paths re-baseline when they finish.
+    fn check_external_changes(&mut self, cx: &mut Context<Self>) {
+        if self.ref_action_running || self.network.is_some() || self.background_fetch_running {
+            return;
+        }
+        let Ok(git) = self.git.clone() else {
+            return;
+        };
+        self.fingerprint_generation = self.fingerprint_generation.wrapping_add(1);
+        let generation = self.fingerprint_generation;
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let new = cx
+                .background_executor()
+                .spawn(async move { read_fingerprint(git, &root) })
+                .await;
+            let Some(new) = new else {
+                return;
+            };
+            this.update(cx, |view, cx| {
+                if generation != view.fingerprint_generation {
+                    return;
+                }
+                let decision = decide_reload(view.fingerprint.as_ref(), &new);
+                view.fingerprint = Some(new);
+                if let Some(change) = decision.refs {
+                    // The Changes status is re-read quietly below, not through
+                    // the `Loading` state the in-app paths use.
+                    view.after_ref_change_with(change, false, cx);
+                }
+                if decision.changes {
+                    view.changes
+                        .update(cx, |changes, cx| changes.refresh_quiet(cx));
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Records the repository's current state as the one the views show. Called
+    /// after the app's own reloads, so what it just did is not mistaken for an
+    /// outside change at the next check.
+    fn rebaseline_fingerprint(&mut self, cx: &mut Context<Self>) {
+        let Ok(git) = self.git.clone() else {
+            return;
+        };
+        self.fingerprint_generation = self.fingerprint_generation.wrapping_add(1);
+        let generation = self.fingerprint_generation;
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let new = cx
+                .background_executor()
+                .spawn(async move { read_fingerprint(git, &root) })
+                .await;
+            this.update(cx, |view, _| {
+                if generation == view.fingerprint_generation && new.is_some() {
+                    view.fingerprint = new;
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The focus handle of the repository root; the workspace focuses it after
@@ -2650,6 +2747,7 @@ impl RepositoryView {
         self.worktrees
             .update(cx, |worktrees, cx| worktrees.refresh(cx));
         self.refresh_with(hosting_status::INTERNAL_RELOAD, cx);
+        self.rebaseline_fingerprint(cx);
         cx.notify();
     }
 
@@ -3579,6 +3677,7 @@ impl RepositoryView {
         self.reload_history(cx);
         self.changes.update(cx, |changes, cx| changes.refresh(cx));
         self.refresh_with(PrTrigger::AfterNetwork, cx);
+        self.rebaseline_fingerprint(cx);
         cx.notify();
     }
 
@@ -7201,6 +7300,92 @@ fn ref_snapshot(repo: &Repo) -> Vec<(String, Oid)> {
         .unwrap_or_default()
 }
 
+/// Git-dir entries whose presence says an operation (merge, rebase, cherry-pick,
+/// revert, bisect, squash) is in progress; one bit each in [`Fingerprint::markers`].
+const OPERATION_MARKERS: [&str; 10] = [
+    "MERGE_HEAD",
+    "SQUASH_MSG",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "REBASE_HEAD",
+    "BISECT_LOG",
+    "rebase-merge",
+    "rebase-apply",
+    "sequencer",
+    "MERGE_MSG",
+];
+
+/// Re-read Changes on window activation at most this often.
+const QUIET_CHANGES_MIN: Duration = Duration::from_secs(2);
+
+/// Everything cheap to read that tells the views are stale: HEAD, every ref,
+/// the index's (mtime, length) and which operation files exist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fingerprint {
+    head: Option<Head>,
+    refs: Vec<(String, Oid)>,
+    /// `None` when there is no index file (a fresh repository).
+    index: Option<(SystemTime, u64)>,
+    markers: u16,
+}
+
+/// Reads the fingerprint of the repository at `root`; `None` when it cannot be
+/// opened. Runs `git for-each-ref` and `rev-parse`, so call it off the UI thread.
+fn read_fingerprint(git: Arc<Git>, root: &Path) -> Option<Fingerprint> {
+    let repo = Repo::open(git, root).ok()?;
+    let git_dir = repo.git_dir();
+    let index = std::fs::metadata(git_dir.join("index"))
+        .ok()
+        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+    let markers = OPERATION_MARKERS
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| git_dir.join(name).exists())
+        .fold(0u16, |bits, (bit, _)| bits | (1 << bit));
+    Some(Fingerprint {
+        head: repo.head().ok(),
+        refs: ref_snapshot(&repo),
+        index,
+        markers,
+    })
+}
+
+/// What to reload after comparing two fingerprints.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReloadDecision {
+    /// Reload HEAD/refs (and the history, for [`RefChange::History`]).
+    refs: Option<RefChange>,
+    /// Re-read the Changes status.
+    changes: bool,
+}
+
+/// Decides what an outside change requires. Without a previous fingerprint
+/// there is nothing to compare: the new one becomes the baseline.
+fn decide_reload(old: Option<&Fingerprint>, new: &Fingerprint) -> ReloadDecision {
+    let Some(old) = old.filter(|old| *old != new) else {
+        return ReloadDecision::default();
+    };
+    let refs_moved = old.refs != new.refs;
+    let head_or_operation = old.head != new.head || old.markers != new.markers;
+    ReloadDecision {
+        refs: if refs_moved {
+            // A ref was added, removed or moved: commits may have changed.
+            Some(RefChange::History)
+        } else if head_or_operation {
+            // e.g. a checkout of an existing branch: only HEAD moved.
+            Some(RefChange::RefsOnly)
+        } else {
+            None
+        },
+        changes: refs_moved || head_or_operation || old.index != new.index,
+    }
+}
+
+/// Whether the last quiet Changes refresh is old enough for another.
+fn quiet_refresh_due(last: Option<Instant>, now: Instant, min: Duration) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= min)
+}
+
 /// One diff row and its cells, in pixels.
 const DIFF_ROW: f32 = 22.;
 const DIFF_GUTTER: f32 = 44.;
@@ -9749,5 +9934,164 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "changed again");
         assert_eq!(repo.stashes().unwrap().len(), 1);
+    }
+
+    fn fp(head: &str, refs: &[(&str, u8)], index: u64, markers: u16) -> Fingerprint {
+        let oid = |n: u8| Oid::from_hex(&format!("{n:02x}").repeat(20)).unwrap();
+        Fingerprint {
+            head: Some(Head::Branch {
+                name: head.to_owned(),
+                target: None,
+            }),
+            refs: refs
+                .iter()
+                .map(|(n, o)| ((*n).to_owned(), oid(*o)))
+                .collect(),
+            index: Some((SystemTime::UNIX_EPOCH, index)),
+            markers,
+        }
+    }
+
+    #[test]
+    fn decide_reload_compares_fingerprints() {
+        let base = fp("main", &[("refs/heads/main", 1)], 10, 0);
+        let none = ReloadDecision::default();
+        // No baseline yet, or nothing changed: nothing to reload.
+        assert_eq!(decide_reload(None, &base), none);
+        assert_eq!(decide_reload(Some(&base), &base.clone()), none);
+        // Only the index changed (an external `git add`): just Changes.
+        assert_eq!(
+            decide_reload(Some(&base), &fp("main", &[("refs/heads/main", 1)], 11, 0)),
+            ReloadDecision {
+                refs: None,
+                changes: true
+            }
+        );
+        // Only HEAD moved (checkout of an existing branch): refs, not the log.
+        assert_eq!(
+            decide_reload(Some(&base), &fp("dev", &[("refs/heads/main", 1)], 10, 0)),
+            ReloadDecision {
+                refs: Some(RefChange::RefsOnly),
+                changes: true
+            }
+        );
+        // An operation started or finished.
+        assert_eq!(
+            decide_reload(Some(&base), &fp("main", &[("refs/heads/main", 1)], 10, 1)),
+            ReloadDecision {
+                refs: Some(RefChange::RefsOnly),
+                changes: true
+            }
+        );
+        // A moved ref (external commit) and a new ref: the history.
+        for refs in [
+            &[("refs/heads/main", 2)][..],
+            &[("refs/heads/main", 1), ("refs/tags/v1", 1)],
+        ] {
+            assert_eq!(
+                decide_reload(Some(&base), &fp("main", refs, 10, 0)),
+                ReloadDecision {
+                    refs: Some(RefChange::History),
+                    changes: true
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn quiet_refresh_is_limited_to_once_per_interval() {
+        let now = Instant::now();
+        let min = Duration::from_secs(2);
+        assert!(quiet_refresh_due(None, now, min));
+        assert!(!quiet_refresh_due(
+            Some(now),
+            now + Duration::from_millis(1999),
+            min
+        ));
+        assert!(quiet_refresh_due(Some(now), now + min, min));
+    }
+
+    /// Opens `repo` in the real window and waits for the history and the
+    /// Changes status to load.
+    fn open_repo_view(
+        repo: &crate::test_support::TempRepo,
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::VisualTestContext, Entity<RepositoryView>) {
+        let (mut cx, workspace) =
+            crate::test_support::open_workspace(crate::test_support::git(), cx);
+        let path = repo.path().to_path_buf();
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_repository(path, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        let view = cx.update(|_, cx| {
+            workspace
+                .read(cx)
+                .repository_for_test()
+                .expect("the repository is open")
+        });
+        (cx, view)
+    }
+
+    /// Runs `git` in `repo`, panicking on failure.
+    fn run_git(repo: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A commit made in a terminal while the window is open shows up when the
+    /// window becomes active again.
+    #[gpui::test]
+    fn an_external_commit_appears_on_window_activation(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("external-commit");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repo_view(&repo, cx);
+        let history = view.read_with(&cx, |view, _| view.history());
+        assert_eq!(history.read_with(&cx, |h, _| h.commit_count()), 1);
+
+        run_git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "two"]);
+        cx.update(|window, cx| view.update(cx, |view, cx| view.on_window_activated(window, cx)));
+        cx.run_until_parked();
+        assert_eq!(
+            history.read_with(&cx, |h, _| h.commit_count()),
+            2,
+            "the commit made outside the app did not appear after activation"
+        );
+    }
+
+    /// A file staged in a terminal is counted by Changes after activation,
+    /// without visiting the Changes tab.
+    #[gpui::test]
+    fn an_external_stage_appears_on_window_activation(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("external-stage");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repo_view(&repo, cx);
+        let changes = view.read_with(&cx, |view, _| view.changes.clone());
+        assert_eq!(changes.read_with(&cx, |c, _| c.staged_count()), 0);
+
+        std::fs::write(repo.path().join("b.txt"), "new\n").unwrap();
+        run_git(repo.path(), &["add", "b.txt"]);
+        cx.update(|window, cx| view.update(cx, |view, cx| view.on_window_activated(window, cx)));
+        cx.run_until_parked();
+        assert_eq!(
+            changes.read_with(&cx, |c, _| c.staged_count()),
+            1,
+            "the file staged outside the app did not show up after activation"
+        );
     }
 }
