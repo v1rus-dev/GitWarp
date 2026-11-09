@@ -5281,6 +5281,8 @@ mod tests {
             .map(|entry| match entry {
                 MenuEntry::Item(item) => item.label.to_string(),
                 MenuEntry::Separator => "---".to_owned(),
+                MenuEntry::Header(header) => header.label.to_string(),
+                MenuEntry::Filter { .. } => "<filter>".to_owned(),
             })
             .collect()
     }

@@ -5,15 +5,17 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, point, px, App, AppContext, BorrowAppContext, Bounds, Context, Div, ElementId,
-    FocusHandle, Global, IntoElement, MouseMoveEvent, ParentElement, Pixels, Point, Render,
-    SharedString, Stateful, Styled, Window, WindowId,
+    div, point, px, App, AppContext, BorrowAppContext, Bounds, Context, Div, ElementId, Entity,
+    FocusHandle, FontWeight, Global, IntoElement, MouseMoveEvent, ParentElement, Pixels, Point,
+    Render, SharedString, Stateful, Styled, Subscription, Window, WindowId,
 };
 use gpui::{InteractiveElement, StatefulInteractiveElement};
 
 use crate::actions::{Confirm, FocusNext, FocusPrev, SelectNext, SelectPrev};
+use crate::components::text_input::{TextInput, TextInputEvent};
+use crate::components::{SearchField, Tooltip};
 use crate::icon::{Icon, IconName};
-use crate::metrics::{FONT_UI, FS_BASE, FS_SM, R_MD, R_SM};
+use crate::metrics::{FONT_UI, FS_BASE, FS_SM, FS_XS, R_MD, R_SM};
 use crate::overlay::{self, LayerId};
 use crate::theme::ActiveTheme;
 
@@ -35,6 +37,12 @@ pub struct MenuItem {
     /// When set, activating the item swaps the open menu's rows for these
     /// instead of closing it and running `action`.
     pub submenu: Option<MenuSubmenu>,
+    /// Muted text right-aligned before the shortcut ("HEAD +origin", "↑2 ↓1").
+    pub hint: Option<SharedString>,
+    /// Draws the icon in the accent colour (the checked-out branch).
+    pub accent_icon: bool,
+    /// What a [`MenuEntry::Filter`] above matches against; the label by default.
+    pub filter_text: Option<SharedString>,
 }
 
 impl MenuItem {
@@ -47,6 +55,9 @@ impl MenuItem {
             disabled: false,
             action: Rc::new(|_, _| {}),
             submenu: None,
+            hint: None,
+            accent_icon: false,
+            filter_text: None,
         }
     }
 
@@ -82,13 +93,111 @@ impl MenuItem {
         self.submenu = Some(Rc::new(entries));
         self
     }
+
+    /// Muted text right-aligned before the shortcut.
+    pub fn hint(mut self, text: impl Into<SharedString>) -> Self {
+        self.hint = Some(text.into());
+        self
+    }
+
+    /// Draws the icon in the accent colour.
+    pub fn accent_icon(mut self) -> Self {
+        self.accent_icon = true;
+        self
+    }
+
+    /// The text a [`MenuEntry::Filter`] matches; the label when unset.
+    pub fn filter_text(mut self, text: impl Into<SharedString>) -> Self {
+        self.filter_text = Some(text.into());
+        self
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        let text = self.filter_text.as_ref().unwrap_or(&self.label);
+        text.to_lowercase().contains(&query.to_lowercase())
+    }
 }
 
-/// A row of a menu: either an item or a rule.
+/// A small icon button at the right end of a [`MenuHeader`].
+#[derive(Clone)]
+pub struct MenuTool {
+    pub icon: IconName,
+    pub tooltip: SharedString,
+    /// The "on" state: accent icon over the active fill.
+    pub selected: bool,
+    pub action: MenuAction,
+}
+
+impl MenuTool {
+    pub fn new(icon: IconName, tooltip: impl Into<SharedString>) -> Self {
+        Self {
+            icon,
+            tooltip: tooltip.into(),
+            selected: false,
+            action: Rc::new(|_, _| {}),
+        }
+    }
+
+    pub fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    pub fn action(mut self, action: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.action = Rc::new(action);
+        self
+    }
+}
+
+/// A section title with optional icon buttons on the right.
+#[derive(Clone)]
+pub struct MenuHeader {
+    pub label: SharedString,
+    pub tools: Vec<MenuTool>,
+}
+
+impl MenuHeader {
+    pub fn new(label: impl Into<SharedString>) -> Self {
+        Self {
+            label: label.into(),
+            tools: Vec::new(),
+        }
+    }
+
+    pub fn tool(mut self, tool: MenuTool) -> Self {
+        self.tools.push(tool);
+        self
+    }
+}
+
+/// A row of a menu: an item, a rule, a section header or the filter field.
 #[derive(Clone)]
 pub enum MenuEntry {
     Item(MenuItem),
     Separator,
+    /// A section title: 11px, semibold, muted, in the ref's original case.
+    Header(MenuHeader),
+    /// A text field; the items after it whose filter text does not contain
+    /// the query (case-insensitive) are hidden, and focus starts in the field.
+    Filter {
+        placeholder: SharedString,
+    },
+}
+
+/// Per item (in item order, separators and headers not counted), whether the
+/// filter query leaves it visible. Only items after a [`MenuEntry::Filter`]
+/// can be hidden; an empty query hides nothing.
+pub fn visible_items(entries: &[MenuEntry], query: &str) -> Vec<bool> {
+    let mut filtering = false;
+    let mut visible = Vec::new();
+    for entry in entries {
+        match entry {
+            MenuEntry::Filter { .. } => filtering = true,
+            MenuEntry::Item(item) => visible.push(!filtering || item.matches(query)),
+            MenuEntry::Separator | MenuEntry::Header(_) => {}
+        }
+    }
+    visible
 }
 
 /// Highlight movement over the enabled flags of a menu's items.
@@ -217,13 +326,13 @@ fn open_at(
 ) -> LayerId {
     close_previous(window, cx);
     let view = cx.new(|cx| {
-        let mut menu = MenuView::new(entries, cx);
+        let mut menu = MenuView::new(entries, window, cx);
         if let Some(index) = highlight.filter(|index| menu.enabled().get(*index) == Some(&true)) {
             menu.nav.set(index);
         }
         menu
     });
-    let focus = view.read(cx).focus.clone();
+    let focus = view.read(cx).entry_focus(cx);
     let id = overlay::open_popover(position, view.clone().into(), window, cx);
     view.update(cx, |menu, _| menu.layer = Some(id));
     remember(window, cx, id);
@@ -251,31 +360,106 @@ fn remember(window: &Window, cx: &mut App, id: LayerId) {
     });
 }
 
+/// The filter field of a menu and what it currently holds.
+struct FilterField {
+    input: Entity<TextInput>,
+    _subscription: Subscription,
+}
+
 struct MenuView {
     entries: Vec<MenuEntry>,
     nav: MenuNav,
     focus: FocusHandle,
     layer: Option<LayerId>,
+    filter: Option<FilterField>,
+    query: String,
 }
 
 impl MenuView {
-    fn new(entries: Vec<MenuEntry>, cx: &mut Context<Self>) -> Self {
-        Self {
-            entries,
+    fn new(entries: Vec<MenuEntry>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut menu = Self {
+            entries: Vec::new(),
             nav: MenuNav::new(),
             focus: cx.focus_handle().tab_stop(false),
             layer: None,
+            filter: None,
+            query: String::new(),
+        };
+        menu.set_entries(entries, window, cx);
+        menu
+    }
+
+    /// Swaps the rows and rebuilds the filter field for them, if they have one.
+    fn set_entries(
+        &mut self,
+        entries: Vec<MenuEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.filter = entries
+            .iter()
+            .find_map(|entry| match entry {
+                MenuEntry::Filter { placeholder } => Some(placeholder.clone()),
+                _ => None,
+            })
+            .map(|placeholder| {
+                let input = cx.new(|cx| TextInput::new(window, cx));
+                input.update(cx, |input, cx| {
+                    input.set_placeholder(placeholder.clone(), cx)
+                });
+                let _subscription = cx.subscribe_in(
+                    &input,
+                    window,
+                    |this, _, event: &TextInputEvent, window, cx| {
+                        match event {
+                            TextInputEvent::Changed(text) => this.set_query(text.clone(), cx),
+                            // The input's own Enter binding shadows `Confirm`, so
+                            // Enter in the field activates the highlighted row here.
+                            TextInputEvent::Submit => this.confirm(window, cx),
+                        }
+                    },
+                );
+                FilterField {
+                    input,
+                    _subscription,
+                }
+            });
+        self.entries = entries;
+        self.query.clear();
+        self.nav.clear();
+    }
+
+    /// Where focus goes when the menu opens: the filter field, else the menu.
+    fn entry_focus(&self, cx: &App) -> FocusHandle {
+        match &self.filter {
+            Some(filter) => filter.input.read(cx).focus_handle().clone(),
+            None => self.focus.clone(),
         }
     }
 
-    /// Enabled flags of the items only, in item order.
+    fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
+        self.query = query;
+        // A narrowed list highlights its first row so Enter picks it; the old
+        // highlight may be hidden now.
+        self.nav.clear();
+        if !self.query.is_empty() {
+            self.nav.next(&self.enabled());
+        }
+        cx.notify();
+    }
+
+    /// Enabled flags of the items only, in item order; a row hidden by the
+    /// filter counts as disabled so the arrows skip it.
     fn enabled(&self) -> Vec<bool> {
+        let visible = visible_items(&self.entries, &self.query);
         self.entries
             .iter()
             .filter_map(|entry| match entry {
                 MenuEntry::Item(item) => Some(!item.disabled),
-                MenuEntry::Separator => None,
+                MenuEntry::Separator | MenuEntry::Header(_) | MenuEntry::Filter { .. } => None,
             })
+            .zip(visible)
+            .map(|(enabled, visible)| enabled && visible)
             .collect()
     }
 
@@ -284,7 +468,7 @@ impl MenuView {
             .iter()
             .filter_map(|entry| match entry {
                 MenuEntry::Item(item) => Some(item),
-                MenuEntry::Separator => None,
+                MenuEntry::Separator | MenuEntry::Header(_) | MenuEntry::Filter { .. } => None,
             })
             .nth(index)
     }
@@ -299,17 +483,34 @@ impl MenuView {
         cx.notify();
     }
 
+    /// Activates the highlighted row (Enter).
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.nav.highlight() {
+            // Enter closes the menu on key-down; the paired key-up
+            // must not activate the opener that regains focus.
+            overlay::defer_focus_restore(window, cx);
+            self.activate(index, window, cx);
+            overlay::clear_deferred_focus_restore(window, cx);
+        }
+    }
+
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.item(index) else {
             return;
         };
         if let Some(submenu) = item.submenu.clone() {
-            self.entries = submenu();
-            self.nav.clear();
+            self.set_entries(submenu(), window, cx);
+            // The old field may have held focus; its replacement is not focused.
+            window.focus(&self.entry_focus(cx), cx);
             cx.notify();
             return;
         }
         let action = item.action.clone();
+        self.close_and_run(action, window, cx);
+    }
+
+    /// Closes the menu, then runs `action`.
+    fn close_and_run(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(layer) = self.layer {
             overlay::close(layer, window, cx);
         }
@@ -338,19 +539,27 @@ impl Render for MenuView {
             // menu that is no longer focused cannot handle Esc any more.
             .on_action(cx.listener(|_, _: &FocusNext, _, _| {}))
             .on_action(cx.listener(|_, _: &FocusPrev, _, _| {}))
-            .on_action(cx.listener(|this, _: &Confirm, window, cx| {
-                if let Some(index) = this.nav.highlight() {
-                    // Enter closes the menu on key-down; the paired key-up
-                    // must not activate the opener that regains focus.
-                    overlay::defer_focus_restore(window, cx);
-                    this.activate(index, window, cx);
-                    overlay::clear_deferred_focus_restore(window, cx);
-                }
-            }));
+            .on_action(cx.listener(|this, _: &Confirm, window, cx| this.confirm(window, cx)));
 
+        let visible = visible_items(&self.entries, &self.query);
         let mut item_index = 0;
-        for entry in &self.entries {
+        for (entry_index, entry) in self.entries.iter().enumerate() {
             match entry {
+                MenuEntry::Header(header) => {
+                    panel = panel.child(menu_header_row(header, entry_index, colors, cx));
+                }
+                MenuEntry::Filter { .. } => {
+                    if let Some(filter) = &self.filter {
+                        panel = panel.child(
+                            div()
+                                .flex_none()
+                                .px(px(4.))
+                                .pt(px(2.))
+                                .pb(px(6.))
+                                .child(SearchField::new("menu-filter", filter.input.clone())),
+                        );
+                    }
+                }
                 MenuEntry::Separator => {
                     panel = panel.child(
                         div()
@@ -364,6 +573,9 @@ impl Render for MenuView {
                 MenuEntry::Item(item) => {
                     let index = item_index;
                     item_index += 1;
+                    if !visible[index] {
+                        continue;
+                    }
                     let highlighted = !item.disabled && self.nav.highlight() == Some(index);
                     let row = menu_item_row(item, index, highlighted, colors);
                     panel = panel.child(if item.disabled {
@@ -388,6 +600,69 @@ impl Render for MenuView {
     }
 }
 
+/// A section title with its tool buttons.
+fn menu_header_row(
+    header: &MenuHeader,
+    entry_index: usize,
+    colors: crate::theme::ThemeColors,
+    cx: &mut Context<MenuView>,
+) -> Div {
+    // GPUI has no letter-spacing, so the design's .06em tracking is not drawn.
+    let mut row = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(4.))
+        .px(px(10.))
+        .pt(px(6.))
+        .pb(px(4.))
+        .font_family(FONT_UI)
+        .text_size(FS_XS)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(colors.muted)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(header.label.clone()),
+        );
+    for (tool_index, tool) in header.tools.iter().enumerate() {
+        let selector = format!("menu-tool-{entry_index}-{tool_index}");
+        let action = tool.action.clone();
+        let (background, icon_color) = if tool.selected {
+            (colors.active, colors.accent)
+        } else {
+            (gpui::transparent_black(), colors.text)
+        };
+        row = row.child(
+            div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector.clone())
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(20.))
+                // The design pulls the last button 4px into the header's padding.
+                .mr(px(-4.))
+                .rounded(R_SM)
+                .bg(background)
+                .cursor_pointer()
+                .hover(move |style| style.bg(colors.hover))
+                .active(move |style| style.bg(colors.active))
+                .tooltip(Tooltip::text(tool.tooltip.clone()))
+                .child(Icon::new(tool.icon).size(px(12.)).color(icon_color))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.close_and_run(action.clone(), window, cx);
+                })),
+        );
+    }
+    row
+}
+
 fn menu_item_row(
     item: &MenuItem,
     index: usize,
@@ -409,6 +684,8 @@ fn menu_item_row(
         colors.error
     } else if highlighted {
         colors.selection_sub
+    } else if item.accent_icon {
+        colors.accent
     } else {
         colors.muted
     };
@@ -433,6 +710,7 @@ fn menu_item_row(
 
     let mut row = div()
         .id(ElementId::named_usize("menu-item", index))
+        .debug_selector(move || format!("menu-0-{index}"))
         .h(px(28.))
         // A fixed-height item in the menu's flex column keeps its height.
         .flex_none()
@@ -446,6 +724,16 @@ fn menu_item_row(
         .text_color(foreground)
         .child(icon_slot)
         .child(div().flex_1().child(item.label.clone()))
+        .when_some(item.hint.clone(), |this, hint| {
+            this.child(
+                div()
+                    .flex_none()
+                    .ml(px(12.))
+                    .text_size(FS_SM)
+                    .text_color(shortcut_color)
+                    .child(hint),
+            )
+        })
         .when_some(item.shortcut.clone(), |this, shortcut| {
             this.child(
                 div()
@@ -504,6 +792,48 @@ mod tests {
         assert_eq!(nav.highlight(), None);
         nav.prev(&enabled);
         assert_eq!(nav.highlight(), None);
+    }
+
+    fn item(label: &'static str) -> MenuEntry {
+        MenuEntry::Item(MenuItem::new(label))
+    }
+
+    fn filter() -> MenuEntry {
+        MenuEntry::Filter {
+            placeholder: "Filter".into(),
+        }
+    }
+
+    #[test]
+    fn items_before_the_filter_and_an_empty_query_stay_visible() {
+        let entries = [item("Pinned"), filter(), item("main"), item("dev")];
+        assert_eq!(visible_items(&entries, ""), [true, true, true]);
+        assert_eq!(visible_items(&entries, "zzz"), [true, false, false]);
+    }
+
+    #[test]
+    fn filter_matches_case_insensitively_on_the_label_or_filter_text() {
+        let entries = [
+            filter(),
+            item("Feature/Login"),
+            MenuEntry::Item(MenuItem::new("origin/x").filter_text("remote hotfix")),
+            MenuEntry::Separator,
+            item("main"),
+        ];
+        assert_eq!(visible_items(&entries, "FEATURE"), [true, false, false]);
+        assert_eq!(visible_items(&entries, "hotfix"), [false, true, false]);
+        // A rule between items does not shift the per-item flags.
+        assert_eq!(visible_items(&entries, "ma"), [false, false, true]);
+    }
+
+    #[test]
+    fn menus_without_a_filter_show_everything() {
+        let entries = [
+            item("a"),
+            MenuEntry::Header(MenuHeader::new("H")),
+            item("b"),
+        ];
+        assert_eq!(visible_items(&entries, "zzz"), [true, true]);
     }
 
     #[test]

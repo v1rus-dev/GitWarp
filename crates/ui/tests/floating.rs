@@ -254,6 +254,109 @@ fn menu_submenu_replaces_the_rows_in_place_and_back_restores_them(cx: &mut TestA
 }
 
 #[gpui::test]
+fn menu_filter_hides_non_matching_rows_and_enter_runs_the_first_match(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let alpha = Rc::new(Cell::new(0));
+    let beta = Rc::new(Cell::new(0));
+    let gamma = Rc::new(Cell::new(0));
+    let entries = vec![
+        MenuEntry::Filter {
+            placeholder: "Filter refs…".into(),
+        },
+        menu_item("Alpha", true, &alpha),
+        menu_item("Beta", true, &beta),
+        menu_item("Gamma", true, &gamma),
+    ];
+
+    cx.update(|window, app| {
+        menu::open_context_menu(point(px(40.), px(40.)), entries, window, app);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("menu-0-0").is_some());
+    assert!(cx.debug_bounds("menu-0-1").is_some());
+    assert!(cx.debug_bounds("menu-0-2").is_some());
+
+    // Focus starts in the field, so typing narrows the list (case-insensitive).
+    cx.simulate_input("BET");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("menu-0-0").is_none(),
+        "Alpha stayed visible"
+    );
+    assert!(cx.debug_bounds("menu-0-1").is_some(), "Beta was hidden");
+    assert!(
+        cx.debug_bounds("menu-0-2").is_none(),
+        "Gamma stayed visible"
+    );
+
+    // Enter in the field activates the first visible row and closes the menu.
+    cx.simulate_keystrokes("enter");
+    assert_eq!(
+        (alpha.get(), beta.get(), gamma.get()),
+        (0, 1, 0),
+        "enter did not run the visible row"
+    );
+    assert_eq!(layer_count(cx), 0);
+}
+
+#[gpui::test]
+fn menu_filter_arrows_skip_hidden_rows(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits: Vec<_> = (0..3).map(|_| Rc::new(Cell::new(0))).collect();
+    let entries = vec![
+        MenuEntry::Filter {
+            placeholder: "Filter".into(),
+        },
+        menu_item("one", true, &hits[0]),
+        menu_item("two", true, &hits[1]),
+        menu_item("three", true, &hits[2]),
+    ];
+
+    cx.update(|window, app| {
+        menu::open_context_menu(point(px(40.), px(40.)), entries, window, app);
+    });
+    cx.run_until_parked();
+
+    // "o" matches one and two; three is hidden. The first match is
+    // highlighted, down moves to the second and wraps past the hidden row.
+    cx.simulate_input("o");
+    cx.simulate_keystrokes("down down enter");
+    assert_eq!(
+        (hits[0].get(), hits[1].get(), hits[2].get()),
+        (1, 0, 0),
+        "navigation stopped on a hidden row"
+    );
+}
+
+#[gpui::test]
+fn menu_header_tool_runs_its_action_and_closes_the_menu(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let tool_hits = Rc::new(Cell::new(0));
+    let item_hits = Rc::new(Cell::new(0));
+    let entries = vec![
+        MenuEntry::Header(menu::MenuHeader::new("main").tool({
+            let hits = tool_hits.clone();
+            menu::MenuTool::new(ui::IconName::Filter, "Show only this branch")
+                .selected(true)
+                .action(move |_, _| hits.set(hits.get() + 1))
+        })),
+        menu_item("Item", true, &item_hits),
+    ];
+
+    cx.update(|window, app| {
+        menu::open_context_menu(point(px(40.), px(40.)), entries, window, app);
+    });
+    cx.run_until_parked();
+
+    let tool = cx.debug_bounds("menu-tool-0-0").expect("no header tool");
+    cx.simulate_click(tool.center(), Modifiers::default());
+
+    assert_eq!(tool_hits.get(), 1, "the tool did not run");
+    assert_eq!(item_hits.get(), 0);
+    assert_eq!(layer_count(cx), 0, "the tool left the menu open");
+}
+
+#[gpui::test]
 fn menu_escape_closes_without_running_anything(cx: &mut TestAppContext) {
     let (_, cx) = start(cx);
     let hits = Rc::new(Cell::new(0));
