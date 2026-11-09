@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use gpui::prelude::*;
 use gpui::{
     actions, canvas, container_query, div, point, px, uniform_list, AnyElement, App, AsyncApp,
-    Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView,
-    EventEmitter, FocusHandle, FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseUpEvent,
-    Pixels, Point, Render, ScrollStrategy, SharedString, StyledText, Task, TextRun, TextStyle,
+    ClickEvent, ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, EventEmitter,
+    FocusHandle, FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point,
+    Render, ScrollStrategy, SharedString, StyledText, Task, TextRun, TextStyle,
     UniformListScrollHandle, WeakEntity, Window,
 };
 
@@ -48,7 +48,7 @@ use crate::ref_ops::{CardRefKind, CommitCard, RefAction};
 pub(crate) type RefActionHandler = Rc<dyn Fn(RefAction, &mut Window, &mut App)>;
 
 /// What the shell does with a sidebar action chosen from a ref's menu.
-pub(crate) type SidebarActionHandler = Rc<dyn Fn(SidebarAction, &mut Window, &mut App)>;
+pub(crate) use crate::sidebar::SidebarActionHandler;
 
 /// Opens the pull request popover of a local branch at a window position.
 pub(crate) type PrClickHandler = Rc<dyn Fn(String, Point<Pixels>, &mut Window, &mut App)>;
@@ -88,9 +88,6 @@ const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(15
 
 /// The gap between the history table's columns.
 const COL_GAP: f32 = 18.;
-/// How many frames a keyboard-opened row menu waits for its row to be painted
-/// after scrolling it into view.
-const MENU_WAIT_FRAMES: u8 = 4;
 /// The pane widths where the table drops a column, as the design's container
 /// queries do: 560 px loses Hash, 460 px loses Author.
 const PANE_MEDIUM: f32 = 560.;
@@ -851,7 +848,8 @@ impl BranchRows {
 enum RefsState {
     #[default]
     Loading,
-    Loaded(Vec<Ref>),
+    /// Shared, so opening a menu clones a pointer, not every ref.
+    Loaded(Rc<[Ref]>),
     Failed,
 }
 
@@ -963,15 +961,6 @@ pub struct HistoryView {
     /// The virtualized list's scroll state, so a selection moved by the
     /// keyboard can be scrolled minimally into view.
     scroll: UniformListScrollHandle,
-    /// Where the selected row's graph cell was painted in the latest frame: the
-    /// row menu opened from the keyboard anchors to it (left of the summary,
-    /// below). Cleared every frame before the rows are built, so `None` means
-    /// the selected row is not on screen.
-    selected_cell: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
-    /// Frames left to wait for the selected row to be painted so the row menu
-    /// asked for from the keyboard can open on it (the row was scrolled into
-    /// view first). 0 when no menu is waiting.
-    menu_wait_frames: u8,
     /// Whether the user picked a row themselves. Until then the selection
     /// follows the HEAD row as it arrives instead of staying on row 0.
     user_selected: bool,
@@ -1052,6 +1041,7 @@ fn ref_menu_entries(
     model: Vec<RefMenuEntry>,
     handler: Option<SidebarActionHandler>,
 ) -> Vec<MenuEntry> {
+    let handler = handler_or_open_url(handler);
     model
         .into_iter()
         .map(|entry| match entry {
@@ -1067,39 +1057,29 @@ fn ref_menu_entries(
                 }
                 MenuEntry::Header(header)
             }
-            RefMenuEntry::Item(item) => {
-                let mut menu_item = MenuItem::new(item.label)
-                    .icon(item.icon)
-                    .disabled(!item.enabled);
-                if let Some(shortcut) = item.shortcut {
-                    menu_item = menu_item.shortcut(shortcut);
-                }
-                if let Some(hint) = item.hint {
-                    menu_item = menu_item.hint(hint);
-                }
-                if item.danger {
-                    menu_item = menu_item.danger();
-                }
-                MenuEntry::Item(menu_item.action(dispatch(handler.clone(), item.action)))
-            }
+            RefMenuEntry::Item(item) => MenuEntry::Item(item.into_menu_item(handler.clone())),
         })
         .collect()
 }
 
-/// What a menu entry does: the shell's sidebar-action handler, or, in a
-/// History without one, just opening a link.
-fn dispatch(
-    handler: Option<SidebarActionHandler>,
-    action: SidebarAction,
-) -> impl Fn(&mut Window, &mut App) + 'static {
-    move |window, cx| match &handler {
-        Some(handler) => handler(action.clone(), window, cx),
-        None => {
+/// The shell's sidebar-action handler, or, in a History without one, one that
+/// just opens a link.
+fn handler_or_open_url(handler: Option<SidebarActionHandler>) -> SidebarActionHandler {
+    handler.unwrap_or_else(|| {
+        Rc::new(|action, _, cx| {
             if let SidebarAction::OpenUrl { url, .. } = &action {
                 cx.open_url(url);
             }
-        }
-    }
+        })
+    })
+}
+
+/// What a menu entry does when chosen.
+fn dispatch(
+    handler: SidebarActionHandler,
+    action: SidebarAction,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    move |window, cx| handler(action.clone(), window, cx)
 }
 
 /// The ref row a badge stands for, or `None` for a badge that has no menu (a
@@ -1128,7 +1108,6 @@ fn badge_row(spec: &BadgeSpec) -> Option<RefRow> {
 /// Everything the history row menu is built from. The menu is pure data plus
 /// callbacks, so its shape is testable without a window: one cascading row per
 /// ref of the commit (see [`ref_menus`]), then the commit's own actions.
-#[derive(Clone)]
 struct RowMenu {
     hash: String,
     card: CommitCard,
@@ -1149,14 +1128,14 @@ struct RowMenu {
 }
 
 impl RowMenu {
-    fn entries(&self) -> Vec<MenuEntry> {
-        let (shown, more) = ref_menus::split_overflow(self.rows.clone());
+    fn entries(self: &Rc<Self>) -> Vec<MenuEntry> {
+        let (shown, more) = ref_menus::split_overflow(&self.rows);
         let mut entries: Vec<MenuEntry> = shown
             .iter()
             .map(|row| MenuEntry::Item(self.ref_item(row)))
             .collect();
         if !more.is_empty() {
-            let this = self.clone();
+            let (this, shown_len) = (self.clone(), shown.len());
             entries.push(MenuEntry::Item(
                 MenuItem::new(ui::t!("history.refmenu.more_refs", n = more.len()))
                     .icon(IconName::Branch)
@@ -1164,7 +1143,11 @@ impl RowMenu {
                         let mut rest = vec![MenuEntry::Filter {
                             placeholder: ui::t!("history.refmenu.filter_refs"),
                         }];
-                        rest.extend(more.iter().map(|row| MenuEntry::Item(this.ref_item(row))));
+                        rest.extend(
+                            this.rows[shown_len..]
+                                .iter()
+                                .map(|row| MenuEntry::Item(this.ref_item(row))),
+                        );
                         rest
                     }),
             ));
@@ -1247,7 +1230,7 @@ impl RowMenu {
 
     /// The row of one ref: its name, hint and a submenu with the ref's
     /// sections (the same entries a badge's right-click shows).
-    fn ref_item(&self, row: &RefRow) -> MenuItem {
+    fn ref_item(self: &Rc<Self>, row: &RefRow) -> MenuItem {
         let mut item = MenuItem::new(row.name.clone()).icon(row.icon());
         if row.is_head() {
             item = item.accent_icon();
@@ -1257,10 +1240,8 @@ impl RowMenu {
         }
         let (row, this) = (row.clone(), self.clone());
         item.submenu(move || {
-            let mut ctx = (*this.ctx).clone();
-            ctx.pr_kind = this.pr_kinds.get(&row.name).copied();
             ref_menu_entries(
-                ref_menus::badge_sections(&ctx, &row),
+                ref_menus::badge_sections(&this.ctx, &row, this.pr_kinds.get(&row.name).copied()),
                 this.on_sidebar.clone(),
             )
         })
@@ -1341,7 +1322,10 @@ impl RowMenu {
             entries.push(MenuEntry::Item(
                 MenuItem::new(label)
                     .icon(IconName::External)
-                    .action(dispatch(self.on_sidebar.clone(), action)),
+                    .action(dispatch(
+                        handler_or_open_url(self.on_sidebar.clone()),
+                        action,
+                    )),
             ));
         }
     }
@@ -1430,8 +1414,6 @@ impl HistoryView {
             hovered: None,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
-            selected_cell: Rc::default(),
-            menu_wait_frames: 0,
             user_selected: false,
             pending_reveal: PendingReveal::default(),
             commit_graph_task: None,
@@ -2376,44 +2358,33 @@ impl HistoryView {
             on_action: self.on_action.clone(),
             on_sidebar: self.sidebar_action.clone(),
         };
-        menu::open_context_menu(position, menu.entries(), window, cx);
+        menu::open_context_menu(position, Rc::new(menu).entries(), window, cx);
     }
 
     /// Shift+F10 / the Menu key: the row menu of the selected row, anchored
-    /// below it, left of the summary cell. Nothing when the row is not drawn.
+    /// below it, left of the summary cell. Rows have a fixed height, so the
+    /// anchor comes from the list's bounds and scroll offset, not from where
+    /// the row was painted. A row off screen is scrolled to the nearest edge
+    /// first (applied at the next paint) and the menu anchors where it lands.
     fn open_selected_row_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.selected else {
             return;
         };
-        let Some(cell) = self.selected_cell.get() else {
-            // Not on screen: scroll it into view and open the menu once the next
-            // frames have painted it and its position is known.
-            self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
-            self.menu_wait_frames = MENU_WAIT_FRAMES;
-            cx.notify();
-            return;
+        let row_height = cx.theme().row_height;
+        let (bounds, offset) = {
+            let scroll = self.scroll.0.borrow();
+            (scroll.base_handle.bounds(), scroll.base_handle.offset())
         };
-        let position = point(cell.right() + px(COL_GAP), cell.bottom());
+        let top = bounds.top() + row_height * index as f32 + offset.y;
+        let lowest = (bounds.bottom() - row_height).max(bounds.top());
+        let top_on_screen = top.clamp(bounds.top(), lowest);
+        if top_on_screen != top {
+            self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+            cx.notify();
+        }
+        let left = bounds.left() + px(SIDE_MARGIN + PAD_LEFT + self.columns.graph + COL_GAP);
+        let position = point(left, top_on_screen + row_height);
         self.open_row_menu(index, position, window, cx);
-    }
-
-    /// Continues a row menu that is waiting for its row to be painted: opens it
-    /// once the position is known, gives up after [`MENU_WAIT_FRAMES`] frames.
-    fn poll_pending_row_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.menu_wait_frames == 0 {
-            return;
-        }
-        if self.selected_cell.get().is_some() {
-            self.menu_wait_frames = 0;
-            cx.defer_in(window, |view, window, cx| {
-                view.open_selected_row_menu(window, cx)
-            });
-            return;
-        }
-        self.menu_wait_frames -= 1;
-        if self.menu_wait_frames > 0 {
-            window.request_animation_frame();
-        }
     }
 
     /// Installs how the shell finds the service "Create pull request…" names
@@ -2430,8 +2401,7 @@ impl HistoryView {
     }
 
     /// What the ref menus are built from: a snapshot of HEAD and the refs, the
-    /// hosts, the stopped operation and the active branch filter. `pr_kind` is
-    /// per branch and set by the caller.
+    /// hosts, the stopped operation and the active branch filter.
     fn ref_menu_ctx(&self, cx: &App) -> RefMenuCtx {
         // The remote a branch without upstream is pushed to: `origin`, else
         // the first one (what `git_core::network::default_remote` answers).
@@ -2443,12 +2413,11 @@ impl HistoryView {
             .map(|target| target.name.clone());
         RefMenuCtx {
             head: self.head().cloned(),
-            refs: self.refs().unwrap_or(&[]).into(),
+            refs: self.shared_refs(),
             links: self.host_links(cx),
             targets: self.remote_targets.clone(),
             operation: self.operation,
             filter: self.branch_filter().map(str::to_owned),
-            pr_kind: None,
             default_remote,
         }
     }
@@ -2466,10 +2435,9 @@ impl HistoryView {
         let Some(row) = badge_row(spec) else {
             return;
         };
-        let mut ctx = self.ref_menu_ctx(cx);
-        ctx.pr_kind = self.pr_kind(&row.name, cx);
+        let ctx = self.ref_menu_ctx(cx);
         let entries = ref_menu_entries(
-            ref_menus::badge_sections(&ctx, &row),
+            ref_menus::badge_sections(&ctx, &row, self.pr_kind(&row.name, cx)),
             self.sidebar_action.clone(),
         );
         menu::open_context_menu(position, entries, window, cx);
@@ -2681,7 +2649,7 @@ impl HistoryView {
             }
         }
         self.refs = match refs {
-            Ok(refs) => RefsState::Loaded(refs),
+            Ok(refs) => RefsState::Loaded(refs.into()),
             Err(e) => {
                 log::warn!("could not read the refs: {e}");
                 RefsState::Failed
@@ -2690,7 +2658,7 @@ impl HistoryView {
         // The per-commit badges are derived once here, never while painting.
         let head = self.head.as_ref().and_then(|head| head.as_ref().ok());
         let refs = match &self.refs {
-            RefsState::Loaded(refs) => refs.as_slice(),
+            RefsState::Loaded(refs) => &refs[..],
             RefsState::Loading | RefsState::Failed => &[],
         };
         self.badges = build_badges(head, refs);
@@ -3129,6 +3097,14 @@ impl HistoryView {
         match &self.refs {
             RefsState::Loaded(refs) => Some(refs),
             RefsState::Loading | RefsState::Failed => None,
+        }
+    }
+
+    /// [`Self::refs`] as a shared pointer (empty while unloaded).
+    fn shared_refs(&self) -> Rc<[Ref]> {
+        match &self.refs {
+            RefsState::Loaded(refs) => refs.clone(),
+            RefsState::Loading | RefsState::Failed => Rc::from(Vec::new()),
         }
     }
 
@@ -3627,9 +3603,6 @@ impl HistoryView {
         let badges = &self.badges;
         let hosting = self.hosting.clone();
         let badge_widths = &mut self.badge_widths;
-        let selected_cell = self.selected_cell.clone();
-        // Painted again below only when the selected row is on screen.
-        selected_cell.set(None);
         let search_matches = &self.search_matches;
         range
             .map(|ix| {
@@ -3667,7 +3640,6 @@ impl HistoryView {
                 let stub = merged_from.is_some();
                 let row_theme = ui_theme.clone();
                 let row_geometry = geometry.clone();
-                let row_cell = selected_cell.clone();
                 let summary_ranges = fields.map(|f| f.summary.as_slice()).unwrap_or(&[]);
                 let author_ranges = fields.map(|f| f.author_name.as_slice()).unwrap_or(&[]);
 
@@ -3731,9 +3703,6 @@ impl HistoryView {
                         canvas(
                             |_, _, _| {},
                             move |bounds, _, window, _| {
-                                if selected {
-                                    row_cell.set(Some(bounds));
-                                }
                                 // Clip to the graph column so lanes past its
                                 // edge are cut instead of drawn over Summary.
                                 // The mask is 1 px taller at top and bottom so
@@ -4667,8 +4636,7 @@ impl Drop for HistoryView {
 }
 
 impl Render for HistoryView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.poll_pending_row_menu(window, cx);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The pane's own width is only known after layout. A container query
         // hands it back in prepaint, so the table is rebuilt for the width the
         // pane really got — no measure-and-notify round trip, no stale frame.
@@ -5039,7 +5007,7 @@ mod tests {
 
     /// A row menu over `refs` with HEAD `head`, one remote `origin` on GitHub
     /// and no stopped operation.
-    fn row_menu(commit: Oid, head: Option<Head>, refs: Vec<Ref>) -> RowMenu {
+    fn row_menu(commit: Oid, head: Option<Head>, refs: Vec<Ref>) -> Rc<RowMenu> {
         let targets = remote_targets(&[("origin", "https://github.com/o/r.git")]);
         let links = web_links::host_links(&[], &targets, None);
         let rows = ref_menus::commit_ref_rows(commit, head.as_ref(), &refs, &targets);
@@ -5054,10 +5022,9 @@ mod tests {
             targets,
             operation: Operation::None,
             filter: None,
-            pr_kind: None,
             default_remote: Some("origin".to_owned()),
         };
-        RowMenu {
+        Rc::new(RowMenu {
             hash: commit.to_string(),
             card: CommitCard::bare(commit),
             summary: "Subject".to_owned(),
@@ -5069,7 +5036,7 @@ mod tests {
             on_action: Rc::new(|_, _, _| {}),
             on_sidebar: None,
             open_links: links,
-        }
+        })
     }
 
     /// Labels of the entries; a rule is `---`, the filter field `<filter>`.
@@ -5199,13 +5166,14 @@ mod tests {
     fn create_pull_request_follows_the_service_of_each_branch() {
         let commit = oid(1);
         let mut menu = row_menu(commit, main_head(oid(9)), vec![local("feat", commit)]);
-        let has_pr = |menu: &RowMenu| {
+        let has_pr = |menu: &Rc<RowMenu>| {
             labels(&open(&menu.entries(), "feat"))
                 .iter()
                 .any(|l| l.starts_with("Create "))
         };
         assert!(!has_pr(&menu), "no hook answer, no item");
-        menu.pr_kinds = Rc::new(HashMap::from([("feat".to_owned(), ServiceKind::GitLab)]));
+        Rc::get_mut(&mut menu).unwrap().pr_kinds =
+            Rc::new(HashMap::from([("feat".to_owned(), ServiceKind::GitLab)]));
         let section = labels(&open(&menu.entries(), "feat"));
         assert!(section.contains(&"Create merge request…".to_owned()));
     }
@@ -5241,10 +5209,11 @@ mod tests {
         ];
         let menu = |n: usize| {
             let mut menu = row_menu(commit, None, Vec::new());
-            menu.open_links = web_links::host_links(&[], &remote_targets(&extras[..n]), None);
+            Rc::get_mut(&mut menu).unwrap().open_links =
+                web_links::host_links(&[], &remote_targets(&extras[..n]), None);
             menu
         };
-        let tail = |menu: &RowMenu| labels(&menu.entries())[COMMIT_BLOCK.len() - 1..].to_vec();
+        let tail = |menu: &Rc<RowMenu>| labels(&menu.entries())[COMMIT_BLOCK.len() - 1..].to_vec();
         assert_eq!(tail(&menu(0)), ["Copy"]);
         assert_eq!(tail(&menu(1)), ["Copy", "Open on GitHub"]);
         assert_eq!(
@@ -5305,7 +5274,7 @@ mod tests {
             main_head(commit),
             vec![local("main", commit), remote("origin/main", commit)],
         );
-        let entries = ref_menu_entries(ref_menus::badge_sections(&menu.ctx, &row), None);
+        let entries = ref_menu_entries(ref_menus::badge_sections(&menu.ctx, &row, None), None);
         let headers: Vec<String> = entries
             .iter()
             .filter_map(|entry| match entry {
@@ -6320,10 +6289,6 @@ mod tests {
             cx.debug_bounds("history-row-0").is_none(),
             "the row is still on screen; the test needs more commits"
         );
-        history.read_with(&cx, |view, _| {
-            assert!(view.selected_cell.get().is_none(), "a stale cell survived");
-        });
-
         cx.simulate_keystrokes("shift-f10");
         for _ in 0..4 {
             cx.update(|window, _| window.refresh());
@@ -6394,11 +6359,11 @@ mod tests {
         history.update(&mut cx, |view, cx| {
             let merge_enabled = |view: &HistoryView, cx: &App| {
                 let ctx = view.ref_menu_ctx(cx);
-                ref_menus::local_section(&ctx, "side")
+                ref_menus::local_section(&ctx, "side", None)
                     .iter()
                     .find_map(|entry| match entry {
                         RefMenuEntry::Item(item) if item.label.starts_with("Merge ") => {
-                            Some(item.enabled)
+                            Some(item.enabled())
                         }
                         _ => None,
                     })

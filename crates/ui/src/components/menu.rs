@@ -18,7 +18,7 @@ use crate::actions::{
     Cancel, Confirm, FocusNext, FocusPrev, MenuCloseSubmenu, MenuOpenSubmenu, SelectNext,
     SelectPrev,
 };
-use crate::components::text_input::{Left, Right, TextInput, TextInputEvent};
+use crate::components::text_input::{TextInput, TextInputEvent};
 use crate::components::{SearchField, Tooltip};
 use crate::focus::{self, RingOffset};
 use crate::icon::{Icon, IconName};
@@ -50,12 +50,17 @@ pub struct MenuItem {
     pub accent_icon: bool,
     /// What a [`MenuEntry::Filter`] above matches against; the label by default.
     pub filter_text: Option<SharedString>,
+    /// The lower-cased filter text (or label), kept so a keystroke in the
+    /// filter field does not lower-case every item again.
+    filter_key: String,
 }
 
 impl MenuItem {
     pub fn new(label: impl Into<SharedString>) -> Self {
+        let label = label.into();
         Self {
-            label: label.into(),
+            filter_key: label.to_lowercase(),
+            label,
             icon: None,
             shortcut: None,
             danger: false,
@@ -113,13 +118,16 @@ impl MenuItem {
 
     /// The text a [`MenuEntry::Filter`] matches; the label when unset.
     pub fn filter_text(mut self, text: impl Into<SharedString>) -> Self {
-        self.filter_text = Some(text.into());
+        let text = text.into();
+        self.filter_key = text.to_lowercase();
+        self.filter_text = Some(text);
         self
     }
 
-    fn matches(&self, query: &str) -> bool {
-        let text = self.filter_text.as_ref().unwrap_or(&self.label);
-        text.to_lowercase().contains(&query.to_lowercase())
+    /// Whether the item's filter text contains `query_lower` (already
+    /// lower-cased).
+    fn matches(&self, query_lower: &str) -> bool {
+        self.filter_key.contains(query_lower)
     }
 }
 
@@ -193,12 +201,13 @@ pub enum MenuEntry {
 /// filter query leaves it visible. Only items after a [`MenuEntry::Filter`]
 /// can be hidden; an empty query hides nothing.
 pub fn visible_items(entries: &[MenuEntry], query: &str) -> Vec<bool> {
+    let query = query.to_lowercase();
     let mut filtering = false;
     let mut visible = Vec::new();
     for entry in entries {
         match entry {
             MenuEntry::Filter { .. } => filtering = true,
-            MenuEntry::Item(item) => visible.push(!filtering || item.matches(query)),
+            MenuEntry::Item(item) => visible.push(!filtering || item.matches(&query)),
             MenuEntry::Separator | MenuEntry::Header(_) => {}
         }
     }
@@ -435,7 +444,8 @@ pub fn in_safe_triangle(
     !(negative && positive)
 }
 
-/// The filter field of a menu and what it currently holds.
+/// The filter field of one level: its text input and the subscription that
+/// feeds the typed query back to the menu.
 struct FilterField {
     input: Entity<TextInput>,
     _subscription: Subscription,
@@ -448,8 +458,9 @@ struct Level {
     nav: MenuNav,
     filter: Option<FilterField>,
     query: String,
-    /// The item of this level whose child level is open (`levels[i + 1]`).
-    open_row: Option<usize>,
+    /// The item of the level before this one that opened it; `None` for the
+    /// root. A level's open row is read from its child (`MenuView::open_row`).
+    opened_from: Option<usize>,
     /// Window bounds of the rows that open a submenu, by item index; written
     /// by a canvas while painting, read by the next render.
     row_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
@@ -462,6 +473,7 @@ impl Level {
     fn new(
         entries: Vec<MenuEntry>,
         level: usize,
+        opened_from: Option<usize>,
         window: &mut Window,
         cx: &mut Context<MenuView>,
     ) -> Self {
@@ -500,7 +512,7 @@ impl Level {
             nav: MenuNav::new(),
             filter,
             query: String::new(),
-            open_row: None,
+            opened_from,
             row_bounds: Rc::default(),
             panel_bounds: Rc::default(),
         }
@@ -559,17 +571,15 @@ struct MenuView {
     /// The pointer position last seen over a row with an open submenu: the
     /// apex of the safe triangle.
     apex: Option<Point<Pixels>>,
-    pending: Option<PendingHover>,
-    hover_task: Option<Task<()>>,
+    pending: Option<(PendingHover, Task<()>)>,
     /// A row passed over inside the safe triangle, taken after [`SAFE_GRACE`]
     /// if the pointer has not reached the child by then.
-    grace_row: Option<(usize, usize)>,
-    grace_task: Option<Task<()>>,
+    grace: Option<((usize, usize), Task<()>)>,
 }
 
 impl MenuView {
     fn new(entries: Vec<MenuEntry>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let root = Level::new(entries, 0, window, cx);
+        let root = Level::new(entries, 0, None, window, cx);
         Self {
             levels: vec![root],
             active_level: 0,
@@ -578,9 +588,7 @@ impl MenuView {
             keyboard: false,
             apex: None,
             pending: None,
-            hover_task: None,
-            grace_row: None,
-            grace_task: None,
+            grace: None,
         }
     }
 
@@ -667,12 +675,11 @@ impl MenuView {
             return;
         };
         self.cancel_hover();
-        if !(self.levels[level].open_row == Some(index) && self.levels.len() > level + 1) {
+        if self.open_row(level) != Some(index) {
             self.levels.truncate(level + 1);
             self.active_level = self.active_level.min(level);
-            let child = Level::new(submenu(), level + 1, window, cx);
+            let child = Level::new(submenu(), level + 1, Some(index), window, cx);
             self.levels.push(child);
-            self.levels[level].open_row = Some(index);
         }
         if take_focus {
             self.active_level = level + 1;
@@ -692,7 +699,6 @@ impl MenuView {
         }
         self.cancel_hover();
         self.levels.truncate(from);
-        self.levels[from - 1].open_row = None;
         self.apex = None;
         if self.active_level >= from {
             self.active_level = from - 1;
@@ -708,58 +714,6 @@ impl MenuView {
         if let Some(index) = self.levels[level].nav.highlight() {
             self.open_child(level, index, true, window, cx);
         }
-    }
-
-    /// The active level's filter input, when it has the focus.
-    fn focused_filter(&self, window: &Window, cx: &App) -> Option<Entity<TextInput>> {
-        let input = self.levels[self.active_level]
-            .filter
-            .as_ref()?
-            .input
-            .clone();
-        input
-            .read(cx)
-            .focus_handle()
-            .is_focused(window)
-            .then_some(input)
-    }
-
-    /// → in the focused filter field: opens the highlighted row's submenu when the
-    /// caret is at the end of the text (the field's own → has nowhere to go there).
-    /// Returns whether it was taken; otherwise the field moves its caret.
-    fn filter_right(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(input) = self.focused_filter(window, cx) else {
-            return false;
-        };
-        let input = input.read(cx);
-        if input.caret() != Some(input.text().len()) {
-            return false;
-        }
-        let level = &self.levels[self.active_level];
-        let Some(index) = level.nav.highlight() else {
-            return false;
-        };
-        if !level
-            .item(index)
-            .is_some_and(|item| item.submenu.is_some() && !item.disabled)
-        {
-            return false;
-        }
-        self.open_highlighted(window, cx);
-        true
-    }
-
-    /// ← in the focused filter field of a submenu: closes the level when the caret
-    /// is at position 0 (nothing left to move over). Returns whether it was taken.
-    fn filter_left(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(input) = self.focused_filter(window, cx) else {
-            return false;
-        };
-        if input.read(cx).caret() != Some(0) || self.active_level == 0 {
-            return false;
-        }
-        self.close_active(window, cx);
-        true
     }
 
     /// ← : closes the active level, unless it is the root.
@@ -779,9 +733,14 @@ impl MenuView {
 
     fn cancel_hover(&mut self) {
         self.pending = None;
-        self.hover_task = None;
-        self.grace_row = None;
-        self.grace_task = None;
+        self.grace = None;
+    }
+
+    /// The item of `level` whose child level is open.
+    fn open_row(&self, level: usize) -> Option<usize> {
+        self.levels
+            .get(level + 1)
+            .and_then(|child| child.opened_from)
     }
 
     fn set_active(&mut self, level: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -805,10 +764,11 @@ impl MenuView {
             self.keyboard = false;
             cx.notify();
         }
-        let Some(target) = self.levels.get(level) else {
+        if level >= self.levels.len() {
             return;
-        };
-        if target.open_row == Some(index) {
+        }
+        let open_row = self.open_row(level);
+        if open_row == Some(index) {
             // Back on the row that owns the open child: nothing pending
             // applies any more, and the safe triangle starts from here.
             self.apex = Some(position);
@@ -816,20 +776,20 @@ impl MenuView {
             self.highlight(level, index, window, cx);
             return;
         }
-        if target.open_row.is_some() && self.heading_for_child(level, position) {
+        if open_row.is_some() && self.heading_for_child(level, position) {
             // Passing over this row on the way to the child: keep the child
             // and the highlight; if the pointer stops here, take the row later.
-            if self.grace_row != Some((level, index)) {
-                self.grace_row = Some((level, index));
-                self.grace_task = Some(cx.spawn_in(window, async move |this, cx| {
+            if self.grace.as_ref().map(|(row, _)| *row) != Some((level, index)) {
+                let task = cx.spawn_in(window, async move |this, cx| {
                     cx.background_executor().timer(SAFE_GRACE).await;
                     this.update_in(cx, |this, window, cx| {
-                        if let Some((level, index)) = this.grace_row.take() {
+                        if let Some(((level, index), _)) = this.grace.take() {
                             this.switch_row(level, index, window, cx);
                         }
                     })
                     .ok();
-                }));
+                });
+                self.grace = Some(((level, index), task));
             }
             return;
         }
@@ -858,7 +818,7 @@ impl MenuView {
                 level,
                 open: Some(index),
             })
-        } else if target.open_row.is_some() {
+        } else if self.open_row(level).is_some() {
             Some(PendingHover { level, open: None })
         } else {
             None
@@ -866,11 +826,10 @@ impl MenuView {
         let Some(wanted) = wanted else {
             return;
         };
-        self.pending = Some(wanted);
-        self.hover_task = Some(cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(HOVER_DELAY).await;
             this.update_in(cx, |this, window, cx| {
-                let Some(pending) = this.pending.take() else {
+                let Some((pending, _)) = this.pending.take() else {
                     return;
                 };
                 match pending.open {
@@ -879,7 +838,8 @@ impl MenuView {
                 }
             })
             .ok();
-        }));
+        });
+        self.pending = Some((wanted, task));
     }
 
     fn highlight(
@@ -916,16 +876,19 @@ impl MenuView {
     /// The pointer is over panel `level`: pending decisions made on a
     /// shallower level no longer apply.
     fn enter_panel(&mut self, level: usize) {
-        if self.pending.is_some_and(|pending| pending.level < level) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(pending, _)| pending.level < level)
+        {
             self.pending = None;
-            self.hover_task = None;
         }
         if self
-            .grace_row
-            .is_some_and(|(row_level, _)| row_level < level)
+            .grace
+            .as_ref()
+            .is_some_and(|((row_level, _), _)| *row_level < level)
         {
-            self.grace_row = None;
-            self.grace_task = None;
+            self.grace = None;
         }
     }
 
@@ -1012,7 +975,7 @@ impl MenuView {
                             level,
                             index,
                             highlighted,
-                            open: state.open_row == Some(index),
+                            open: self.open_row(level) == Some(index),
                             // Only the deepest active level shows the ring: a parent row keeps
                             // its open fill while its submenu holds the focus.
                             ring: highlighted && self.keyboard && level == self.active_level,
@@ -1049,8 +1012,8 @@ impl Render for MenuView {
         let mut children = Vec::new();
         for level in 1..self.levels.len() {
             let parent = &self.levels[level - 1];
-            let row = parent
-                .open_row
+            let row = self
+                .open_row(level - 1)
                 .and_then(|index| parent.row_bounds.borrow().get(&index).copied());
             let (Some(parent_bounds), Some(row)) = (parent.panel_bounds.get(), row) else {
                 // The parent has not painted yet; try again next frame.
@@ -1102,19 +1065,6 @@ impl Render for MenuView {
                 cx.listener(|this, _: &MenuCloseSubmenu, window, cx| this.close_active(window, cx)),
             )
             .on_action(cx.listener(|this, _: &Cancel, window, cx| this.cancel(window, cx)))
-            // The filter field binds ←/→ itself (deeper context), so the menu's own
-            // arrow bindings never fire there. Intercept in the capture phase, before
-            // the field, and only where the caret has nowhere to go.
-            .capture_action(cx.listener(|this, _: &Right, window, cx| {
-                if this.filter_right(window, cx) {
-                    cx.stop_propagation();
-                }
-            }))
-            .capture_action(cx.listener(|this, _: &Left, window, cx| {
-                if this.filter_left(window, cx) {
-                    cx.stop_propagation();
-                }
-            }))
             // An open menu absorbs Tab so focus cannot escape behind it: a
             // menu that is no longer focused cannot handle Esc any more.
             .on_action(cx.listener(|_, _: &FocusNext, _, _| {}))

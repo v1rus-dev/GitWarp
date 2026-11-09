@@ -28,7 +28,6 @@ pub const FETCH_INTERVALS: [u16; 4] = [1, 5, 15, 60];
 pub const WORKTREE_RECENCY_LIMIT: usize = 200;
 
 /// The most recent repositories kept.
-#[allow(dead_code)] // used by the welcome screen (stage 2.3+)
 pub const RECENT_LIMIT: usize = 20;
 /// The narrowest usable sidebar.
 pub const SIDEBAR_WIDTH_MIN: f32 = 160.0;
@@ -346,7 +345,6 @@ pub enum AfterCreate {
     Stay,
 }
 
-#[allow(dead_code)] // used by the welcome screen (stage 2.3+)
 impl Settings {
     /// Remembers `account_id` as the account `remote` uses in the repository
     /// `repo_key` (see [`Settings::remote_accounts`]).

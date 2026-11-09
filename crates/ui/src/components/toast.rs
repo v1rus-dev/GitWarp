@@ -66,17 +66,13 @@ impl ToastKind {
 /// How long a toast stays, or `None` when it stays until dismissed. Errors
 /// never hide; a toast with a button (the message button or any line button)
 /// stays too, since five seconds are too short to press it, unless the caller
-/// passes an explicit `lifetime` (e.g. an Undo toast that lives 8 s).
-fn lifetime_of(
-    kind: ToastKind,
-    body: Option<&ToastBody>,
-    lifetime: Option<Duration>,
-) -> Option<Duration> {
+/// sets an explicit [`ToastBody::lifetime`] (e.g. an Undo toast that lives 8 s).
+fn lifetime_of(kind: ToastKind, body: Option<&ToastBody>) -> Option<Duration> {
     if !kind.auto_hide() {
         return None;
     }
-    if lifetime.is_some() {
-        return lifetime;
+    if let Some(lifetime) = body.and_then(|body| body.lifetime) {
+        return Some(lifetime);
     }
     let has_button = body.is_some_and(|body| {
         body.action.is_some() || body.lines.iter().any(|line| line.action.is_some())
@@ -140,6 +136,9 @@ pub struct ToastLine {
 pub struct ToastBody {
     pub lines: Vec<ToastLine>,
     pub action: Option<ToastAction>,
+    /// How long the toast stays, also when it has a button (which otherwise
+    /// never hides). Errors still stay until dismissed.
+    pub lifetime: Option<Duration>,
 }
 
 /// One visible toast.
@@ -190,23 +189,9 @@ impl ToastQueue {
         body: Option<ToastBody>,
         now: Instant,
     ) -> ToastId {
-        self.push_with_lifetime(kind, message, body, None, now)
-    }
-
-    /// [`ToastQueue::push_with`] with an explicit lifetime that also applies
-    /// to a toast with a button (which otherwise never hides). Errors still
-    /// stay until dismissed.
-    pub fn push_with_lifetime(
-        &mut self,
-        kind: ToastKind,
-        message: impl Into<SharedString>,
-        body: Option<ToastBody>,
-        lifetime: Option<Duration>,
-        now: Instant,
-    ) -> ToastId {
         self.next_id += 1;
         let id = ToastId(self.next_id);
-        let lifetime = lifetime_of(kind, body.as_ref(), lifetime);
+        let lifetime = lifetime_of(kind, body.as_ref());
         self.entries.push(QueuedToast {
             toast: Toast {
                 id,
@@ -333,23 +318,10 @@ pub fn show_with(
     window: &mut Window,
     cx: &mut App,
 ) -> ToastId {
-    show_with_lifetime(kind, message, body, None, window, cx)
-}
-
-/// [`show_with`] with an explicit lifetime that overrides "a toast with a
-/// button never hides" (errors still stay).
-pub fn show_with_lifetime(
-    kind: ToastKind,
-    message: impl Into<SharedString>,
-    body: Option<ToastBody>,
-    lifetime: Option<Duration>,
-    window: &mut Window,
-    cx: &mut App,
-) -> ToastId {
     let now = cx.background_executor().now();
-    let auto_hide = lifetime_of(kind, body.as_ref(), lifetime).is_some();
+    let auto_hide = lifetime_of(kind, body.as_ref()).is_some();
     let id = with_queue(window, cx, |queue| {
-        queue.push_with_lifetime(kind, message, body, lifetime, now)
+        queue.push_with(kind, message, body, now)
     });
     window.refresh();
 
@@ -674,6 +646,7 @@ mod tests {
         let body = ToastBody {
             lines: Vec::new(),
             action: Some(ToastAction::new("View release", |_, _| {})),
+            ..Default::default()
         };
         let with_button = queue.push_with(ToastKind::Info, "update", Some(body), now);
         let line_body = ToastBody {
@@ -684,6 +657,7 @@ mod tests {
                 action: Some(ToastAction::new("Open", |_, _| {})),
             }],
             action: None,
+            ..Default::default()
         };
         let with_line_button = queue.push_with(ToastKind::Ok, "done", Some(line_body), now);
         let plain = queue.push(ToastKind::Info, "fetched", now);
@@ -700,14 +674,9 @@ mod tests {
         let body = ToastBody {
             lines: Vec::new(),
             action: Some(ToastAction::new("Undo", |_, _| {})),
+            lifetime: Some(Duration::from_secs(8)),
         };
-        let id = queue.push_with_lifetime(
-            ToastKind::Ok,
-            "removed",
-            Some(body),
-            Some(Duration::from_secs(8)),
-            now,
-        );
+        let id = queue.push_with(ToastKind::Ok, "removed", Some(body), now);
         // Still up after the default five seconds, gone at eight.
         assert!(queue.expire(now + Duration::from_millis(7999)).is_empty());
         assert_eq!(queue.expire(now + Duration::from_secs(8)), vec![id]);
@@ -720,14 +689,9 @@ mod tests {
         let body = ToastBody {
             lines: Vec::new(),
             action: Some(ToastAction::new("Undo", |_, _| {})),
+            lifetime: Some(Duration::from_secs(8)),
         };
-        let id = queue.push_with_lifetime(
-            ToastKind::Ok,
-            "removed",
-            Some(body),
-            Some(Duration::from_secs(8)),
-            now,
-        );
+        let id = queue.push_with(ToastKind::Ok, "removed", Some(body), now);
         queue.set_paused(id, Some(true), None, now + Duration::from_secs(2));
         assert!(queue.expire(now + Duration::from_secs(60)).is_empty());
         let left = now + Duration::from_secs(60);
@@ -808,6 +772,7 @@ mod tests {
                 action: Some(ToastAction::new("Reconnect", |_, _| {})),
             }],
             action: None,
+            ..Default::default()
         };
         let id = queue.push_with(
             ToastKind::Error,

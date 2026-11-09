@@ -62,7 +62,8 @@ use crate::settings_ui::accounts::open_picker;
 use crate::sidebar::{
     commit_for, read_sidebar_extras, shortcut_action, sidebar_menu_with_links, sidebar_nodes_with,
     worktree_menu, worktree_panel_rows, Expansion, PanelEvent, PanelState, RemoteDisplays,
-    SidebarAction, SidebarExtras, SidebarMenuEntry, WorktreeAction, WorktreePanel,
+    SidebarAction, SidebarActionHandler, SidebarExtras, SidebarMenuEntry, WorktreeAction,
+    WorktreePanel,
 };
 use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::web_links::{self, HostLink};
@@ -663,11 +664,17 @@ fn follow_with_push(job: &Job, then_push: bool) -> bool {
 }
 
 /// Which failures open the error dialog, and whether it offers "Pull, then
-/// push". Only a rejected *branch* push can be fixed that way: a rejected tag
-/// or remote-branch delete has no branch to pull.
-fn error_dialog_remedy(known: &KnownError, job: &Job) -> Option<bool> {
+/// push". Only a rejected push of the *checked-out branch* can be fixed that
+/// way (the pull updates HEAD's branch): a rejected tag or remote-branch
+/// delete has no branch to pull, and nor has a push of another branch.
+fn error_dialog_remedy(known: &KnownError, job: &Job, head: Option<&Head>) -> Option<bool> {
     match known {
-        KnownError::PushRejected => Some(matches!(job, Job::Push { branch: None })),
+        KnownError::PushRejected => Some(match job {
+            Job::Push { branch } => branch.as_deref().is_none_or(
+                |branch| matches!(head, Some(Head::Branch { name, .. }) if name == branch),
+            ),
+            _ => false,
+        }),
         KnownError::PullNotFastForward if matches!(job, Job::Pull) => Some(false),
         _ => None,
     }
@@ -1502,30 +1509,15 @@ impl RepositoryView {
         }
         self.selected_node = Some(key.into());
         let view = cx.entity();
+        let handler: SidebarActionHandler = Rc::new(move |action, window, cx| {
+            view.update(cx, |view, cx| view.run_sidebar_action(action, window, cx));
+        });
         let entries: Vec<MenuEntry> = model
             .into_iter()
             .map(|entry| match entry {
                 SidebarMenuEntry::Separator => MenuEntry::Separator,
                 SidebarMenuEntry::Item(item) => {
-                    let mut menu_item = MenuItem::new(item.label)
-                        .icon(item.icon)
-                        .disabled(!item.enabled);
-                    if let Some(shortcut) = item.shortcut {
-                        menu_item = menu_item.shortcut(shortcut);
-                    }
-                    if item.danger {
-                        menu_item = menu_item.danger();
-                    }
-                    if !matches!(item.action, SidebarAction::None) {
-                        let action = item.action.clone();
-                        let view = view.clone();
-                        menu_item = menu_item.action(move |window, cx| {
-                            view.update(cx, |view, cx| {
-                                view.run_sidebar_action(action.clone(), window, cx);
-                            });
-                        });
-                    }
-                    MenuEntry::Item(menu_item)
+                    MenuEntry::Item(item.into_menu_item(handler.clone()))
                 }
             })
             .collect();
@@ -1795,9 +1787,7 @@ impl RepositoryView {
                 );
             }
             SidebarAction::PushBranch(branch) => {
-                // The checked-out branch goes through the toolbar's path
-                // (`None`) so a rejected push still offers "Pull, then push".
-                let branch = push_target(self.history.read(cx).head(), branch);
+                let branch = Some(branch);
                 self.start_network_job(Job::Push { branch }, window, cx);
             }
             SidebarAction::Pull => self.pull_branch(window, cx),
@@ -2008,8 +1998,7 @@ impl RepositoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        cx.write_to_clipboard(ClipboardItem::new_string(url));
-        toast::show(ui::ToastKind::Ok, message, window, cx);
+        crate::copy_with_toast(url, message, window, cx);
     }
 
     /// The configured accounts and this repository's remembered choices.
@@ -3232,7 +3221,9 @@ impl RepositoryView {
         cx: &mut Context<Self>,
     ) {
         if let Some(known) = error_dialog::classify_git_error(error) {
-            if let Some(offer_pull_then_push) = error_dialog_remedy(&known, job) {
+            if let Some(offer_pull_then_push) =
+                error_dialog_remedy(&known, job, self.history.read(cx).head())
+            {
                 let title = known.title();
                 let explanation = known.explanation();
                 let details = error_dialog::raw_output(error);
@@ -3256,6 +3247,7 @@ impl RepositoryView {
                 let body = ui::ToastBody {
                     lines: Vec::new(),
                     action: Some(self.reconnect_action(account.account_id.clone(), cx)),
+                    ..Default::default()
                 };
                 toast::show_with(
                     ui::ToastKind::Error,
@@ -3362,6 +3354,7 @@ impl RepositoryView {
             Some(ui::ToastBody {
                 lines,
                 action: None,
+                ..Default::default()
             }),
             window,
             cx,
@@ -6470,6 +6463,7 @@ impl RepositoryView {
         let body = ui::ToastBody {
             lines: Vec::new(),
             action: Some(self.reconnect_action(id.clone(), cx)),
+            ..Default::default()
         };
         toast::show_with(
             ui::ToastKind::Error,
@@ -7026,14 +7020,6 @@ impl Render for RepositoryView {
             .child(body)
             .child(status)
     }
-}
-
-/// The `Job::Push` branch for a sidebar/menu "Push" on `branch`: the checked-out
-/// branch maps to `None` so it goes through the toolbar's path (a rejected push
-/// still offers "Pull, then push"); any other branch is pushed by name.
-fn push_target(head: Option<&Head>, branch: String) -> Option<String> {
-    let is_head = matches!(head, Some(Head::Branch { name, .. }) if *name == branch);
-    (!is_head).then_some(branch)
 }
 
 /// The text "Copy › Full message" puts on the clipboard: the raw commit message
@@ -7699,23 +7685,6 @@ fn node_toggler(
 mod tests {
     use super::*;
     use gpui::px;
-
-    #[test]
-    fn push_target_maps_the_current_branch_to_none() {
-        let head = Head::Branch {
-            name: "main".to_owned(),
-            target: None,
-        };
-        assert_eq!(push_target(Some(&head), "main".to_owned()), None);
-        assert_eq!(
-            push_target(Some(&head), "feat".to_owned()),
-            Some("feat".to_owned())
-        );
-        assert_eq!(
-            push_target(None, "main".to_owned()),
-            Some("main".to_owned())
-        );
-    }
 
     #[test]
     fn full_message_text_is_the_raw_message() {
@@ -9667,9 +9636,36 @@ mod tests {
     }
 
     #[test]
-    fn only_a_branch_push_offers_pull_then_push() {
+    fn only_a_push_of_the_checked_out_branch_offers_pull_then_push() {
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: None,
+        };
+        let push = |branch: Option<&str>| Job::Push {
+            branch: branch.map(str::to_owned),
+        };
+        // The current branch by name, and via the toolbar (`None`): offered.
+        for job in [push(Some("main")), push(None)] {
+            assert_eq!(
+                error_dialog_remedy(&KnownError::PushRejected, &job, Some(&head)),
+                Some(true)
+            );
+        }
+        // Another branch, or no branch checked out: the pull would not help.
         assert_eq!(
-            error_dialog_remedy(&KnownError::PushRejected, &Job::Push { branch: None }),
+            error_dialog_remedy(&KnownError::PushRejected, &push(Some("feat")), Some(&head)),
+            Some(false)
+        );
+        assert_eq!(
+            error_dialog_remedy(&KnownError::PushRejected, &push(Some("main")), None),
+            Some(false)
+        );
+        assert_eq!(
+            error_dialog_remedy(
+                &KnownError::PushRejected,
+                &Job::Push { branch: None },
+                Some(&head)
+            ),
             Some(true)
         );
         for job in [
@@ -9686,21 +9682,29 @@ mod tests {
             },
         ] {
             assert_eq!(
-                error_dialog_remedy(&KnownError::PushRejected, &job),
+                error_dialog_remedy(&KnownError::PushRejected, &job, Some(&head)),
                 Some(false),
                 "{job:?} must show the dialog without the pull-then-push remedy"
             );
         }
         assert_eq!(
-            error_dialog_remedy(&KnownError::PullNotFastForward, &Job::Pull),
+            error_dialog_remedy(&KnownError::PullNotFastForward, &Job::Pull, Some(&head)),
             Some(false)
         );
         assert_eq!(
-            error_dialog_remedy(&KnownError::PullNotFastForward, &Job::Push { branch: None }),
+            error_dialog_remedy(
+                &KnownError::PullNotFastForward,
+                &Job::Push { branch: None },
+                Some(&head)
+            ),
             None
         );
         assert_eq!(
-            error_dialog_remedy(&KnownError::LocalChangesOverwritten, &Job::Pull),
+            error_dialog_remedy(
+                &KnownError::LocalChangesOverwritten,
+                &Job::Pull,
+                Some(&head)
+            ),
             None
         );
     }

@@ -13,7 +13,7 @@ use git_core::{Head, Oid, Operation, Ref, RefKind};
 use ui::IconName;
 
 use crate::remote_accounts::RemoteTargets;
-use crate::sidebar::SidebarAction;
+use crate::sidebar::{self, SidebarAction, SidebarMenuItem};
 use crate::web_links::{self, HostLink};
 
 /// With more refs than this a commit menu shows [`SHOWN_WHEN_OVERFLOWING`] rows
@@ -167,13 +167,12 @@ pub fn commit_ref_rows(
 }
 
 /// `(top-level rows, rows for "More refs (N)")`: more than [`MAX_REF_ROWS`]
-/// rows become five and the rest; N is the length of the second list.
-pub fn split_overflow(mut rows: Vec<RefRow>) -> (Vec<RefRow>, Vec<RefRow>) {
+/// rows become five and the rest; N is the length of the second slice.
+pub fn split_overflow(rows: &[RefRow]) -> (&[RefRow], &[RefRow]) {
     if rows.len() > MAX_REF_ROWS {
-        let rest = rows.split_off(SHOWN_WHEN_OVERFLOWING);
-        (rows, rest)
+        rows.split_at(SHOWN_WHEN_OVERFLOWING)
     } else {
-        (rows, Vec::new())
+        (rows, &[])
     }
 }
 
@@ -187,72 +186,6 @@ pub struct RefMenuTool {
     pub action: SidebarAction,
 }
 
-/// One item of a ref menu section.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RefMenuItem {
-    pub label: String,
-    pub icon: IconName,
-    /// Muted text at the right (`current`).
-    pub hint: Option<String>,
-    pub shortcut: Option<String>,
-    pub danger: bool,
-    pub enabled: bool,
-    /// [`SidebarAction::None`] exactly when the item is disabled.
-    pub action: SidebarAction,
-}
-
-impl RefMenuItem {
-    /// A disabled item; [`Self::action`] enables it.
-    fn new(label: impl Into<String>, icon: IconName) -> Self {
-        Self {
-            label: label.into(),
-            icon,
-            hint: None,
-            shortcut: None,
-            danger: false,
-            enabled: false,
-            action: SidebarAction::None,
-        }
-    }
-
-    fn action(mut self, action: SidebarAction) -> Self {
-        self.enabled = !matches!(action, SidebarAction::None);
-        self.action = action;
-        self
-    }
-
-    /// Enabled with `action` when `enabled`, else shown but off.
-    fn action_if(self, enabled: bool, action: SidebarAction) -> Self {
-        if enabled {
-            self.action(action)
-        } else {
-            self
-        }
-    }
-
-    fn maybe_action(self, action: Option<SidebarAction>) -> Self {
-        match action {
-            Some(action) => self.action(action),
-            None => self,
-        }
-    }
-
-    fn hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
-        self
-    }
-
-    fn shortcut(mut self, shortcut: &str) -> Self {
-        self.shortcut = Some(shortcut.to_owned());
-        self
-    }
-
-    fn danger(mut self) -> Self {
-        self.danger = true;
-        self
-    }
-}
-
 /// One row of a ref menu: a section header, an item or a rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefMenuEntry {
@@ -261,7 +194,7 @@ pub enum RefMenuEntry {
         label: String,
         tools: Vec<RefMenuTool>,
     },
-    Item(RefMenuItem),
+    Item(SidebarMenuItem),
     Separator,
 }
 
@@ -270,8 +203,7 @@ pub enum RefMenuEntry {
 #[derive(Clone, Debug)]
 pub struct RefMenuCtx {
     pub head: Option<Head>,
-    /// Shared, so a submenu opening does not deep-copy every ref when it
-    /// clones the context to set `pr_kind`.
+    /// Shared, so a submenu opening clones a pointer, not every ref.
     pub refs: std::rc::Rc<[Ref]>,
     /// The hosts the remotes lead to (see [`web_links::host_links`]); empty
     /// hides "Open on <Service>" and "Open release".
@@ -282,9 +214,6 @@ pub struct RefMenuCtx {
     pub operation: Operation,
     /// The branch the History is narrowed to.
     pub filter: Option<String>,
-    /// The service of the repository's host, `None` without one: it hides
-    /// "Create pull request…" and names it "merge request" for GitLab.
-    pub pr_kind: Option<ServiceKind>,
     /// The remote a tag or a branch without upstream is pushed to; `None`
     /// when the repository has no remote.
     pub default_remote: Option<String>,
@@ -301,12 +230,11 @@ impl RefMenuCtx {
 
     /// What "Merge … into {head}" names: the branch, or `HEAD` when detached.
     fn head_label(&self) -> &str {
-        self.head_branch().unwrap_or("HEAD")
+        sidebar::head_label(self.head.as_ref())
     }
 
-    /// Merging needs a branch to merge into and no stopped operation.
     fn can_merge(&self) -> bool {
-        self.head_branch().is_some() && self.operation == Operation::None
+        sidebar::can_merge(self.head.as_ref(), self.operation)
     }
 
     fn find(&self, kind: RefKind, name: &str) -> Option<&Ref> {
@@ -319,9 +247,9 @@ impl RefMenuCtx {
 
     /// "Open on <Service>" for the branch `key` (`local:<name>` or
     /// `rbranch:<remote>/<name>`).
-    fn open_branch(&self, key: &str) -> Option<RefMenuItem> {
+    fn open_branch(&self, key: &str) -> Option<SidebarMenuItem> {
         let (link, target) = web_links::branch_target(&self.links, &self.targets, &self.refs, key)?;
-        open_item(
+        sidebar::open_item(
             link,
             &target,
             ui::t!("history.menu.open_on_host", service = link.service_name()),
@@ -333,53 +261,89 @@ impl RefMenuCtx {
     /// the rows, selection and scroll for nothing).
     fn filter_tool(&self, name: &str) -> RefMenuTool {
         let selected = self.filter.as_deref() == Some(name);
-        if selected {
-            return RefMenuTool {
-                icon: IconName::Filter,
-                tooltip: ui::t!("history.action.show_all_commits").into(),
-                selected,
-                action: SidebarAction::ShowAllCommits,
-            };
-        }
+        let (tooltip, action) = if selected {
+            (
+                ui::t!("history.action.show_all_commits").into(),
+                SidebarAction::ShowAllCommits,
+            )
+        } else {
+            (
+                ui::t!("history.refmenu.show_only_tip", name = name).into(),
+                SidebarAction::ShowBranchCommits(name.to_owned()),
+            )
+        };
         RefMenuTool {
             icon: IconName::Filter,
-            tooltip: ui::t!("history.refmenu.show_only_tip", name = name).into(),
+            tooltip,
             selected,
-            action: SidebarAction::ShowBranchCommits(name.to_owned()),
+            action,
         }
     }
 }
 
-fn open_item(link: &HostLink, target: &WebTarget, label: impl Into<String>) -> Option<RefMenuItem> {
-    let url = link.url(target)?;
+/// "Merge `name` into {head}…", on when `allowed`.
+fn merge_item(ctx: &RefMenuCtx, name: &str, allowed: bool) -> Option<SidebarMenuItem> {
     Some(
-        RefMenuItem::new(label, IconName::External).action(SidebarAction::OpenUrl {
-            url,
-            host: link.host().to_owned(),
-        }),
+        SidebarMenuItem::new(
+            ui::t!(
+                "history.refmenu.merge_into",
+                name = name,
+                head = ctx.head_label()
+            ),
+            IconName::Merge,
+        )
+        .maybe_action(allowed.then(|| SidebarAction::Merge(name.to_owned()))),
     )
 }
 
-fn items(list: Vec<Option<RefMenuItem>>) -> Vec<RefMenuEntry> {
+/// "New branch from `name`…" at the ref's commit; off while that is unknown.
+fn new_branch_item(name: &str, oid: Option<Oid>) -> Option<SidebarMenuItem> {
+    Some(
+        SidebarMenuItem::new(
+            ui::t!("history.refmenu.new_branch_from", name = name),
+            IconName::Branch,
+        )
+        .maybe_action(oid.map(SidebarAction::CreateBranchAt)),
+    )
+}
+
+/// "Copy … name": copies the ref's name.
+fn copy_name_item(label: impl Into<String>, name: &str) -> Option<SidebarMenuItem> {
+    Some(
+        SidebarMenuItem::new(label, IconName::Copy)
+            .action(SidebarAction::CopyText(name.to_owned())),
+    )
+}
+
+fn items(list: Vec<Option<SidebarMenuItem>>) -> Vec<RefMenuEntry> {
     list.into_iter().flatten().map(RefMenuEntry::Item).collect()
 }
 
 /// `header`, then the non-empty groups with a rule between them.
 fn sectioned(header: RefMenuEntry, groups: Vec<Vec<RefMenuEntry>>) -> Vec<RefMenuEntry> {
     let mut entries = vec![header];
-    let mut first = true;
-    for group in groups.into_iter().filter(|group| !group.is_empty()) {
-        if !first {
+    for (i, group) in groups
+        .into_iter()
+        .filter(|group| !group.is_empty())
+        .enumerate()
+    {
+        if i > 0 {
             entries.push(RefMenuEntry::Separator);
         }
-        first = false;
         entries.extend(group);
     }
     entries
 }
 
 /// The section of the local branch `name`.
-pub fn local_section(ctx: &RefMenuCtx, name: &str) -> Vec<RefMenuEntry> {
+///
+/// `pr_kind` is the service of the branch's host, `None` without one: it hides
+/// "Create pull request…" and names it "merge request" for GitLab.
+pub fn local_section(
+    ctx: &RefMenuCtx,
+    name: &str,
+    pr_kind: Option<ServiceKind>,
+) -> Vec<RefMenuEntry> {
     let current = ctx.head_branch() == Some(name);
     let branch = ctx.find(RefKind::LocalBranch, name);
     let oid = branch.map(|r| r.target);
@@ -392,62 +356,44 @@ pub fn local_section(ctx: &RefMenuCtx, name: &str) -> Vec<RefMenuEntry> {
     let remote_known = ctx.has_remote();
 
     let switch = {
-        let item = RefMenuItem::new(
+        let item = SidebarMenuItem::new(
             ui::t!("history.refmenu.switch_to", name = name),
             IconName::Check,
         )
-        .action_if(!current, SidebarAction::CheckoutBranch(name.to_owned()));
+        .maybe_action((!current).then(|| SidebarAction::CheckoutBranch(name.to_owned())));
         Some(if current {
             item.hint(ui::t!("history.refmenu.current"))
         } else {
             item
         })
     };
-    let merge = Some(
-        RefMenuItem::new(
-            ui::t!(
-                "history.refmenu.merge_into",
-                name = name,
-                head = ctx.head_label()
-            ),
-            IconName::Merge,
-        )
-        .action_if(
-            ctx.can_merge() && !current,
-            SidebarAction::Merge(name.to_owned()),
-        ),
-    );
+    let merge = merge_item(ctx, name, ctx.can_merge() && !current);
     // A pull without an upstream only fails with "no upstream".
     let pull = (current && branch.is_some_and(|r| r.upstream.is_some())).then(|| {
-        RefMenuItem::new(ui::t!("history.refmenu.pull"), IconName::Down).action(SidebarAction::Pull)
+        SidebarMenuItem::new(ui::t!("history.refmenu.pull"), IconName::Down)
+            .action(SidebarAction::Pull)
     });
     let push = push_remote.filter(|_| remote_known).map(|remote| {
-        RefMenuItem::new(
+        SidebarMenuItem::new(
             ui::t!("history.refmenu.push_to", name = name, remote = remote),
             IconName::Up,
         )
         .action(SidebarAction::PushBranch(name.to_owned()))
     });
     let set_upstream = remote_known.then(|| {
-        RefMenuItem::new(ui::t!("history.refmenu.set_upstream"), IconName::Link)
+        SidebarMenuItem::new(ui::t!("history.refmenu.set_upstream"), IconName::Link)
             .action(SidebarAction::SetUpstream(name.to_owned()))
     });
-    let new_branch = Some(
-        RefMenuItem::new(
-            ui::t!("history.refmenu.new_branch_from", name = name),
-            IconName::Branch,
-        )
-        .maybe_action(oid.map(SidebarAction::CreateBranchAt)),
-    );
+    let new_branch = new_branch_item(name, oid);
     let new_tag = Some(
-        RefMenuItem::new(
+        SidebarMenuItem::new(
             ui::t!("history.refmenu.new_tag_on", name = name),
             IconName::Tag,
         )
         .maybe_action(oid.map(SidebarAction::CreateTagAt)),
     );
     let rename = Some(
-        RefMenuItem::new(
+        SidebarMenuItem::new(
             ui::t!("history.refmenu.rename_branch", name = name),
             IconName::Edit,
         )
@@ -455,25 +401,22 @@ pub fn local_section(ctx: &RefMenuCtx, name: &str) -> Vec<RefMenuEntry> {
         .action(SidebarAction::RenameBranch(name.to_owned())),
     );
     let open = ctx.open_branch(&format!("local:{name}"));
-    let create_pr = ctx.pr_kind.map(|kind| {
+    let create_pr = pr_kind.map(|kind| {
         let label = match kind {
             ServiceKind::GitLab => ui::t!("history.refmenu.create_mr"),
             _ => ui::t!("history.refmenu.create_pr"),
         };
-        RefMenuItem::new(label, IconName::Pr)
+        SidebarMenuItem::new(label, IconName::Pr)
             .action(SidebarAction::CreatePullRequest(name.to_owned()))
     });
-    let copy = Some(
-        RefMenuItem::new(ui::t!("history.refmenu.copy_branch_name"), IconName::Copy)
-            .action(SidebarAction::CopyText(name.to_owned())),
-    );
+    let copy = copy_name_item(ui::t!("history.refmenu.copy_branch_name"), name);
     let delete = Some(
-        RefMenuItem::new(
+        SidebarMenuItem::new(
             ui::t!("history.refmenu.delete_branch", name = name),
             IconName::Trash,
         )
         .danger()
-        .action_if(!current, SidebarAction::DeleteBranch(name.to_owned())),
+        .maybe_action((!current).then(|| SidebarAction::DeleteBranch(name.to_owned()))),
     );
 
     sectioned(
@@ -498,41 +441,22 @@ pub fn remote_section(ctx: &RefMenuCtx, name: &str) -> Vec<RefMenuEntry> {
     let remote = web_links::split_remote_ref(name, &ctx.targets).map(|(remote, _)| remote);
 
     let checkout = Some(
-        RefMenuItem::new(ui::t!("history.refmenu.checkout_as_local"), IconName::Check)
+        SidebarMenuItem::new(ui::t!("history.refmenu.checkout_as_local"), IconName::Check)
             .action(SidebarAction::CheckoutRemoteBranch(name.to_owned())),
     );
-    let merge = Some(
-        RefMenuItem::new(
-            ui::t!(
-                "history.refmenu.merge_into",
-                name = name,
-                head = ctx.head_label()
-            ),
-            IconName::Merge,
-        )
-        .action_if(ctx.can_merge(), SidebarAction::Merge(name.to_owned())),
-    );
+    let merge = merge_item(ctx, name, ctx.can_merge());
     let fetch = remote.map(|remote| {
-        RefMenuItem::new(
+        SidebarMenuItem::new(
             ui::t!("history.refmenu.fetch_remote", remote = remote),
             IconName::Fetch,
         )
         .action(SidebarAction::FetchRemote(remote.to_owned()))
     });
-    let new_branch = Some(
-        RefMenuItem::new(
-            ui::t!("history.refmenu.new_branch_from", name = name),
-            IconName::Branch,
-        )
-        .maybe_action(oid.map(SidebarAction::CreateBranchAt)),
-    );
+    let new_branch = new_branch_item(name, oid);
     let open = ctx.open_branch(&format!("rbranch:{name}"));
-    let copy = Some(
-        RefMenuItem::new(ui::t!("history.refmenu.copy_branch_name"), IconName::Copy)
-            .action(SidebarAction::CopyText(name.to_owned())),
-    );
+    let copy = copy_name_item(ui::t!("history.refmenu.copy_branch_name"), name);
     let delete = Some(
-        RefMenuItem::new(
+        SidebarMenuItem::new(
             ui::t!("history.refmenu.delete_remote_branch"),
             IconName::Trash,
         )
@@ -559,18 +483,12 @@ pub fn tag_section(ctx: &RefMenuCtx, name: &str) -> Vec<RefMenuEntry> {
     let oid = ctx.find(RefKind::Tag, name).map(|r| r.target);
 
     let checkout = Some(
-        RefMenuItem::new(ui::t!("history.refmenu.checkout_tag"), IconName::Check)
+        SidebarMenuItem::new(ui::t!("history.refmenu.checkout_tag"), IconName::Check)
             .action(SidebarAction::CheckoutTag(name.to_owned())),
     );
-    let new_branch = Some(
-        RefMenuItem::new(
-            ui::t!("history.refmenu.new_branch_from", name = name),
-            IconName::Branch,
-        )
-        .maybe_action(oid.map(SidebarAction::CreateBranchAt)),
-    );
+    let new_branch = new_branch_item(name, oid);
     let push = ctx.default_remote.as_ref().map(|remote| {
-        RefMenuItem::new(
+        SidebarMenuItem::new(
             ui::t!("history.refmenu.push_tag", remote = remote),
             IconName::Up,
         )
@@ -579,7 +497,7 @@ pub fn tag_section(ctx: &RefMenuCtx, name: &str) -> Vec<RefMenuEntry> {
     // Tags are opened on the first host (the upstream's, else origin's), as
     // the sidebar does.
     let open = ctx.links.first().and_then(|link| {
-        open_item(
+        sidebar::open_item(
             link,
             &WebTarget::Tag(name.to_owned()),
             ui::t!(
@@ -589,16 +507,13 @@ pub fn tag_section(ctx: &RefMenuCtx, name: &str) -> Vec<RefMenuEntry> {
         )
     });
     let rename = Some(
-        RefMenuItem::new(ui::t!("history.refmenu.rename_tag"), IconName::Edit)
+        SidebarMenuItem::new(ui::t!("history.refmenu.rename_tag"), IconName::Edit)
             .shortcut("F2")
             .action(SidebarAction::RenameTag(name.to_owned())),
     );
-    let copy = Some(
-        RefMenuItem::new(ui::t!("history.refmenu.copy_tag_name"), IconName::Copy)
-            .action(SidebarAction::CopyText(name.to_owned())),
-    );
+    let copy = copy_name_item(ui::t!("history.refmenu.copy_tag_name"), name);
     let delete = Some(
-        RefMenuItem::new(ui::t!("history.refmenu.delete_tag"), IconName::Trash)
+        SidebarMenuItem::new(ui::t!("history.refmenu.delete_tag"), IconName::Trash)
             .danger()
             .action(SidebarAction::DeleteTag(name.to_owned())),
     );
@@ -620,10 +535,16 @@ pub fn tag_section(ctx: &RefMenuCtx, name: &str) -> Vec<RefMenuEntry> {
 /// the section of each remote branch merged into it (`main +origin` shows two
 /// headers), a remote branch's or a tag's own section. The ref row's submenu
 /// in the commit menu has the same content.
-pub fn badge_sections(ctx: &RefMenuCtx, row: &RefRow) -> Vec<RefMenuEntry> {
+///
+/// `pr_kind` is the service of a local branch's host (see [`local_section`]).
+pub fn badge_sections(
+    ctx: &RefMenuCtx,
+    row: &RefRow,
+    pr_kind: Option<ServiceKind>,
+) -> Vec<RefMenuEntry> {
     match &row.kind {
         RefRowKind::Local { remotes, .. } => {
-            let mut entries = local_section(ctx, &row.name);
+            let mut entries = local_section(ctx, &row.name, pr_kind);
             for remote in remotes {
                 entries.push(RefMenuEntry::Separator);
                 entries.extend(remote_section(ctx, &format!("{remote}/{}", row.name)));
@@ -639,6 +560,9 @@ pub fn badge_sections(ctx: &RefMenuCtx, row: &RefRow) -> Vec<RefMenuEntry> {
 mod tests {
     use super::*;
     use forge::{Instance, RepoCoords};
+
+    /// The service of a GitHub-hosted branch.
+    const PR: Option<ServiceKind> = Some(ServiceKind::GitHub);
 
     fn oid(n: u8) -> Oid {
         Oid::from_hex(&format!("{n:02x}").repeat(20)).unwrap()
@@ -713,7 +637,6 @@ mod tests {
             targets: targets(&["origin"]),
             operation: Operation::None,
             filter: None,
-            pr_kind: Some(ServiceKind::GitHub),
             default_remote: Some("origin".to_owned()),
         }
     }
@@ -732,7 +655,7 @@ mod tests {
             .collect()
     }
 
-    fn item<'a>(entries: &'a [RefMenuEntry], label: &str) -> &'a RefMenuItem {
+    fn item<'a>(entries: &'a [RefMenuEntry], label: &str) -> &'a SidebarMenuItem {
         entries
             .iter()
             .find_map(|entry| match entry {
@@ -834,14 +757,17 @@ mod tests {
                 })
                 .collect()
         };
-        let (shown, rest) = split_overflow(rows(6));
+        let six = rows(6);
+        let (shown, rest) = split_overflow(&six);
         assert_eq!((shown.len(), rest.len()), (6, 0));
-        let (shown, rest) = split_overflow(rows(7));
+        let seven = rows(7);
+        let (shown, rest) = split_overflow(&seven);
         assert_eq!((shown.len(), rest.len()), (5, 2));
-        assert_eq!(row_names(&rest), ["t5", "t6"]);
-        let (shown, rest) = split_overflow(rows(9));
+        assert_eq!(row_names(rest), ["t5", "t6"]);
+        let nine = rows(9);
+        let (shown, rest) = split_overflow(&nine);
         assert_eq!((shown.len(), rest.len()), (5, 4));
-        let (shown, rest) = split_overflow(Vec::new());
+        let (shown, rest) = split_overflow(&[]);
         assert!(shown.is_empty() && rest.is_empty());
     }
 
@@ -895,7 +821,7 @@ mod tests {
     fn a_non_head_local_section_is_complete_and_in_the_design_order() {
         let c = oid(1);
         let ctx = ctx(vec![local("main", oid(9)), local("feat", c)]);
-        let section = local_section(&ctx, "feat");
+        let section = local_section(&ctx, "feat", PR);
         assert_eq!(
             section[0],
             RefMenuEntry::Header {
@@ -924,8 +850,8 @@ mod tests {
             ]
         );
         assert!(!has(&section, "Pull"));
-        assert!(item(&section, "Switch to feat").enabled);
-        assert!(item(&section, "Merge feat into main…").enabled);
+        assert!(item(&section, "Switch to feat").enabled());
+        assert!(item(&section, "Merge feat into main…").enabled());
         assert_eq!(
             item(&section, "Push feat to origin").action,
             SidebarAction::PushBranch("feat".to_owned())
@@ -939,7 +865,7 @@ mod tests {
             SidebarAction::CreateTagAt(c)
         );
         let delete = item(&section, "Delete feat…");
-        assert!(delete.danger && delete.enabled);
+        assert!(delete.danger && delete.enabled());
         assert_eq!(
             delete.action,
             SidebarAction::DeleteBranch("feat".to_owned())
@@ -961,14 +887,14 @@ mod tests {
         let mut main = local("main", oid(1));
         main.upstream = Some("origin/main".to_owned());
         let ctx = ctx(vec![main.clone()]);
-        let section = local_section(&ctx, "main");
+        let section = local_section(&ctx, "main", PR);
         let switch = item(&section, "Switch to main");
-        assert!(!switch.enabled);
+        assert!(!switch.enabled());
         assert_eq!(switch.action, SidebarAction::None);
         assert_eq!(switch.hint.as_deref(), Some("current"));
-        assert!(!item(&section, "Merge main into main…").enabled);
+        assert!(!item(&section, "Merge main into main…").enabled());
         let delete = item(&section, "Delete main…");
-        assert!(!delete.enabled && delete.danger);
+        assert!(!delete.enabled() && delete.danger);
         let pull = item(&section, "Pull");
         assert_eq!(pull.action, SidebarAction::Pull);
         assert!(has(&section, "Push main to origin"));
@@ -978,7 +904,7 @@ mod tests {
             refs: vec![main].into(),
             ..ctx
         };
-        assert!(!has(&local_section(&ctx, "main"), "Pull"));
+        assert!(!has(&local_section(&ctx, "main", PR), "Pull"));
     }
 
     #[test]
@@ -987,7 +913,7 @@ mod tests {
         feat.upstream = Some("fork/feat".to_owned());
         let mut ctx = ctx(vec![feat]);
         ctx.targets = targets(&["origin", "fork"]);
-        let section = local_section(&ctx, "feat");
+        let section = local_section(&ctx, "feat", PR);
         assert!(has(&section, "Push feat to fork"));
     }
 
@@ -995,18 +921,16 @@ mod tests {
     fn merge_is_off_on_a_detached_head() {
         let mut ctx = ctx(vec![local("feat", oid(1)), remote("origin/feat", oid(1))]);
         ctx.head = Some(Head::Detached(oid(5)));
-        let section = local_section(&ctx, "feat");
+        let section = local_section(&ctx, "feat", PR);
         let merge = item(&section, "Merge feat into HEAD…");
-        assert!(!merge.enabled);
-        assert!(item(&section, "Switch to feat").enabled);
+        assert!(!merge.enabled());
+        assert!(item(&section, "Switch to feat").enabled());
         assert!(!has(&section, "Pull"));
-        assert!(
-            !item(
-                &remote_section(&ctx, "origin/feat"),
-                "Merge origin/feat into HEAD…"
-            )
-            .enabled
-        );
+        assert!(!item(
+            &remote_section(&ctx, "origin/feat"),
+            "Merge origin/feat into HEAD…"
+        )
+        .enabled());
     }
 
     #[test]
@@ -1018,14 +942,12 @@ mod tests {
         ] {
             let mut ctx = ctx(vec![local("feat", oid(1)), remote("origin/feat", oid(1))]);
             ctx.operation = operation;
-            assert!(!item(&local_section(&ctx, "feat"), "Merge feat into main…").enabled);
-            assert!(
-                !item(
-                    &remote_section(&ctx, "origin/feat"),
-                    "Merge origin/feat into main…"
-                )
-                .enabled
-            );
+            assert!(!item(&local_section(&ctx, "feat", PR), "Merge feat into main…").enabled());
+            assert!(!item(
+                &remote_section(&ctx, "origin/feat"),
+                "Merge origin/feat into main…"
+            )
+            .enabled());
         }
     }
 
@@ -1035,7 +957,7 @@ mod tests {
         let mut ctx = ctx(vec![local("feat", c), tag("v1", c)]);
         ctx.targets.clear();
         ctx.default_remote = None;
-        let local_labels = labels(&local_section(&ctx, "feat"));
+        let local_labels = labels(&local_section(&ctx, "feat", PR));
         assert!(local_labels
             .iter()
             .all(|l| !l.starts_with("Push") && l != "Set upstream…"));
@@ -1061,9 +983,8 @@ mod tests {
             tag("v1", c),
         ]);
         ctx.links.clear();
-        ctx.pr_kind = None;
         for section in [
-            local_section(&ctx, "feat"),
+            local_section(&ctx, "feat", None),
             remote_section(&ctx, "origin/feat"),
             tag_section(&ctx, "v1"),
         ] {
@@ -1078,8 +999,8 @@ mod tests {
         let c = oid(1);
         let mut feat = local("feat", c);
         feat.upstream = Some("origin/feat".to_owned());
-        let mut ctx = ctx(vec![feat, remote("origin/feat", c), tag("v1", c)]);
-        let local = local_section(&ctx, "feat");
+        let ctx = ctx(vec![feat, remote("origin/feat", c), tag("v1", c)]);
+        let local = local_section(&ctx, "feat", PR);
         assert!(matches!(
             item(&local, "Open on GitHub").action,
             SidebarAction::OpenUrl { .. }
@@ -1090,22 +1011,24 @@ mod tests {
             item(&local, "Create pull request…").action,
             SidebarAction::CreatePullRequest("feat".to_owned())
         );
-        ctx.pr_kind = Some(ServiceKind::GitLab);
-        assert!(has(&local_section(&ctx, "feat"), "Create merge request…"));
+        assert!(has(
+            &local_section(&ctx, "feat", Some(ServiceKind::GitLab)),
+            "Create merge request…"
+        ));
     }
 
     #[test]
     fn the_filter_tool_is_selected_for_the_filtered_branch() {
         let mut ctx = ctx(vec![local("feat", oid(1))]);
         ctx.filter = Some("feat".to_owned());
-        let RefMenuEntry::Header { tools, .. } = &local_section(&ctx, "feat")[0] else {
+        let RefMenuEntry::Header { tools, .. } = &local_section(&ctx, "feat", PR)[0] else {
             panic!("a section starts with its header");
         };
         assert!(tools[0].selected);
         // Already filtered: the tool clears the filter instead of re-applying it.
         assert_eq!(tools[0].action, SidebarAction::ShowAllCommits);
         assert_eq!(tools[0].tooltip, "Show all commits");
-        let RefMenuEntry::Header { tools, .. } = &local_section(&ctx, "main")[0] else {
+        let RefMenuEntry::Header { tools, .. } = &local_section(&ctx, "main", PR)[0] else {
             panic!("a section starts with its header");
         };
         assert!(!tools[0].selected);
@@ -1178,7 +1101,7 @@ mod tests {
         let refs = vec![local("main", c), remote("origin/main", c)];
         let ctx = ctx(refs.clone());
         let rows = commit_ref_rows(c, ctx.head.as_ref(), &refs, &ctx.targets);
-        let entries = badge_sections(&ctx, &rows[0]);
+        let entries = badge_sections(&ctx, &rows[0], PR);
         let headers: Vec<&str> = entries
             .iter()
             .filter_map(|e| match e {
@@ -1193,7 +1116,7 @@ mod tests {
             kind: RefRowKind::Tag,
             name: "v1".to_owned(),
         };
-        assert_eq!(badge_sections(&ctx, &tag_row), tag_section(&ctx, "v1"));
+        assert_eq!(badge_sections(&ctx, &tag_row, PR), tag_section(&ctx, "v1"));
     }
 
     #[test]
@@ -1209,8 +1132,8 @@ mod tests {
             tag("v1", c),
         ]);
         let mut all = Vec::new();
-        all.extend(local_section(&ctx, "main"));
-        all.extend(local_section(&ctx, "feat"));
+        all.extend(local_section(&ctx, "main", PR));
+        all.extend(local_section(&ctx, "feat", PR));
         all.extend(remote_section(&ctx, "origin/feat"));
         all.extend(tag_section(&ctx, "v1"));
         for label in labels(&all) {
@@ -1234,10 +1157,10 @@ mod tests {
     #[test]
     fn a_disabled_item_has_no_action() {
         let ctx = ctx(vec![local("main", oid(1))]);
-        for entry in local_section(&ctx, "main") {
+        for entry in local_section(&ctx, "main", PR) {
             if let RefMenuEntry::Item(item) = entry {
                 assert_eq!(
-                    item.enabled,
+                    item.enabled(),
                     item.action != SidebarAction::None,
                     "{}",
                     item.label

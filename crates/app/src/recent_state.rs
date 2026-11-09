@@ -9,7 +9,7 @@ use git_core::{Head, PathProbe};
 use gpui::SharedString;
 use ui::ChipKind;
 
-use crate::format::display_path;
+use crate::format::{display_path, same_path};
 
 /// Why a recent entry can't be opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +58,7 @@ pub fn classify(path: &Path, probe: PathProbe, open: Option<OpenResult>) -> RowS
                 // `Repo::open` searches upward: a folder that is no longer a
                 // repository but sits inside another one opens that parent.
                 // Only the stored folder itself counts as the repository.
-                if same_folder(&root, path) {
+                if same_path(&root, path) {
                     let branch = match head {
                         Some(Head::Branch { name, .. }) => Some(SharedString::from(name)),
                         // Same as before the row states: a detached HEAD shows no branch.
@@ -78,15 +78,6 @@ pub fn classify(path: &Path, probe: PathProbe, open: Option<OpenResult>) -> RowS
             Some(Err(error)) => RowState::Unavailable(Unavailable::Unreadable(error.to_string())),
         },
     }
-}
-
-/// `a` and `b` name the same folder: equal as written, or equal once symlinks are resolved.
-pub(crate) fn same_folder(a: &Path, b: &Path) -> bool {
-    a == b
-        || matches!(
-            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
-            (Ok(a), Ok(b)) if a == b
-        )
 }
 
 impl Unavailable {
@@ -137,6 +128,19 @@ impl RowState {
     }
 }
 
+/// What a [`RecentSelection`] selects.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Selected {
+    /// Just the cursor row.
+    #[default]
+    Cursor,
+    /// An explicit multi-selection. Empty means nothing is selected:
+    /// Ctrl-toggling off the last selected row must not fall back to the
+    /// cursor row. Any other selection change (click, Shift range, select all,
+    /// `clear`) replaces it.
+    Explicit(BTreeSet<PathBuf>),
+}
+
 /// Which recent rows are selected. Keyed by path so filtering the list does
 /// not lose the selection; the index arguments are positions in the currently
 /// visible `rows`.
@@ -146,13 +150,7 @@ pub struct RecentSelection {
     pub cursor: usize,
     /// Where a Shift range starts.
     anchor: Option<usize>,
-    /// The explicit multi-selection. Empty means "just the cursor row" unless
-    /// `none` is set.
-    set: BTreeSet<PathBuf>,
-    /// Ctrl-toggling off the last selected row leaves nothing selected: the empty
-    /// `set` then must not fall back to the cursor row. Cleared by any other
-    /// selection change (click, arrows, Shift range, select all, `clear`).
-    none: bool,
+    selected: Selected,
 }
 
 impl RecentSelection {
@@ -160,23 +158,21 @@ impl RecentSelection {
     pub fn click(&mut self, index: usize) {
         self.cursor = index;
         self.anchor = Some(index);
-        self.set.clear();
-        self.none = false;
+        self.selected = Selected::Cursor;
     }
 
     /// Ctrl/Cmd+click: adds or removes the row. The cursor row counts as
     /// selected before the first toggle, so the click extends it.
     pub fn toggle(&mut self, index: usize, rows: &[PathBuf]) {
         let Some(path) = rows.get(index) else { return };
-        if self.set.is_empty() && !self.none {
-            if let Some(current) = rows.get(self.cursor) {
-                self.set.insert(current.clone());
-            }
+        let mut set = match std::mem::take(&mut self.selected) {
+            Selected::Cursor => rows.get(self.cursor).cloned().into_iter().collect(),
+            Selected::Explicit(set) => set,
+        };
+        if !set.remove(path) {
+            set.insert(path.clone());
         }
-        if !self.set.remove(path) {
-            self.set.insert(path.clone());
-        }
-        self.none = self.set.is_empty();
+        self.selected = Selected::Explicit(set);
         self.cursor = index;
         self.anchor = Some(index);
     }
@@ -189,8 +185,7 @@ impl RecentSelection {
         let index = index.min(rows.len() - 1);
         let anchor = self.anchor.unwrap_or(self.cursor).min(rows.len() - 1);
         let (from, to) = (anchor.min(index), anchor.max(index));
-        self.set = rows[from..=to].iter().cloned().collect();
-        self.none = false;
+        self.selected = Selected::Explicit(rows[from..=to].iter().cloned().collect());
         self.cursor = index;
         self.anchor = Some(anchor);
     }
@@ -203,15 +198,17 @@ impl RecentSelection {
 
     /// Ctrl/Cmd+A: every visible row.
     pub fn select_all(&mut self, rows: &[PathBuf]) {
-        self.set = rows.iter().cloned().collect();
-        self.none = false;
+        self.selected = if rows.is_empty() {
+            Selected::Cursor
+        } else {
+            Selected::Explicit(rows.iter().cloned().collect())
+        };
         self.anchor.get_or_insert(self.cursor);
     }
 
     /// Drops the multi-selection; the cursor row stays selected.
     pub fn clear(&mut self) {
-        self.set.clear();
-        self.none = false;
+        self.selected = Selected::Cursor;
         self.anchor = None;
     }
 
@@ -219,16 +216,14 @@ impl RecentSelection {
     /// visible rows in list order, or the cursor row when nothing is selected
     /// explicitly. Rows hidden by the filter are never targeted.
     pub fn targets(&self, rows: &[PathBuf]) -> Vec<PathBuf> {
-        if self.set.is_empty() {
-            if self.none {
-                return Vec::new();
-            }
-            return rows.get(self.cursor).cloned().into_iter().collect();
+        match &self.selected {
+            Selected::Cursor => rows.get(self.cursor).cloned().into_iter().collect(),
+            Selected::Explicit(set) => rows
+                .iter()
+                .filter(|path| set.contains(*path))
+                .cloned()
+                .collect(),
         }
-        rows.iter()
-            .filter(|path| self.set.contains(*path))
-            .cloned()
-            .collect()
     }
 
     /// How many visible rows are selected.
@@ -238,21 +233,22 @@ impl RecentSelection {
 
     /// Whether the row at `index` is highlighted as selected.
     pub fn is_selected(&self, index: usize, rows: &[PathBuf]) -> bool {
-        if self.set.is_empty() {
-            !self.none && index == self.cursor
-        } else {
-            rows.get(index).is_some_and(|path| self.set.contains(path))
+        match &self.selected {
+            Selected::Cursor => index == self.cursor,
+            Selected::Explicit(set) => rows.get(index).is_some_and(|path| set.contains(path)),
         }
     }
 
     /// Forgets selected paths that are no longer in the list (after a removal)
     /// and keeps the cursor inside `len` visible rows.
     pub fn retain(&mut self, existing: &[PathBuf], len: usize) {
-        let had = !self.set.is_empty();
-        self.set.retain(|path| existing.contains(path));
-        // Every explicitly selected row was removed: fall back to the cursor row.
-        if had && self.set.is_empty() {
-            self.none = false;
+        if let Selected::Explicit(set) = &mut self.selected {
+            let had = !set.is_empty();
+            set.retain(|path| existing.contains(path));
+            // Every explicitly selected row was removed: fall back to the cursor row.
+            if had && set.is_empty() {
+                self.selected = Selected::Cursor;
+            }
         }
         self.anchor = None;
         self.cursor = self.cursor.min(len.saturating_sub(1));

@@ -9,15 +9,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, div, px, transparent_black, uniform_list, App, AppContext, ClickEvent, ClipboardItem,
-    Context, ElementId, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, PathPromptOptions, Render, ScrollStrategy,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle,
-    WeakEntity, Window,
+    actions, div, px, transparent_black, uniform_list, App, AppContext, ClickEvent, Context,
+    ElementId, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, PathPromptOptions, Render, ScrollStrategy, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle, WeakEntity, Window,
 };
 
 use git_core::{Error, Git, Repo};
@@ -31,10 +30,10 @@ use ui::{
 };
 
 use crate::clone_dialog::CloneDialog;
-use crate::format::{display_path, expand_home, home_dir, relative_time};
+use crate::format::{display_path, expand_home, home_dir, relative_time, same_path};
 use crate::history_view::unix_now;
 use crate::init_flow::{banner_body, details, DialogKind, InitFlow, StatusKind};
-use crate::recent_state::{classify, same_folder, OpenResult, RecentSelection, RowState};
+use crate::recent_state::{classify, OpenResult, RecentSelection, RowState};
 use crate::settings::RecentRepo;
 use crate::welcome_activity::WelcomeActivity;
 use crate::workspace::{
@@ -68,6 +67,8 @@ const TIME_W: f32 = 110.;
 const REMOVE_SLOT_W: f32 = 20.;
 /// How long the Undo toast of a removal stays (longer while hovered).
 const UNDO_LIFETIME: Duration = Duration::from_secs(8);
+/// The least time between two re-checks of the whole list on window activation.
+const REPROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A recent repository row, resolved for one frame.
 struct RecentRow {
@@ -98,14 +99,19 @@ pub struct WelcomeView {
     undo_toast: Option<ToastId>,
     /// The cleanup bar's "Show only these": the list shows unavailable rows only.
     only_unavailable: bool,
-    /// What the background check found for each recent path.
+    /// What the background check found for each recent path; a path without an
+    /// entry is still being checked (see `probing`).
     states: HashMap<PathBuf, RowState>,
-    /// Recent entries the background check found to be linked worktrees. They
-    /// are never listed (older versions recorded them; startup prunes them from
-    /// the settings in the background), so they are hidden once known.
-    worktrees: HashSet<PathBuf>,
     /// Paths with a background check in flight.
     probing: HashSet<PathBuf>,
+    /// When the whole list was last re-checked on window activation.
+    last_reprobe: Option<Instant>,
+    /// Bumped whenever `recent` changes, so the activity card is only told
+    /// again when the list or the selected row did.
+    recent_revision: u64,
+    /// What the activity card was last told: the list revision and the
+    /// selected path.
+    activity_sent: Option<(u64, Option<PathBuf>)>,
     /// Enter / double click on a row that was still being checked or was
     /// unavailable: it opens as soon as its (re-)check says it is available.
     open_when_ready: Option<PathBuf>,
@@ -125,6 +131,8 @@ pub struct WelcomeView {
     _filter_events: Subscription,
     /// Re-checks every row when the window becomes active again.
     _activation: Subscription,
+    /// Re-reads the recent list when the settings change.
+    _settings: Subscription,
 }
 
 impl WelcomeView {
@@ -159,6 +167,11 @@ impl WelcomeView {
                 this.reprobe_all(window, cx);
             }
         });
+        let settings = cx.observe_global::<crate::AppSettings>(|this, cx| {
+            if this.sync_recent(cx) {
+                cx.notify();
+            }
+        });
         Self {
             git,
             workspace,
@@ -170,8 +183,10 @@ impl WelcomeView {
             undo_toast: None,
             only_unavailable: false,
             states: HashMap::new(),
-            worktrees: HashSet::new(),
             probing: HashSet::new(),
+            last_reprobe: None,
+            recent_revision: 0,
+            activity_sent: None,
             open_when_ready: None,
             list_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle().tab_stop(true),
@@ -184,6 +199,7 @@ impl WelcomeView {
             activity,
             _filter_events: filter_events,
             _activation: activation,
+            _settings: settings,
         }
     }
 
@@ -209,33 +225,37 @@ impl WelcomeView {
     }
 
     /// Re-reads the settings' recent list; a changed list clamps the
-    /// selection instead of leaving it past the end.
-    fn sync_recent(&mut self, cx: &App) {
+    /// selection instead of leaving it past the end. Returns whether it changed.
+    fn sync_recent(&mut self, cx: &App) -> bool {
         let recent = read_recent(cx);
-        if recent != self.recent {
-            self.recent = recent;
-            let paths = self.visible_paths();
-            self.selection.retain(&paths, paths.len());
+        if recent == self.recent {
+            return false;
         }
+        self.recent = recent;
+        self.recent_revision += 1;
+        let paths = self.visible_paths();
+        self.selection.retain(&paths, paths.len());
+        true
     }
 
-    /// Tells the activity card the recent list and the selected row.
-    fn sync_activity(&self, cx: &mut Context<Self>) {
-        // Most recently opened first: worktrees of one repository are listed
-        // under the newest entry.
-        let mut by_recency: Vec<&RecentRepo> = self
-            .recent
-            .iter()
-            .filter(|repo| !self.worktrees.contains(&repo.path))
-            .collect();
-        by_recency.sort_by_key(|repo| std::cmp::Reverse(repo.last_opened));
-        let paths = by_recency.iter().map(|repo| repo.path.clone()).collect();
+    /// Tells the activity card the recent list and the selected row, when
+    /// either changed since the last time.
+    fn sync_activity(&mut self, cx: &mut Context<Self>) {
         let selected = self
-            .recent
-            .iter()
-            .filter(|repo| self.matches(repo))
+            .visible()
             .nth(self.selection.cursor)
             .map(|repo| repo.path.clone());
+        let sent = (self.recent_revision, selected);
+        if self.activity_sent.as_ref() == Some(&sent) {
+            return;
+        }
+        // Most recently opened first: worktrees of one repository are listed
+        // under the newest entry.
+        let mut by_recency: Vec<&RecentRepo> = self.recent.iter().collect();
+        by_recency.sort_by_key(|repo| std::cmp::Reverse(repo.last_opened));
+        let paths = by_recency.iter().map(|repo| repo.path.clone()).collect();
+        let selected = sent.1.clone();
+        self.activity_sent = Some(sent);
         self.activity
             .update(cx, |activity, cx| activity.sync(paths, selected, cx));
     }
@@ -246,11 +266,11 @@ impl WelcomeView {
         let missing: Vec<PathBuf> = self
             .recent
             .iter()
-            .filter(|repo| !self.states.contains_key(&repo.path))
-            .map(|repo| repo.path.clone())
+            .map(|repo| &repo.path)
+            .filter(|path| !self.states.contains_key(*path) && !self.probing.contains(*path))
+            .cloned()
             .collect();
         for path in missing {
-            self.states.insert(path.clone(), RowState::Checking);
             self.start_probe(path, window, cx);
         }
     }
@@ -293,9 +313,17 @@ impl WelcomeView {
     ) {
         self.probing.remove(&path);
         if linked {
-            self.worktrees.insert(path.clone());
-        } else {
-            self.worktrees.remove(&path);
+            // Linked worktrees are never listed; older versions recorded them,
+            // so the entry is dropped from the settings (a one-off migration).
+            crate::update_settings(cx, |settings| {
+                settings.prune_recent_worktrees(|recent| recent == path);
+            });
+            if self.open_when_ready.as_ref() == Some(&path) {
+                self.open_when_ready = None;
+            }
+            self.sync_recent(cx);
+            cx.notify();
+            return;
         }
         let available = matches!(state, RowState::Available { .. });
         self.states.insert(path.clone(), state);
@@ -311,8 +339,18 @@ impl WelcomeView {
     }
 
     /// Re-checks every row (window activation): an unmounted share may be back,
-    /// a repository may have been deleted meanwhile.
+    /// a repository may have been deleted meanwhile. At most every
+    /// [`REPROBE_INTERVAL`]: each check reads the disk and opens the repository.
     fn reprobe_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The executor's clock, so tests can move it.
+        let now = cx.background_executor().now();
+        if self
+            .last_reprobe
+            .is_some_and(|last| now.saturating_duration_since(last) < REPROBE_INTERVAL)
+        {
+            return;
+        }
+        self.last_reprobe = Some(now);
         let paths: Vec<PathBuf> = self.recent.iter().map(|repo| repo.path.clone()).collect();
         for path in paths {
             self.start_probe(path, window, cx);
@@ -330,39 +368,37 @@ impl WelcomeView {
     fn unavailable_paths(&self) -> Vec<PathBuf> {
         self.recent
             .iter()
-            .filter(|repo| !self.worktrees.contains(&repo.path) && self.is_unavailable(&repo.path))
+            .filter(|repo| self.is_unavailable(&repo.path))
             .map(|repo| repo.path.clone())
             .collect()
     }
 
-    fn matches(&self, repo: &RecentRepo) -> bool {
-        !self.worktrees.contains(&repo.path)
-            && (!self.only_unavailable || self.is_unavailable(&repo.path))
-            && matches_filter(
-                &recent_name(&repo.path),
-                &display_path(&repo.path, self.home.as_deref()),
-                &self.filter_text,
-            )
+    /// The rows the list shows, in list order: those the filter text matches
+    /// (and, under "Show only these", the unavailable ones).
+    fn visible(&self) -> impl Iterator<Item = &RecentRepo> + '_ {
+        let filter = self.filter_text.to_lowercase();
+        self.recent.iter().filter(move |repo| {
+            (!self.only_unavailable || self.is_unavailable(&repo.path))
+                && matches_filter(
+                    &recent_name(&repo.path),
+                    &display_path(&repo.path, self.home.as_deref()),
+                    &filter,
+                )
+        })
     }
 
     fn filtered_len(&self) -> usize {
-        self.recent.iter().filter(|repo| self.matches(repo)).count()
+        self.visible().count()
     }
 
     /// The paths of the visible rows, in list order: what [`RecentSelection`] indexes into.
     fn visible_paths(&self) -> Vec<PathBuf> {
-        self.recent
-            .iter()
-            .filter(|repo| self.matches(repo))
-            .map(|repo| repo.path.clone())
-            .collect()
+        self.visible().map(|repo| repo.path.clone()).collect()
     }
 
     fn filtered_rows(&self) -> Vec<RecentRow> {
         let now = unix_now();
-        self.recent
-            .iter()
-            .filter(|repo| self.matches(repo))
+        self.visible()
             .map(|repo| {
                 let state = self
                     .states
@@ -537,14 +573,14 @@ impl WelcomeView {
         if let Some(previous) = self.undo_toast.take() {
             toast::dismiss(previous, window, cx);
         }
-        self.undo_toast = Some(toast::show_with_lifetime(
+        self.undo_toast = Some(toast::show_with(
             ToastKind::Info,
             message,
             Some(ToastBody {
                 lines: Vec::new(),
                 action: Some(undo),
+                lifetime: Some(UNDO_LIFETIME),
             }),
-            Some(UNDO_LIFETIME),
             window,
             cx,
         ));
@@ -612,9 +648,8 @@ impl WelcomeView {
             }
             MenuCommand::Reveal => cx.reveal_path(path),
             MenuCommand::CopyPath => {
-                cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
-                toast::show(
-                    ToastKind::Ok,
+                crate::copy_with_toast(
+                    path.display().to_string(),
                     ui::t!("welcome.recent.toast.path_copied"),
                     window,
                     cx,
@@ -860,6 +895,9 @@ impl WelcomeView {
     fn render_right(&self, cx: &Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         let rows = self.filtered_rows();
+        // The visible paths, in the order of `rows`, and how many are selected.
+        let paths: Vec<PathBuf> = rows.iter().map(|row| row.path.clone()).collect();
+        let selected_count = self.selection.count(&paths);
 
         let header = div()
             .w_full()
@@ -919,8 +957,9 @@ impl WelcomeView {
         } else {
             let weak = cx.entity().downgrade();
             let focus = self.focus.clone();
-            let paths = self.visible_paths();
             let selection = self.selection.clone();
+            let alone = selected_count == 1;
+            let paths = paths.clone();
             let count = rows.len();
             let list = uniform_list("recent-list", count, move |range, _, _| {
                 range
@@ -930,7 +969,7 @@ impl WelcomeView {
                             &rows[index],
                             RowPlace {
                                 selected: selection.is_selected(index, &paths),
-                                alone: selection.count(&paths) == 1,
+                                alone,
                                 cursor: index == selection.cursor,
                                 last: index + 1 == count,
                             },
@@ -962,7 +1001,6 @@ impl WelcomeView {
             cleanup_bar(unavailable, self.only_unavailable, weak, colors)
         });
 
-        let selected_count = self.selection.count(&self.visible_paths());
         let hint = div()
             .debug_selector(|| "recent-footer".to_string())
             .w_full()
@@ -973,7 +1011,7 @@ impl WelcomeView {
             .text_color(colors.muted);
         // Two or more selected rows replace the key hints with bulk actions.
         let hint = if selected_count >= 2 {
-            let remove = self.selection.targets(&self.visible_paths());
+            let remove = self.selection.targets(&paths);
             let weak = cx.entity().downgrade();
             let clear = weak.clone();
             hint.child(
@@ -1142,7 +1180,6 @@ impl WelcomeView {
 impl Render for WelcomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prune_dialog(window, cx);
-        self.sync_recent(cx);
         // Nothing unavailable is left (removed, relocated): leave the filtered view.
         if self.only_unavailable && self.unavailable_paths().is_empty() {
             self.only_unavailable = false;
@@ -2261,7 +2298,7 @@ fn locate_outcome(
     is_worktree: impl Fn(&Path) -> bool,
 ) -> LocateOutcome {
     match opened {
-        Ok(root) if !same_folder(&root, picked) => LocateOutcome::NotRepository,
+        Ok(root) if !same_path(&root, picked) => LocateOutcome::NotRepository,
         Ok(root) if is_worktree(&root) => LocateOutcome::LinkedWorktree,
         Ok(root) => LocateOutcome::Repository(root),
         Err(Error::NotARepository { .. }) => LocateOutcome::NotRepository,
@@ -2384,10 +2421,10 @@ fn cleanup_bar(
 ///
 /// The flag says the entry is a linked worktree (never listed in Recent).
 fn check_recent(git: Option<Arc<Git>>, path: &Path) -> (RowState, bool) {
-    let linked = git_core::is_linked_worktree(path);
-    let probe = git_core::probe_repo_path(path);
+    let (probe, linked) = git_core::probe_repo_path_linked(path);
     let open: Option<OpenResult> = match (&probe, git) {
-        (git_core::PathProbe::Candidate, Some(git)) => {
+        // A linked worktree is dropped from the list, so it is not opened.
+        (git_core::PathProbe::Candidate, Some(git)) if !linked => {
             Some(Repo::open(git, path).map(|repo| (repo.root().to_path_buf(), repo.head().ok())))
         }
         _ => None,
@@ -2408,13 +2445,13 @@ pub(crate) fn recent_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// Case-insensitive substring match on the name or the full displayed path.
-fn matches_filter(name: &str, path: &str, filter: &str) -> bool {
-    if filter.is_empty() {
+/// Case-insensitive substring match on the name or the full displayed path;
+/// `filter_lower` is the filter text, already lower-cased.
+fn matches_filter(name: &str, path: &str, filter_lower: &str) -> bool {
+    if filter_lower.is_empty() {
         return true;
     }
-    let filter = filter.to_lowercase();
-    name.to_lowercase().contains(&filter) || path.to_lowercase().contains(&filter)
+    name.to_lowercase().contains(filter_lower) || path.to_lowercase().contains(filter_lower)
 }
 
 #[cfg(test)]
@@ -2423,11 +2460,12 @@ mod tests {
 
     #[test]
     fn the_filter_is_case_insensitive_on_the_name_or_the_path() {
-        assert!(matches_filter("GitWarp", "~/dev/gitwarp", ""));
-        assert!(matches_filter("GitWarp", "~/dev/gitwarp", "git"));
-        assert!(matches_filter("GitWarp", "~/dev/gitwarp", "GITWARP"));
-        assert!(matches_filter("notes", "/mnt/data/notes", "mnt/Data"));
-        assert!(!matches_filter("notes", "/mnt/data/notes", "gitwarp"));
+        let matches = |name, path, filter: &str| matches_filter(name, path, &filter.to_lowercase());
+        assert!(matches("GitWarp", "~/dev/gitwarp", ""));
+        assert!(matches("GitWarp", "~/dev/gitwarp", "git"));
+        assert!(matches("GitWarp", "~/dev/gitwarp", "GITWARP"));
+        assert!(matches("notes", "/mnt/data/notes", "mnt/Data"));
+        assert!(!matches("notes", "/mnt/data/notes", "gitwarp"));
     }
 
     #[test]
@@ -3090,6 +3128,19 @@ mod tests {
         cx.run_until_parked();
 
         std::fs::rename(&away, &path).unwrap();
+        // Activations within the throttle interval do not re-check.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("recent-chip-0").is_some(),
+            "a re-check ran within the throttle interval"
+        );
+        other
+            .update(&mut cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(REPROBE_INTERVAL);
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
         cx.run_until_parked();
@@ -3099,8 +3150,8 @@ mod tests {
         );
     }
 
-    /// A linked worktree recorded by an older version is hidden once the
-    /// background check has seen it, without any blocking work at startup.
+    /// A linked worktree recorded by an older version is removed from the
+    /// stored list once the background check has seen it.
     #[gpui::test]
     fn linked_worktree_entries_are_not_listed(cx: &mut gpui::TestAppContext) {
         let repo = crate::test_support::TempRepo::new("recent-worktree");
@@ -3119,6 +3170,7 @@ mod tests {
             cx.debug_bounds("recent-row-1").is_none(),
             "the linked worktree is still listed"
         );
+        assert_eq!(recent_paths(&mut cx), vec![paths[1].clone()]);
     }
 
     /// Undo still restores the entries after the welcome view is gone (a

@@ -84,6 +84,17 @@ struct AppSettings {
 
 impl Global for AppSettings {}
 
+/// Puts `text` on the clipboard and confirms with an Ok toast saying `message`.
+fn copy_with_toast(
+    text: String,
+    message: impl Into<gpui::SharedString>,
+    window: &mut gpui::Window,
+    cx: &mut App,
+) {
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    ui::toast::show(ui::ToastKind::Ok, message, window, cx);
+}
+
 /// Applies `f` to the loaded settings and saves them on the background
 /// executor. The in-memory copy changes at once; a save that is already in
 /// flight makes this one just mark the state dirty, so a burst of changes
@@ -413,48 +424,9 @@ fn main() {
                 },
             )
             .expect("failed to open the main window");
-            prune_recent_worktrees(cx);
             update_check::start(cx);
             cx.activate(true);
         });
-}
-
-/// Linked worktrees are never listed in Recent: drops the ones recorded by older
-/// versions so they stop taking slots of RECENT_LIMIT. The probes read files, which
-/// can hang on a dead network mount, so they run on the background executor after
-/// the first window is up; the settings are updated (and saved) from the
-/// foreground once they finish. Until then the Welcome list hides such rows itself
-/// from its own background check.
-fn prune_recent_worktrees(cx: &mut App) {
-    let recent: Vec<PathBuf> = match cx.try_global::<AppSettings>() {
-        Some(state) => state
-            .settings
-            .recent
-            .iter()
-            .map(|r| r.path.clone())
-            .collect(),
-        None => return,
-    };
-    cx.spawn(async move |cx| {
-        let linked: Vec<PathBuf> = cx
-            .background_executor()
-            .spawn(async move {
-                recent
-                    .into_iter()
-                    .filter(|path| git_core::is_linked_worktree(path))
-                    .collect()
-            })
-            .await;
-        if linked.is_empty() {
-            return;
-        }
-        cx.update(|cx| {
-            update_settings(cx, |settings| {
-                settings.prune_recent_worktrees(|path| linked.iter().any(|l| l == path));
-            })
-        });
-    })
-    .detach();
 }
 
 #[derive(Debug, PartialEq, Eq)]

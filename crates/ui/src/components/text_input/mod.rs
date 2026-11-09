@@ -98,11 +98,6 @@ impl TextInput {
         &self.focus_handle
     }
 
-    /// The caret's byte offset, or `None` while a range is selected.
-    pub fn caret(&self) -> Option<usize> {
-        self.model.selection.is_empty().then(|| self.model.cursor())
-    }
-
     pub fn text(&self) -> &str {
         &self.model.text
     }
@@ -186,12 +181,23 @@ impl TextInput {
         self.after_edit(before, cx);
     }
 
+    // With the caret already at an edge (and no selection to collapse) ← / →
+    // have nowhere to go, so the key is passed on to the next binding: a menu
+    // around a filter field uses that to open and close submenus.
     fn move_left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        if self.model.selection.is_empty() && self.model.cursor() == 0 {
+            cx.propagate();
+            return;
+        }
         self.model.move_left();
         cx.notify();
     }
 
     fn move_right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        if self.model.selection.is_empty() && self.model.cursor() == self.model.text.len() {
+            cx.propagate();
+            return;
+        }
         self.model.move_right();
         cx.notify();
     }

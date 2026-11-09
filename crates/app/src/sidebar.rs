@@ -317,25 +317,83 @@ pub enum SidebarAction {
 pub struct SidebarMenuItem {
     pub label: String,
     pub icon: IconName,
+    /// Muted text at the right (`current`).
+    pub hint: Option<String>,
     pub shortcut: Option<String>,
     pub danger: bool,
-    pub enabled: bool,
+    /// [`SidebarAction::None`] exactly when the item is disabled.
     pub action: SidebarAction,
 }
 
 impl SidebarMenuItem {
-    /// A shown-but-disabled item: no later stage has wired it yet.
-    fn new(label: impl Into<String>, icon: IconName) -> Self {
+    /// A shown-but-disabled item; [`Self::action`] enables it.
+    pub(crate) fn new(label: impl Into<String>, icon: IconName) -> Self {
         Self {
             label: label.into(),
             icon,
+            hint: None,
             shortcut: None,
             danger: false,
-            enabled: false,
             action: SidebarAction::None,
         }
     }
+
+    /// An item is enabled exactly when it has an action.
+    pub fn enabled(&self) -> bool {
+        !matches!(self.action, SidebarAction::None)
+    }
+
+    pub(crate) fn action(mut self, action: SidebarAction) -> Self {
+        self.action = action;
+        self
+    }
+
+    /// Enabled with the action when there is one, else shown but off.
+    pub(crate) fn maybe_action(self, action: Option<SidebarAction>) -> Self {
+        match action {
+            Some(action) => self.action(action),
+            None => self,
+        }
+    }
+
+    pub(crate) fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    pub(crate) fn shortcut(mut self, shortcut: &str) -> Self {
+        self.shortcut = Some(shortcut.to_owned());
+        self
+    }
+
+    pub(crate) fn danger(mut self) -> Self {
+        self.danger = true;
+        self
+    }
+
+    /// The UI kit's menu item: a click calls `handler` with the action; an
+    /// item without one stays shown but off.
+    pub(crate) fn into_menu_item(self, handler: SidebarActionHandler) -> ui::MenuItem {
+        let disabled = !self.enabled();
+        let mut menu_item = ui::MenuItem::new(self.label)
+            .icon(self.icon)
+            .disabled(disabled);
+        if let Some(shortcut) = self.shortcut {
+            menu_item = menu_item.shortcut(shortcut);
+        }
+        if let Some(hint) = self.hint {
+            menu_item = menu_item.hint(hint);
+        }
+        if self.danger {
+            menu_item = menu_item.danger();
+        }
+        let action = self.action;
+        menu_item.action(move |window, cx| handler(action.clone(), window, cx))
+    }
 }
+
+/// Runs a [`SidebarAction`] of a menu item.
+pub(crate) type SidebarActionHandler = Rc<dyn Fn(SidebarAction, &mut Window, &mut App)>;
 
 /// One row of a sidebar context menu: an item or a rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,7 +427,6 @@ impl SidebarMenuEntry {
     fn action(self, action: SidebarAction) -> Self {
         match self {
             SidebarMenuEntry::Item(mut item) => {
-                item.enabled = !matches!(action, SidebarAction::None);
                 item.action = action;
                 SidebarMenuEntry::Item(item)
             }
@@ -403,20 +460,45 @@ pub fn sidebar_menu(
     sidebar_menu_with_links(key, head, extras, refs, &[], operation)
 }
 
-/// "Open on <Service>" for `target` on the host of `link`; `None` when the
-/// service has no such page.
-fn open_item(link: &HostLink, target: &forge::WebTarget) -> Option<SidebarMenuEntry> {
+/// "Open on <Service>" (or any other `label`) for `target` on the host of
+/// `link`; `None` when the service has no such page.
+pub(crate) fn open_item(
+    link: &HostLink,
+    target: &forge::WebTarget,
+    label: impl Into<String>,
+) -> Option<SidebarMenuItem> {
     let url = link.url(target)?;
     Some(
-        item(
-            &ui::t!("sidebar.menu.open_on_host", service = link.service_name()),
-            IconName::External,
-        )
-        .action(SidebarAction::OpenUrl {
+        SidebarMenuItem::new(label, IconName::External).action(SidebarAction::OpenUrl {
             url,
             host: link.host().to_owned(),
         }),
     )
+}
+
+/// The sidebar's "Open on <Service>" entry.
+fn open_on_host(link: &HostLink, target: &forge::WebTarget) -> Option<SidebarMenuEntry> {
+    open_item(
+        link,
+        target,
+        ui::t!("sidebar.menu.open_on_host", service = link.service_name()),
+    )
+    .map(SidebarMenuEntry::Item)
+}
+
+/// Merging needs a branch to merge into (not a detached or unread HEAD) and
+/// no stopped operation (git refuses to start another).
+pub(crate) fn can_merge(head: Option<&Head>, operation: Operation) -> bool {
+    matches!(head, Some(Head::Branch { .. })) && operation == Operation::None
+}
+
+/// What "Merge … into {head}" names: the branch, or `HEAD` when detached or
+/// still unread.
+pub(crate) fn head_label(head: Option<&Head>) -> &str {
+    match head {
+        Some(Head::Branch { name, .. }) => name.as_str(),
+        Some(Head::Detached(_)) | None => "HEAD",
+    }
 }
 
 /// [`sidebar_menu`] plus the "Open on <Service>" items of the repository's
@@ -434,15 +516,10 @@ pub fn sidebar_menu_with_links(
     // local branch without an upstream.
     let branch_open = |key: &str| {
         let (link, target) = web_links::branch_target(links, targets, refs.unwrap_or(&[]), key)?;
-        open_item(link, &target)
+        open_on_host(link, &target)
     };
-    // Merging needs a branch to merge into: not on a detached or unread HEAD.
-    // ... and not while another operation is stopped (git refuses to start one).
-    let can_merge = matches!(head, Some(Head::Branch { .. })) && operation == Operation::None;
-    let head = match head {
-        Some(Head::Branch { name, .. }) => name.as_str(),
-        Some(Head::Detached(_)) | None => "HEAD",
-    };
+    let can_merge = can_merge(head, operation);
+    let head = head_label(head);
     // Stage 7 wires checkout, rename/delete and the stash/remote dialogs; the
     // network (stage 8), worktree (stage 9) and merge/rebase (stage 12) items
     // stay shown-but-disabled.
@@ -545,7 +622,7 @@ pub fn sidebar_menu_with_links(
         // Tags are opened on the first host (the upstream's, else origin's).
         if let Some(open) = links
             .first()
-            .and_then(|link| open_item(link, &forge::WebTarget::Tag(name.to_owned())))
+            .and_then(|link| open_on_host(link, &forge::WebTarget::Tag(name.to_owned())))
         {
             entries.push(open);
             entries.push(SidebarMenuEntry::Separator);
@@ -597,7 +674,7 @@ pub fn sidebar_menu_with_links(
         ];
         // The repository page of the remote's own host.
         let remote_link = links.iter().find(|link| link.fetches(name));
-        entries.extend(remote_link.and_then(|link| open_item(link, &forge::WebTarget::Repo)));
+        entries.extend(remote_link.and_then(|link| open_on_host(link, &forge::WebTarget::Repo)));
         entries.push(SidebarMenuEntry::Separator);
         entries.extend(
             [item(&ui::t!("sidebar.menu.remove_remote"), IconName::Trash)
@@ -721,7 +798,7 @@ pub fn shortcut_action(
         .into_iter()
         .find_map(|entry| match entry {
             SidebarMenuEntry::Item(item)
-                if item.enabled && item.shortcut.as_deref() == Some(hint) =>
+                if item.enabled() && item.shortcut.as_deref() == Some(hint) =>
             {
                 Some(item.action)
             }
@@ -2945,7 +3022,7 @@ mod tests {
         let SidebarMenuEntry::Item(item) = &without[n - 3] else {
             panic!("an item")
         };
-        assert!(item.enabled);
+        assert!(item.enabled());
         assert_eq!(
             item.action,
             SidebarAction::CreatePullRequest("loose".to_owned())
@@ -3123,8 +3200,8 @@ mod tests {
             SidebarAction::OpenSubmodule("vendor/a".to_owned())
         );
         let missing = sidebar_menu("sub:vendor/b", None, Some(&extras), None, Operation::None);
-        assert!(menu_item(&missing, "Update submodule").enabled);
-        assert!(!menu_item(&missing, "Open in new window").enabled);
+        assert!(menu_item(&missing, "Update submodule").enabled());
+        assert!(!menu_item(&missing, "Open in new window").enabled());
     }
 
     fn menu_item<'a>(entries: &'a [SidebarMenuEntry], label: &str) -> &'a SidebarMenuItem {
@@ -3377,10 +3454,10 @@ mod tests {
         };
         let menu = sidebar_menu("local:feat/x", Some(&head), None, None, Operation::None);
         let merge = menu_item(&menu, "Merge feat/x into main…");
-        assert!(merge.enabled);
+        assert!(merge.enabled());
         assert_eq!(merge.action, SidebarAction::Merge("feat/x".to_owned()));
         // Rebase stays disabled until its own stage.
-        assert!(!menu_item(&menu, "Rebase main onto feat/x").enabled);
+        assert!(!menu_item(&menu, "Rebase main onto feat/x").enabled());
     }
 
     #[test]
@@ -3391,7 +3468,7 @@ mod tests {
         };
         let menu = sidebar_menu("local:main", Some(&head), None, None, Operation::None);
         let merge = menu_item(&menu, "Merge main into main…");
-        assert!(!merge.enabled);
+        assert!(!merge.enabled());
         assert_eq!(merge.action, SidebarAction::None);
     }
 
@@ -3403,19 +3480,19 @@ mod tests {
         };
         for operation in [Operation::Merge, Operation::Squash, Operation::CherryPick] {
             let local = sidebar_menu("local:feat/x", Some(&head), None, None, operation);
-            assert!(!menu_item(&local, "Merge feat/x into main…").enabled);
+            assert!(!menu_item(&local, "Merge feat/x into main…").enabled());
             let remote = sidebar_menu("rbranch:origin/feat/x", Some(&head), None, None, operation);
-            assert!(!menu_item(&remote, "Merge origin/feat/x into main…").enabled);
+            assert!(!menu_item(&remote, "Merge origin/feat/x into main…").enabled());
         }
         let local = sidebar_menu("local:feat/x", Some(&head), None, None, Operation::None);
-        assert!(menu_item(&local, "Merge feat/x into main…").enabled);
+        assert!(menu_item(&local, "Merge feat/x into main…").enabled());
     }
 
     #[test]
     fn merge_is_disabled_on_a_detached_head() {
         let detached = Head::Detached(oid());
         let local = sidebar_menu("local:feat/x", Some(&detached), None, None, Operation::None);
-        assert!(!menu_item(&local, "Merge feat/x into HEAD…").enabled);
+        assert!(!menu_item(&local, "Merge feat/x into HEAD…").enabled());
         let remote = sidebar_menu(
             "rbranch:origin/feat/x",
             Some(&detached),
@@ -3423,9 +3500,9 @@ mod tests {
             None,
             Operation::None,
         );
-        assert!(!menu_item(&remote, "Merge origin/feat/x into HEAD…").enabled);
+        assert!(!menu_item(&remote, "Merge origin/feat/x into HEAD…").enabled());
         let unread = sidebar_menu("local:feat/x", None, None, None, Operation::None);
-        assert!(!menu_item(&unread, "Merge feat/x into HEAD…").enabled);
+        assert!(!menu_item(&unread, "Merge feat/x into HEAD…").enabled());
     }
 
     #[test]
@@ -3442,7 +3519,7 @@ mod tests {
             Operation::None,
         );
         let merge = menu_item(&menu, "Merge origin/feat/x into main…");
-        assert!(merge.enabled);
+        assert!(merge.enabled());
         assert_eq!(
             merge.action,
             SidebarAction::Merge("origin/feat/x".to_owned())
@@ -3531,7 +3608,7 @@ mod tests {
             let enabled: Vec<&str> = entries
                 .iter()
                 .filter_map(|entry| match entry {
-                    SidebarMenuEntry::Item(item) if item.enabled => Some(item.label.as_str()),
+                    SidebarMenuEntry::Item(item) if item.enabled() => Some(item.label.as_str()),
                     _ => None,
                 })
                 .collect();

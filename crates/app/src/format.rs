@@ -3,6 +3,16 @@
 
 use std::path::{Path, PathBuf};
 
+/// `a` and `b` name the same file or folder: equal as written, or equal once
+/// symlinks are resolved.
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
 /// Group `count` with thousands separators.
 pub fn format_count(count: usize) -> String {
     let digits = count.to_string();
