@@ -565,10 +565,9 @@ pub struct RepositoryView {
     network: Option<NetworkActivity>,
     /// Bumped per network job; an older poll loop stops.
     network_generation: u64,
-    /// Whether the background fetch is on, mirrored in the settings.
-    background_fetch: bool,
-    /// Pause between background fetches, from the settings.
-    background_fetch_interval: Duration,
+    /// When the last fetch (background, or a Fetch/Pull the user started)
+    /// began; activation fetches only once the interval has passed.
+    last_fetch: Option<Instant>,
     /// The repeating background-fetch task.
     background_fetch_task: Option<Task<()>>,
     /// A background fetch is in flight; the next tick skips while it runs.
@@ -651,9 +650,11 @@ struct NetworkRun<'a> {
     then_push: bool,
 }
 
-/// The first background fetch waits a little, so opening a repository is not
-/// immediately followed by network traffic.
-const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(30);
+/// The first background fetch waits a little (for the history to load), so a
+/// repository opened after a while away shows remote changes soon.
+const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(3);
+/// Window activation fetches at most this often.
+const ACTIVATION_FETCH_MIN: Duration = Duration::from_secs(60);
 /// How often the UI drains the job's progress channel.
 const NETWORK_POLL: Duration = Duration::from_millis(80);
 
@@ -662,6 +663,27 @@ const NETWORK_POLL: Duration = Duration::from_millis(80);
 fn ci_status_enabled(cx: &App) -> bool {
     cx.try_global::<crate::AppSettings>()
         .is_none_or(|state| state.settings.show_ci_status)
+}
+
+/// Whether the settings ask for the background fetch. Read fresh, so a toggle
+/// in Settings applies to windows that are already open.
+fn background_fetch_enabled(cx: &App) -> bool {
+    cx.try_global::<crate::AppSettings>()
+        .is_none_or(|state| state.settings.background_fetch)
+}
+
+/// Pause between background fetches, read fresh from the settings.
+fn background_fetch_interval(cx: &App) -> Duration {
+    let minutes = cx.try_global::<crate::AppSettings>().map_or(
+        crate::settings::Settings::default().fetch_interval_minutes,
+        |state| state.settings.fetch_interval_minutes,
+    );
+    Duration::from_secs(u64::from(minutes) * 60)
+}
+
+/// Whether a fetch is due: none yet, or the last one began `min` ago or more.
+fn fetch_due(last: Option<Instant>, now: Instant, min: Duration) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= min)
 }
 
 /// Whether a finished network job is followed by a push: only the pull that
@@ -1050,10 +1072,7 @@ impl RepositoryView {
             ref_action_running: false,
             network: None,
             network_generation: 0,
-            background_fetch: settings.background_fetch,
-            background_fetch_interval: Duration::from_secs(
-                u64::from(settings.fetch_interval_minutes) * 60,
-            ),
+            last_fetch: None,
             background_fetch_task: None,
             background_fetch_running: false,
             fingerprint: None,
@@ -1083,6 +1102,7 @@ impl RepositoryView {
         self.hosting_sync(PrTrigger::Focus, cx);
         self.ensure_ci_timer(window, cx);
         self.check_external_changes(cx);
+        self.fetch_on_activation(cx);
         let now = Instant::now();
         // A busy Changes view re-reads the status itself; don't spend the interval on it.
         if !self.changes.read(cx).is_busy()
@@ -1092,6 +1112,19 @@ impl RepositoryView {
             self.changes
                 .update(cx, |changes, cx| changes.refresh_quiet(cx));
         }
+    }
+
+    /// Fetches on activation when the background fetch is on and the last
+    /// fetch is at least [`ACTIVATION_FETCH_MIN`] old. Returns whether a fetch
+    /// tick was attempted (the tick itself still skips while a job runs).
+    fn fetch_on_activation(&mut self, cx: &mut Context<Self>) -> bool {
+        if !background_fetch_enabled(cx)
+            || !fetch_due(self.last_fetch, Instant::now(), ACTIVATION_FETCH_MIN)
+        {
+            return false;
+        }
+        self.background_fetch_tick(cx);
+        true
     }
 
     /// Reads the repository's fingerprint off the UI thread and reloads the
@@ -2893,14 +2926,18 @@ impl RepositoryView {
 
     /// Starts the repeating, quiet fetch of every remote.
     fn start_background_fetch(&mut self, cx: &mut Context<Self>) {
-        let interval = self.background_fetch_interval;
         self.background_fetch_task = Some(cx.spawn(async move |this, cx| {
             let mut first = true;
             loop {
+                // The interval is read each round, so a change in Settings
+                // applies without reopening the repository.
                 let delay = if first {
                     BACKGROUND_FETCH_FIRST
                 } else {
-                    interval
+                    match this.update(cx, |_, cx| background_fetch_interval(cx)) {
+                        Ok(interval) => interval,
+                        Err(_) => break,
+                    }
                 };
                 first = false;
                 cx.background_executor().timer(delay).await;
@@ -2916,7 +2953,8 @@ impl RepositoryView {
 
     /// One background fetch, skipped while another network action runs.
     fn background_fetch_tick(&mut self, cx: &mut Context<Self>) {
-        if !self.background_fetch || self.network.is_some() || self.background_fetch_running {
+        if !background_fetch_enabled(cx) || self.network.is_some() || self.background_fetch_running
+        {
             return;
         }
         let Some(root) = self
@@ -2948,6 +2986,7 @@ impl RepositoryView {
             None => Default::default(),
         };
         self.background_fetch_running = true;
+        self.last_fetch = Some(Instant::now());
         cx.spawn(async move |this, cx| {
             let changed = cx
                 .background_executor()
@@ -2994,7 +3033,6 @@ impl RepositoryView {
 
     /// Turns the background fetch on or off and remembers it in the settings.
     fn set_background_fetch(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.background_fetch = enabled;
         crate::update_settings(cx, |settings| settings.background_fetch = enabled);
         cx.notify();
     }
@@ -3051,6 +3089,9 @@ impl RepositoryView {
         let root = self.root.clone();
         self.network_generation = self.network_generation.wrapping_add(1);
         let generation = self.network_generation;
+        if matches!(job, Job::Fetch(_) | Job::Pull) {
+            self.last_fetch = Some(Instant::now());
+        }
         self.network = Some(NetworkActivity {
             verb: job.verb(),
             detail: ui::t!("repo.network.connecting"),
@@ -4403,7 +4444,7 @@ impl RepositoryView {
                 }),
         ));
         entries.push(MenuEntry::Separator);
-        let enabled = self.background_fetch;
+        let enabled = background_fetch_enabled(cx);
         let view = cx.entity();
         entries.push(MenuEntry::Item(
             MenuItem::new(if enabled {
@@ -9996,6 +10037,51 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn fetch_is_due_after_a_minute() {
+        let now = Instant::now();
+        let min = Duration::from_secs(60);
+        assert!(fetch_due(None, now, min));
+        assert!(!fetch_due(Some(now), now + Duration::from_secs(59), min));
+        assert!(fetch_due(Some(now), now + min, min));
+    }
+
+    /// Activation ticks a fetch only when the background fetch is on and the
+    /// last fetch is old enough. The test repository has no remote, so the
+    /// fetch itself does nothing and touches no network.
+    #[gpui::test]
+    fn activation_fetches_only_when_due_and_enabled(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("activation-fetch");
+        commit(repo.path(), "a.txt", "one\n");
+        cx.update(|cx| {
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings: crate::settings::Settings {
+                    background_fetch: false,
+                    ..crate::settings::Settings::default()
+                },
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+        let (mut cx, view) = open_repo_view(&repo, cx);
+        let activate = |cx: &mut gpui::VisualTestContext| {
+            let ticked =
+                cx.update(|_, cx| view.update(cx, |view, cx| view.fetch_on_activation(cx)));
+            cx.run_until_parked();
+            ticked
+        };
+        assert!(!activate(&mut cx), "disabled in the settings");
+        cx.update(|_, cx| crate::update_settings(cx, |settings| settings.background_fetch = true));
+        assert!(activate(&mut cx), "enabled and never fetched");
+        assert!(view.read_with(&cx, |view, _| view.last_fetch.is_some()));
+        assert!(!activate(&mut cx), "fetched a moment ago");
+        view.update(&mut cx, |view, _| {
+            view.last_fetch = Some(Instant::now() - Duration::from_secs(61));
+        });
+        assert!(activate(&mut cx), "the last fetch is over a minute old");
     }
 
     #[test]
