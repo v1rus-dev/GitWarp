@@ -54,7 +54,7 @@ use crate::ref_dialog::{self, RefDialog, RefDialogContext, RefDialogKind, Remote
 use crate::ref_ops::{CommitCard, RefAction};
 use crate::remote_accounts::{self, AccountAction, RemoteResolution};
 use crate::repo_watch::{
-    GitLayout, Kinds, Mode as WatchMode, RepoWatcher, StartError, WatchSignal,
+    GitLayout, Kinds, Mode as WatchMode, RepoWatcher, StartError, WatchSignal, OPERATION_MARKERS,
 };
 use crate::settings::{
     sidebar_width_limit, DiffLayout, Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX,
@@ -578,8 +578,16 @@ pub struct RepositoryView {
     /// What the repository looked like when the views were last known to be
     /// current; `None` until the first read. See [`Fingerprint`].
     fingerprint: Option<Fingerprint>,
-    /// Bumped by every fingerprint read, so only the newest result is applied.
+    /// Bumped by every re-baseline, so only the newest one is applied.
     fingerprint_generation: u64,
+    /// A re-baseline (the app's own change was just reloaded) is being read. A check
+    /// that starts meanwhile would take that change for an outside one, so it waits.
+    baseline_in_flight: bool,
+    /// Bumped by every check, so only the newest result is applied. Separate from
+    /// `fingerprint_generation`: a re-baseline must not discard a check, nor the reverse.
+    check_generation: u64,
+    /// A check was asked for while a re-baseline was in flight; it runs when that ends.
+    check_wanted: bool,
     /// When Changes was last re-read quietly on window activation.
     last_quiet_changes: Option<Instant>,
     /// The running file watcher; `None` until started (and in tests).
@@ -676,8 +684,10 @@ struct NetworkRun<'a> {
 const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(3);
 /// Window activation fetches at most this often.
 const ACTIVATION_FETCH_MIN: Duration = Duration::from_secs(60);
-/// How often the UI drains the watcher's channel.
-const WATCH_POLL: Duration = Duration::from_millis(100);
+/// How often the UI drains the watcher's channel. Well under the 1 s Changes throttle, and the
+/// channel is a std `mpsc` polled from a timer (as the network job does) because no async
+/// channel dependency is approved. 250 ms keeps an idle window's wake-ups low.
+const WATCH_POLL: Duration = Duration::from_millis(250);
 /// Signals arriving within this window are merged into one reload.
 const WATCH_FLUSH: Duration = Duration::from_millis(200);
 /// Work-tree file changes re-read Changes at most this often.
@@ -708,7 +718,55 @@ fn background_fetch_interval(cx: &App) -> Duration {
     Duration::from_secs(u64::from(minutes) * 60)
 }
 
-/// Whether a fetch is due: none yet, or the last one began `min` ago or more.
+/// What a requested external-change check does right now.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckStart {
+    /// The app is itself changing refs or talking to a remote: it re-baselines when done.
+    Skip,
+    /// A re-baseline is being read: wait for it and compare against its result.
+    Defer,
+    Run,
+}
+
+fn check_start(app_busy: bool, baseline_in_flight: bool) -> CheckStart {
+    if app_busy {
+        CheckStart::Skip
+    } else if baseline_in_flight {
+        CheckStart::Defer
+    } else {
+        CheckStart::Run
+    }
+}
+
+/// What to do with a finished check, given the generations of checks and re-baselines when
+/// it started and now.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckOutcome {
+    /// A newer check superseded it.
+    Discard,
+    /// A re-baseline began meanwhile: this read may hold the app's own change, so ask again
+    /// once the new baseline is recorded.
+    Rerun,
+    Apply,
+}
+
+fn check_outcome(
+    check_started: u64,
+    check_now: u64,
+    baseline_started: u64,
+    baseline_now: u64,
+) -> CheckOutcome {
+    if check_started != check_now {
+        CheckOutcome::Discard
+    } else if baseline_started != baseline_now {
+        CheckOutcome::Rerun
+    } else {
+        CheckOutcome::Apply
+    }
+}
+
+/// Whether something throttled is due: it has not run yet, or its last run began `min` ago or
+/// more. Used for fetches and for the quiet Changes refreshes.
 fn fetch_due(last: Option<Instant>, now: Instant, min: Duration) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= min)
 }
@@ -1121,6 +1179,9 @@ impl RepositoryView {
             background_fetch_running: false,
             fingerprint: None,
             fingerprint_generation: 0,
+            baseline_in_flight: false,
+            check_generation: 0,
+            check_wanted: false,
             last_quiet_changes: None,
             watcher: None,
             watch_root: None,
@@ -1150,7 +1211,9 @@ impl RepositoryView {
 
     /// The window became active: besides the hosting and CI state, pick up
     /// whatever changed in the repository while the user was in a terminal or
-    /// another tool (nothing watches the files; this is the focus check).
+    /// another tool. The file watcher normally reports those changes already;
+    /// this focus check is the fallback for where it cannot (watch limit, a
+    /// network file system, a failed start).
     fn on_window_activated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.hosting_sync(PrTrigger::Focus, cx);
         self.ensure_ci_timer(window, cx);
@@ -1159,7 +1222,7 @@ impl RepositoryView {
         let now = Instant::now();
         // A busy Changes view re-reads the status itself; don't spend the interval on it.
         if !self.changes.read(cx).is_busy()
-            && quiet_refresh_due(self.last_quiet_changes, now, QUIET_CHANGES_MIN)
+            && fetch_due(self.last_quiet_changes, now, QUIET_CHANGES_MIN)
         {
             self.last_quiet_changes = Some(now);
             self.changes
@@ -1183,16 +1246,26 @@ impl RepositoryView {
     /// Reads the repository's fingerprint off the UI thread and reloads the
     /// parts [`decide_reload`] names when it differs from the last known one.
     /// Skipped while the app itself is changing refs or talking to a remote:
-    /// those paths re-baseline when they finish.
+    /// those paths re-baseline when they finish. While such a re-baseline is
+    /// still being read the check waits for it, so the app's own change is not
+    /// mistaken for an outside one.
     fn check_external_changes(&mut self, cx: &mut Context<Self>) {
-        if self.ref_action_running || self.network.is_some() || self.background_fetch_running {
-            return;
+        let app_busy =
+            self.ref_action_running || self.network.is_some() || self.background_fetch_running;
+        match check_start(app_busy, self.baseline_in_flight) {
+            CheckStart::Skip => return,
+            CheckStart::Defer => {
+                self.check_wanted = true;
+                return;
+            }
+            CheckStart::Run => {}
         }
         let Ok(git) = self.git.clone() else {
             return;
         };
-        self.fingerprint_generation = self.fingerprint_generation.wrapping_add(1);
-        let generation = self.fingerprint_generation;
+        self.check_generation = self.check_generation.wrapping_add(1);
+        let generation = self.check_generation;
+        let baseline_generation = self.fingerprint_generation;
         let root = self.root.clone();
         cx.spawn(async move |this, cx| {
             let new = cx
@@ -1203,8 +1276,24 @@ impl RepositoryView {
                 return;
             };
             this.update(cx, |view, cx| {
-                if generation != view.fingerprint_generation {
-                    return;
+                match check_outcome(
+                    generation,
+                    view.check_generation,
+                    baseline_generation,
+                    view.fingerprint_generation,
+                ) {
+                    CheckOutcome::Discard => return,
+                    CheckOutcome::Rerun => {
+                        // A re-baseline began while this was read: the baseline it will
+                        // record is the one to compare with, so ask again after it.
+                        view.check_wanted = true;
+                        if !view.baseline_in_flight {
+                            view.check_wanted = false;
+                            view.check_external_changes(cx);
+                        }
+                        return;
+                    }
+                    CheckOutcome::Apply => {}
                 }
                 let decision = decide_reload(view.fingerprint.as_ref(), &new);
                 view.fingerprint = Some(new);
@@ -1289,15 +1378,21 @@ impl RepositoryView {
         self.watch_task = Some(cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(WATCH_POLL).await;
             let mut signals = Vec::new();
-            while let Ok(signal) = rx.try_recv() {
-                signals.push(signal);
-            }
+            // Every sender lives in the watcher's sink: once it is gone (the start failed or
+            // the watcher was dropped) nothing can arrive any more, so the loop ends.
+            let senders_gone = loop {
+                match rx.try_recv() {
+                    Ok(signal) => signals.push(signal),
+                    Err(mpsc::TryRecvError::Empty) => break false,
+                    Err(mpsc::TryRecvError::Disconnected) => break true,
+                }
+            };
             let alive = this.update(cx, |view, cx| {
                 for signal in signals {
                     view.on_watch_signal(signal, cx);
                 }
             });
-            if alive.is_err() {
+            if alive.is_err() || senders_gone {
                 break;
             }
         }));
@@ -1367,9 +1462,16 @@ impl RepositoryView {
             self.worktrees
                 .update(cx, |worktrees, cx| worktrees.refresh(cx));
         }
-        if kinds.intersects(Kinds::HEAD | Kinds::REFS | Kinds::INDEX | Kinds::OPERATION) {
+        if kinds.intersects(Kinds::HEAD | Kinds::REFS | Kinds::OPERATION) {
             // The fingerprint says whether anything the views show really changed.
             self.check_external_changes(cx);
+        }
+        if kinds.intersects(Kinds::INDEX) {
+            // Straight to Changes: the fingerprint's coarse (mtime, length) index stamp must
+            // not veto a staging change (it stays the focus fallback's tool). The refresh
+            // drops a status equal to the shown one, so the app's own staging costs a read.
+            self.changes
+                .update(cx, |changes, cx| changes.refresh_quiet(cx));
         }
         if kinds.intersects(Kinds::WORKTREE_FILES) {
             self.refresh_changes_for_files(cx);
@@ -1380,7 +1482,7 @@ impl RepositoryView {
     /// [`WATCH_CHANGES_MIN`], with one trailing refresh for a throttled burst.
     fn refresh_changes_for_files(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
-        if quiet_refresh_due(self.last_watch_changes, now, WATCH_CHANGES_MIN) {
+        if fetch_due(self.last_watch_changes, now, WATCH_CHANGES_MIN) {
             self.last_watch_changes = Some(now);
             self.changes
                 .update(cx, |changes, cx| changes.refresh_quiet(cx));
@@ -1413,6 +1515,7 @@ impl RepositoryView {
             return;
         };
         self.fingerprint_generation = self.fingerprint_generation.wrapping_add(1);
+        self.baseline_in_flight = true;
         let generation = self.fingerprint_generation;
         let root = self.root.clone();
         cx.spawn(async move |this, cx| {
@@ -1420,9 +1523,16 @@ impl RepositoryView {
                 .background_executor()
                 .spawn(async move { read_fingerprint(git, &root) })
                 .await;
-            this.update(cx, |view, _| {
-                if generation == view.fingerprint_generation && new.is_some() {
+            this.update(cx, |view, cx| {
+                if generation != view.fingerprint_generation {
+                    return;
+                }
+                if new.is_some() {
                     view.fingerprint = new;
+                }
+                view.baseline_in_flight = false;
+                if std::mem::take(&mut view.check_wanted) {
+                    view.check_external_changes(cx);
                 }
             })
             .ok();
@@ -7579,21 +7689,6 @@ fn ref_snapshot(repo: &Repo) -> Vec<(String, Oid)> {
         .unwrap_or_default()
 }
 
-/// Git-dir entries whose presence says an operation (merge, rebase, cherry-pick,
-/// revert, bisect, squash) is in progress; one bit each in [`Fingerprint::markers`].
-const OPERATION_MARKERS: [&str; 10] = [
-    "MERGE_HEAD",
-    "SQUASH_MSG",
-    "CHERRY_PICK_HEAD",
-    "REVERT_HEAD",
-    "REBASE_HEAD",
-    "BISECT_LOG",
-    "rebase-merge",
-    "rebase-apply",
-    "sequencer",
-    "MERGE_MSG",
-];
-
 /// Re-read Changes on window activation at most this often.
 const QUIET_CHANGES_MIN: Duration = Duration::from_secs(2);
 
@@ -7658,11 +7753,6 @@ fn decide_reload(old: Option<&Fingerprint>, new: &Fingerprint) -> ReloadDecision
         },
         changes: refs_moved || head_or_operation || old.index != new.index,
     }
-}
-
-/// Whether the last quiet Changes refresh is old enough for another.
-fn quiet_refresh_due(last: Option<Instant>, now: Instant, min: Duration) -> bool {
-    last.is_none_or(|last| now.duration_since(last) >= min)
 }
 
 /// One diff row and its cells, in pixels.
@@ -10323,16 +10413,29 @@ mod tests {
     }
 
     #[test]
-    fn quiet_refresh_is_limited_to_once_per_interval() {
+    fn a_check_waits_for_an_in_flight_baseline_and_never_discards_it() {
+        assert_eq!(check_start(true, true), CheckStart::Skip);
+        assert_eq!(check_start(true, false), CheckStart::Skip);
+        assert_eq!(check_start(false, true), CheckStart::Defer);
+        assert_eq!(check_start(false, false), CheckStart::Run);
+        // Newest check wins; one that overlapped a re-baseline is redone, not applied and
+        // not dropped (dropping it would lose an outside change made meanwhile).
+        assert_eq!(check_outcome(2, 3, 5, 5), CheckOutcome::Discard);
+        assert_eq!(check_outcome(3, 3, 5, 6), CheckOutcome::Rerun);
+        assert_eq!(check_outcome(3, 3, 5, 5), CheckOutcome::Apply);
+    }
+
+    #[test]
+    fn throttle_helper_limits_to_once_per_interval() {
         let now = Instant::now();
         let min = Duration::from_secs(2);
-        assert!(quiet_refresh_due(None, now, min));
-        assert!(!quiet_refresh_due(
+        assert!(fetch_due(None, now, min));
+        assert!(!fetch_due(
             Some(now),
             now + Duration::from_millis(1999),
             min
         ));
-        assert!(quiet_refresh_due(Some(now), now + min, min));
+        assert!(fetch_due(Some(now), now + min, min));
     }
 
     /// Opens `repo` in the real window and waits for the history and the
@@ -10443,6 +10546,32 @@ mod tests {
         cx.executor().advance_clock(WATCH_FLUSH * 2);
         cx.run_until_parked();
         assert_eq!(history.read_with(&cx, |h, _| h.commit_count()), 2);
+    }
+
+    /// An INDEX signal re-reads Changes directly: the fingerprint's index stamp
+    /// is not asked, so a stamp that did not change cannot veto the refresh.
+    #[gpui::test]
+    fn an_index_signal_refreshes_changes_without_the_fingerprint(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("watch-index");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repo_view(&repo, cx);
+        let changes = view.read_with(&cx, |view, _| view.changes.clone());
+
+        std::fs::write(repo.path().join("a.txt"), "two\n").unwrap();
+        run_git(repo.path(), &["add", "a.txt"]);
+        view.update(&mut cx, |view, cx| {
+            // Pretend the baseline already holds the new index stamp: the fingerprint
+            // comparison alone would see no change.
+            view.fingerprint = read_fingerprint(view.git.clone().unwrap(), &view.root);
+            let signal = WatchSignal {
+                kinds: Kinds::INDEX,
+                limit_hit: false,
+            };
+            view.on_watch_signal(signal, cx);
+        });
+        cx.executor().advance_clock(WATCH_FLUSH * 2);
+        cx.run_until_parked();
+        assert_eq!(changes.read_with(&cx, |c, _| c.staged_count()), 1);
     }
 
     /// Signals are held while the app runs a ref action and applied after it.

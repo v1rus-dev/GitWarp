@@ -35,7 +35,7 @@ pub(crate) fn list(repo: &Repo) -> Result<Vec<Submodule>> {
         return Ok(Vec::new());
     }
     let out = repo
-        .command()
+        .read_command()
         .args(["submodule", "status"])
         .output()
         .map_err(Error::Spawn)?;

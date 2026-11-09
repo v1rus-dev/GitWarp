@@ -1,13 +1,14 @@
-//! Pure logic of the repository file watcher: where a repository keeps its git data
-//! ([`GitLayout`]), which kind of change a touched path stands for ([`classify`]) and which
-//! folders have to be watched ([`watch_plan`]). No GPUI and no real watcher here; the watcher
-//! itself is added in step S4 and its wiring into the repository view in S5.
+//! The repository file watcher, without GPUI: where a repository keeps its git data
+//! ([`GitLayout`]), which kind of change a touched path stands for ([`classify`]), which folders
+//! have to be watched ([`watch_plan`]) and the running watcher itself ([`RepoWatcher`]). The
+//! repository view owns one and turns its [`WatchSignal`]s into reloads.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::ops::{BitOr, BitOrAssign};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use notify_debouncer_full::notify::{Config, ErrorKind, RecommendedWatcher, RecursiveMode};
@@ -75,6 +76,9 @@ pub struct GitLayout {
     root: Option<Roots>,
     git_dir: Roots,
     common_dir: Roots,
+    /// Names of top-level work-tree folders that git ignores (`target`, `node_modules`);
+    /// paths below them classify as [`Kinds::NONE`].
+    ignored_dirs: Vec<OsString>,
 }
 
 /// One folder as given and as canonicalized. Events carry either form depending on the
@@ -87,7 +91,9 @@ struct Roots {
 
 impl Roots {
     fn new(raw: &Path) -> Self {
-        let raw = raw.to_path_buf();
+        // Raw paths can carry `\\?\` too (the CLI engine reports them that way on Windows), and
+        // events never do.
+        let raw = strip_verbatim(raw);
         // A folder that cannot be canonicalized (gone, no access) still matches by its raw form.
         let canonical = std::fs::canonicalize(&raw)
             .map(|p| strip_verbatim(&p))
@@ -110,7 +116,15 @@ impl GitLayout {
             root: root.map(Roots::new),
             git_dir: Roots::new(git_dir),
             common_dir: Roots::new(common_dir),
+            ignored_dirs: Vec::new(),
         }
+    }
+
+    /// Paths below these top-level work-tree folders are not changes anybody can see in
+    /// `git status`, so [`classify`] drops them (see [`ignored_top_level_dirs`]).
+    pub fn with_ignored_dirs(mut self, dirs: Vec<OsString>) -> Self {
+        self.ignored_dirs = dirs;
+        self
     }
 
     pub fn root(&self) -> Option<&Path> {
@@ -125,8 +139,12 @@ impl GitLayout {
         &self.common_dir.raw
     }
 
+    /// Whether the git dir and the common dir differ. Compared canonically: the two come from
+    /// different code paths (git-core's `git_dir()` and `common_dir()`) and can spell the same
+    /// folder differently (`\\?\` prefix, symlinks, `..`), which must not look like a linked
+    /// worktree (its refs events would then be dropped).
     fn is_linked(&self) -> bool {
-        self.git_dir.raw != self.common_dir.raw
+        self.git_dir.canonical != self.common_dir.canonical
     }
 }
 
@@ -175,7 +193,13 @@ pub fn classify(layout: &GitLayout, path: &Path) -> Kinds {
     }
     if let Some(root) = &layout.root {
         // Everything else below the work tree, a nested `.git` of a submodule included.
-        if root.relative(path).is_some() {
+        if let Some(rel) = root.relative(path) {
+            let top = rel.components().next();
+            if let Some(Component::Normal(top)) = top {
+                if layout.ignored_dirs.iter().any(|d| d == top) {
+                    return Kinds::NONE;
+                }
+            }
             return Kinds::WORKTREE_FILES;
         }
     }
@@ -202,16 +226,22 @@ fn is_lock(name: &OsStr) -> bool {
     name.to_str().is_some_and(|n| n.ends_with(".lock"))
 }
 
-/// Files and folders of the per-worktree git dir that mark a running operation.
-const OPERATION_FILES: &[&str] = &[
+/// Entries of the per-worktree git dir whose presence says an operation (merge, rebase,
+/// cherry-pick, revert, bisect, squash) is in progress. The view's fingerprint uses the same
+/// list, one bit per entry.
+pub const OPERATION_MARKERS: [&str; 10] = [
     "MERGE_HEAD",
-    "MERGE_MSG",
     "SQUASH_MSG",
     "CHERRY_PICK_HEAD",
     "REVERT_HEAD",
     "REBASE_HEAD",
     "BISECT_LOG",
+    "rebase-merge",
+    "rebase-apply",
+    "sequencer",
+    "MERGE_MSG",
 ];
+/// The markers that are folders: anything below them counts as well.
 const OPERATION_DIRS: &[&str] = &["rebase-merge", "rebase-apply", "sequencer"];
 
 /// `rel` is relative to the per-worktree git dir.
@@ -226,7 +256,7 @@ fn classify_git_dir(rel: &Path) -> Kinds {
     match (first, c.len()) {
         ("HEAD", 1) => Kinds::HEAD,
         ("index", 1) => Kinds::INDEX,
-        (name, 1) if OPERATION_FILES.contains(&name) => Kinds::OPERATION,
+        (name, 1) if OPERATION_MARKERS.contains(&name) => Kinds::OPERATION,
         (name, _) if OPERATION_DIRS.contains(&name) => Kinds::OPERATION,
         _ => Kinds::NONE,
     }
@@ -244,6 +274,9 @@ fn classify_common_dir(rel: &Path) -> Kinds {
     match first {
         "refs" if c.len() == 2 && c[1] == "stash" => Kinds::STASH | Kinds::REFS,
         "refs" | "packed-refs" => Kinds::REFS,
+        // The reftable ref backend keeps every ref (and HEAD) in `reftable/*`; `tables.list`
+        // is swapped on every ref update. (`.lock` names were dropped above.)
+        "reftable" => Kinds::REFS,
         // `git stash list` reads the reflog, and dropping a stash entry other than the top
         // one changes only the reflog. Every other reflog is noise.
         "logs" if c.len() == 3 && c[1] == "refs" && c[2] == "stash" => Kinds::STASH,
@@ -251,7 +284,9 @@ fn classify_common_dir(rel: &Path) -> Kinds {
         // `worktrees/<name>` added or removed, or its HEAD / lock marker changed.
         "worktrees" if c.len() <= 2 => Kinds::WORKTREES,
         "worktrees" if c[2] == "HEAD" || c[2] == "locked" => Kinds::WORKTREES,
-        // A submodule's git dir: its commit shows up in the parent's status.
+        // A submodule's git dir: its commit shows up in the parent's status. Its object
+        // store is noise.
+        "modules" if c.contains(&OsStr::new("objects")) => Kinds::NONE,
         "modules" => Kinds::WORKTREE_FILES,
         _ => Kinds::NONE,
     }
@@ -289,7 +324,8 @@ fn watch_plan_impl(
 ) -> Vec<(PathBuf, RecursiveMode)> {
     let mut plan: Vec<(PathBuf, RecursiveMode)> = Vec::new();
     let mut add = |path: PathBuf, recursive: RecursiveMode| {
-        if path.exists() && !plan.iter().any(|(p, _)| *p == path) {
+        // Identical folders can be spelled differently (raw vs `\\?\`, symlinks): one watch.
+        if path.exists() && !plan.iter().any(|(p, _)| same_folder(p, &path)) {
             plan.push((path, recursive));
         }
     };
@@ -303,6 +339,10 @@ fn watch_plan_impl(
     add(cd.join("refs"), RecursiveMode::Recursive);
     add(cd.join("logs").join("refs"), RecursiveMode::NonRecursive);
     add(cd.join("worktrees"), RecursiveMode::Recursive);
+    // Submodule git dirs: a commit made inside a submodule moves its HEAD/refs here.
+    add(cd.join("modules"), RecursiveMode::Recursive);
+    // Only the reftable ref backend has this folder; it then holds every ref.
+    add(cd.join("reftable"), RecursiveMode::NonRecursive);
 
     if mode == Mode::Normal {
         // A bare repository has no root and so no work-tree entries.
@@ -318,6 +358,10 @@ fn watch_plan_impl(
         }
     }
     plan
+}
+
+fn same_folder(a: &Path, b: &Path) -> bool {
+    a == b || Roots::new(a).canonical == Roots::new(b).canonical
 }
 
 /// Direct child folders of `root` other than `.git` and the pruned ones, sorted. Symlinks
@@ -370,15 +414,19 @@ impl std::fmt::Display for StartError {
 
 /// A running watcher of one repository. Dropping it stops the watcher without blocking.
 pub struct RepoWatcher {
-    // Held only for its Drop: it stops the debouncer thread and removes the OS watches.
-    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
+    // Held only for its Drop: it stops the debouncer thread and removes the OS watches. Shared
+    // with the thread that adds watches for new top-level folders (Linux); that thread only
+    // holds a `Weak`, so dropping the watcher still drops the debouncer.
+    _debouncer: Arc<Mutex<Debouncer<RecommendedWatcher, NoCache>>>,
     mode: Mode,
 }
 
+type Sink = Arc<Mutex<Box<dyn FnMut(WatchSignal) + Send>>>;
+
 impl RepoWatcher {
     /// Starts watching `layout` in [`Mode::Normal`], asking the `git` on `PATH` which top-level
-    /// folders to skip on Linux. Blocks (the recursive watch walks the tree), so call it only
-    /// from a background thread. The view uses [`RepoWatcher::start_in`] with the app's git.
+    /// folders to skip. Blocks (the recursive watch walks the tree), so call it only from a
+    /// background thread. The view uses [`RepoWatcher::start_in`] with the app's git.
     #[cfg(test)]
     pub fn start(
         layout: &GitLayout,
@@ -395,29 +443,50 @@ impl RepoWatcher {
         git_exe: &Path,
         sink: impl FnMut(WatchSignal) + Send + 'static,
     ) -> Result<RepoWatcher, StartError> {
-        let pruned = match (cfg!(target_os = "linux"), mode, layout.root()) {
-            (true, Mode::Normal, Some(root)) => ignored_top_level_dirs(git_exe, root),
+        // On every platform: ignored top-level folders (`target/`, `node_modules/`) are dropped
+        // from classification, so their churn does not run `git status` every second. On Linux
+        // they are also not watched at all (a watch per directory). Ignored folders nested
+        // deeper are left to the view's 1 s throttle and its equal-status drop.
+        let pruned = match (mode, layout.root()) {
+            (Mode::Normal, Some(root)) => ignored_top_level_dirs(git_exe, root),
             _ => Vec::new(),
         };
-        Self::start_with(layout, mode, &pruned, sink)
+        Self::start_with(layout, mode, git_exe, &pruned, sink)
     }
 
     /// The core: watch the plan for (`layout`, `mode`, `pruned_dirs`).
     pub fn start_with(
         layout: &GitLayout,
         mode: Mode,
+        git_exe: &Path,
         pruned_dirs: &[OsString],
-        mut sink: impl FnMut(WatchSignal) + Send + 'static,
+        sink: impl FnMut(WatchSignal) + Send + 'static,
     ) -> Result<RepoWatcher, StartError> {
-        let layout_for_handler = layout.clone();
+        let layout = layout.clone().with_ignored_dirs(pruned_dirs.to_vec());
+        let sink: Sink = Arc::new(Mutex::new(Box::new(sink)));
+        // New top-level folders (Linux only) go to a thread that adds their recursive watch:
+        // `watch()` walks the tree, which must not happen on the debouncer's thread or the UI's.
+        let (new_dirs_tx, new_dirs_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let watch_new_dirs = cfg!(target_os = "linux") && mode == Mode::Normal;
+        let handler_layout = layout.clone();
+        let handler_sink = Arc::clone(&sink);
         // NoCache: the default file-id cache walks the whole tree on macOS/Windows while holding
         // the debouncer's lock, and rename stitching is not needed here.
         let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
             DEBOUNCE,
             None,
             move |result: DebounceEventResult| {
-                if let Some(signal) = signal_of(&layout_for_handler, result) {
-                    sink(signal);
+                if watch_new_dirs {
+                    if let Ok(events) = &result {
+                        for dir in new_top_level_dirs(&handler_layout, events) {
+                            let _ = new_dirs_tx.send(dir);
+                        }
+                    }
+                }
+                if let Some(signal) = signal_of(&handler_layout, result) {
+                    if let Ok(mut sink) = handler_sink.lock() {
+                        sink(signal);
+                    }
                 }
             },
             NoCache,
@@ -428,7 +497,7 @@ impl RepoWatcher {
             _ => StartError::Other(e.to_string()),
         })?;
 
-        let plan = watch_plan(layout, mode, pruned_dirs);
+        let plan = watch_plan(&layout, mode, pruned_dirs);
         let mut watched = 0usize;
         for (path, recursive) in &plan {
             match debouncer.watch(path, *recursive) {
@@ -444,6 +513,21 @@ impl RepoWatcher {
         if watched == 0 {
             return Err(StartError::Other("no folder could be watched".into()));
         }
+        let debouncer = Arc::new(Mutex::new(debouncer));
+        if watch_new_dirs {
+            let weak = Arc::downgrade(&debouncer);
+            let git_exe = git_exe.to_path_buf();
+            let root = layout.root().map(Path::to_path_buf);
+            std::thread::spawn(move || {
+                // Ends when the debouncer (and with it the sending side) is dropped.
+                while let Ok(dir) = new_dirs_rx.recv() {
+                    let (Some(debouncer), Some(root)) = (weak.upgrade(), root.as_deref()) else {
+                        break;
+                    };
+                    watch_new_dir(&debouncer, &sink, &git_exe, root, &dir);
+                }
+            });
+        }
         Ok(RepoWatcher {
             _debouncer: debouncer,
             mode,
@@ -452,6 +536,85 @@ impl RepoWatcher {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+}
+
+/// Direct child folders of the work tree that an event says were created or renamed in and
+/// that exist now. Only these need a watch of their own; the root watch is not recursive on
+/// Linux.
+fn new_top_level_dirs(
+    layout: &GitLayout,
+    events: &[notify_debouncer_full::DebouncedEvent],
+) -> Vec<PathBuf> {
+    use notify_debouncer_full::notify::{event::ModifyKind, EventKind};
+    let Some(root) = &layout.root else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for event in events {
+        if !(event.kind.is_create() || matches!(event.kind, EventKind::Modify(ModifyKind::Name(_))))
+        {
+            continue;
+        }
+        for path in &event.paths {
+            let path = strip_verbatim(path);
+            let Some(rel) = root.relative(&path) else {
+                continue;
+            };
+            let mut parts = rel.components();
+            let (Some(Component::Normal(name)), None) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if name == ".git" || layout.ignored_dirs.iter().any(|d| d == name) {
+                continue;
+            }
+            // Not `is_dir()`: a symlinked folder is not followed by the initial plan either.
+            let is_dir = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
+            if is_dir && !dirs.contains(&path) {
+                dirs.push(path);
+            }
+        }
+    }
+    dirs
+}
+
+/// Adds the recursive watch for a top-level folder that appeared after the watcher started
+/// (unless git ignores it), then reports the work tree as changed: files created in it
+/// between its creation and the watch were never seen.
+fn watch_new_dir(
+    debouncer: &Mutex<Debouncer<RecommendedWatcher, NoCache>>,
+    sink: &Sink,
+    git_exe: &Path,
+    root: &Path,
+    dir: &Path,
+) {
+    let Some(name) = dir.file_name() else { return };
+    if !dir.is_dir() || !ignored_among(git_exe, root, &[name.to_os_string()]).is_empty() {
+        return;
+    }
+    let result = match debouncer.lock() {
+        Ok(mut debouncer) => debouncer.watch(dir, RecursiveMode::Recursive),
+        Err(_) => return,
+    };
+    match result {
+        Ok(()) => {
+            if let Ok(mut sink) = sink.lock() {
+                sink(WatchSignal {
+                    kinds: Kinds::WORKTREE_FILES,
+                    limit_hit: false,
+                });
+            }
+        }
+        // Out of watches: the owner rebuilds in reduced mode (the focus check covers the rest).
+        Err(e) if matches!(e.kind, ErrorKind::MaxFilesWatch) => {
+            if let Ok(mut sink) = sink.lock() {
+                sink(WatchSignal {
+                    kinds: Kinds::NONE,
+                    limit_hit: true,
+                });
+            }
+        }
+        Err(e) => log::warn!("cannot watch new folder {}: {e}", dir.display()),
     }
 }
 
@@ -491,13 +654,18 @@ fn ignored_top_level_dirs(git_exe: &Path, root: &Path) -> Vec<OsString> {
         .iter()
         .filter_map(|d| d.file_name().map(OsStr::to_os_string))
         .collect();
+    ignored_among(git_exe, root, &dirs)
+}
+
+/// The folders of `dirs` (names directly under `root`) that git ignores.
+fn ignored_among(git_exe: &Path, root: &Path, dirs: &[OsString]) -> Vec<OsString> {
     if dirs.is_empty() {
         return Vec::new();
     }
     // NUL-separated both ways so odd folder names survive; the trailing slash makes
     // directory-only patterns (`target/`) match.
     let mut input = Vec::new();
-    for dir in &dirs {
+    for dir in dirs {
         let Some(name) = dir.to_str() else { continue };
         input.extend_from_slice(name.as_bytes());
         input.extend_from_slice(b"/\0");
@@ -608,6 +776,10 @@ mod tests {
             ("/r/.git/worktrees/w/index", Kinds::NONE),
             ("/r/.git/modules/sub/HEAD", Kinds::WORKTREE_FILES),
             ("/r/.git/modules/sub/refs/heads/x", Kinds::WORKTREE_FILES),
+            ("/r/.git/modules/sub/objects/ab/cd", Kinds::NONE),
+            ("/r/.git/reftable/tables.list", Kinds::REFS),
+            ("/r/.git/reftable/0x1-0x2-ab.ref", Kinds::REFS),
+            ("/r/.git/reftable/tables.list.lock", Kinds::NONE),
             ("/r/.git/unknown", Kinds::NONE),
             // The git dir itself, and a work-tree path.
             ("/r/.git", Kinds::NONE),
@@ -753,6 +925,75 @@ mod tests {
             Path::new(r"C:\r\.git"),
         );
         assert_eq!(classify(&l, Path::new(r"\\?\C:\r\.git\HEAD")), Kinds::HEAD);
+    }
+
+    #[test]
+    fn the_same_folder_spelled_differently_is_not_a_linked_worktree() {
+        let t = TempDir::new("same-folder");
+        let root = t.path();
+        mkdirs(root, &[".git/refs/heads", "sub"]);
+        // `common_dir` as another code path might spell it.
+        let other = root.join("sub").join("..").join(".git");
+        let l = GitLayout::new(Some(root), &root.join(".git"), &other);
+        assert!(!l.is_linked());
+        assert_eq!(
+            classify(&l, &root.join(".git/refs/heads/main")),
+            Kinds::REFS
+        );
+        assert_eq!(classify(&l, &root.join(".git/HEAD")), Kinds::HEAD);
+        // The watch plan holds the git dir once.
+        let plan = watch_plan_impl(&l, Mode::Reduced, &[], true);
+        assert_eq!(
+            plan.iter()
+                .filter(|(p, _)| same_folder(p, &root.join(".git")))
+                .count(),
+            1,
+            "{plan:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_common_dir_is_not_a_linked_worktree() {
+        let t = TempDir::new("symlink-folder");
+        let root = t.path();
+        mkdirs(root, &[".git/refs"]);
+        std::os::unix::fs::symlink(root.join(".git"), root.join("gitlink")).unwrap();
+        let l = GitLayout::new(Some(root), &root.join(".git"), &root.join("gitlink"));
+        assert!(!l.is_linked());
+        assert!(!layout().is_linked() && linked().is_linked());
+    }
+
+    #[test]
+    fn ignored_top_level_dirs_classify_as_nothing() {
+        let l = layout().with_ignored_dirs(vec![OsString::from("target")]);
+        assert_eq!(c(&l, "/r/target/debug/app"), Kinds::NONE);
+        assert_eq!(c(&l, "/r/target"), Kinds::NONE);
+        assert_eq!(c(&l, "/r/src/target/x"), Kinds::WORKTREE_FILES);
+        assert_eq!(c(&l, "/r/targets/x"), Kinds::WORKTREE_FILES);
+        assert_eq!(c(&l, "/r/.git/HEAD"), Kinds::HEAD);
+    }
+
+    #[test]
+    fn plan_watches_submodule_git_dirs_and_reftable_when_present() {
+        let t = TempDir::new("plan-modules");
+        let root = t.path();
+        mkdirs(root, &[".git/refs", ".git/modules/sub", ".git/reftable"]);
+        let l = GitLayout::new(Some(root), &root.join(".git"), &root.join(".git"));
+        let plan = watch_plan_impl(&l, Mode::Reduced, &[], true);
+        assert!(plan.contains(&(root.join(".git/modules"), RecursiveMode::Recursive)));
+        assert!(plan.contains(&(root.join(".git/reftable"), RecursiveMode::NonRecursive)));
+        let t = TempDir::new("plan-no-modules");
+        mkdirs(t.path(), &[".git/refs"]);
+        let l = GitLayout::new(
+            Some(t.path()),
+            &t.path().join(".git"),
+            &t.path().join(".git"),
+        );
+        let plan = watch_plan_impl(&l, Mode::Reduced, &[], true);
+        assert!(!plan
+            .iter()
+            .any(|(p, _)| p.ends_with("modules") || p.ends_with("reftable")));
     }
 
     #[test]
@@ -1011,6 +1252,39 @@ mod tests {
         let (_repo, root, _watcher, rx) = started("watch-file");
         std::fs::write(root.join("src").join("x.txt"), "x").unwrap();
         assert!(wait_for(&rx, Kinds::WORKTREE_FILES));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_folder_created_after_the_start_gets_watched() {
+        let (_repo, root, _watcher, rx) = started("watch-newdir");
+        std::fs::create_dir_all(root.join("newdir")).unwrap();
+        // Let the creation be reported and the new watch be added, then forget those signals.
+        std::thread::sleep(Duration::from_millis(2500));
+        while rx.try_recv().is_ok() {}
+        std::fs::write(root.join("newdir").join("z.txt"), "z").unwrap();
+        assert!(wait_for(&rx, Kinds::WORKTREE_FILES));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_new_ignored_folder_is_not_watched() {
+        let (_repo, root, _watcher, rx) = started("watch-newignored");
+        std::fs::write(root.join(".gitignore"), "build/\n").unwrap();
+        std::thread::sleep(Duration::from_millis(1000));
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::thread::sleep(Duration::from_millis(2500));
+        while rx.try_recv().is_ok() {}
+        std::fs::write(root.join("build").join("o.bin"), "z").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            if let Ok(sig) = rx.recv_timeout(left) {
+                assert!(
+                    !sig.kinds.intersects(Kinds::WORKTREE_FILES),
+                    "a file in an ignored new folder was reported"
+                );
+            }
+        }
     }
 
     #[test]

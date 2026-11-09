@@ -206,6 +206,16 @@ impl Repo {
         cmd
     }
 
+    /// [`Repo::command`] for read-only queries that may run in the background
+    /// (status, work-tree diffs): `GIT_OPTIONAL_LOCKS=0` stops git taking
+    /// `index.lock` just to refresh the index's stat cache, which would make a
+    /// `git commit` in the user's terminal fail with "index.lock: File exists".
+    pub(crate) fn read_command(&self) -> Command {
+        let mut cmd = self.command();
+        cmd.env("GIT_OPTIONAL_LOCKS", "0");
+        cmd
+    }
+
     /// Whether this is a bare repository (no work tree).
     pub(crate) fn is_bare(&self) -> bool {
         self.bare

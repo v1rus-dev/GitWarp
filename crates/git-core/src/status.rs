@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use crate::conflict::IndexStage;
@@ -146,7 +147,7 @@ pub(crate) fn changed_paths(repo: &Repo) -> Result<Vec<String>> {
 /// Like [`changed_paths`], with a status letter per path.
 pub(crate) fn changed_entries(repo: &Repo) -> Result<Vec<ChangedEntry>> {
     let out = repo
-        .command()
+        .read_command()
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()
         .map_err(Error::Spawn)?;
@@ -277,6 +278,49 @@ pub(crate) fn literal_command(repo: &Repo) -> std::process::Command {
     let mut command = repo.command();
     command.env("GIT_LITERAL_PATHSPECS", "1");
     command
+}
+
+/// A private copy of the index for work-tree `git diff` runs.
+///
+/// `git diff` against the work tree silently refreshes the index's stat cache
+/// and writes it back under `index.lock`, and it ignores `GIT_OPTIONAL_LOCKS=0`
+/// (checked on git 2.56; `git status` and `git diff --cached` do honour it or
+/// never write). A background refresh must not touch the real index, so the
+/// diff gets a copy to refresh instead. The copy lives in the git dir because
+/// a split index finds its `sharedindex.*` files there. Dropped after the run.
+struct ScratchIndex(PathBuf);
+
+impl ScratchIndex {
+    /// `None` when there is no index to copy (a fresh repository): nothing
+    /// to refresh then, so the plain command is already read-only.
+    fn copy_of(repo: &Repo) -> Option<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let copy = repo
+            .git_dir()
+            .join(format!("index.gitwarp-{}-{n}", std::process::id()));
+        let original = repo.git_dir().join("index");
+        fs::copy(&original, &copy).ok()?;
+        let scratch = Self(copy);
+        // Keep the original's mtime: git decides which entries are "racily clean" (same
+        // second as the index was written, so their stat data proves nothing) by comparing
+        // against the index file's mtime. A fresh mtime on the copy makes such entries look
+        // clean and a same-size edit made right after a `git add`/`commit` would be missed.
+        let mtime = fs::metadata(&original).and_then(|m| m.modified()).ok()?;
+        let file = fs::OpenOptions::new().write(true).open(&scratch.0).ok()?;
+        file.set_modified(mtime).ok()?;
+        Some(scratch)
+    }
+
+    fn apply(&self, command: &mut std::process::Command) {
+        command.env("GIT_INDEX_FILE", &self.0);
+    }
+}
+
+impl Drop for ScratchIndex {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 /// Adds `paths` to the index, including deletions and new files.
@@ -625,7 +669,17 @@ fn file_patch(
     cached: bool,
     options: crate::DiffOptions,
 ) -> Result<FileDiff> {
+    let scratch = if cached {
+        None
+    } else {
+        ScratchIndex::copy_of(repo)
+    };
     let mut command = literal_command(repo);
+    // Read-only: see `Repo::read_command` and `ScratchIndex`.
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    if let Some(scratch) = &scratch {
+        scratch.apply(&mut command);
+    }
     command.arg("diff");
     if cached {
         command.arg("--cached");
@@ -644,8 +698,13 @@ fn file_patch(
 
 /// One side's changed files, from `git diff`'s name-status and numstat.
 fn side(repo: &Repo, cached: bool) -> Result<Vec<WorkingFile>> {
-    let numstat = run_diff(repo, cached, "--numstat")?;
-    let name_status = run_diff(repo, cached, "--name-status")?;
+    let scratch = if cached {
+        None
+    } else {
+        ScratchIndex::copy_of(repo)
+    };
+    let numstat = run_diff(repo, scratch.as_ref(), cached, "--numstat")?;
+    let name_status = run_diff(repo, scratch.as_ref(), cached, "--name-status")?;
     let stats = parse_numstat(&numstat)?;
     let files = parse_name_status(&name_status)?;
     Ok(files
@@ -665,8 +724,16 @@ fn side(repo: &Repo, cached: bool) -> Result<Vec<WorkingFile>> {
         .collect())
 }
 
-fn run_diff(repo: &Repo, cached: bool, mode: &'static str) -> Result<Vec<u8>> {
-    let mut command = repo.command();
+fn run_diff(
+    repo: &Repo,
+    scratch: Option<&ScratchIndex>,
+    cached: bool,
+    mode: &'static str,
+) -> Result<Vec<u8>> {
+    let mut command = repo.read_command();
+    if let Some(scratch) = scratch {
+        scratch.apply(&mut command);
+    }
     command.arg("diff");
     if cached {
         command.arg("--cached");
@@ -761,7 +828,7 @@ pub(crate) fn conflicted_paths(repo: &Repo) -> Result<Vec<String>> {
 /// Reads the status porcelain and returns only its parsed facts.
 fn porcelain(repo: &Repo) -> Result<Porcelain> {
     let out = repo
-        .command()
+        .read_command()
         .args([
             "status",
             "--porcelain=v2",
