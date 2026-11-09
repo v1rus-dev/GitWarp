@@ -33,6 +33,7 @@ mod palette;
 mod pr_logic;
 mod pr_panel;
 mod ref_dialog;
+mod ref_menus;
 mod ref_ops;
 mod remote_accounts;
 mod repo_view;
