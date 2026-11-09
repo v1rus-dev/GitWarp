@@ -3,14 +3,18 @@
 //! folders have to be watched ([`watch_plan`]). No GPUI and no real watcher here; the watcher
 //! itself is added in step S4 and its wiring into the repository view in S5.
 
-// Nothing calls this module yet: S4 (the watcher) and S5 (the view wiring) are its users.
+// Nothing calls this module yet: S5 (the view wiring) is its user.
 #![allow(dead_code)]
 
 use std::ffi::{OsStr, OsString};
+use std::io::Write as _;
 use std::ops::{BitOr, BitOrAssign};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use notify_debouncer_full::notify::RecursiveMode;
+use notify_debouncer_full::notify::{Config, ErrorKind, RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, Debouncer, NoCache};
 
 /// A set of change kinds, a hand-written bitmask (nine kinds, so `u16`).
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -341,6 +345,193 @@ fn top_level_dirs(root: &Path, pruned_dirs: &[OsString]) -> Vec<PathBuf> {
         .collect();
     dirs.sort();
     dirs
+}
+
+/// How long the debouncer holds an event back before reporting it.
+const DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// What the watcher reports: the merged kinds of one debounced batch, and whether the OS
+/// watch limit was hit while the watcher ran (the owner should rebuild it in [`Mode::Reduced`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct WatchSignal {
+    pub kinds: Kinds,
+    pub limit_hit: bool,
+}
+
+/// Why a watcher could not be started.
+#[derive(Debug)]
+pub enum StartError {
+    /// The OS watch limit (inotify `ENOSPC`) was hit; start again in [`Mode::Reduced`].
+    Limit,
+    /// Anything else (no backend, no folder could be watched).
+    Other(String),
+}
+
+/// A running watcher of one repository. Dropping it stops the watcher without blocking.
+pub struct RepoWatcher {
+    // Held only for its Drop: it stops the debouncer thread and removes the OS watches.
+    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
+    mode: Mode,
+}
+
+impl RepoWatcher {
+    /// Starts watching `layout` in [`Mode::Normal`], asking the `git` on `PATH` which top-level
+    /// folders to skip on Linux. Blocks (the recursive watch walks the tree), so call it only
+    /// from a background thread.
+    pub fn start(
+        layout: &GitLayout,
+        sink: impl FnMut(WatchSignal) + Send + 'static,
+    ) -> Result<RepoWatcher, StartError> {
+        Self::start_in(layout, Mode::Normal, Path::new("git"), sink)
+    }
+
+    /// Like [`RepoWatcher::start`] with an explicit mode and the git executable used for the
+    /// ignore check (the app's resolved git).
+    pub fn start_in(
+        layout: &GitLayout,
+        mode: Mode,
+        git_exe: &Path,
+        sink: impl FnMut(WatchSignal) + Send + 'static,
+    ) -> Result<RepoWatcher, StartError> {
+        let pruned = match (cfg!(target_os = "linux"), mode, layout.root()) {
+            (true, Mode::Normal, Some(root)) => ignored_top_level_dirs(git_exe, root),
+            _ => Vec::new(),
+        };
+        Self::start_with(layout, mode, &pruned, sink)
+    }
+
+    /// The core: watch the plan for (`layout`, `mode`, `pruned_dirs`).
+    pub fn start_with(
+        layout: &GitLayout,
+        mode: Mode,
+        pruned_dirs: &[OsString],
+        mut sink: impl FnMut(WatchSignal) + Send + 'static,
+    ) -> Result<RepoWatcher, StartError> {
+        let layout_for_handler = layout.clone();
+        // NoCache: the default file-id cache walks the whole tree on macOS/Windows while holding
+        // the debouncer's lock, and rename stitching is not needed here.
+        let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+            DEBOUNCE,
+            None,
+            move |result: DebounceEventResult| {
+                if let Some(signal) = signal_of(&layout_for_handler, result) {
+                    sink(signal);
+                }
+            },
+            NoCache,
+            Config::default(),
+        )
+        .map_err(|e| match e.kind {
+            ErrorKind::MaxFilesWatch => StartError::Limit,
+            _ => StartError::Other(e.to_string()),
+        })?;
+
+        let plan = watch_plan(layout, mode, pruned_dirs);
+        let mut watched = 0usize;
+        for (path, recursive) in &plan {
+            match debouncer.watch(path, *recursive) {
+                Ok(()) => watched += 1,
+                // Watches added before the failure stay behind, so the whole debouncer is
+                // dropped (on return) and the caller rebuilds with fewer paths.
+                Err(e) if matches!(e.kind, ErrorKind::MaxFilesWatch) => {
+                    return Err(StartError::Limit);
+                }
+                Err(e) => log::warn!("cannot watch {}: {e}", path.display()),
+            }
+        }
+        if watched == 0 {
+            return Err(StartError::Other("no folder could be watched".into()));
+        }
+        Ok(RepoWatcher {
+            _debouncer: debouncer,
+            mode,
+        })
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+}
+
+/// Turns one debouncer delivery into a signal; `None` when nothing relevant happened.
+fn signal_of(layout: &GitLayout, result: DebounceEventResult) -> Option<WatchSignal> {
+    let mut signal = WatchSignal::default();
+    match result {
+        Ok(events) => {
+            for event in &events {
+                if event.need_rescan() {
+                    signal.kinds |= Kinds::RESCAN;
+                }
+                // Every path counts: a `x.lock -> x` rename carries both, and the final
+                // name is the one that matters.
+                for path in &event.paths {
+                    signal.kinds |= classify(layout, path);
+                }
+            }
+        }
+        Err(errors) => {
+            for error in errors {
+                if matches!(error.kind, ErrorKind::MaxFilesWatch) {
+                    signal.limit_hit = true;
+                } else {
+                    log::warn!("file watcher error: {error}");
+                }
+            }
+        }
+    }
+    (!signal.kinds.is_empty() || signal.limit_hit).then_some(signal)
+}
+
+/// Names of the top-level folders of `root` that git ignores (`target`, `node_modules`, ...).
+/// Empty when git cannot be run: nothing is skipped then, which is only slower.
+fn ignored_top_level_dirs(git_exe: &Path, root: &Path) -> Vec<OsString> {
+    let dirs: Vec<OsString> = top_level_dirs(root, &[])
+        .iter()
+        .filter_map(|d| d.file_name().map(OsStr::to_os_string))
+        .collect();
+    if dirs.is_empty() {
+        return Vec::new();
+    }
+    // NUL-separated both ways so odd folder names survive; the trailing slash makes
+    // directory-only patterns (`target/`) match.
+    let mut input = Vec::new();
+    for dir in &dirs {
+        let Some(name) = dir.to_str() else { continue };
+        input.extend_from_slice(name.as_bytes());
+        input.extend_from_slice(b"/\0");
+    }
+    let mut cmd = Command::new(git_exe);
+    cmd.arg("-C")
+        .arg(root)
+        .args(["check-ignore", "--stdin", "-z"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let Ok(mut child) = cmd.spawn() else {
+        log::warn!("git check-ignore could not be started; watching every top-level folder");
+        return Vec::new();
+    };
+    // Write from a thread so a full stdout pipe cannot deadlock against our stdin write.
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let out = child.wait_with_output();
+    let _ = writer.join();
+    // Exit status 1 only means "nothing ignored"; the output is what counts.
+    let Ok(out) = out else { return Vec::new() };
+    out.stdout
+        .split(|b| *b == 0)
+        .filter_map(|raw| std::str::from_utf8(raw).ok())
+        .map(|s| s.trim_end_matches('/'))
+        .filter(|s| !s.is_empty())
+        .map(OsString::from)
+        .collect()
 }
 
 #[cfg(test)]
@@ -756,5 +947,116 @@ mod tests {
                 (root.join("real"), R),
             ]
         );
+    }
+
+    // ---- the real watcher ----
+
+    use crate::test_support::TempRepo;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    fn git_cli(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// Waits up to 10 s for a signal containing `want`.
+    fn wait_for(rx: &mpsc::Receiver<WatchSignal>, want: Kinds) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = Kinds::NONE;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            if let Ok(sig) = rx.recv_timeout(left) {
+                seen |= sig.kinds;
+                if seen.intersects(want) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Starts a watcher on a fresh repository; canonical paths because FSEvents reports them.
+    fn started(name: &str) -> (TempRepo, PathBuf, RepoWatcher, mpsc::Receiver<WatchSignal>) {
+        let repo = TempRepo::new(name);
+        let root = std::fs::canonicalize(repo.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        git_cli(&root, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let layout = GitLayout::new(Some(&root), &root.join(".git"), &root.join(".git"));
+        let (tx, rx) = mpsc::channel();
+        let watcher = RepoWatcher::start(&layout, move |s| {
+            let _ = tx.send(s);
+        })
+        .expect("the watcher starts");
+        // FSEvents and Windows need a moment before the stream delivers.
+        std::thread::sleep(Duration::from_millis(500));
+        (repo, root, watcher, rx)
+    }
+
+    #[test]
+    fn real_watcher_reports_a_commit() {
+        let (_repo, root, watcher, rx) = started("watch-commit");
+        assert_eq!(watcher.mode(), Mode::Normal);
+        git_cli(&root, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        assert!(wait_for(&rx, Kinds::REFS | Kinds::HEAD));
+    }
+
+    #[test]
+    fn real_watcher_reports_a_work_tree_file() {
+        let (_repo, root, _watcher, rx) = started("watch-file");
+        std::fs::write(root.join("src").join("x.txt"), "x").unwrap();
+        assert!(wait_for(&rx, Kinds::WORKTREE_FILES));
+    }
+
+    #[test]
+    fn reduced_mode_ignores_the_work_tree() {
+        let repo = TempRepo::new("watch-reduced");
+        let root = std::fs::canonicalize(repo.path()).unwrap();
+        git_cli(&root, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let layout = GitLayout::new(Some(&root), &root.join(".git"), &root.join(".git"));
+        let (tx, rx) = mpsc::channel();
+        let watcher = RepoWatcher::start_in(&layout, Mode::Reduced, Path::new("git"), move |s| {
+            let _ = tx.send(s);
+        })
+        .expect("the watcher starts");
+        assert_eq!(watcher.mode(), Mode::Reduced);
+        std::thread::sleep(Duration::from_millis(500));
+        git_cli(&root, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        assert!(wait_for(&rx, Kinds::REFS | Kinds::HEAD));
+    }
+
+    #[test]
+    fn signal_merges_every_path_and_maps_errors() {
+        use notify_debouncer_full::notify::{Error, Event, EventKind};
+        use notify_debouncer_full::DebouncedEvent;
+        let l = layout();
+        let event = Event::new(EventKind::Any)
+            .add_path("/r/.git/refs/heads/x.lock".into())
+            .add_path("/r/.git/refs/heads/x".into());
+        let sig = signal_of(&l, Ok(vec![DebouncedEvent::new(event, Instant::now())])).unwrap();
+        assert_eq!(sig.kinds, Kinds::REFS);
+        assert!(!sig.limit_hit);
+
+        let sig = signal_of(&l, Err(vec![Error::new(ErrorKind::MaxFilesWatch)])).unwrap();
+        assert!(sig.limit_hit);
+        assert!(signal_of(&l, Err(vec![Error::generic("boom")])).is_none());
+        let noise = Event::new(EventKind::Any).add_path("/r/.git/objects/ab/c".into());
+        assert!(signal_of(&l, Ok(vec![DebouncedEvent::new(noise, Instant::now())])).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ignored_top_level_dirs_come_from_git() {
+        let repo = TempRepo::new("watch-ignore");
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        let ignored = ignored_top_level_dirs(Path::new("git"), root);
+        assert_eq!(ignored, vec![OsString::from("target")]);
     }
 }
