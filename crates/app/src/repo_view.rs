@@ -53,6 +53,9 @@ use crate::pr_panel::{PrEvent, PrModel, PrPanel};
 use crate::ref_dialog::{self, RefDialog, RefDialogContext, RefDialogKind, RemoteEdit};
 use crate::ref_ops::{CommitCard, RefAction};
 use crate::remote_accounts::{self, AccountAction, RemoteResolution};
+use crate::repo_watch::{
+    GitLayout, Kinds, Mode as WatchMode, RepoWatcher, StartError, WatchSignal,
+};
 use crate::settings::{
     sidebar_width_limit, DiffLayout, Dock, SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX,
     SIDEBAR_WIDTH_MIN,
@@ -579,6 +582,24 @@ pub struct RepositoryView {
     fingerprint_generation: u64,
     /// When Changes was last re-read quietly on window activation.
     last_quiet_changes: Option<Instant>,
+    /// The running file watcher; `None` until started (and in tests).
+    watcher: Option<RepoWatcher>,
+    /// The root the watcher was started for, so it is rebuilt when the root changes.
+    watch_root: Option<PathBuf>,
+    /// The watcher was rebuilt in [`WatchMode::Reduced`] after the OS watch limit was hit.
+    watch_reduced: bool,
+    /// Bumped per watcher start; a start that finishes later is dropped.
+    watch_generation: u64,
+    /// Drains the watcher's channel (replaced together with the watcher).
+    watch_task: Option<Task<()>>,
+    /// Change kinds reported but not yet applied (merged, or held while an operation runs).
+    watch_pending: Kinds,
+    /// The pending flush after [`WATCH_FLUSH`].
+    watch_flush: Option<Task<()>>,
+    /// When Changes was last re-read because work-tree files changed.
+    last_watch_changes: Option<Instant>,
+    /// The trailing quiet Changes refresh of a throttled burst of file changes.
+    watch_changes_trailing: Option<Task<()>>,
     /// Pull request badges and CI status of the primary remote's repository.
     hosting: HostingState,
     /// What the rows were last given, to skip a redraw that changes nothing.
@@ -655,6 +676,12 @@ struct NetworkRun<'a> {
 const BACKGROUND_FETCH_FIRST: Duration = Duration::from_secs(3);
 /// Window activation fetches at most this often.
 const ACTIVATION_FETCH_MIN: Duration = Duration::from_secs(60);
+/// How often the UI drains the watcher's channel.
+const WATCH_POLL: Duration = Duration::from_millis(100);
+/// Signals arriving within this window are merged into one reload.
+const WATCH_FLUSH: Duration = Duration::from_millis(200);
+/// Work-tree file changes re-read Changes at most this often.
+const WATCH_CHANGES_MIN: Duration = Duration::from_secs(1);
 /// How often the UI drains the job's progress channel.
 const NETWORK_POLL: Duration = Duration::from_millis(80);
 
@@ -859,6 +886,7 @@ impl RepositoryView {
                 // The sidebar's own lists need the root: load them once, when
                 // the history first reports it.
                 this.ensure_sidebar(cx);
+                this.ensure_watcher(root, cx);
             }
             // HEAD and the refs were read again: the branches that track the
             // primary remote may have changed.
@@ -908,6 +936,8 @@ impl RepositoryView {
             let operation = changes.read(cx).operation();
             this.history
                 .update(cx, |history, _| history.set_operation(operation));
+            // Changes finishing its own work releases held watcher signals.
+            this.retry_watch_flush(cx);
             cx.notify();
         });
         let worktrees_model =
@@ -1078,6 +1108,15 @@ impl RepositoryView {
             fingerprint: None,
             fingerprint_generation: 0,
             last_quiet_changes: None,
+            watcher: None,
+            watch_root: None,
+            watch_reduced: false,
+            watch_generation: 0,
+            watch_task: None,
+            watch_pending: Kinds::NONE,
+            watch_flush: None,
+            last_watch_changes: None,
+            watch_changes_trailing: None,
             hosting: HostingState::default(),
             hosting_view: Arc::default(),
             ci_visible: Vec::new(),
@@ -1168,6 +1207,188 @@ impl RepositoryView {
             .ok();
         })
         .detach();
+    }
+
+    /// Starts the file watcher for `root` once per root (never in tests: the
+    /// wiring is tested by calling [`Self::on_watch_signal`] directly).
+    fn ensure_watcher(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if cfg!(test) || self.watch_root.as_ref() == Some(&root) {
+            return;
+        }
+        self.watch_root = Some(root.clone());
+        self.watch_reduced = false;
+        self.start_watcher(root, WatchMode::Normal, cx);
+    }
+
+    /// Replaces the watcher and its channel. Starting walks directories, so it
+    /// runs on the background executor; a start that is superseded meanwhile is
+    /// dropped when it finishes.
+    fn start_watcher(&mut self, root: PathBuf, mode: WatchMode, cx: &mut Context<Self>) {
+        let Ok(git) = self.git.clone() else {
+            return;
+        };
+        self.watcher = None;
+        self.watch_generation = self.watch_generation.wrapping_add(1);
+        let generation = self.watch_generation;
+        let (tx, rx) = mpsc::channel::<WatchSignal>();
+        let started = cx.background_executor().spawn(async move {
+            let repo =
+                Repo::open(git.clone(), &root).map_err(|e| StartError::Other(e.to_string()))?;
+            let common =
+                git_core::common_dir(&repo).map_err(|e| StartError::Other(e.to_string()))?;
+            let layout = GitLayout::new(Some(repo.root()), repo.git_dir(), &common);
+            let start = |mode| {
+                let tx = tx.clone();
+                RepoWatcher::start_in(&layout, mode, git.path(), move |signal| {
+                    let _ = tx.send(signal);
+                })
+            };
+            match start(mode) {
+                // Out of OS watches: the work tree is left to the activation check.
+                Err(StartError::Limit) if mode == WatchMode::Normal => {
+                    log::warn!("file watcher hit the OS watch limit, watching git folders only");
+                    start(WatchMode::Reduced)
+                }
+                other => other,
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = started.await;
+            this.update(cx, |view, _| {
+                if generation != view.watch_generation {
+                    return;
+                }
+                match result {
+                    Ok(watcher) => {
+                        log::info!("file watcher started ({:?} mode)", watcher.mode());
+                        view.watch_reduced = watcher.mode() == WatchMode::Reduced;
+                        view.watcher = Some(watcher);
+                    }
+                    Err(error) => {
+                        log::warn!("file watcher not started, relying on window focus: {error:?}");
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+        self.watch_task = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(WATCH_POLL).await;
+            let mut signals = Vec::new();
+            while let Ok(signal) = rx.try_recv() {
+                signals.push(signal);
+            }
+            let alive = this.update(cx, |view, cx| {
+                for signal in signals {
+                    view.on_watch_signal(signal, cx);
+                }
+            });
+            if alive.is_err() {
+                break;
+            }
+        }));
+    }
+
+    /// Merges a watcher signal into the pending kinds and schedules the flush;
+    /// a reported watch-limit overflow rebuilds the watcher in reduced mode.
+    fn on_watch_signal(&mut self, signal: WatchSignal, cx: &mut Context<Self>) {
+        self.watch_pending |= signal.kinds;
+        if signal.limit_hit && !self.watch_reduced {
+            log::warn!("file watcher hit the OS watch limit, rebuilding in git-folders-only mode");
+            self.watch_reduced = true;
+            if let Some(root) = self.watch_root.clone() {
+                self.start_watcher(root, WatchMode::Reduced, cx);
+            }
+        }
+        self.retry_watch_flush(cx);
+    }
+
+    /// Schedules a flush of the pending kinds after [`WATCH_FLUSH`], unless one
+    /// is already scheduled or nothing is pending. Also called when an
+    /// operation that held the signals finishes.
+    fn retry_watch_flush(&mut self, cx: &mut Context<Self>) {
+        if self.watch_pending.is_empty() || self.watch_flush.is_some() {
+            return;
+        }
+        self.watch_flush = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(WATCH_FLUSH).await;
+            this.update(cx, |view, cx| {
+                // Let the task finish; dropping the handle would cancel it midway.
+                if let Some(task) = view.watch_flush.take() {
+                    task.detach();
+                }
+                view.flush_watch(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Whether the app itself is changing the repository or the status.
+    fn operation_running(&self, cx: &App) -> bool {
+        self.ref_action_running
+            || self.network.is_some()
+            || self.background_fetch_running
+            || self.changes.read(cx).is_busy()
+    }
+
+    /// Applies the pending kinds. Held (kept pending) while an operation runs:
+    /// the code paths that finish one call [`Self::retry_watch_flush`].
+    fn flush_watch(&mut self, cx: &mut Context<Self>) {
+        if self.operation_running(cx) {
+            return;
+        }
+        let kinds = std::mem::take(&mut self.watch_pending);
+        if kinds.is_empty() {
+            return;
+        }
+        if kinds.contains(Kinds::RESCAN) {
+            // The backend lost events: everything may have changed.
+            self.after_ref_change(RefChange::History, cx);
+            return;
+        }
+        if kinds.intersects(Kinds::STASH | Kinds::CONFIG) {
+            self.refresh_with(hosting_status::INTERNAL_RELOAD, cx);
+        }
+        if kinds.intersects(Kinds::WORKTREES) {
+            self.worktrees
+                .update(cx, |worktrees, cx| worktrees.refresh(cx));
+        }
+        if kinds.intersects(Kinds::HEAD | Kinds::REFS | Kinds::INDEX | Kinds::OPERATION) {
+            // The fingerprint says whether anything the views show really changed.
+            self.check_external_changes(cx);
+        }
+        if kinds.intersects(Kinds::WORKTREE_FILES) {
+            self.refresh_changes_for_files(cx);
+        }
+    }
+
+    /// Quiet Changes refresh for work-tree file changes: at most once per
+    /// [`WATCH_CHANGES_MIN`], with one trailing refresh for a throttled burst.
+    fn refresh_changes_for_files(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if quiet_refresh_due(self.last_watch_changes, now, WATCH_CHANGES_MIN) {
+            self.last_watch_changes = Some(now);
+            self.changes
+                .update(cx, |changes, cx| changes.refresh_quiet(cx));
+            return;
+        }
+        if self.watch_changes_trailing.is_some() {
+            return;
+        }
+        let wait = self.last_watch_changes.map_or(Duration::ZERO, |last| {
+            WATCH_CHANGES_MIN.saturating_sub(now.duration_since(last))
+        });
+        self.watch_changes_trailing = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |view, cx| {
+                if let Some(task) = view.watch_changes_trailing.take() {
+                    task.detach();
+                }
+                view.watch_pending |= Kinds::WORKTREE_FILES;
+                view.retry_watch_flush(cx);
+            })
+            .ok();
+        }));
     }
 
     /// Records the repository's current state as the one the views show. Called
@@ -2852,6 +3073,7 @@ impl RepositoryView {
                 .await;
             this.update_in(cx, |view, window, cx| {
                 view.ref_action_running = false;
+                view.retry_watch_flush(cx);
                 match result {
                     Ok((kind, notice)) => {
                         toast::show(kind, notice, window, cx);
@@ -3025,6 +3247,7 @@ impl RepositoryView {
                 if changed {
                     view.reload_after_network(cx);
                 }
+                view.retry_watch_flush(cx);
             })
             .ok();
         })
@@ -3205,6 +3428,7 @@ impl RepositoryView {
         }
         if let Some(result) = finished {
             self.network = None;
+            self.retry_watch_flush(cx);
             match result {
                 Ok(outcome) if !outcome.targets.is_empty() => {
                     self.show_push_result(&outcome, meta, window, cx);
@@ -10179,5 +10403,67 @@ mod tests {
             1,
             "the file staged outside the app did not show up after activation"
         );
+    }
+
+    /// A watcher signal reloads the views after the merge delay.
+    #[gpui::test]
+    fn a_watch_signal_reloads_after_the_flush_delay(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("watch-signal");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repo_view(&repo, cx);
+        let history = view.read_with(&cx, |view, _| view.history());
+        assert_eq!(history.read_with(&cx, |h, _| h.commit_count()), 1);
+
+        run_git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "two"]);
+        let signal = WatchSignal {
+            kinds: Kinds::HEAD | Kinds::REFS,
+            limit_hit: false,
+        };
+        view.update(&mut cx, |view, cx| view.on_watch_signal(signal, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            history.read_with(&cx, |h, _| h.commit_count()),
+            1,
+            "the reload must wait for the merge delay"
+        );
+        cx.executor().advance_clock(WATCH_FLUSH * 2);
+        cx.run_until_parked();
+        assert_eq!(history.read_with(&cx, |h, _| h.commit_count()), 2);
+    }
+
+    /// Signals are held while the app runs a ref action and applied after it.
+    #[gpui::test]
+    fn watch_signals_are_held_while_a_ref_action_runs(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("watch-held");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, view) = open_repo_view(&repo, cx);
+        let history = view.read_with(&cx, |view, _| view.history());
+
+        run_git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "two"]);
+        view.update(&mut cx, |view, cx| {
+            view.ref_action_running = true;
+            let signal = WatchSignal {
+                kinds: Kinds::REFS,
+                limit_hit: false,
+            };
+            view.on_watch_signal(signal, cx);
+        });
+        cx.executor().advance_clock(WATCH_FLUSH * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            history.read_with(&cx, |h, _| h.commit_count()),
+            1,
+            "applied while a ref action was running"
+        );
+        assert!(!view.read_with(&cx, |view, _| view.watch_pending.is_empty()));
+
+        view.update(&mut cx, |view, cx| {
+            view.ref_action_running = false;
+            view.retry_watch_flush(cx);
+        });
+        cx.executor().advance_clock(WATCH_FLUSH * 2);
+        cx.run_until_parked();
+        assert_eq!(history.read_with(&cx, |h, _| h.commit_count()), 2);
+        assert!(view.read_with(&cx, |view, _| view.watch_pending.is_empty()));
     }
 }
