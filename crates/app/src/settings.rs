@@ -434,9 +434,67 @@ impl Settings {
         }
     }
 
+    /// Drops the recent entries for which `is_worktree` holds (linked worktrees
+    /// are never listed in Recent), keeping the order of the rest. Returns
+    /// whether anything was removed.
+    pub fn prune_recent_worktrees(&mut self, is_worktree: impl Fn(&Path) -> bool) -> bool {
+        let before = self.recent.len();
+        self.recent.retain(|repo| !is_worktree(&repo.path));
+        self.recent.len() != before
+    }
+
     /// Removes `path` from the recent list, if present.
     pub fn remove_recent(&mut self, path: &Path) {
         self.recent.retain(|repo| repo.path != path);
+    }
+
+    /// Removes every path in `paths` from the recent list and returns what was
+    /// removed with the original indices, ascending, for [`Self::restore_recent`].
+    pub fn remove_recent_many(&mut self, paths: &[PathBuf]) -> Vec<(usize, RecentRepo)> {
+        let mut removed = Vec::new();
+        let mut kept = Vec::with_capacity(self.recent.len());
+        for (index, repo) in std::mem::take(&mut self.recent).into_iter().enumerate() {
+            if paths.contains(&repo.path) {
+                removed.push((index, repo));
+            } else {
+                kept.push(repo);
+            }
+        }
+        self.recent = kept;
+        removed
+    }
+
+    /// Undoes [`Self::remove_recent_many`]: re-inserts the entries at their
+    /// original positions (ascending order, so each index is valid once the
+    /// earlier ones are back). A path that was opened again in the meantime is
+    /// not duplicated, and the list is cut back to [`RECENT_LIMIT`].
+    pub fn restore_recent(&mut self, removed: Vec<(usize, RecentRepo)>) {
+        for (index, repo) in removed {
+            if self
+                .recent
+                .iter()
+                .any(|existing| existing.path == repo.path)
+            {
+                continue;
+            }
+            self.recent.insert(index.min(self.recent.len()), repo);
+        }
+        self.recent.truncate(RECENT_LIMIT);
+    }
+
+    /// Points the entry `old` at `new` (the folder was moved), keeping its
+    /// position and `last_opened`. Another entry already stored for `new` is
+    /// dropped so the list has no duplicates.
+    pub fn relocate_recent(&mut self, old: &Path, new: PathBuf) {
+        if !self.recent.iter().any(|repo| repo.path == old) {
+            return;
+        }
+        if old != new {
+            self.recent.retain(|repo| repo.path != new);
+        }
+        if let Some(repo) = self.recent.iter_mut().find(|repo| repo.path == old) {
+            repo.path = new;
+        }
     }
 
     /// The executable choice the Git page stored.
@@ -1104,6 +1162,95 @@ mod tests {
         settings.recent.iter().map(|r| r.path.as_path()).collect()
     }
 
+    fn recent_of(names: &[&str]) -> Settings {
+        Settings {
+            recent: names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| RecentRepo {
+                    path: PathBuf::from(format!("/r/{name}")),
+                    last_opened: 100 - i as u64,
+                })
+                .collect(),
+            ..Settings::default()
+        }
+    }
+
+    fn pb(name: &str) -> PathBuf {
+        PathBuf::from(format!("/r/{name}"))
+    }
+
+    #[test]
+    fn remove_recent_many_then_restore_gives_the_original_order() {
+        let mut settings = recent_of(&["a", "b", "c", "d", "e", "f"]);
+        let before = settings.recent.clone();
+        let removed = settings.remove_recent_many(&[pb("e"), pb("b"), pb("d"), pb("zzz")]);
+        assert_eq!(
+            removed.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+        assert_eq!(paths(&settings), [pb("a"), pb("c"), pb("f")]);
+        settings.restore_recent(removed);
+        assert_eq!(settings.recent, before);
+    }
+
+    #[test]
+    fn restore_recent_skips_a_path_reopened_meanwhile() {
+        let mut settings = recent_of(&["a", "b", "c"]);
+        let removed = settings.remove_recent_many(&[pb("b")]);
+        settings.touch_recent(pb("b"), 500);
+        settings.restore_recent(removed);
+        assert_eq!(paths(&settings), [pb("b"), pb("a"), pb("c")]);
+        assert_eq!(settings.recent[0].last_opened, 500);
+    }
+
+    #[test]
+    fn restore_recent_keeps_the_limit() {
+        let names: Vec<String> = (0..RECENT_LIMIT).map(|i| format!("r{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut settings = recent_of(&refs);
+        let removed = settings.remove_recent_many(&[pb("r0"), pb("r1")]);
+        // Two new entries fill the freed slots before the undo.
+        settings.touch_recent(pb("n1"), 900);
+        settings.touch_recent(pb("n2"), 901);
+        settings.restore_recent(removed);
+        assert_eq!(settings.recent.len(), RECENT_LIMIT);
+        // The restored entries return to their slots; the oldest ones fall off the end.
+        assert_eq!(settings.recent[0].path, pb("r0"));
+        assert_eq!(settings.recent[1].path, pb("r1"));
+        assert!(!paths(&settings).contains(&pb("r19").as_path()));
+    }
+
+    #[test]
+    fn restore_recent_clamps_an_out_of_range_index() {
+        let mut settings = recent_of(&["a"]);
+        let entry = RecentRepo {
+            path: pb("x"),
+            last_opened: 1,
+        };
+        settings.restore_recent(vec![(9, entry)]);
+        assert_eq!(paths(&settings), [pb("a"), pb("x")]);
+    }
+
+    #[test]
+    fn relocate_recent_keeps_time_and_position() {
+        let mut settings = recent_of(&["a", "b", "c"]);
+        settings.relocate_recent(&pb("b"), pb("moved"));
+        assert_eq!(paths(&settings), [pb("a"), pb("moved"), pb("c")]);
+        assert_eq!(settings.recent[1].last_opened, 99);
+        settings.relocate_recent(&pb("unknown"), pb("other"));
+        assert_eq!(settings.recent.len(), 3);
+    }
+
+    #[test]
+    fn relocate_recent_drops_a_duplicate_target() {
+        let mut settings = recent_of(&["a", "b", "c"]);
+        settings.relocate_recent(&pb("c"), pb("a"));
+        assert_eq!(paths(&settings), [pb("b"), pb("a")]);
+        // The relocated entry (with its own time) survives, not the old duplicate.
+        assert_eq!(settings.recent[1].last_opened, 98);
+    }
+
     #[test]
     fn missing_file_loads_defaults_and_round_trips() {
         let dir = TempDir::new("round-trip");
@@ -1362,6 +1509,21 @@ mod tests {
             load_json(dir.path(), r#"{"diff_layout":"diagonal"}"#).diff_layout,
             DiffLayout::Unified
         );
+    }
+
+    #[test]
+    fn pruning_worktrees_keeps_the_order_of_the_rest() {
+        let mut settings = Settings::default();
+        for (i, name) in ["/a", "/wt1", "/b", "/wt2", "/c"].iter().enumerate() {
+            settings.touch_recent(PathBuf::from(name), i as u64);
+        }
+        let is_wt = |p: &Path| p.to_string_lossy().starts_with("/wt");
+        assert!(settings.prune_recent_worktrees(is_wt));
+        assert_eq!(
+            paths(&settings),
+            vec![Path::new("/c"), Path::new("/b"), Path::new("/a")]
+        );
+        assert!(!settings.prune_recent_worktrees(is_wt));
     }
 
     #[test]

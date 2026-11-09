@@ -2,8 +2,9 @@
 //!
 //! Toasts are drawn by [`crate::overlay::render_overlays`] above every layer,
 //! bottom-right and newest last. Errors stay until dismissed, and so does any
-//! toast with a button (five seconds are too short to press one); every other
-//! toast hides itself after five seconds.
+//! toast with a button (five seconds are too short to press one) unless the
+//! caller gives it an explicit lifetime; every other toast hides itself after
+//! five seconds.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -62,13 +63,25 @@ impl ToastKind {
     }
 }
 
-/// Whether a toast hides itself: not an error and without a button (the
-/// message button or any line button), which needs more than five seconds.
-fn auto_hides(kind: ToastKind, body: Option<&ToastBody>) -> bool {
+/// How long a toast stays, or `None` when it stays until dismissed. Errors
+/// never hide; a toast with a button (the message button or any line button)
+/// stays too, since five seconds are too short to press it, unless the caller
+/// passes an explicit `lifetime` (e.g. an Undo toast that lives 8 s).
+fn lifetime_of(
+    kind: ToastKind,
+    body: Option<&ToastBody>,
+    lifetime: Option<Duration>,
+) -> Option<Duration> {
+    if !kind.auto_hide() {
+        return None;
+    }
+    if lifetime.is_some() {
+        return lifetime;
+    }
     let has_button = body.is_some_and(|body| {
         body.action.is_some() || body.lines.iter().any(|line| line.action.is_some())
     });
-    kind.auto_hide() && !has_button
+    (!has_button).then_some(TOAST_LIFETIME)
 }
 
 /// What a toast button runs.
@@ -177,9 +190,23 @@ impl ToastQueue {
         body: Option<ToastBody>,
         now: Instant,
     ) -> ToastId {
+        self.push_with_lifetime(kind, message, body, None, now)
+    }
+
+    /// [`ToastQueue::push_with`] with an explicit lifetime that also applies
+    /// to a toast with a button (which otherwise never hides). Errors still
+    /// stay until dismissed.
+    pub fn push_with_lifetime(
+        &mut self,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        body: Option<ToastBody>,
+        lifetime: Option<Duration>,
+        now: Instant,
+    ) -> ToastId {
         self.next_id += 1;
         let id = ToastId(self.next_id);
-        let auto_hide = auto_hides(kind, body.as_ref());
+        let lifetime = lifetime_of(kind, body.as_ref(), lifetime);
         self.entries.push(QueuedToast {
             toast: Toast {
                 id,
@@ -187,7 +214,7 @@ impl ToastQueue {
                 message: message.into(),
                 body,
             },
-            deadline: auto_hide.then(|| now + TOAST_LIFETIME),
+            deadline: lifetime.map(|lifetime| now + lifetime),
             remaining: None,
             hovered: false,
             selected: false,
@@ -306,10 +333,23 @@ pub fn show_with(
     window: &mut Window,
     cx: &mut App,
 ) -> ToastId {
+    show_with_lifetime(kind, message, body, None, window, cx)
+}
+
+/// [`show_with`] with an explicit lifetime that overrides "a toast with a
+/// button never hides" (errors still stay).
+pub fn show_with_lifetime(
+    kind: ToastKind,
+    message: impl Into<SharedString>,
+    body: Option<ToastBody>,
+    lifetime: Option<Duration>,
+    window: &mut Window,
+    cx: &mut App,
+) -> ToastId {
     let now = cx.background_executor().now();
-    let auto_hide = auto_hides(kind, body.as_ref());
+    let auto_hide = lifetime_of(kind, body.as_ref(), lifetime).is_some();
     let id = with_queue(window, cx, |queue| {
-        queue.push_with(kind, message, body, now)
+        queue.push_with_lifetime(kind, message, body, lifetime, now)
     });
     window.refresh();
 
@@ -651,6 +691,49 @@ mod tests {
         assert_eq!(expired, vec![plain]);
         let left: Vec<_> = queue.iter().map(|toast| toast.id).collect();
         assert_eq!(left, vec![with_button, with_line_button]);
+    }
+
+    #[test]
+    fn an_explicit_lifetime_makes_a_toast_with_a_button_expire() {
+        let mut queue = ToastQueue::new();
+        let now = Instant::now();
+        let body = ToastBody {
+            lines: Vec::new(),
+            action: Some(ToastAction::new("Undo", |_, _| {})),
+        };
+        let id = queue.push_with_lifetime(
+            ToastKind::Ok,
+            "removed",
+            Some(body),
+            Some(Duration::from_secs(8)),
+            now,
+        );
+        // Still up after the default five seconds, gone at eight.
+        assert!(queue.expire(now + Duration::from_millis(7999)).is_empty());
+        assert_eq!(queue.expire(now + Duration::from_secs(8)), vec![id]);
+    }
+
+    #[test]
+    fn an_explicit_lifetime_is_paused_by_hover() {
+        let mut queue = ToastQueue::new();
+        let now = Instant::now();
+        let body = ToastBody {
+            lines: Vec::new(),
+            action: Some(ToastAction::new("Undo", |_, _| {})),
+        };
+        let id = queue.push_with_lifetime(
+            ToastKind::Ok,
+            "removed",
+            Some(body),
+            Some(Duration::from_secs(8)),
+            now,
+        );
+        queue.set_paused(id, Some(true), None, now + Duration::from_secs(2));
+        assert!(queue.expire(now + Duration::from_secs(60)).is_empty());
+        let left = now + Duration::from_secs(60);
+        queue.set_paused(id, Some(false), None, left);
+        assert!(queue.expire(left + Duration::from_secs(5)).is_empty());
+        assert_eq!(queue.expire(left + Duration::from_secs(6)), vec![id]);
     }
 
     #[test]

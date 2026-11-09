@@ -32,6 +32,7 @@ mod open_dialog;
 mod palette;
 mod pr_logic;
 mod pr_panel;
+mod recent_state;
 mod ref_dialog;
 mod ref_menus;
 mod ref_ops;
@@ -201,13 +202,23 @@ fn main() {
         };
 
     let config_path = settings::config_dir().map(|dir| dir.join("settings.json"));
-    let loaded = match &config_path {
+    let mut loaded = match &config_path {
         Some(path) => SettingsStore::new(path.clone()).load(),
         None => {
             log::warn!("no configuration directory found; using default settings");
             Settings::default()
         }
     };
+    // Linked worktrees are never listed in Recent: drop the ones recorded by
+    // older versions so they stop taking slots of RECENT_LIMIT. At most
+    // RECENT_LIMIT small file reads, before any window exists.
+    if loaded.prune_recent_worktrees(git_core::is_linked_worktree) {
+        if let Some(path) = &config_path {
+            if let Err(e) = SettingsStore::new(path.clone()).save(&loaded) {
+                log::warn!("failed to save the pruned recent list: {e}");
+            }
+        }
+    }
     // Kept alive until `main` returns: dropping the guard flushes queued events.
     let _sentry = telemetry::init(loaded.telemetry);
     // Before the first window renders, so every view reads the chosen language.
@@ -335,7 +346,7 @@ fn main() {
                 // and in a repository window.
                 ui::actions::key_binding(cx, "secondary-shift-o", workspace::OpenCloneDialog, None),
                 // Welcome screen: Ctrl N opens the Initialize dialog and Del
-                // drops a recent entry.
+                // drops the selected recent entries.
                 ui::actions::key_binding(
                     cx,
                     "secondary-n",
@@ -343,6 +354,16 @@ fn main() {
                     Some("welcome"),
                 ),
                 KeyBinding::new("delete", welcome::RemoveSelected, Some("welcome")),
+                // Multi-select in the recent list. A focused filter input has
+                // its own Ctrl+A / Shift+arrows in a deeper context.
+                ui::actions::key_binding(
+                    cx,
+                    "secondary-a",
+                    welcome::SelectAllRecent,
+                    Some("welcome"),
+                ),
+                KeyBinding::new("shift-down", welcome::ExtendNext, Some("welcome")),
+                KeyBinding::new("shift-up", welcome::ExtendPrev, Some("welcome")),
             ];
             cx.bind_keys(shortcuts);
             // The search field's own keys (Shift+Enter, F3, Esc, ↓) live in

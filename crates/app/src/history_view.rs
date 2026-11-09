@@ -1511,14 +1511,22 @@ impl HistoryView {
         // The repository opened: remember it for the switcher, whatever the
         // history walk does next. The root is canonicalized (and the settings
         // saved) off the UI thread; the entry is stored as canonical, so later
-        // touches compare as stored.
+        // touches compare as stored. A linked worktree is never recorded (and
+        // does not bump its main repository): Recent lists repositories, and
+        // worktrees are opened from their repository's Worktrees view.
         let root = repo.root().to_path_buf();
         let recent_root = root.clone();
         cx.spawn(async move |cx| {
-            let canonical = cx
+            let (canonical, linked) = cx
                 .background_executor()
-                .spawn(async move { recent_root.canonicalize().unwrap_or(recent_root) })
+                .spawn(async move {
+                    let linked = git_core::is_linked_worktree(&recent_root);
+                    (recent_root.canonicalize().unwrap_or(recent_root), linked)
+                })
                 .await;
+            if linked {
+                return;
+            }
             cx.update(|cx| {
                 crate::update_settings(cx, |settings| {
                     settings.touch_recent(canonical, unix_now());
