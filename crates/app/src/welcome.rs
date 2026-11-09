@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -22,16 +23,17 @@ use git_core::{Error, Git, Repo};
 use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_LG, FS_SM, FS_XL, MONO, R_MD, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    dialog, focus, overlay, toast, Banner, BannerKind, Button, Checkbox, Chip, Dialog, DialogFocus,
-    DialogHost, EmptyState, Icon, IconName, Kbd, Scrollbar, SearchField, Skeleton, TextInput,
-    TextInputEvent, TextInputSubmit, ToastKind, Tooltip,
+    dialog, focus, overlay, toast, Banner, BannerKind, Button, ButtonSize, Checkbox, Chip, Dialog,
+    DialogFocus, DialogHost, EmptyState, Icon, IconName, Kbd, Scrollbar, SearchField, Skeleton,
+    TextInput, TextInputEvent, TextInputSubmit, ToastAction, ToastBody, ToastId, ToastKind,
+    Tooltip,
 };
 
 use crate::clone_dialog::CloneDialog;
 use crate::format::{display_path, expand_home, home_dir, relative_time};
 use crate::history_view::unix_now;
 use crate::init_flow::{banner_body, details, DialogKind, InitFlow, StatusKind};
-use crate::recent_state::{classify, OpenResult, RowState};
+use crate::recent_state::{classify, OpenResult, RecentSelection, RowState};
 use crate::settings::RecentRepo;
 use crate::welcome_activity::WelcomeActivity;
 use crate::workspace::{
@@ -39,7 +41,16 @@ use crate::workspace::{
     titlebar_fill, uses_title_strip, window_titlebar, Workspace,
 };
 
-actions!(welcome, [NewRepository, RemoveSelected]);
+actions!(
+    welcome,
+    [
+        NewRepository,
+        RemoveSelected,
+        SelectAllRecent,
+        ExtendNext,
+        ExtendPrev
+    ]
+);
 
 /// The left column: the design's fixed width.
 const LEFT_W: f32 = 300.;
@@ -51,6 +62,11 @@ const ROW_H: f32 = 44.;
 const BRANCH_W: f32 = 150.;
 /// The relative-time column.
 const TIME_W: f32 = 110.;
+/// The slot reserved at the end of a row for the remove button, so showing it
+/// never shifts the columns.
+const REMOVE_SLOT_W: f32 = 20.;
+/// How long the Undo toast of a removal stays (longer while hovered).
+const UNDO_LIFETIME: Duration = Duration::from_secs(8);
 
 /// A recent repository row, resolved for one frame.
 struct RecentRow {
@@ -74,8 +90,11 @@ pub struct WelcomeView {
     home: Option<PathBuf>,
     filter: Entity<TextInput>,
     filter_text: String,
-    /// Index into the filtered rows, never past the end.
-    selected: usize,
+    /// The cursor row (an index into the filtered rows, never past the end)
+    /// and the explicit multi-selection.
+    selection: RecentSelection,
+    /// The Undo toast of the last removal, replaced by the next one.
+    undo_toast: Option<ToastId>,
     /// What the background check found for each recent path.
     states: HashMap<PathBuf, RowState>,
     list_scroll: UniformListScrollHandle,
@@ -110,7 +129,7 @@ impl WelcomeView {
             if let TextInputEvent::Changed(text) = event {
                 this.filter_text = text.clone();
                 // Typing always starts again at the first match.
-                this.selected = 0;
+                this.selection.click(0);
                 cx.notify();
             }
         });
@@ -126,7 +145,8 @@ impl WelcomeView {
             home: home_dir(),
             filter,
             filter_text: String::new(),
-            selected: 0,
+            selection: RecentSelection::default(),
+            undo_toast: None,
             states: HashMap::new(),
             list_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle().tab_stop(true),
@@ -168,8 +188,8 @@ impl WelcomeView {
         let recent = read_recent(cx);
         if recent != self.recent {
             self.recent = recent;
-            let len = self.filtered_len();
-            self.selected = clamp_selection(self.selected, len);
+            let paths = self.visible_paths();
+            self.selection.retain(&paths, paths.len());
         }
     }
 
@@ -184,7 +204,7 @@ impl WelcomeView {
             .recent
             .iter()
             .filter(|repo| self.matches(repo))
-            .nth(self.selected)
+            .nth(self.selection.cursor)
             .map(|repo| repo.path.clone());
         self.activity
             .update(cx, |activity, cx| activity.sync(paths, selected, cx));
@@ -237,6 +257,15 @@ impl WelcomeView {
         self.recent.iter().filter(|repo| self.matches(repo)).count()
     }
 
+    /// The paths of the visible rows, in list order: what [`RecentSelection`] indexes into.
+    fn visible_paths(&self) -> Vec<PathBuf> {
+        self.recent
+            .iter()
+            .filter(|repo| self.matches(repo))
+            .map(|repo| repo.path.clone())
+            .collect()
+    }
+
     fn filtered_rows(&self) -> Vec<RecentRow> {
         let now = unix_now();
         self.recent
@@ -264,10 +293,27 @@ impl WelcomeView {
     }
 
     fn select_row(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.filtered_len() && index != self.selected {
-            self.selected = index;
+        if index < self.filtered_len() {
+            self.selection.click(index);
             cx.notify();
         }
+    }
+
+    /// A click on a row: Ctrl/Cmd toggles it, Shift extends a range from the
+    /// anchor, a plain click selects it alone.
+    fn click_row(&mut self, index: usize, toggle: bool, range: bool, cx: &mut Context<Self>) {
+        let paths = self.visible_paths();
+        if index >= paths.len() {
+            return;
+        }
+        if range {
+            self.selection.extend_to(index, &paths);
+        } else if toggle {
+            self.selection.toggle(index, &paths);
+        } else {
+            self.selection.click(index);
+        }
+        cx.notify();
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -275,17 +321,47 @@ impl WelcomeView {
         if len == 0 {
             return;
         }
-        let next = (self.selected as isize + delta).clamp(0, len as isize - 1) as usize;
-        if next != self.selected {
-            self.selected = next;
+        let next = (self.selection.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+        if next != self.selection.cursor || self.selection.count(&self.visible_paths()) > 1 {
+            self.selection.click(next);
             self.list_scroll
                 .scroll_to_item(next, ScrollStrategy::Nearest);
             cx.notify();
         }
     }
 
+    /// Shift+↑/↓: grows the selection one row at a time.
+    fn extend_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let paths = self.visible_paths();
+        if paths.is_empty() {
+            return;
+        }
+        self.selection.extend_by(delta, &paths);
+        self.list_scroll
+            .scroll_to_item(self.selection.cursor, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    /// Ctrl/Cmd+A: every visible row (the focused filter keeps its own select-all).
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        let paths = self.visible_paths();
+        self.selection.select_all(&paths);
+        cx.notify();
+    }
+
+    /// Esc: drops a selection of two or more rows. Returns whether it did,
+    /// so a lone Esc can reach whatever sits behind the list.
+    fn clear_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.selection.count(&self.visible_paths()) < 2 {
+            return false;
+        }
+        self.selection.clear();
+        cx.notify();
+        true
+    }
+
     fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_row(self.selected, window, cx);
+        self.open_row(self.selection.cursor, window, cx);
     }
 
     fn open_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -307,18 +383,61 @@ impl WelcomeView {
         }
     }
 
-    /// Drops the selected row from the recent list and keeps a valid
-    /// selection.
-    fn remove_selected(&mut self, cx: &mut Context<Self>) {
-        let rows = self.filtered_rows();
-        let Some(row) = rows.get(self.selected) else {
+    /// Del: removes the selected rows (or the cursor row).
+    fn remove_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = self.selection.targets(&self.visible_paths());
+        self.remove_paths(targets, window, cx);
+    }
+
+    /// The one removal path (× button, Del, the footer link): drops the
+    /// entries from the recent list and offers Undo in a toast. Nothing asks
+    /// for confirmation; Undo puts the entries back where they were.
+    fn remove_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        if paths.is_empty() {
             return;
-        };
-        let path = row.path.clone();
-        crate::update_settings(cx, |settings| settings.remove_recent(&path));
+        }
+        let mut removed = Vec::new();
+        crate::update_settings(cx, |settings| removed = settings.remove_recent_many(&paths));
+        if removed.is_empty() {
+            return;
+        }
         self.sync_recent(cx);
-        let len = self.filtered_len();
-        self.selected = clamp_selection(self.selected, len);
+        cx.notify();
+
+        let message = match removed.as_slice() {
+            [(_, repo)] => ui::t!(
+                "welcome.recent.toast.removed_one",
+                name = recent_name(&repo.path)
+            ),
+            many => ui::i18n::t_count("welcome.recent.toast.removed_many", many.len() as u64, &[]),
+        };
+        let view = cx.entity().downgrade();
+        let undo = ToastAction::new(ui::t!("welcome.recent.toast.undo"), move |_, cx| {
+            let removed = removed.clone();
+            view.update(cx, |view, cx| view.restore_removed(removed, cx))
+                .ok();
+        });
+        // One Undo at a time: a newer removal replaces the older toast.
+        if let Some(previous) = self.undo_toast.take() {
+            toast::dismiss(previous, window, cx);
+        }
+        self.undo_toast = Some(toast::show_with_lifetime(
+            ToastKind::Info,
+            message,
+            Some(ToastBody {
+                lines: Vec::new(),
+                action: Some(undo),
+            }),
+            Some(UNDO_LIFETIME),
+            window,
+            cx,
+        ));
+    }
+
+    /// Undo of [`Self::remove_paths`]: the entries return to their old positions.
+    fn restore_removed(&mut self, removed: Vec<(usize, RecentRepo)>, cx: &mut Context<Self>) {
+        crate::update_settings(cx, |settings| settings.restore_recent(removed));
+        self.sync_recent(cx);
         cx.notify();
     }
 
@@ -503,7 +622,8 @@ impl WelcomeView {
         } else {
             let weak = cx.entity().downgrade();
             let focus = self.focus.clone();
-            let selected = self.selected;
+            let paths = self.visible_paths();
+            let selection = self.selection.clone();
             let count = rows.len();
             let list = uniform_list("recent-list", count, move |range, _, _| {
                 range
@@ -511,8 +631,11 @@ impl WelcomeView {
                         render_recent_row(
                             index,
                             &rows[index],
-                            index == selected,
-                            index + 1 == count,
+                            RowPlace {
+                                selected: selection.is_selected(index, &paths),
+                                cursor: index == selection.cursor,
+                                last: index + 1 == count,
+                            },
                             weak.clone(),
                             focus.clone(),
                             colors,
@@ -535,20 +658,62 @@ impl WelcomeView {
                 )))
         };
 
+        let selected_count = self.selection.count(&self.visible_paths());
         let hint = div()
+            .debug_selector(|| "recent-footer".to_string())
             .w_full()
             .flex()
             .items_center()
             .gap(px(4.))
             .text_size(FS_SM)
-            .text_color(colors.muted)
-            .child(Kbd::new("↑"))
-            .child(Kbd::new("↓"))
-            .child(ui::t!("welcome.recent.hint.select"))
-            .child(Kbd::new("Enter"))
-            .child(ui::t!("welcome.recent.hint.open"))
-            .child(Kbd::new("Del"))
-            .child(ui::t!("welcome.recent.hint.remove"));
+            .text_color(colors.muted);
+        // Two or more selected rows replace the key hints with bulk actions.
+        let hint = if selected_count >= 2 {
+            let remove = self.selection.targets(&self.visible_paths());
+            let weak = cx.entity().downgrade();
+            let clear = weak.clone();
+            hint.child(
+                div()
+                    .debug_selector(|| "recent-footer-selected".to_string())
+                    .child(ui::i18n::t_count(
+                        "welcome.recent.selected",
+                        selected_count as u64,
+                        &[],
+                    )),
+            )
+            .child("·")
+            .child(footer_link(
+                "recent-footer-remove",
+                ui::t!("welcome.recent.remove_n", n = selected_count),
+                colors,
+                move |window, cx| {
+                    let paths = remove.clone();
+                    weak.update(cx, |view, cx| view.remove_paths(paths, window, cx))
+                        .ok();
+                },
+            ))
+            .child("·")
+            .child(footer_link(
+                "recent-footer-clear",
+                ui::t!("welcome.recent.clear_selection"),
+                colors,
+                move |_, cx| {
+                    clear
+                        .update(cx, |view, cx| {
+                            view.clear_selection(cx);
+                        })
+                        .ok();
+                },
+            ))
+        } else {
+            hint.child(Kbd::new("↑"))
+                .child(Kbd::new("↓"))
+                .child(ui::t!("welcome.recent.hint.select"))
+                .child(Kbd::new("Enter"))
+                .child(ui::t!("welcome.recent.hint.open"))
+                .child(Kbd::new("Del"))
+                .child(ui::t!("welcome.recent.hint.remove"))
+        };
 
         div()
             .flex_1()
@@ -711,7 +876,21 @@ impl Render for WelcomeView {
                     view.open_init_dialog(window, cx)
                 }),
             )
-            .on_action(cx.listener(|view, _: &RemoveSelected, _, cx| view.remove_selected(cx)))
+            .on_action(
+                cx.listener(|view, _: &RemoveSelected, window, cx| {
+                    view.remove_selected(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|view, _: &SelectAllRecent, _, cx| view.select_all(cx)))
+            .on_action(cx.listener(|view, _: &ExtendNext, _, cx| view.extend_selection(1, cx)))
+            .on_action(cx.listener(|view, _: &ExtendPrev, _, cx| view.extend_selection(-1, cx)))
+            // Esc drops a multi-selection; otherwise it goes on to whatever
+            // handles it behind the list.
+            .on_action(cx.listener(|view, _: &ui::actions::Cancel, _, cx| {
+                if !view.clear_selection(cx) {
+                    cx.propagate();
+                }
+            }))
             .on_action(
                 cx.listener(|view, _: &ui::actions::SelectNext, _, cx| view.move_selection(1, cx)),
             )
@@ -1310,18 +1489,36 @@ fn action_row(
     row
 }
 
+/// Where a row stands in the list.
+#[derive(Clone, Copy)]
+struct RowPlace {
+    /// Part of the selection (highlighted).
+    selected: bool,
+    /// The keyboard cursor row: its remove button stays visible.
+    cursor: bool,
+    /// The last row has no bottom border.
+    last: bool,
+}
+
 /// One 44px recent repository row with the design's four columns.
 fn render_recent_row(
     index: usize,
     row: &RecentRow,
-    selected: bool,
-    last: bool,
+    place: RowPlace,
     weak: WeakEntity<WelcomeView>,
     focus: FocusHandle,
     colors: ThemeColors,
 ) -> impl IntoElement {
+    let RowPlace {
+        selected,
+        cursor,
+        last,
+    } = place;
+    let group = SharedString::from(format!("recent-row-group-{index}"));
     let mut element = div()
         .id(ElementId::named_usize("recent-row", index))
+        .debug_selector(move || format!("recent-row-{index}"))
+        .group(group.clone())
         .relative()
         .w_full()
         .h(px(ROW_H))
@@ -1350,11 +1547,15 @@ fn render_recent_row(
         element = element.hover(move |style| style.bg(hover));
     }
 
+    let weak_remove = weak.clone();
     element = element.on_click(move |event: &ClickEvent, window, cx| {
         window.focus(&focus, cx);
-        let open = event.click_count() >= 2;
+        let modifiers = event.modifiers();
+        let (toggle, range) = (modifiers.secondary(cx), modifiers.shift);
+        // A double click opens; with Ctrl/Shift held it is just two selections.
+        let open = event.click_count() >= 2 && !toggle && !range;
         weak.update(cx, |view, cx| {
-            view.select_row(index, cx);
+            view.click_row(index, toggle, range, cx);
             if open {
                 view.open_row(index, window, cx);
             }
@@ -1423,6 +1624,52 @@ fn render_recent_row(
                 .text_right()
                 .child(row.time.clone()),
         )
+        .child(
+            // The slot is always reserved; the button shows on hover and on
+            // the cursor row. Hidden by opacity, not removed, so it keeps its
+            // size and never moves the columns.
+            div()
+                .debug_selector(move || format!("recent-remove-{index}"))
+                .w(px(REMOVE_SLOT_W))
+                .flex_none()
+                .when(!cursor, |slot| {
+                    slot.opacity(0.)
+                        .group_hover(group, |style| style.opacity(1.))
+                })
+                .child(
+                    Button::ghost(("recent-remove", index))
+                        .size(ButtonSize::Xs)
+                        .icon_only(IconName::X)
+                        .tooltip(ui::t!("welcome.recent.remove_tip"))
+                        .on_click(move |_, window, cx| {
+                            // The row behind it would otherwise treat this as a click on itself.
+                            cx.stop_propagation();
+                            weak_remove
+                                .update(cx, |view, cx| {
+                                    let path = view.visible_paths().get(index).cloned();
+                                    view.remove_paths(path.into_iter().collect(), window, cx);
+                                })
+                                .ok();
+                        }),
+                ),
+        )
+}
+
+/// A text link of the footer line: accent coloured, underlined on hover.
+fn footer_link(
+    id: &'static str,
+    label: SharedString,
+    colors: ThemeColors,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .cursor_pointer()
+        .text_color(colors.accent)
+        .hover(|style| style.underline())
+        .on_click(move |_, window, cx| on_click(window, cx))
+        .child(label)
 }
 
 /// The folder icon; an unavailable row gets a muted one with a small badge
@@ -1548,16 +1795,6 @@ fn matches_filter(name: &str, path: &str, filter: &str) -> bool {
     name.to_lowercase().contains(&filter) || path.to_lowercase().contains(&filter)
 }
 
-/// Keeps a selection valid when rows disappear; an empty list selects nothing
-/// (index 0 is harmless because opening and removing check the length).
-fn clamp_selection(selected: usize, len: usize) -> usize {
-    if len == 0 {
-        0
-    } else {
-        selected.min(len - 1)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1569,17 +1806,6 @@ mod tests {
         assert!(matches_filter("GitWarp", "~/dev/gitwarp", "GITWARP"));
         assert!(matches_filter("notes", "/mnt/data/notes", "mnt/Data"));
         assert!(!matches_filter("notes", "/mnt/data/notes", "gitwarp"));
-    }
-
-    #[test]
-    fn the_selection_is_clamped_after_removal_and_filtering() {
-        // A list of three rows after Del shortens to two: index 2 clamps to 1.
-        assert_eq!(clamp_selection(2, 2), 1);
-        assert_eq!(clamp_selection(1, 2), 1);
-        // Typing a filter that matches nothing leaves a harmless zero.
-        assert_eq!(clamp_selection(3, 0), 0);
-        assert_eq!(clamp_selection(0, 0), 0);
-        assert_eq!(clamp_selection(4, 5), 4);
     }
 
     #[test]
@@ -1775,5 +2001,143 @@ mod tests {
         assert!(workspace.read_with(&cx, |workspace, _| workspace
             .repository_for_test()
             .is_some()));
+    }
+    /// Four recent entries (none exists on disk; removal does not care) in the real window.
+    fn open_with_recent(cx: &mut gpui::TestAppContext) -> (gpui::VisualTestContext, Vec<PathBuf>) {
+        let paths: Vec<PathBuf> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| PathBuf::from(format!("/nonexistent-recent/{name}")))
+            .collect();
+        let settings = crate::settings::Settings {
+            recent: paths
+                .iter()
+                .enumerate()
+                .map(|(i, path)| RecentRepo {
+                    path: path.clone(),
+                    last_opened: 100 - i as u64,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        cx.update(|cx| {
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings,
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+        let (cx, _workspace) = crate::test_support::open_workspace(crate::test_support::git(), cx);
+        (cx, paths)
+    }
+
+    fn recent_paths(cx: &mut gpui::VisualTestContext) -> Vec<PathBuf> {
+        cx.update(|_, cx| read_recent(cx).into_iter().map(|r| r.path).collect())
+    }
+
+    fn click_row(cx: &mut gpui::VisualTestContext, index: usize, modifiers: gpui::Modifiers) {
+        // `debug_bounds` wants a `'static` selector; a leaked string is fine in a test.
+        let selector: &'static str = Box::leak(format!("recent-row-{index}").into_boxed_str());
+        let bounds = cx.debug_bounds(selector).expect("the row is rendered");
+        cx.simulate_click(bounds.center(), modifiers);
+        cx.run_until_parked();
+    }
+
+    fn ctrl(cx: &mut gpui::VisualTestContext) -> gpui::Modifiers {
+        cx.update(|_, cx| gpui::Modifiers::secondary_key(cx))
+    }
+
+    /// Ctrl-click two rows, Del removes both and shows a toast with Undo;
+    /// the Undo puts them back where they were.
+    #[gpui::test]
+    fn ctrl_click_two_rows_then_del_removes_both_and_undo_restores_them(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (mut cx, paths) = open_with_recent(cx);
+        cx.run_until_parked();
+        // The cursor starts on row 0; Ctrl+click adds row 2.
+        let modifiers = ctrl(&mut cx);
+        click_row(&mut cx, 2, modifiers);
+        assert!(
+            cx.debug_bounds("recent-footer-selected").is_some(),
+            "two selected rows did not bring up the selection footer"
+        );
+
+        cx.update(|window, cx| window.dispatch_action(Box::new(RemoveSelected), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            recent_paths(&mut cx),
+            vec![paths[1].clone(), paths[3].clone()]
+        );
+        assert!(
+            cx.debug_bounds("recent-footer-selected").is_none(),
+            "the selection footer outlived the removed rows"
+        );
+        let action = cx.update(|window, cx| {
+            let toasts = toast::toasts(window, cx);
+            assert_eq!(toasts.len(), 1, "no Undo toast after a removal");
+            assert_eq!(toasts[0].message, "Removed 2 repositories from Recent");
+            toasts[0]
+                .body
+                .as_ref()
+                .and_then(|body| body.action.clone())
+                .expect("the toast has an Undo button")
+        });
+
+        cx.update(|window, cx| (action.on_click)(window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            recent_paths(&mut cx),
+            paths,
+            "Undo did not restore the order"
+        );
+    }
+
+    /// Ctrl+A selects every visible row, Shift+click selects a range and Esc
+    /// drops a multi-selection.
+    #[gpui::test]
+    fn select_all_shift_click_and_escape(cx: &mut gpui::TestAppContext) {
+        let (mut cx, paths) = open_with_recent(cx);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("recent-footer-selected").is_none());
+
+        cx.update(|window, cx| window.dispatch_action(Box::new(SelectAllRecent), cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("recent-footer-selected").is_some(),
+            "Ctrl+A did not select the rows"
+        );
+
+        cx.update(|window, cx| window.dispatch_action(Box::new(ui::actions::Cancel), cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("recent-footer-selected").is_none(),
+            "Esc did not clear the selection"
+        );
+
+        // Shift+click from row 0 to row 1, then remove the pair with the footer link.
+        click_row(&mut cx, 1, gpui::Modifiers::shift());
+        assert!(cx.debug_bounds("recent-footer-selected").is_some());
+        let link = cx
+            .debug_bounds("recent-footer-remove")
+            .expect("the footer has a Remove link");
+        cx.simulate_click(link.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(recent_paths(&mut cx), paths[2..].to_vec());
+    }
+
+    /// The × button of a row removes just that row.
+    #[gpui::test]
+    fn the_remove_button_removes_its_row_only(cx: &mut gpui::TestAppContext) {
+        let (mut cx, paths) = open_with_recent(cx);
+        cx.run_until_parked();
+        let button = cx
+            .debug_bounds("recent-remove-1")
+            .expect("the row has a remove button");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let mut expected = paths.clone();
+        expected.remove(1);
+        assert_eq!(recent_paths(&mut cx), expected);
     }
 }
