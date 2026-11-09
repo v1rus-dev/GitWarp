@@ -35,16 +35,16 @@
   <h2>Anatomy</h2>
   <div class="anat"><div><div class="zoom" aria-label="Graph rows at 4× zoom"><div id="zoomrows" class="hist" style="--row-bg:var(--bg)"></div></div><div class="cap">Rows 1–8 of the sample history at 4×.</div></div>
   <table class="t"><tr><th>Element</th><th>Value</th></tr>
-    <tr><td>Lane width</td><td>14px; lane <i>n</i> centre = 14n + 9 (2px left inset so the HEAD ring is not clipped)</td></tr>
+    <tr><td>Lane width</td><td>16px (<code>LANE_W</code>); lane <i>n</i> centre = 16n + 10 (2px <code>GRAPH_INSET</code> so the HEAD ring is not clipped)</td></tr>
     <tr><td>Row height</td><td>26px; commit dot centred at y = 13</td></tr>
-    <tr><td>Dot</td><td>radius 4.5px, filled, 1.5px halo in the row background so lines never touch it</td></tr>
-    <tr><td>Merge commit</td><td>hollow ring: outer radius 4.5px, 2px stroke, row-colour fill</td></tr>
-    <tr><td>HEAD</td><td>extra 1.5px ring in the text colour, radius 7.5px</td></tr>
+    <tr><td>Dot</td><td>radius 5px (<code>DOT_R</code>), filled, with a halo (radius 6.5px, <code>DOT_HALO</code>) in the row background so lines never touch it</td></tr>
+    <tr><td>Merge commit</td><td>hollow ring: outer radius 5px, inner 2.5px (<code>MERGE_INNER</code>) in the row colour, no halo</td></tr>
+    <tr><td>HEAD</td><td>extra ring in the lane colour, radius 8px (<code>HEAD_RING</code>), stroke 1.5px</td></tr>
     <tr><td>Line</td><td>1–3px (Appearance setting, default 2px), round joins; same-lane lines are vertical</td></tr>
     <tr><td>Monochrome</td><td>Appearance “graph colored” off: every lane line and dot is drawn in <code>muted</code> instead of the golden-angle hues; the HEAD ring and idle-lane dashes are unchanged</td></tr>
-    <tr><td>Merge ring</td><td>outer 4.5px / inner 2.5px</td></tr>
-    <tr><td>Dot halo</td><td>radius 6px in the row background; a dot is still drawn up to 6px past the clip edge</td></tr>
-    <tr><td>Clip fade / dashes</td><td>20px fade at the clipped edge; folded lanes dashed 2 on / 3 off, running continuously across rows</td></tr>
+    <tr><td>Merge ring</td><td>outer 5px / inner 2.5px</td></tr>
+    <tr><td>Dot halo</td><td>radius 6.5px in the row background; a dot is still drawn up to 6px past the clip edge</td></tr>
+    <tr><td>Clip fade / dashes</td><td>20px fade (<code>GRAPH_FADE</code>) at the clipped edge; folded lanes dashed 2 on / 3 off, running continuously across rows</td></tr>
     <tr><td>Lane change</td><td>S-curve (cubic): control points at 7px / 20px so the bend completes inside the row</td></tr>
     <tr><td>Colour</td><td>hue = lane × 137.508° · saturation 0.65 · lightness 0.62 dark / 0.45 light</td></tr>
     <tr><td>Selection</td><td>row background changes, the dot halo follows it (--row-bg); lane colours never change</td></tr></table></div>

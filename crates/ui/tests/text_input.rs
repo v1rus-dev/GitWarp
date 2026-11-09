@@ -8,7 +8,7 @@ use gpui::{
     MouseButton, Render, TestAppContext, VisualTestContext, Window,
 };
 
-use ui::actions::{Cancel, SelectFirst};
+use ui::actions::{Cancel, MenuOpenSubmenu, SelectFirst};
 use ui::{TextInput, TextInputEvent};
 
 fn init(cx: &mut TestAppContext) {
@@ -270,4 +270,65 @@ fn tab_focuses_the_input(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("tab");
     cx.simulate_input("hi");
     assert_eq!(text(cx, &view), "hi");
+}
+
+/// Counts the `MenuOpenSubmenu` actions that reach a `probe` ancestor bound to
+/// Right, i.e. the Right presses the input passed on.
+struct EdgeProbe {
+    input: Entity<TextInput>,
+    passed_on: Rc<Cell<u32>>,
+}
+
+impl Render for EdgeProbe {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .key_context("probe")
+            .on_action(cx.listener(|this, _: &MenuOpenSubmenu, _, _| {
+                this.passed_on.set(this.passed_on.get() + 1)
+            }))
+            .child(div().w(px(300.)).child(self.input.clone()))
+    }
+}
+
+fn right_at_the_end_passed_on(cx: &mut TestAppContext, propagate: bool) -> u32 {
+    init(cx);
+    cx.update(|cx| {
+        cx.bind_keys([gpui::KeyBinding::new(
+            "right",
+            MenuOpenSubmenu,
+            Some("probe"),
+        )])
+    });
+    let passed_on = Rc::new(Cell::new(0));
+    let probe = passed_on.clone();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(window, cx);
+            input.propagate_edge_arrows(propagate);
+            input
+        });
+        EdgeProbe {
+            input,
+            passed_on: probe,
+        }
+    });
+    cx.update(|window, _| window.activate_window());
+    let handle = cx.read(|app| view.read(app).input.read(app).focus_handle().clone());
+    cx.update(|window, cx| window.focus(&handle, cx));
+    cx.run_until_parked();
+    cx.simulate_input("ab");
+    // The caret is at the end of the text: Right has nowhere to go.
+    cx.simulate_keystrokes("right");
+    passed_on.get()
+}
+
+#[gpui::test]
+fn right_at_the_end_stays_in_the_input_by_default(cx: &mut TestAppContext) {
+    assert_eq!(right_at_the_end_passed_on(cx, false), 0);
+}
+
+#[gpui::test]
+fn right_at_the_end_passes_on_when_the_input_opted_in(cx: &mut TestAppContext) {
+    assert_eq!(right_at_the_end_passed_on(cx, true), 1);
 }

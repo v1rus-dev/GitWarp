@@ -66,6 +66,7 @@
     ['Add · path inside repository', (w) => D.worktreeAdd(w, { path: '~/develop/gitwarp/tmp', touched: { path: true } })],
     ['Add · path already a worktree', (w) => D.worktreeAdd(w, { path: '~/develop/gitwarp-hotfix', touched: { path: true } })],
     ['Remove · uncommitted changes', (w) => D.worktreeRemove(w, { wt: find('~/develop/gitwarp-hotfix') })],
+    ['Remove · branch not merged (confirm)', (w) => D.worktreeRemove(w, { wt: { path: '~/develop/gitwarp-spike', branch: 'feat/spike', dirty: [] }, delBranch: true, unmerged: true })],
     ['Remove · locked', (w) => D.worktreeRemove(w, { wt: find('~/develop/gitwarp-review') })],
     ['Remove · folder missing', (w) => D.worktreeRemove(w, { wt: find('~/develop/gitwarp-old') })],
     ['Remove · clean, with branch', (w) => D.worktreeRemove(w, { wt: { path: '~/develop/gitwarp-spike', branch: 'feat/spike', dirty: [] } })],

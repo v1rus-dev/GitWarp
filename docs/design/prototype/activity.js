@@ -176,12 +176,12 @@
   if (Q.get('v') === 'A' || Q.get('v') === 'B') S.variant = Q.get('v');
   const STATES = [['ok', 'Populated'], ['loading', 'Loading'], ['large', 'Large repo'], ['empty', 'Empty repo'], ['nomine', 'No commits by me'], ['noemail', 'No user.email'], ['error', 'Error']];
   const pageHost = document.getElementById('act-stage');
-  const ctrl = document.getElementById('act-ctrls');
+  const ctrl = document.getElementById('act-ctrls') || document.createElement('div'); // main-*.html loads this file only for G.activity
   if (STATES.some(([k]) => k === Q.get('s'))) { S.state = Q.get('s'); if (S.state === 'noemail') S.who = 'everyone'; }
   if (Q.get('day')) S.day = Date.parse(Q.get('day') + 'T00:00:00Z');
   if (Q.get('who') === 'everyone') S.who = 'everyone';
   if (Q.get('collapsed')) S.collapsed = true;
-  ctrl.innerHTML = `<span><span class="lab">Placement</span><span class="seg" role="group" aria-label="Placement"><button data-v="A" aria-pressed="${S.variant === 'A'}">A · Welcome</button><button data-v="B" aria-pressed="${S.variant === 'B'}">B · Repository window (recommended)</button></span></span>
+  ctrl.innerHTML = `<span><span class="lab">Placement</span><span class="seg" role="group" aria-label="Placement"><button data-v="A" aria-pressed="${S.variant === 'A'}">A · Welcome</button><button data-v="B" aria-pressed="${S.variant === 'B'}">B · Repository window</button></span></span>
     <span><span class="lab">State</span><span class="seg sm" role="group" aria-label="State">${STATES.map(([k, l]) => `<button data-s="${k}" aria-pressed="${k === S.state}">${l}</button>`).join('')}</span></span>`;
   ctrl.addEventListener('click', (e) => {
     const v = e.target.closest('[data-v]'), s = e.target.closest('[data-s]');
@@ -194,6 +194,7 @@
 
   let timer = null;
   function render() {
+    if (!pageHost) return;
     clearInterval(timer); timer = null;
     pageHost.innerHTML = '<div class="winwrap"></div>';
     document.getElementById('act-cap').innerHTML = S.variant === 'A' ? CAP_A : CAP_B;
@@ -223,28 +224,18 @@
     return { html: h.html, head, ranges: h.ranges, total: h.total, zero };
   }
 
-  /* ================= Variant B: repository window ================= */
-  function variantB(wrap) {
-    const sh = G.shell({ host: wrap, w: 1200, h: 800, view: 'history', statusInfo: S.state === 'large' ? '48 210 commits loaded' : '21 commits loaded' });
-    const win = sh.win;
-    sh.center.innerHTML = `<div class="work dock-bottom"><div class="histcol"><section class="act-strip${S.collapsed ? ' collapsed' : ''}" aria-label="Commit activity"></section><div class="dayfilter" hidden></div><div class="hist-host" style="display:flex;flex:1;min-width:0;min-height:0"></div></div><div class="splitter h" role="separator" aria-label="Resize details"></div><section class="details" aria-label="Commit details" style="height:300px"></section></div>`;
-    const strip = sh.center.querySelector('.act-strip'), filt = sh.center.querySelector('.dayfilter'), histHost = sh.center.querySelector('.hist-host'), details = sh.center.querySelector('.details');
-    let hist;
+  /* ================= Variant B: the strip above History (shipped in the repository window) =================
+     mountStrip is shared with main-1200.html / main-1600.html (main.js): it draws the 34px header + heatmap body into `strip`,
+     the day-filter bar into `filt`, wires hover/keys/click, and calls `redraw()` whenever the day filter or author scope changes.
+     Returns { reset, list, S }: reset() re-draws from the current state S (state / who / year / collapsed / day). */
+  function mountStrip(win, strip, filt, redraw) {
     const dayCount = (t) => (S.who === 'me' ? DATA.repo.me : DATA.repo.everyone)[key(t)] || 0;
-    if (S.day != null) { while (S.day > TODAY - 360 * DAY && !dayCount(S.day)) S.day -= DAY; if (!dayCount(S.day)) S.day = null; }  // deep link to an empty day → nearest earlier day with commits
-    const showDetails = (c) => { details.innerHTML = `<div class="dhead"><span>Commit <span class="mono muted">${c.hash}</span></span></div><div class="dinfo" style="padding:16px 18px"><h3 style="margin:0 0 8px">${esc(c.summary)}</h3><dl class="meta"><dt>Author</dt><dd class="who">${G.avatar(c, 20)}<span class="od-truncate">${esc(c.author)} &lt;${esc(c.email)}&gt;</span></dd><dt>Authored</dt><dd>${G.abs(c.min)} <span class="muted">(${G.rel(c.min)})</span></dd><dt>Hash</dt><dd class="mono">${c.full.slice(0, 20)}…</dd></dl></div>`; };
-    function drawHistory() {
-      if (S.state === 'empty') { histHost.className = 'hist-host'; histHost.innerHTML = `<div class="empty"><div class="ei">${ic('git', 22)}</div><h4>No commits yet</h4><p>This repository is empty. Stage some files and make your first commit to see history here.</p></div>`; details.innerHTML = '<div class="empty"><p>Select a commit</p></div>'; return; }
-      const list = S.day != null ? commitsOn(S.day, dayCount(S.day), S.who === 'me') : G.commits;
-      hist = G.history(histHost, list, { gw: 112, onSelect: showDetails });
-    }
     let pendingFrom = null, partial = 0;
     function drawStrip() {
-      const R = range(S.year);
       const data = S.who === 'me' ? DATA.repo.me : DATA.repo.everyone;
       const b = body({ data, mine: S.who === 'me', pendingFrom, partial, label: `Commit activity, ${S.who === 'me' ? 'your commits' : 'all authors'}, ${S.year || 'last 12 months'}` });
       const meDisabled = S.state === 'noemail';
-      const years = [2026, 2025, 2024, 2023];
+      strip.className = 'act-strip' + (S.collapsed ? ' collapsed' : '');
       strip.innerHTML = `<div class="act-head">
           <button class="btn btn-icon btn-ghost btn-xs" data-toggle aria-expanded="${!S.collapsed}" aria-label="${S.collapsed ? 'Expand' : 'Collapse'} activity" data-tip="${S.collapsed ? 'Expand' : 'Collapse'} activity">${ic('chevD', 12, 'chev')}</button>
           <span class="ttl">Activity</span>${b.head}
@@ -255,12 +246,11 @@
         </div>
         <div class="act-body"><div class="heat-scroll">${b.html}</div>
           <div class="act-side">${sideHTML(b, meDisabled)}</div></div>`;
-      strip.dataset.years = years.join(',');
     }
     function sideHTML(b, meDisabled) {
       if (S.state === 'error' || S.state === 'loading') return S.state === 'loading' ? '<span class="skel" style="width:140px"></span><span class="skel" style="width:110px"></span>' : '';
       if (meDisabled) return `<span>Showing everyone: <span class="mono">user.email</span> is not set for this repository.</span><a href="settings-identity.html">Set identity…</a>`;
-      if (S.state === 'nomine') return `<span>No commits by <span class="mono">${ME}</span>.</span><a href="#" data-who="everyone" role="button">Show everyone’s commits</a>`;
+      if (S.state === 'nomine' && S.who === 'me') return `<span>No commits by <span class="mono">${ME}</span>.</span><a href="#" data-who="everyone" role="button">Show everyone’s commits</a>`;
       if (S.state === 'empty') return '<span>Make the first commit to start the graph.</span>';
       if (S.day != null) { const v = dayCount(S.day); return `<span class="kv"><b>${dateLong(S.day)}</b></span><span>${v} commit${v === 1 ? '' : 's'} · History is filtered to this day.</span>`; }
       if (b.pendingFrom != null || pendingFrom != null) return '<span>Older weeks fill in as <span class="mono">git log</span> streams; colours settle when counting ends.</span>';
@@ -272,17 +262,21 @@
       filt.hidden = false;
       filt.innerHTML = `${ic('lanes', 14)}<span>Showing <b>${v}</b> ${S.who === 'me' ? 'of your commits' : 'commits'} on <b>${dateLong(S.day)}</b></span><span class="od-fill"></span><button class="btn btn-sm" data-clear>Clear filter <span class="kbd">Esc</span></button>`;
     }
-    function all() { drawStrip(); drawFilter(); drawHistory(); G.initTips(win); }
-    all();
-    if (S.state === 'large') {                                   // progressive fill: newest week first, one week per tick
-      const R = range(0); let wk = 0; pendingFrom = TODAY - dow(TODAY) * DAY;
-      const sum = (from) => { let s = 0; for (let t = from; t <= TODAY; t += DAY) s += (S.who === 'me' ? DATA.repo.me : DATA.repo.everyone)[key(t)] || 0; return s; };
-      partial = sum(pendingFrom) * 37; drawStrip();
-      timer = setInterval(() => {
-        wk += 3; pendingFrom = TODAY - dow(TODAY) * DAY - wk * 7 * DAY;
-        if (pendingFrom <= R.start) { pendingFrom = null; clearInterval(timer); timer = null; }
-        partial = sum(pendingFrom || R.start) * 37; drawStrip();
-      }, 450);
+    function all() { drawStrip(); drawFilter(); redraw(); G.initTips(win); }
+    function reset() {
+      clearInterval(timer); timer = null; pendingFrom = null; partial = 0;
+      if (S.day != null) { while (S.day > TODAY - 360 * DAY && !dayCount(S.day)) S.day -= DAY; if (!dayCount(S.day)) S.day = null; }  // deep link to an empty day → nearest earlier day with commits
+      all();
+      if (S.state === 'large') {                                   // progressive fill: newest week first, three weeks per tick
+        const R = range(0); let wk = 0; pendingFrom = TODAY - dow(TODAY) * DAY;
+        const sum = (from) => { let s = 0; for (let t = from; t <= TODAY; t += DAY) s += (S.who === 'me' ? DATA.repo.me : DATA.repo.everyone)[key(t)] || 0; return s; };
+        partial = sum(pendingFrom) * 37; drawStrip();
+        timer = setInterval(() => {
+          wk += 3; pendingFrom = TODAY - dow(TODAY) * DAY - wk * 7 * DAY;
+          if (pendingFrom <= R.start) { pendingFrom = null; clearInterval(timer); timer = null; }
+          partial = sum(pendingFrom || R.start) * 37; drawStrip();
+        }, 450);
+      }
     }
     wire(win, strip, (cell) => {
       const v = +cell.dataset.v; if (!v || S.state === 'large' && pendingFrom != null) return;
@@ -292,15 +286,34 @@
     strip.addEventListener('click', (e) => {
       const w = e.target.closest('[data-who]'), tg = e.target.closest('[data-toggle]'), rg = e.target.closest('[data-range]'), rt = e.target.closest('[data-retry]');
       if (w && w.tagName === 'A') e.preventDefault();
-      if (w && !w.disabled) { S.who = w.dataset.who; if (S.state === 'nomine' && S.who === 'everyone') { /* stays in state; data now non-zero */ } S.day = null; all(); }
-      else if (tg) { S.collapsed = !S.collapsed; strip.classList.toggle('collapsed', S.collapsed); drawStrip(); G.initTips(win); }
+      if (w && !w.disabled) { S.who = w.dataset.who; S.day = null; all(); }
+      else if (tg) { S.collapsed = !S.collapsed; drawStrip(); G.initTips(win); }
       else if (rg) { const r = rg.getBoundingClientRect(); G.menu(win, { clientX: r.left, clientY: r.bottom + 2 }, [{ label: 'Last 12 months', icon: S.year ? '' : 'check', onClick: () => { S.year = 0; S.day = null; all(); } }, { sep: 1 }].concat([2026, 2025, 2024].map((y) => ({ label: String(y), icon: S.year === y ? 'check' : '', onClick: () => { S.year = y; S.day = null; all(); } })))); }
       else if (rt) { G.toast(win, 'Counting commits again…', 'info'); }
     });
     filt.addEventListener('click', (e) => { if (e.target.closest('[data-clear]')) { S.day = null; all(); } });
     win.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.day != null && !win.querySelector('.menu')) { S.day = null; refocus(); } });
+    return { reset, S, list: () => (S.day != null ? commitsOn(S.day, dayCount(S.day), S.who === 'me') : G.commits), dayCount };
+  }
+
+  function variantB(wrap) {
+    const sh = G.shell({ host: wrap, w: 1200, h: 800, view: 'history', statusInfo: S.state === 'large' ? '48 210 commits loaded' : '21 commits loaded' });
+    const win = sh.win;
+    sh.center.innerHTML = `<div class="work dock-bottom"><div class="histcol"><section class="act-strip${S.collapsed ? ' collapsed' : ''}" aria-label="Commit activity"></section><div class="dayfilter" hidden></div><div class="hist-host" style="display:flex;flex:1;min-width:0;min-height:0"></div></div><div class="splitter h" role="separator" aria-label="Resize details"></div><section class="details" aria-label="Commit details" style="height:300px"></section></div>`;
+    const strip = sh.center.querySelector('.act-strip'), filt = sh.center.querySelector('.dayfilter'), histHost = sh.center.querySelector('.hist-host'), details = sh.center.querySelector('.details');
+    let hist;
+    const showDetails = (c) => { details.innerHTML = `<div class="dhead"><span>Commit <span class="mono muted">${c.hash}</span></span></div><div class="dinfo" style="padding:16px 18px"><h3 style="margin:0 0 8px">${esc(c.summary)}</h3><dl class="meta"><dt>Author</dt><dd class="who">${G.avatar(c, 20)}<span class="od-truncate">${esc(c.author)} &lt;${esc(c.email)}&gt;</span></dd><dt>Authored</dt><dd>${G.abs(c.min)} <span class="muted">(${G.rel(c.min)})</span></dd><dt>Hash</dt><dd class="mono">${c.full.slice(0, 20)}…</dd></dl></div>`; };
+    let M;
+    function drawHistory() {
+      if (S.state === 'empty') { histHost.className = 'hist-host'; histHost.innerHTML = `<div class="empty"><div class="ei">${ic('git', 22)}</div><h4>No commits yet</h4><p>This repository is empty. Stage some files and make your first commit to see history here.</p></div>`; details.innerHTML = '<div class="empty"><p>Select a commit</p></div>'; return; }
+      hist = G.history(histHost, M.list(), { gw: 112, onSelect: showDetails });
+    }
+    M = mountStrip(win, strip, filt, drawHistory);
+    M.reset();
     G.fit(win);
   }
+  /* exported for the repository windows (main.js): the strip component and its state */
+  G.activity = { S, mountStrip, heatHTML, legendHTML, body, DATA, ME, dateLong, commitsOn, range, key, TODAY, DAY, fmtN };
 
   /* ================= Variant A: Welcome ================= */
   function variantA(wrap) {

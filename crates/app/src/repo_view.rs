@@ -22,7 +22,7 @@ use gpui::{
 };
 
 use git_core::network::{FetchOptions, Progress};
-use git_core::{ChangedFile, CommitDetails, CommitInfo, Error, Git, Head, Oid, RefKind, Repo};
+use git_core::{ChangedFile, CommitDetails, CommitInfo, Error, Git, Head, Oid, Ref, RefKind, Repo};
 use ui::actions::{SelectFirst, SelectLast, SelectNext, SelectPrev};
 use ui::metrics::{DOCK_HEADER, FONT_MONO, FONT_UI, FS_BASE, FS_MD, FS_SM, FS_XS, R_SM, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
@@ -62,7 +62,8 @@ use crate::settings_ui::accounts::open_picker;
 use crate::sidebar::{
     commit_for, read_sidebar_extras, shortcut_action, sidebar_menu_with_links, sidebar_nodes_with,
     worktree_menu, worktree_panel_rows, Expansion, PanelEvent, PanelState, RemoteDisplays,
-    SidebarAction, SidebarExtras, SidebarMenuEntry, WorktreeAction, WorktreePanel,
+    SidebarAction, SidebarActionHandler, SidebarExtras, SidebarMenuEntry, WorktreeAction,
+    WorktreePanel,
 };
 use crate::syntax::{self, HighlightSpan, Highlighted, Token};
 use crate::web_links::{self, HostLink};
@@ -663,11 +664,17 @@ fn follow_with_push(job: &Job, then_push: bool) -> bool {
 }
 
 /// Which failures open the error dialog, and whether it offers "Pull, then
-/// push". Only a rejected *branch* push can be fixed that way: a rejected tag
-/// or remote-branch delete has no branch to pull.
-fn error_dialog_remedy(known: &KnownError, job: &Job) -> Option<bool> {
+/// push". Only a rejected push of the *checked-out branch* can be fixed that
+/// way (the pull updates HEAD's branch): a rejected tag or remote-branch
+/// delete has no branch to pull, and nor has a push of another branch.
+fn error_dialog_remedy(known: &KnownError, job: &Job, head: Option<&Head>) -> Option<bool> {
     match known {
-        KnownError::PushRejected => Some(matches!(job, Job::Push)),
+        KnownError::PushRejected => Some(match job {
+            Job::Push { branch } => branch.as_deref().is_none_or(
+                |branch| matches!(head, Some(Head::Branch { name, .. }) if name == branch),
+            ),
+            _ => false,
+        }),
         KnownError::PullNotFastForward if matches!(job, Job::Pull) => Some(false),
         _ => None,
     }
@@ -786,6 +793,17 @@ impl RepositoryView {
                 pr_view.update(cx, |view, cx| {
                     view.open_pr_popover(&branch, position, window, cx)
                 });
+            }));
+        });
+        let service_view = cx.entity();
+        history.update(cx, |history, _| {
+            // The History asks while it is itself being updated, so it hands
+            // over its own HEAD and refs instead of being read back.
+            history.set_pr_service(Rc::new(move |branch, head, refs, cx| {
+                let view = service_view.read(cx);
+                let targets = view.pr_targets_in(head, refs, cx);
+                let upstream = view.branch_upstream_remote_in(branch, refs);
+                pr_logic::default_target(&targets, upstream.as_deref()).map(|target| target.kind())
             }));
         });
         let history_events =
@@ -1491,30 +1509,15 @@ impl RepositoryView {
         }
         self.selected_node = Some(key.into());
         let view = cx.entity();
+        let handler: SidebarActionHandler = Rc::new(move |action, window, cx| {
+            view.update(cx, |view, cx| view.run_sidebar_action(action, window, cx));
+        });
         let entries: Vec<MenuEntry> = model
             .into_iter()
             .map(|entry| match entry {
                 SidebarMenuEntry::Separator => MenuEntry::Separator,
                 SidebarMenuEntry::Item(item) => {
-                    let mut menu_item = MenuItem::new(item.label)
-                        .icon(item.icon)
-                        .disabled(!item.enabled);
-                    if let Some(shortcut) = item.shortcut {
-                        menu_item = menu_item.shortcut(shortcut);
-                    }
-                    if item.danger {
-                        menu_item = menu_item.danger();
-                    }
-                    if !matches!(item.action, SidebarAction::None) {
-                        let action = item.action.clone();
-                        let view = view.clone();
-                        menu_item = menu_item.action(move |window, cx| {
-                            view.update(cx, |view, cx| {
-                                view.run_sidebar_action(action.clone(), window, cx);
-                            });
-                        });
-                    }
-                    MenuEntry::Item(menu_item)
+                    MenuEntry::Item(item.into_menu_item(handler.clone()))
                 }
             })
             .collect();
@@ -1783,6 +1786,16 @@ impl RepositoryView {
                     cx,
                 );
             }
+            SidebarAction::PushBranch(branch) => {
+                let branch = Some(branch);
+                self.start_network_job(Job::Push { branch }, window, cx);
+            }
+            SidebarAction::Pull => self.pull_branch(window, cx),
+            SidebarAction::CreateTagAt(oid) => {
+                let card = self.card_for(oid, cx);
+                self.open_ref_dialog(RefDialogKind::CreateTag { card }, window, cx);
+            }
+            SidebarAction::CopyCommitMessage(oid) => self.copy_commit_message(oid, window, cx),
             SidebarAction::PushTag(tag) => {
                 let remote = self.default_remote_name();
                 self.start_network_job(Job::PushTag { remote, tag }, window, cx);
@@ -1874,6 +1887,10 @@ impl RepositoryView {
             }
             SidebarAction::ShowBranchCommits(name) => {
                 self.show_branch_commits(name, window, cx);
+            }
+            SidebarAction::ShowAllCommits => {
+                self.history
+                    .update(cx, |history, cx| history.set_branch_filter(None, cx));
             }
             SidebarAction::ShowWorktrees => {
                 self.set_view(ViewMode::Worktrees, window, cx);
@@ -1981,8 +1998,7 @@ impl RepositoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        cx.write_to_clipboard(ClipboardItem::new_string(url));
-        toast::show(ui::ToastKind::Ok, message, window, cx);
+        crate::copy_with_toast(url, message, window, cx);
     }
 
     /// The configured accounts and this repository's remembered choices.
@@ -2258,20 +2274,14 @@ impl RepositoryView {
     /// `origin` when configured, otherwise the first remote, otherwise
     /// `origin` (the operation then reports the missing remote).
     fn default_remote_name(&self) -> String {
-        let remotes = self
+        let names: Vec<String> = self
             .sidebar_extras
             .as_ref()
-            .map(|extras| &extras.remote_urls)
-            .filter(|urls| !urls.is_empty());
-        let Some(remotes) = remotes else {
-            return "origin".to_owned();
-        };
-        remotes
-            .iter()
-            .find(|(name, _)| name == "origin")
-            .or_else(|| remotes.first())
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| "origin".to_owned())
+            .map(|extras| extras.remote_urls.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default();
+        network_ops::default_remote_of(&names)
+            .unwrap_or("origin")
+            .to_owned()
     }
 
     /// Runs one history-row action.
@@ -3118,6 +3128,9 @@ impl RepositoryView {
             Job::PushTag { tag, .. } => tag.clone(),
             Job::PushTags { .. } => ui::t!("network.push.subject_tags").to_string(),
             Job::DeleteRemoteBranch { branch, .. } => branch.clone(),
+            Job::Push {
+                branch: Some(branch),
+            } => branch.clone(),
             _ => match self.history.read(cx).head() {
                 Some(git_core::Head::Branch { name, .. }) => name.clone(),
                 _ => String::new(),
@@ -3202,7 +3215,9 @@ impl RepositoryView {
         cx: &mut Context<Self>,
     ) {
         if let Some(known) = error_dialog::classify_git_error(error) {
-            if let Some(offer_pull_then_push) = error_dialog_remedy(&known, job) {
+            if let Some(offer_pull_then_push) =
+                error_dialog_remedy(&known, job, self.history.read(cx).head())
+            {
                 let title = known.title();
                 let explanation = known.explanation();
                 let details = error_dialog::raw_output(error);
@@ -3226,6 +3241,7 @@ impl RepositoryView {
                 let body = ui::ToastBody {
                     lines: Vec::new(),
                     action: Some(self.reconnect_action(account.account_id.clone(), cx)),
+                    ..Default::default()
                 };
                 toast::show_with(
                     ui::ToastKind::Error,
@@ -3332,6 +3348,7 @@ impl RepositoryView {
             Some(ui::ToastBody {
                 lines,
                 action: None,
+                ..Default::default()
             }),
             window,
             cx,
@@ -3343,16 +3360,18 @@ impl RepositoryView {
     /// The remotes that can take a pull request, the current branch's
     /// upstream first. Pure: no network, no keychain.
     fn pr_targets(&self, cx: &App) -> Vec<PrTarget> {
+        let history = self.history.read(cx);
+        self.pr_targets_in(history.head(), history.refs().unwrap_or(&[]), cx)
+    }
+
+    /// [`Self::pr_targets`] over a given HEAD and refs, for callers that run
+    /// inside an update of the history (which cannot be read then).
+    fn pr_targets_in(&self, head: Option<&Head>, refs: &[Ref], cx: &App) -> Vec<PrTarget> {
         let Some(extras) = self.sidebar_extras.as_ref() else {
             return Vec::new();
         };
         let (accounts, remembered) = self.account_settings(cx);
-        let history = self.history.read(cx);
-        let preferred = web_links::upstream_remote(
-            history.head(),
-            history.refs().unwrap_or(&[]),
-            &extras.remote_targets,
-        );
+        let preferred = web_links::upstream_remote(head, refs, &extras.remote_targets);
         pr_logic::pr_targets(
             &accounts,
             &extras.remote_targets,
@@ -3443,15 +3462,16 @@ impl RepositoryView {
 
     /// The remote the local branch `branch` tracks, if it is a configured one.
     fn branch_upstream_remote(&self, branch: &str, cx: &App) -> Option<String> {
+        self.branch_upstream_remote_in(branch, self.history.read(cx).refs().unwrap_or(&[]))
+    }
+
+    /// [`Self::branch_upstream_remote`] over a given list of refs.
+    fn branch_upstream_remote_in(&self, branch: &str, refs: &[Ref]) -> Option<String> {
         let remote_targets: &[remote_accounts::RemoteTargets] = self
             .sidebar_extras
             .as_ref()
             .map_or(&[], |extras| &extras.remote_targets);
-        self.history
-            .read(cx)
-            .refs()
-            .unwrap_or(&[])
-            .iter()
+        refs.iter()
             .find(|r| r.kind == RefKind::LocalBranch && r.name == branch)
             .and_then(|r| r.upstream.as_deref())
             .and_then(|upstream| web_links::split_remote_ref(upstream, remote_targets))
@@ -3574,12 +3594,53 @@ impl RepositoryView {
         );
     }
 
+    /// Copies `oid`'s full message; `CommitInfo` carries only the subject, so
+    /// the body is read in the background.
+    fn copy_commit_message(&mut self, oid: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+                return;
+            }
+        };
+        let root = self.root.clone();
+        let window_handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &root)?;
+                    repo.commit_details(oid)
+                })
+                .await;
+            cx.update(|cx| match result {
+                Ok(details) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(full_message_text(&details)));
+                }
+                Err(error) => {
+                    window_handle
+                        .update(cx, |_, window, cx| {
+                            toast::show(
+                                ui::ToastKind::Error,
+                                ui::t!("history.refmenu.message_failed", error = error.to_string()),
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn pull_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.start_network_job(Job::Pull, window, cx);
     }
 
     pub(crate) fn push_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_network_job(Job::Push, window, cx);
+        self.start_network_job(Job::Push { branch: None }, window, cx);
     }
 
     /// Starts the sidebar's background load when the history first reports a
@@ -6396,6 +6457,7 @@ impl RepositoryView {
         let body = ui::ToastBody {
             lines: Vec::new(),
             action: Some(self.reconnect_action(id.clone(), cx)),
+            ..Default::default()
         };
         toast::show_with(
             ui::ToastKind::Error,
@@ -6952,6 +7014,12 @@ impl Render for RepositoryView {
             .child(body)
             .child(status)
     }
+}
+
+/// The text "Copy › Full message" puts on the clipboard: the raw commit message
+/// (`%B`), not `summary + body`, since `%s` joins a wrapped first paragraph.
+fn full_message_text(details: &CommitDetails) -> String {
+    details.message.clone()
 }
 
 /// A toolbar item with rich content: icon · bold name · chevron.
@@ -7611,6 +7679,28 @@ fn node_toggler(
 mod tests {
     use super::*;
     use gpui::px;
+
+    #[test]
+    fn full_message_text_is_the_raw_message() {
+        let details = CommitDetails {
+            id: Oid::from_hex(&"a".repeat(40)).unwrap(),
+            parents: Vec::new(),
+            author_name: String::new(),
+            author_email: String::new(),
+            author_time: 0,
+            committer_name: String::new(),
+            committer_email: String::new(),
+            committer_time: 0,
+            // `%s` joins the wrapped first paragraph into one line.
+            summary: "A long subject wrapped over two lines".to_owned(),
+            body: "Body".to_owned(),
+            message: "A long subject wrapped\nover two lines\n\nBody".to_owned(),
+        };
+        assert_eq!(
+            full_message_text(&details),
+            "A long subject wrapped\nover two lines\n\nBody"
+        );
+    }
 
     /// Builds the real window (the workspace frame around the repository
     /// view) in a test window and returns the bounds of the sidebar filter.
@@ -9532,7 +9622,7 @@ mod tests {
         assert!(follow_with_push(&Job::Pull, true));
         assert!(!follow_with_push(&Job::Pull, false));
         // Any later job, including a plain pull, must not inherit the intent.
-        assert!(!follow_with_push(&Job::Push, true));
+        assert!(!follow_with_push(&Job::Push { branch: None }, true));
         assert!(!follow_with_push(
             &Job::Fetch(FetchOptions::default()),
             true
@@ -9540,9 +9630,36 @@ mod tests {
     }
 
     #[test]
-    fn only_a_branch_push_offers_pull_then_push() {
+    fn only_a_push_of_the_checked_out_branch_offers_pull_then_push() {
+        let head = Head::Branch {
+            name: "main".to_owned(),
+            target: None,
+        };
+        let push = |branch: Option<&str>| Job::Push {
+            branch: branch.map(str::to_owned),
+        };
+        // The current branch by name, and via the toolbar (`None`): offered.
+        for job in [push(Some("main")), push(None)] {
+            assert_eq!(
+                error_dialog_remedy(&KnownError::PushRejected, &job, Some(&head)),
+                Some(true)
+            );
+        }
+        // Another branch, or no branch checked out: the pull would not help.
         assert_eq!(
-            error_dialog_remedy(&KnownError::PushRejected, &Job::Push),
+            error_dialog_remedy(&KnownError::PushRejected, &push(Some("feat")), Some(&head)),
+            Some(false)
+        );
+        assert_eq!(
+            error_dialog_remedy(&KnownError::PushRejected, &push(Some("main")), None),
+            Some(false)
+        );
+        assert_eq!(
+            error_dialog_remedy(
+                &KnownError::PushRejected,
+                &Job::Push { branch: None },
+                Some(&head)
+            ),
             Some(true)
         );
         for job in [
@@ -9559,21 +9676,29 @@ mod tests {
             },
         ] {
             assert_eq!(
-                error_dialog_remedy(&KnownError::PushRejected, &job),
+                error_dialog_remedy(&KnownError::PushRejected, &job, Some(&head)),
                 Some(false),
                 "{job:?} must show the dialog without the pull-then-push remedy"
             );
         }
         assert_eq!(
-            error_dialog_remedy(&KnownError::PullNotFastForward, &Job::Pull),
+            error_dialog_remedy(&KnownError::PullNotFastForward, &Job::Pull, Some(&head)),
             Some(false)
         );
         assert_eq!(
-            error_dialog_remedy(&KnownError::PullNotFastForward, &Job::Push),
+            error_dialog_remedy(
+                &KnownError::PullNotFastForward,
+                &Job::Push { branch: None },
+                Some(&head)
+            ),
             None
         );
         assert_eq!(
-            error_dialog_remedy(&KnownError::LocalChangesOverwritten, &Job::Pull),
+            error_dialog_remedy(
+                &KnownError::LocalChangesOverwritten,
+                &Job::Pull,
+                Some(&head)
+            ),
             None
         );
     }

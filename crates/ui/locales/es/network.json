@@ -5,6 +5,7 @@
   "network.done.fetch": "Obtención completada",
   "network.done.pull": "Traer completado",
   "network.done.push": "Se envió la rama actual",
+  "network.done.push_branch": "Rama {branch} enviada",
   "network.done.push_tag": "Etiqueta {tag} enviada",
   "network.done.push_tags": "Se enviaron todas las etiquetas",
   "network.done.up_to_date": "Ya está actualizado",

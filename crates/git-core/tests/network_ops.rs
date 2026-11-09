@@ -351,6 +351,68 @@ fn pushes_all_tags() {
 }
 
 #[test]
+fn pushes_a_non_current_branch_and_sets_its_upstream() {
+    let (source, _remote, repo) = source_with_remote();
+    git(source.path(), &["branch", "feat"]);
+    network::push(
+        &repo,
+        &PushOptions {
+            remote: Some("origin".to_owned()),
+            refspec: Some("feat".to_owned()),
+            set_upstream: true,
+        },
+        &NetworkContext::default(),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(branch(&repo), "main");
+    let feat = repo
+        .refs()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.kind == RefKind::LocalBranch && r.name == "feat")
+        .unwrap();
+    assert_eq!(feat.upstream.as_deref(), Some("origin/feat"));
+}
+
+#[test]
+fn pushes_a_branch_to_a_differently_named_upstream() {
+    let (source, remote, repo) = source_with_remote();
+    git(source.path(), &["branch", "feat"]);
+    commit_file(source.path(), "f.txt", "f", "on main");
+    network::push(
+        &repo,
+        &PushOptions {
+            remote: Some("origin".to_owned()),
+            refspec: Some("feat:feature-x".to_owned()),
+            set_upstream: true,
+        },
+        &NetworkContext::default(),
+        &CancelToken::new(),
+        |_| {},
+    )
+    .unwrap();
+    // The remote's `feature-x` holds local `feat`'s commit, not `main`'s, and
+    // no stray `feat` branch appears there.
+    let feat = git_out(source.path(), &["rev-parse", "feat"]);
+    let remote_x = git_out(remote.path(), &["rev-parse", "refs/heads/feature-x"]);
+    assert_eq!(feat.trim(), remote_x.trim());
+    assert_ne!(
+        feat.trim(),
+        git_out(source.path(), &["rev-parse", "main"]).trim()
+    );
+    let upstream = repo
+        .refs()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.kind == RefKind::LocalBranch && r.name == "feat")
+        .unwrap()
+        .upstream;
+    assert_eq!(upstream.as_deref(), Some("origin/feature-x"));
+}
+
+#[test]
 fn sets_an_upstream_explicitly() {
     let (source, _remote, source_repo) = source_with_remote();
     git(source.path(), &["branch", "feat"]);

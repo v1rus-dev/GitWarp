@@ -5,13 +5,13 @@
   const stage = G.h('<div class="stage"><div class="scen" id="scen"></div><div class="winwrap"></div><div class="notes" id="notes"></div></div>'); document.body.appendChild(stage);
   const sh = G.shell({ host: stage.querySelector('.winwrap'), w: 1200, h: 800, view: 'changes', statusInfo: '4 unstaged · 3 staged' });
   const win = sh.win;
-  const BRANCH = 'main', FALLBACK = 'src/history/graph.rs';
+  const BRANCH = 'main', LONG_BRANCH = 'v1rus-dev/some_improvements', FALLBACK = 'src/history/graph.rs';
   const initial = () => ({
     unstaged: [{ st: 'M', path: 'src/history/graph.rs', a: 9, d: 3 }, { st: 'M', path: 'src/ui/toolbar.rs', a: 4, d: 1 }, { st: 'q', path: 'docs/graph.md', a: 38, d: 0 }, { st: 'D', path: 'scripts/old-release.sh', a: 0, d: 22 }],
     staged: [{ st: 'M', path: 'src/ui/sidebar.rs', a: 6, d: 4 }, { st: 'A', path: 'src/settings/git_exec.rs', a: 11, d: 0 }, { st: 'R', path: 'src/ui/tree.rs', old: 'src/ui/tree_view.rs', a: 2, d: 2 }]
   });
   const LBL = { A: 'Added', M: 'Modified', D: 'Deleted', R: 'Renamed', q: 'Untracked', U: 'Conflicted' };
-  const S = Object.assign(initial(), { sel: { g: 'u', path: 'src/history/graph.rs' }, status: 'ok', diffState: null, mode: 'unified', discard: null, picked: new Set(), amend: false, noCommits: false, msg: 'feat(graph): clip lanes past the column edge\n\nSkip paths that are fully outside the clipped column so wide graphs\nstay cheap to paint.', busy: false, op: null, conflicts: [], opTotal: 0, step: 2, abortAsk: false });
+  const S = Object.assign(initial(), { branch: null, sel: { g: 'u', path: 'src/history/graph.rs' }, status: 'ok', diffState: null, mode: 'unified', discard: null, picked: new Set(), amend: false, noCommits: false, msg: 'feat(graph): clip lanes past the column edge\n\nSkip paths that are fully outside the clipped column so wide graphs\nstay cheap to paint.', busy: false, op: null, conflicts: [], opTotal: 0, step: 2, abortAsk: false });
 
   /* local toast: errors stay until dismissed, everything else auto-hides after 5 s (G.toast hides every kind) */
   const toast = (msg, kind) => {
@@ -21,6 +21,9 @@
     t.querySelector('button').onclick = () => t.remove(); c.appendChild(t);
     if (kind !== 'error') setTimeout(() => t.remove(), 5000);
   };
+  const PLANNED = '<span class="planned-tag">Planned</span>';
+  /* menu with the Planned marker on items flagged planned:true (W1's G.menu may not draw it itself) */
+  const menuP = (e, items) => { const close = G.menu(win, e, items); win.querySelectorAll('.menu .menu-item').forEach((el) => { const it = items[+el.dataset.i]; if (it && it.planned && !el.querySelector('.planned-tag')) el.insertAdjacentHTML('beforeend', PLANNED); }); return close; };
   const list = (g) => (g === 'c' ? S.conflicts : g === 'u' ? S.unstaged : S.staged);
   const cur = () => { const f = list(S.sel.g).find((x) => x.path === S.sel.path); return f ? { f, g: S.sel.g } : null; };
   const all = () => [...S.conflicts.map((f) => ({ f, g: 'c' })), ...S.unstaged.map((f) => ({ f, g: 'u' })), ...S.staged.map((f) => ({ f, g: 's' }))];
@@ -37,15 +40,19 @@
 
   /* ---- merge / rebase in progress: operation banner, Conflicts group, conflict markers in the diff ---- */
   const REPLAYED = G.commits[2]; /* the commit being replayed in the rebase sample (commit 2 of 4) */
-  const OP_FILES = { merge: ['src/history/graph.rs', 'src/ui/sidebar.rs', 'src/settings/git_exec.rs'], rebase: ['src/history/graph.rs', 'src/ui/sidebar.rs'] };
+  const OP_FILES = { merge: ['src/history/graph.rs', 'src/ui/sidebar.rs', 'src/settings/git_exec.rs'], squash: ['src/history/graph.rs', 'src/ui/sidebar.rs', 'src/settings/git_exec.rs'], mergeu: ['src/history/graph.rs', 'src/ui/sidebar.rs', 'src/settings/git_exec.rs'], rebase: ['src/history/graph.rs', 'src/ui/sidebar.rs'] };
   /* sides are named by branch, never ours/theirs; in a rebase the "current" side is the new base (feat/palette) and the other is the commit being replayed */
   const sides = () => (S.op === 'rebase' ? { a: 'feat/palette', aMark: 'feat/palette (upstream)', b: REPLAYED.hash, bMark: `${REPLAYED.hash} ${REPLAYED.summary}`, bTake: `commit ${REPLAYED.hash}` } : { a: 'main', aMark: 'main', b: 'feat/palette', bMark: 'feat/palette', bTake: 'feat/palette' });
+  /* SQUASH_MSG as git writes it; the commit box opens with it prefilled (changes_view.rs: prepared commit message) */
+  const SQUASH_MSG = 'Squashed commit of the following:\n\ncommit 9f3c1a2e0b7d4c55a1e8f2d6b3c4a7e9d0f1b2c3\nAuthor: Mira Vance <mira@example.com>\nDate:   Mon Nov 9 11:42:10 2026 +0100\n\n    feat(palette): add the command palette\n';
   const enterOp = (kind, resolved, step) => {
     Object.assign(S, initial(), { op: kind, abortAsk: false, picked: new Set(), discard: null, diffState: null, amend: false, noCommits: false, status: 'ok', step: step || 2 });
     const files = OP_FILES[kind]; S.opTotal = files.length;
     S.conflicts = files.map((p) => ({ st: 'U', path: p }));
     S.unstaged = S.unstaged.filter((f) => !files.includes(f.path)); S.staged = S.staged.filter((f) => !files.includes(f.path));
     if (kind === 'merge') S.msg = "Merge branch 'feat/palette'";
+    if (kind === 'mergeu') S.msg = 'Merge commit';
+    if (kind === 'squash') S.msg = SQUASH_MSG;
     S.sel = { g: 'c', path: files[0] };
     if (resolved) files.slice().forEach((p) => resolveFile(p, null, true));
   };
@@ -58,39 +65,46 @@
     const nx = S.conflicts[0]; S.sel = nx ? { g: 'c', path: nx.path } : { g: 's', path }; S.diffState = null; S.picked.clear();
   }
   const finishOp = () => {
-    const merge = S.op === 'merge'; clearOp();
-    toast(merge ? 'Merged feat/palette into main' : 'Rebased main onto feat/palette', 'ok');
+    const op = S.op, n = S.staged.length; clearOp();
+    toast(op === 'merge' ? 'Merge committed' : op === 'mergeu' ? 'Merge committed' : op === 'squash' ? `Committed ${plural(n, 'file')} to ${BRANCH}` : 'Rebased main onto feat/palette', 'ok');
   };
+  /* banner titles/texts: changes.json "changes.merge.*" / "changes.squash.*". A squash message names no branch; a merge whose MERGE_MSG has none reads "Merge in progress". */
   function opBar() {
     if (!S.op) return '';
-    const merge = S.op === 'merge', left = S.conflicts.length, done = left === 0, kind = done ? 'info' : 'warn';
+    const rebase = S.op === 'rebase', squash = S.op === 'squash', left = S.conflicts.length, done = left === 0, kind = done ? 'info' : 'warn';
     const tip = (label, inner) => (done ? inner : `<span data-tip="${label}">${inner}</span>`);
-    const title = merge ? 'Merging feat/palette into main' : `Rebasing main onto feat/palette · commit ${S.step} of 4`;
-    let detail = merge ? (done ? 'All conflicts resolved — commit to finish the merge' : `${left} of ${S.opTotal} conflicted files left`)
+    const title = rebase ? `Rebasing main onto feat/palette · commit ${S.step} of 4 ${PLANNED}` : squash ? 'Squash in progress into main' : S.op === 'mergeu' ? 'Merge in progress into main' : 'Merging feat/palette into main';
+    let detail = !rebase ? (done ? (squash ? 'All conflicts resolved — commit to finish the squash' : 'All conflicts resolved — commit to finish the merge') : `${left} conflicted file${left === 1 ? '' : 's'} left`)
       : `<div class="mono"><span class="hash">${REPLAYED.hash}</span> ${esc(REPLAYED.summary)}</div>${done ? 'All conflicts resolved — continue to replay the next commit' : `${left} of ${S.opTotal} conflicted files left`}`;
     let acts;
     if (S.abortAsk) {
-      detail = merge ? 'Abort the merge? Changes from feat/palette are dropped and main goes back to where it was.' : 'Abort the rebase? main goes back to where it was before the rebase.';
-      acts = `<button class="btn btn-sm btn-danger" data-act="abortYes">${merge ? 'Abort merge' : 'Abort rebase'}</button><button class="btn btn-sm" data-act="abortNo">${merge ? 'Keep merging' : 'Keep rebasing'}</button>`;
-    } else if (merge) acts = `<button class="btn btn-sm btn-danger" data-act="abort">Abort merge</button>${tip('Resolve all conflicts first', `<button class="btn btn-sm btn-primary" data-act="opDone"${done ? '' : ' disabled'}>Commit merge</button>`)}`;
+      detail = squash ? 'Abort the squash? The staged changes are dropped and main goes back to where it was. Files you already resolved go back to how they were before the squash.'
+        : S.op === 'mergeu' ? 'Abort the merge? The merged changes are dropped and main goes back to where it was. Files you already resolved go back to how they were before the merge.'
+        : rebase ? 'Abort the rebase? main goes back to where it was before the rebase.'
+        : 'Abort the merge? Changes from feat/palette are dropped and main goes back to where it was. Files you already resolved go back to how they were before the merge.';
+      acts = `<button class="btn btn-sm btn-danger" data-act="abortYes">${rebase ? 'Abort rebase' : squash ? 'Abort squash' : 'Abort merge'}</button><button class="btn btn-sm" data-act="abortNo">${rebase ? 'Keep rebasing' : 'Keep merging'}</button>`;
+    } else if (!rebase) acts = `<button class="btn btn-sm btn-danger" data-act="abort">${squash ? 'Abort squash' : 'Abort merge'}</button>${tip('Resolve all conflicts first', `<button class="btn btn-sm btn-primary" data-act="opDone"${done && (!squash || S.staged.length) ? '' : ' disabled'}>${squash ? 'Commit' : 'Commit merge'}</button>`)}`;
     else acts = `<button class="btn btn-sm btn-danger" data-act="abort">Abort</button><button class="btn btn-sm" data-act="skip">Skip commit</button>${tip('Resolve all conflicts first', `<button class="btn btn-sm btn-primary" data-act="opDone"${done ? '' : ' disabled'}>Continue</button>`)}`;
     return `<div class="banner ${kind} chg-op" role="status">${ic(done ? 'info' : 'warn', 16)}<div style="min-width:0"><div class="b-title">${title}</div><div>${detail}</div></div><div class="opacts">${acts}</div></div>`;
   }
+  /* app rows: status U + path; right-click / Enter / Menu key open the menu; Xs "Resolve…" opens the editor */
   const conflictRow = (f) => {
     const d = f.path.lastIndexOf('/'), sel = S.sel.g === 'c' && S.sel.path === f.path;
-    return `<div class="frow${sel ? ' sel' : ''}" role="option" aria-selected="${sel}" tabindex="-1" data-g="c" data-p="${esc(f.path)}"><span class="fs U" aria-label="Conflicted">U</span><span class="fname" title="${esc(f.path)}"><bdi><span class="fdir">${esc(f.path.slice(0, d + 1))}</span>${esc(f.path.slice(d + 1))}</bdi></span><span class="acts"><button class="btn btn-xs btn-ghost" data-act="openTool" data-tip="Open in merge tool" aria-label="Open in merge tool">${ic('external', 12)}</button><button class="btn btn-xs btn-ghost" data-act="cmenu" data-tip="Resolve…" aria-label="Resolve options">…</button></span></div>`;
+    return `<div class="frow${sel ? ' sel' : ''}" role="option" aria-selected="${sel}" tabindex="-1" data-g="c" data-p="${esc(f.path)}"><span class="fs U" aria-label="Conflicted">U</span><span class="fname" title="${esc(f.path)}"><bdi><span class="fdir">${esc(f.path.slice(0, d + 1))}</span>${esc(f.path.slice(d + 1))}</bdi></span><span class="acts"><button class="btn btn-xs btn-ghost" data-act="resolveRow" data-tip="Resolve in GitWarp…" aria-label="Resolve in GitWarp…" style="width:auto;padding:0 6px">Resolve…</button></span></div>`;
   };
   const conflictGroup = () => `<section class="grp grp-c" aria-label="Conflicts"><div class="grp-h"><span>Conflicts</span><span class="ncount">${S.conflicts.length}</span></div><div class="flist" role="listbox" tabindex="0" aria-label="Conflicts files" data-g="c">${S.conflicts.length ? S.conflicts.map(conflictRow).join('') : '<div class="none">All conflicts resolved</div>'}</div></section>`;
   /* GitWarp's own conflict editor (conflicts.html): resolve chunk by chunk */
   const openEditor = (path) => { location.href = 'conflicts.html?op=' + (S.op || 'merge') + '&file=' + encodeURIComponent(path); };
+  /* app menu order: Resolve in GitWarp… —, Take ours, Take theirs, —, Mark as resolved. "Open in merge tool" is not shipped (Planned). */
   const conflictMenu = (path) => { const sd = sides(); return [
     { label: 'Resolve in GitWarp…', icon: 'edit', onClick: () => openEditor(path) },
     { sep: 1 },
     { label: `Take ${sd.a}`, icon: 'check', onClick: () => { resolveFile(path, 'a'); render(); } },
     { label: `Take ${sd.bTake}`, icon: 'check', onClick: () => { resolveFile(path, 'b'); render(); } },
     { sep: 1 },
-    { label: 'Open in merge tool', icon: 'external', onClick: () => toast(`Opened ${path} in your merge tool`, 'info') },
-    { label: 'Mark as resolved', icon: 'plus', onClick: () => { resolveFile(path); render(); } }]; };
+    { label: 'Mark as resolved', icon: 'plus', onClick: () => { resolveFile(path); render(); } },
+    { sep: 1 },
+    { label: 'Open in merge tool', icon: 'external', planned: true, onClick: () => toast(`Opened ${path} in your merge tool`, 'info') }]; };
   /* conflict markers: GitWarp does not edit them yet; the diff pane shows the file as git wrote it */
   function conflictHTML(f) {
     const sd = sides(), rows = [
@@ -124,8 +138,8 @@
     const noSel = !c || S.diffState === 'none';
     const side = c && c.g === 'c' ? 'conflicted' : c && c.g === 'u' ? 'unstaged' : 'staged';
     const path = c ? (c.f.old ? `${c.f.path} ← ${c.f.old}` : c.f.path) : '';
-    const nStaged = S.staged.length, canCommit = !S.busy && (nStaged > 0 || S.amend) && !S.conflicts.length && S.op !== 'rebase';
-    const commitLabel = S.op === 'merge' ? 'Commit merge' : S.amend ? 'Amend commit' : `Commit ${plural(nStaged, 'file')} to ${BRANCH}`;
+    const nStaged = S.staged.length, merging = S.op === 'merge' || S.op === 'mergeu', canCommit = !S.busy && (merging ? true : (nStaged > 0 || S.amend)) && !S.conflicts.length && S.op !== 'rebase';
+    const commitLabel = merging ? 'Commit merge' : S.amend ? 'Amend commit' : `Commit ${plural(nStaged, 'file')} to ${S.branch || BRANCH}`;
     const subj = S.msg.split('\n')[0].length, wide = Math.max(0, ...S.msg.split('\n').slice(1).map((l) => l.length));
     sh.center.innerHTML = `${opBar()}<div class="chg-wrap">
       <div class="lists" tabindex="-1">${S.discard ? `<div class="discardbar" role="alertdialog" aria-label="Confirm discard"><span class="msg" title="${esc(S.discard)}">Discard changes to ${esc(S.discard)}?</span><button class="btn btn-sm btn-danger" data-act="doDiscard">Discard</button><button class="btn btn-sm" data-act="cancelDiscard">Cancel</button></div>` : ''}${S.op ? conflictGroup() : ''}${groupHTML('u', 'Unstaged', 'Stage all')}${groupHTML('s', 'Staged', 'Unstage all')}</div>
@@ -138,7 +152,7 @@
           <div class="od-row" style="margin-top:6px;gap:16px"><span class="cnt${subj > 50 ? ' over' : ''}" id="subj">Subject ${subj} / 50</span><span class="cnt${wide > 72 ? ' over' : ''}" id="wide">Longest body line ${wide} / 72</span><span class="od-fill"></span><span class="cnt">Ctrl+Enter to commit</span></div></div>
         <div class="cb-side">
           <div class="od-stack" style="--od-gap:4px"><div class="switch${S.amend ? ' on' : ''}${S.noCommits ? ' dis' : ''}" id="amend" role="switch" aria-checked="${S.amend}" aria-disabled="${S.noCommits}" tabindex="${S.noCommits ? -1 : 0}"><span class="track"></span><span>Amend previous commit</span></div><div class="field-help" style="margin:0">${S.noCommits ? 'There is no commit to amend yet.' : 'Amend reuses the message of e4f2a91 and rewrites it.'}</div></div>
-          <div class="od-stack" style="--od-gap:8px"><button class="btn btn-primary" id="commit"${canCommit ? '' : ' disabled'}>${commitLabel}</button><button class="btn" id="commitPush"${canCommit ? '' : ' disabled'}>Commit &amp; Push</button></div>
+          <div class="od-stack" style="--od-gap:8px"><button class="btn btn-primary btn-trunc" id="commit" title="${esc(commitLabel)}"${canCommit ? '' : ' disabled'}><span class="lbl">${esc(commitLabel)}</span></button><button class="btn" id="commitPush"${canCommit ? '' : ' disabled'}>Commit &amp; Push</button></div>
         </div>
       </div></div>`;
     // diff body
@@ -186,8 +200,7 @@
     const t = e.target, act = t.closest('[data-act]'), row = t.closest('.frow');
     if (act && row) {
       const g = row.dataset.g, p = row.dataset.p, a = act.dataset.act;
-      if (a === 'openTool') return toast(`Opened ${p} in your merge tool`, 'info');
-      if (a === 'cmenu') { select('c', p); render(); const r = act.getBoundingClientRect(); return G.menu(win, { clientX: r.left, clientY: r.bottom }, conflictMenu(p)); }
+      if (a === 'resolveRow') return openEditor(p);
       if (a === 'stage') { move(p, 'u', 's'); S.sel = { g: 's', path: p }; toast(`Staged ${p}`, 'ok'); }
       else if (a === 'unstage') { move(p, 's', 'u'); S.sel = { g: 'u', path: p }; toast(`Unstaged ${p}`, 'ok'); }
       else if (a === 'discard') { S.discard = p; select('u', p); S.discard = p; }
@@ -198,7 +211,7 @@
       if (a === 'resolve') return openEditor(S.sel.path);
       if (a === 'abort') S.abortAsk = true;
       else if (a === 'abortNo') S.abortAsk = false;
-      else if (a === 'abortYes') { const merge = S.op === 'merge'; clearOp(); toast(merge ? 'Merge aborted, main is back where it was' : 'Rebase aborted, main is back where it was', 'ok'); }
+      else if (a === 'abortYes') { const op = S.op; clearOp(); toast(op === 'rebase' ? 'Rebase aborted, main is back where it was' : op === 'squash' ? 'Squash aborted' : 'Merge aborted', 'ok'); }
       else if (a === 'opDone') { if (!S.conflicts.length) finishOp(); }
       else if (a === 'skip') { if (S.step < 4) { const n = S.step + 1; enterOp('rebase', false, n); toast(`Skipped ${REPLAYED.hash}; now at commit ${n} of 4`, 'info'); } else { clearOp(); toast('Rebased main onto feat/palette', 'ok'); } }
       else if (a === 'stageAll') { const n = S.unstaged.length; S.staged.push(...S.unstaged.splice(0)); toast(`Staged ${plural(n, 'file')}`, 'ok'); }
@@ -226,7 +239,7 @@
     const am = t.closest('#amend');
     if (am && !S.noCommits) toggleAmend();
   });
-  sh.center.addEventListener('contextmenu', (e) => { const row = e.target.closest('.frow[data-g="c"]'); if (!row) return; select('c', row.dataset.p); render(); G.menu(win, e, conflictMenu(row.dataset.p)); });
+  sh.center.addEventListener('contextmenu', (e) => { const row = e.target.closest('.frow[data-g="c"]'); if (!row) return; select('c', row.dataset.p); render(); menuP(e, conflictMenu(row.dataset.p)); });
   sh.center.addEventListener('keydown', (e) => {
     if (e.target.id === 'amend' && (e.key === ' ' || e.key === 'Enter') && !S.noCommits) { e.preventDefault(); toggleAmend(); return; }
     if (e.target.id === 'msg' && e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); doCommit(false); return; }
@@ -245,9 +258,10 @@
   let draft = '';
   function toggleAmend() { if (!S.amend) { draft = S.msg; S.msg = HEAD_MSG; } else S.msg = draft; S.amend = !S.amend; render(); }
   function doCommit() {
-    if (S.op === 'merge') { if (!S.conflicts.length) finishOp(); return; }
+    if (S.op === 'merge' || S.op === 'mergeu') { if (!S.conflicts.length) finishOp(); return; }
     if (!S.msg.trim()) { toast('Write a commit message first', 'warn'); return; }
     if (!(S.staged.length || S.amend)) return;
+    if (S.op === 'squash') { if (!S.conflicts.length) finishOp(); return; } /* a squash commits like a plain commit, from what it staged */
     toast(S.amend ? 'Amended the previous commit' : `Committed ${plural(S.staged.length, 'file')} to ${BRANCH}`, 'ok');
     S.staged = []; S.msg = ''; S.amend = false; S.picked.clear(); if (S.sel.g === 's') S.sel = { g: 'u', path: S.unstaged[0] ? S.unstaged[0].path : '' }; render();
   }
@@ -258,16 +272,17 @@
   const groups = [
     ['Lists & status', [['work', 'Working tree'], ['discard', 'Discard confirm'], ['clean', 'Clean tree'], ['loading', 'Loading status'], ['failure', 'Status failed']]],
     ['Diff pane', [['loaded', 'Loaded'], ['none', 'No selection'], ['dloading', 'Loading'], ['derror', 'Error'], ['binary', 'Binary'], ['empty', 'No changes']]],
-    ['Commit box', [['cb', 'Default'], ['amend', 'Amend on'], ['nocommit', 'No commits yet'], ['nostage', 'Nothing staged'], ['nomsg', 'Empty message']]],
-    ['Operation', [['op-none', 'None'], ['op-merge', 'Merge · conflicts'], ['op-merge-ok', 'Merge · resolved'], ['op-rebase', 'Rebase · conflicts'], ['op-rebase-ok', 'Rebase · resolved']]],
+    ['Commit box', [['cb', 'Default'], ['longbranch', 'Long branch name'], ['amend', 'Amend on'], ['nocommit', 'No commits yet'], ['nostage', 'Nothing staged'], ['nomsg', 'Empty message']]],
+    ['Operation', [['op-none', 'None'], ['op-merge', 'Merge · conflicts'], ['op-merge-ok', 'Merge · resolved'], ['op-mergeu', 'Merge · branch unknown'], ['op-squash', 'Squash · conflicts'], ['op-squash-ok', 'Squash · resolved'], ['op-rebase', 'Rebase · conflicts <span class="planned-tag">Planned</span>'], ['op-rebase-ok', 'Rebase · resolved <span class="planned-tag">Planned</span>']]],
     ['Toasts', [['t-ok', 'Ok'], ['t-warn', 'Warn'], ['t-err', 'Error']]]
   ];
   scen.innerHTML = groups.map(([l, items]) => `<div class="grp-s"><span class="l">${l}</span><div class="seg sm" role="group" aria-label="${l}">${items.map(([k, t]) => `<button data-s="${k}">${t}</button>`).join('')}</div></div>`).join('');
-  const reset = () => { Object.assign(S, initial(), { op: null, conflicts: [], opTotal: 0, abortAsk: false, sel: { g: 'u', path: 'src/history/graph.rs' }, status: 'ok', diffState: null, discard: null, picked: new Set(), amend: false, noCommits: false, msg: 'feat(graph): clip lanes past the column edge\n\nSkip paths that are fully outside the clipped column so wide graphs\nstay cheap to paint.' }); };
+  const reset = () => { Object.assign(S, initial(), { branch: null, op: null, conflicts: [], opTotal: 0, abortAsk: false, sel: { g: 'u', path: 'src/history/graph.rs' }, status: 'ok', diffState: null, discard: null, picked: new Set(), amend: false, noCommits: false, msg: 'feat(graph): clip lanes past the column edge\n\nSkip paths that are fully outside the clipped column so wide graphs\nstay cheap to paint.' }); };
   scen.addEventListener('click', (e) => {
     const b = e.target.closest('[data-s]'); if (!b) return; const k = b.dataset.s;
     if (k === 'op-none') clearOp();
     else if (k === 'op-merge') enterOp('merge'); else if (k === 'op-merge-ok') enterOp('merge', true);
+    else if (k === 'op-mergeu') enterOp('mergeu'); else if (k === 'op-squash') enterOp('squash'); else if (k === 'op-squash-ok') enterOp('squash', true);
     else if (k === 'op-rebase') enterOp('rebase'); else if (k === 'op-rebase-ok') enterOp('rebase', true);
     else if (k === 'work') reset();
     else if (k === 'discard') { reset(); S.discard = 'docs/graph.md'; S.sel = { g: 'u', path: 'docs/graph.md' }; }
@@ -276,7 +291,8 @@
     else if (k === 'loaded') { S.diffState = null; S.status = 'ok'; if (!cur()) S.sel = { g: 'u', path: 'src/history/graph.rs' }; }
     else if (k === 'none') S.diffState = 'none'; else if (k === 'dloading') S.diffState = 'loading'; else if (k === 'derror') S.diffState = 'error';
     else if (k === 'binary') S.diffState = 'binary'; else if (k === 'empty') S.diffState = 'empty';
-    else if (k === 'cb') { S.amend = false; S.noCommits = false; S.msg = initialMsg(); if (!S.staged.length) S.staged = initial().staged; }
+    else if (k === 'longbranch') { S.branch = LONG_BRANCH; S.amend = false; S.noCommits = false; S.msg = initialMsg(); if (!S.staged.length) S.staged = initial().staged; }
+    else if (k === 'cb') { S.branch = null; S.amend = false; S.noCommits = false; S.msg = initialMsg(); if (!S.staged.length) S.staged = initial().staged; }
     else if (k === 'amend') { S.noCommits = false; if (!S.amend) { draft = S.msg; S.msg = HEAD_MSG; S.amend = true; } }
     else if (k === 'nocommit') { S.noCommits = true; S.amend = false; }
     else if (k === 'nostage') { S.unstaged.push(...S.staged.splice(0)); S.amend = false; }
@@ -296,7 +312,9 @@
     ['Hunks and lines', 'Hunk button: Stage hunk / Unstage hunk, or Stage n lines / Unstage n lines when lines are picked. Disabled while busy, for renamed or conflicted files, and for a staged added file. Click a line-number gutter to pick a line, Shift+click for a range within the hunk; picks reset on selection change. Unstaged: added / modified / deleted files; staged: modified only.'],
     ['Side-by-side', 'The toggle is saved to settings (shared with Diff settings). In side-by-side there is no hunk button and the gutters are not clickable: no hunk or line staging.'],
     ['Diff rendering', 'No syntax highlighting: text colour plus changed-word emphasis. No gutter tint on context lines, no row hover, hunk headers are not sticky, an empty split side is a flat hover fill. With line numbers off in Diff settings there are no gutters and so no picking.'],
-    ['Merge and rebase', 'While a merge or rebase runs, a full-width banner sits above the lists and the diff: warn while conflicts are left, info once all are resolved. Merge: Abort merge (danger, asks inline first) and Commit merge (primary, disabled until every conflict is resolved; the commit box is prefilled with the merge message and uses the same label). Rebase: "commit n of 4" with the commit being replayed, Abort, Skip commit and Continue (disabled while unresolved); the commit box cannot commit during a rebase. A Conflicts group sits above Unstaged: status U, count in the header, per row Open in merge tool and a … menu (also right-click) with Take main / Take feat/palette and Mark as resolved; sides are named by branch, never ours/theirs, and in a rebase they are feat/palette (the new base) and the commit being replayed. Resolving moves the file to Staged and updates the banner. A conflicted file shows its conflict markers in the diff pane; no hunk or line staging. GitWarp\'s own conflict editor comes later. In the app, Merge with conflicts closes the dialog and switches to Changes.'],
+    ['Merge and rebase', 'While a merge or squash runs, a full-width banner sits above the lists and the diff: warn while conflicts are left, info once all are resolved. Merge: Abort merge (danger, asks inline first) and Commit merge (primary, disabled until every conflict is resolved; the commit box is prefilled with the merge message and uses the same label). A Conflicts group sits above Unstaged: status U, count in the header, an Xs Resolve… per row and a menu (right-click, Enter, Menu key) with Resolve in GitWarp…, Take main / Take feat/palette and Mark as resolved; sides are named by branch, never ours/theirs. Resolving moves the file to Staged and updates the banner. A conflicted file shows its conflict markers in the diff pane with Resolve… (opens the conflict editor, conflicts.html); no hunk or line staging. PLANNED, not shipped: the rebase banner (commit n of 4, Abort, Skip commit, Continue) and the menu item Open in merge tool. In the app, Merge with conflicts closes the dialog and switches to Changes.'],
+    ['Long branch names', 'DESIGN RULE (the app has a bug here): the shipped primary button clips its label at the column edge, so "Commit 0 files to v1rus-dev/some_improvements" runs out of the button and is cut by the window. The intended rule drawn here: the button keeps the column width and the label truncates with an ellipsis inside it; the full label is the tooltip.'],
+    ['Squash and merge banners', 'Squash in progress: title "Squash in progress into {head}" (a squash message names no branch), buttons Abort squash (danger, asks inline, "Keep merging" keeps it) and Commit; Changes opens with SQUASH_MSG prefilled and the commit box commits like a plain commit from what the squash staged. A merge whose message has no branch reads "Merge in progress into {head}". Banner detail: "{n} conflicted files left", then "All conflicts resolved — commit to finish the merge / squash". Rebase states are not shipped and stay as Planned.'],
     ['Commit box', 'Primary is disabled while busy, or with nothing staged and amend off. Amend saves the typed draft and fills in HEAD\'s message; turning it off restores the draft; after a commit the message clears and amend switches off. With no commits yet, amend is disabled. Commit & Push is available alongside Commit.']
   ].map(([t, b]) => `<div class="n"><b>${t}</b>${b}</div>`).join('');
 
@@ -305,5 +323,8 @@
   /* deep link: ?op=merge|merge-ok|rebase|rebase-ok opens that operation state */
   const opQ = new URLSearchParams(location.search).get('op'), opBtn = opQ && scen.querySelector(`[data-s="op-${opQ}"]`);
   if (opBtn) opBtn.click();
+  /* deep link: ?s=<scenario key> (e.g. longbranch, nocommit) opens any other state */
+  const sQ = new URLSearchParams(location.search).get('s'), sBtn = sQ && scen.querySelector(`[data-s="${sQ}"]`);
+  if (sBtn) sBtn.click();
   G.fit(win);
 })();

@@ -335,6 +335,7 @@ pub fn start(cx: &mut App) {
                             Some(ToastBody {
                                 lines: Vec::new(),
                                 action: Some(action),
+                                ..Default::default()
                             }),
                             window,
                             cx,

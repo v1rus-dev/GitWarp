@@ -1,4 +1,4 @@
-/* GitWarp — commit activity heatmap (design proposal).
+/* GitWarp — commit activity heatmap (shipped).
    Proposed NEW tokens (to move into tokens.css once accepted): --heat-0 … --heat-4, --heat-cell, --heat-gap.
    Every value is derived from existing tokens; only the mix percentages are new. */
 :root,
@@ -98,3 +98,14 @@
 .ramp th { color: var(--text); font-weight: 600; }
 .ramp .hc { display: inline-block; vertical-align: middle; }
 .stage-cap { max-width: 1240px; margin: 0 auto; padding: 0 16px; }
+
+/* ---------- parity with activity_strip.rs: 13px controls, 20px key caps ---------- */
+.act-head .seg.sm > button { height: 24px; font-size: var(--fs-base); padding: 0 12px; }
+.act-head .select.sm { height: 26px; font-size: var(--fs-base); padding: 0 10px; }
+.act-side { font-size: var(--fs-base); }
+.act-side .kbd { min-width: 20px; height: 20px; padding: 0 4px; border-bottom-width: 1px; font: 400 var(--fs-sm)/18px var(--font-ui); color: var(--muted); }
+/* narrow history pane (details docked right): the side column keeps its 160px minimum, the grid scrolls sideways, header controls never wrap */
+.act-side { min-width: 160px; }
+.act-body .heat-scroll { min-width: 0; }
+.act-head > .seg, .act-head > .select, .act-head > .heat-legend, .act-head > .heat-total { flex: none; white-space: nowrap; }
+.act-head > .heat-total { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }

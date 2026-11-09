@@ -23,46 +23,7 @@
 .tb-search .tb-stat[hidden], .tb-search .tb-kbd[hidden] { display: none; }
 .titlebar .seg > button .od-icon { color: inherit; }
 
-/* Toolbar steps are measured against the app's window-width breakpoints, replacing the older prototype steps.
-   Every block restates all of its properties so it fully overrides the earlier steps in gitwarp.css. */
-.titlebar { gap: 6px; padding: 0 12px; }
-.titlebar .tb-search { flex: 0 1 270px; min-width: 150px; }
-.titlebar .tb-name { max-width: 140px; }
-@container tb (max-width: 1359px) {
-  .titlebar { gap: 6px; padding: 0 12px; }
-  .titlebar .tb-kbd { display: none; }
-  .titlebar .lbl { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-  .titlebar .btn-tool { gap: 4px; padding: 0 8px; }
-  .titlebar .seg > button { padding: 0 8px; gap: 4px; }
-  .titlebar .tb-name { display: block; max-width: 96px; }
-  .titlebar [data-tip="Switch repository"] .tb-name { display: block; }
-  .titlebar .tb-search { flex-basis: 270px; min-width: 150px; }
-}
-@container tb (max-width: 999px) {
-  .titlebar { gap: 6px; padding: 0 12px; }
-  .titlebar .tb-name { max-width: 64px; }
-  .titlebar .tb-search { flex-basis: 180px; min-width: 120px; }
-}
-@container tb (max-width: 869px) {
-  .titlebar { gap: 6px; padding: 0 12px; }
-  .titlebar .tb-name { max-width: 64px; }
-  .titlebar .tb-search { flex-basis: 96px; min-width: 96px; }
-}
-@container tb (max-width: 809px) {
-  .titlebar { gap: 4px; padding: 0 12px; }
-  .titlebar .btn-tool { padding: 0 7px; }
-  .titlebar .seg > button { padding: 0 7px; }
-  .titlebar [data-tip="Switch repository"] .tb-name { display: none; }
-  .titlebar [data-tip="Switch branch"] .tb-name { max-width: 64px; }
-  .titlebar .tb-search { flex-basis: 96px; min-width: 96px; }
-}
-@container tb (max-width: 759px) {
-  .titlebar [data-tip="Switch branch"] .tb-name { display: none; }
-}
-@container tb (max-width: 699px) {
-  .titlebar { gap: 4px; padding: 0 8px; }
-  .titlebar .tb-search { flex-basis: 72px; min-width: 72px; }
-}
+/* Toolbar steps: see the block at the end of this file (app breakpoints, crates/app/src/repo_view.rs toolbar_layout). */
 
 /* ---------- status bar (24px, bg, padding 0 8, gap 12, 12px muted) ---------- */
 .statusbar { background: var(--bg); padding: 0 8px; gap: 12px; font-size: var(--fs-sm); }
@@ -81,9 +42,6 @@
 .splitter.v::after { left: 50%; top: 0; bottom: 0; width: 2px; margin-left: -1px; }
 .splitter.h::after { top: 50%; left: 0; right: 0; height: 2px; margin-top: -1px; }
 .splitter:hover::after, .splitter.drag::after { opacity: 1; }
-.lhead .gh .grip:hover, .lhead .gh .grip.drag { background: transparent; opacity: 1; }
-.lhead .gh .grip::after { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 2px; margin-left: -1px; background: var(--accent); opacity: 0; }
-.lhead .gh .grip:hover::after, .lhead .gh .grip.drag::after { opacity: 1; }
 
 /* ---------- scrollbars: always visible, 6px thumb in border-strong (decision 5) ---------- */
 .tree, .lbody, .dscroll, .flist, .dinfo, .spane { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
@@ -93,7 +51,7 @@
 
 /* ---------- sidebar: no border under the filter; tree scrolls sideways, labels never truncate ---------- */
 .sbfilter { padding: 12px 10px 8px; border-bottom: 0; }
-.sidebar .tree { overflow-x: scroll; overflow-y: auto; padding: 0 0 8px; }
+.sidebar .tree { overflow-x: scroll; overflow-y: scroll; padding: 0 0 8px; }
 .sidebar .tree .node { width: max-content; min-width: calc(100% - 12px); }
 .sidebar .tree .node .nlabel { flex: 1 0 auto; overflow: visible; text-overflow: clip; white-space: nowrap; }
 .sidebar .tree .node .od-icon, .sidebar .tree .node .twisty { flex: none; }
@@ -122,7 +80,7 @@ mark.hl { background: var(--accent-soft); color: inherit; border-radius: 2px; }
 /* graph drawing options (Appearance): monochrome lanes and 1-3px line width */
 .hist.mono .g-e:not(.idle) { stroke: var(--muted); }
 .hist.mono .g-d { fill: var(--muted); }
-.hist.mono .g-d.m { fill: var(--row-bg); stroke: var(--muted); }
+.hist.mono .g-h { stroke: var(--muted); }
 .hist .g-e { stroke-width: var(--line-w); }
 
 /* in-list strips above the rows: loading / cancelled / incomplete */
@@ -134,7 +92,7 @@ mark.hl { background: var(--accent-soft); color: inherit; border-radius: 2px; }
 .strip.load .pct { color: var(--muted); font-size: var(--fs-sm); }
 .strip .od-fill { flex: 1; }
 .hs-body { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.sk { display: grid; grid-template-columns: var(--gw, 112px) minmax(0, 1fr) var(--aw, 130px) var(--dw, 104px) 64px; column-gap: 18px; align-items: center; height: var(--row); margin: 0 6px; padding: 0 18px 0 14px; }
+.sk { display: grid; grid-template-columns: var(--gw, 112px) minmax(0, 1fr) var(--aw, 130px) var(--dw, 104px) var(--hw, 64px); column-gap: 18px; align-items: center; height: var(--row); margin: 0 6px; padding: 0 18px 0 14px; }
 .sk .lane { height: 100%; position: relative; }
 .sk .lane::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: 2px; background: var(--border-strong); opacity: .6; }
 .sk .lane::after { content: ""; position: absolute; left: 2.5px; top: 8.5px; width: 9px; height: 9px; border-radius: 50%; background: var(--border-strong); }
@@ -203,3 +161,113 @@ mark.hl { background: var(--accent-soft); color: inherit; border-radius: 2px; }
 /* ---------- index (overview): keyboard model ---------- */
 .kb .kbd { white-space: nowrap; }
 .kb-note { color: var(--muted); font-size: var(--fs-sm); margin: 8px 0 0; }
+
+
+/* ============================================================================================================
+   W1 — design parity with the shipped app (window shell, sidebar nav, toolbar steps, history, details, status bar)
+   ============================================================================================================ */
+
+/* ---------- sidebar view nav (repo_view.rs render_view_nav: pt10 px6 gap2; active = bold + 2px accent bar on the sidebar's left edge) ---------- */
+.vnav { flex: none; display: flex; flex-direction: column; gap: 2px; padding: 10px 6px 0; }
+.vrow { all: unset; box-sizing: border-box; position: relative; display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 10px; border-radius: var(--r-sm); color: var(--muted); cursor: default; white-space: nowrap; }
+.vrow:hover { background: var(--hover); color: var(--text); }
+.vrow:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.vrow.on { color: var(--text); font-weight: 700; }
+.vrow.on .od-icon { color: var(--text); }
+.vrow.on::before { content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 2px; background: var(--accent); border-radius: 1px; }
+.vrow .od-icon { flex: none; }
+.vrow .vcnt { margin-left: auto; display: inline-flex; gap: 6px; font-size: var(--fs-xs); font-weight: 600; font-variant-numeric: tabular-nums; }
+.vrow .vcnt .a { color: var(--st-added); } .vrow .vcnt .m { color: var(--st-modified); } .vrow .vcnt .d { color: var(--st-deleted); }
+.sbfilter { padding: 14px 10px 8px; }
+
+/* ---------- toolbar ---------- */
+.titlebar .tb-views { flex: none; }
+.titlebar .tb-views > button { height: 26px; }
+.titlebar .tb-name { display: block; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.titlebar .tb-wt .tb-name { max-width: 96px; }
+.titlebar .wt-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--warning); flex: none; }
+.titlebar .tb-search { flex: 0 1 270px; min-width: 150px; }
+.titlebar .btn-tool { padding: 0 8px; }
+.titlebar .counter { min-width: 16px; }
+/* Steps measured against the app's window-width breakpoints (repo_view.rs toolbar_layout). The app's window width includes the 10px
+   shadow band and 1px border per side, so the container (the prototype's window content) is that width minus 22. */
+@container tb (max-width: 1557px) { .titlebar .tb-repo .tb-name, .titlebar .tb-branch .tb-name { max-width: 96px; } .titlebar .tb-wt .tb-name { max-width: 64px; } }
+@container tb (max-width: 1437px) {
+  .titlebar .lbl { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .titlebar .tb-kbd { display: none; }
+}
+@container tb (max-width: 1057px) {
+  .titlebar .tb-name, .titlebar .tb-wt .tb-name { max-width: 64px; }
+  .titlebar .tb-search { flex-basis: 180px; min-width: 120px; }
+}
+@container tb (max-width: 967px) { .titlebar .tb-search { flex-basis: 96px; min-width: 96px; } }
+@container tb (max-width: 947px) { .titlebar .tb-wt .tb-name { display: none; } }
+@container tb (max-width: 877px) {
+  .titlebar { gap: 4px; }
+  .titlebar .btn-tool { padding: 0 7px; }
+  .titlebar .tb-repo .tb-name { display: none; }
+}
+@container tb (max-width: 787px) { .titlebar .tb-branch .tb-name { display: none; } }
+@container tb (max-width: 717px) {
+  .titlebar { gap: 3px; padding: 0 6px; }
+  .titlebar .tb-wt { display: none; }
+  .titlebar .tb-search { flex-basis: 60px; min-width: 60px; }
+}
+
+/* ---------- platform title bars (workspace.rs) ---------- */
+.win[data-platform="windows"] { grid-template-rows: 30px var(--bar) minmax(0, 1fr) var(--status); }
+.win-strip { position: relative; display: flex; align-items: center; background: var(--bg); user-select: none; }
+.win-strip .ws-title { position: absolute; left: 0; right: 0; text-align: center; font-size: var(--fs-sm); color: var(--muted); pointer-events: none; }
+.win-strip .wc { margin: 0 0 0 auto; }
+.win-strip .wc .btn { height: 30px; }
+.win[data-platform="windows"] .titlebar .wc, .win[data-platform="macos"] .titlebar .wc { display: none; }
+.win[data-platform="macos"] .titlebar { position: relative; padding-left: 78px; }
+.mac-lights { position: absolute; left: 14px; top: 13px; display: flex; gap: 8px; }
+.mac-lights i { width: 12px; height: 12px; border-radius: 50%; background: #ff5f57; }
+.mac-lights i.y { background: #febc2e; } .mac-lights i.g { background: #28c840; }
+
+/* ---------- status bar: clickable git chip, dock toggle ---------- */
+.statusbar button.sb-git { font: inherit; background: transparent; border: 0; border-radius: var(--r-sm); }
+.statusbar button.sb-git:hover { background: var(--hover); color: var(--text); }
+.statusbar .sb-git .od-icon { color: inherit; }
+.statusbar .sb-dock { width: 24px; height: 20px; padding: 0; display: inline-flex; align-items: center; justify-content: center; margin: 0 -4px 0 -4px; background: transparent; border: 0; border-radius: var(--r-sm); color: var(--muted); cursor: default; }
+.statusbar .sb-dock:hover { background: var(--hover); color: var(--text); }
+.statusbar .sb-dock.off { color: var(--accent); }
+.statusbar .sb-dock:focus-visible, .statusbar .sb-git:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+
+/* ---------- Planned marker: design-only elements the app does not have yet ---------- */
+/* (.planned-tag itself is defined in gitwarp.css) */
+
+/* ---------- history: column grips (7px; resting 1px divider, accent on hover), merged badges, PR badge, CI glyph ---------- */
+.lhead .hcol { position: relative; }
+.lhead .grip { position: absolute; top: 3px; bottom: 3px; width: 7px; cursor: col-resize; border-radius: 2px; }
+.lhead .hcol .grip { left: -8px; }
+.lhead .grip::before { content: ""; position: absolute; top: 0; bottom: 0; left: 3px; width: 1px; background: var(--border-strong); }
+.lhead .grip:hover, .lhead .grip.drag { background: color-mix(in srgb, var(--accent) 70%, transparent); }
+.lhead .grip:hover::before, .lhead .grip.drag::before { display: none; }
+.lrow .ref .rs { color: var(--muted); font-weight: 500; margin-left: 1px; }
+.lrow .ref.head .rs { color: color-mix(in srgb, var(--accent-fg) 70%, transparent); }
+.lrow .ref.hid + .prb { display: none; }
+.lrow .summary .prb { margin-left: -2px; }
+
+/* ---------- Settings modal (settings_ui: card inset over the window, title bar gear + "Settings" + ×, nav 200, footer) ---------- */
+.set-scrim { padding: 32px 60px; }
+.set-card { max-width: 1080px; max-height: none; background: var(--bg); }
+.set-card .set-tb { padding: 0 8px 0 16px; }
+.set-card .set-sb .sb-git { display: inline-flex; align-items: center; gap: 4px; }
+
+/* ---------- details: host tools + Checks block (repo_view.rs details info pane) ---------- */
+.dinfo .meta { font-size: var(--fs-base); line-height: 20px; gap: 6px 12px; }
+.hosttools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.hosttools .btn { height: 24px; padding: 0 10px; font-size: var(--fs-base); }
+.hosttools .btn .od-icon { color: var(--muted); }
+.chk { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.chk-h { font-weight: 600; font-size: var(--fs-sm); color: var(--muted); }
+.chk-row { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto 20px; align-items: center; gap: 8px; height: 26px; font-size: var(--fs-sm); }
+.chk.card { padding: 12px; gap: 8px; border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--surface); }
+.chk.card.err { border-color: color-mix(in srgb, var(--error) 55%, transparent); background: color-mix(in srgb, var(--error) 10%, transparent); }
+.chk-t { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.chk-t .od-icon { color: var(--error); }
+.chk.card p { margin: 0; color: var(--muted); }
+.chk .btn { align-self: stretch; height: 26px; }
+.chk .chk-open { align-self: flex-start; }

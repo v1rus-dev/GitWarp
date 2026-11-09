@@ -240,7 +240,7 @@ textarea.input { height: auto; padding: 6px 8px; resize: none; line-height: 1.5;
 
 /* ---------- history list + commit graph ---------- */
 .hist { display: flex; flex-direction: column; min-height: 0; min-width: 0; flex: 1; background: var(--bg); container-type: inline-size; }
-.lhead, .lrow { display: grid; grid-template-columns: var(--gw, 112px) minmax(0, 1fr) var(--aw, 130px) var(--dw, 104px) 64px; column-gap: 12px; align-items: center; padding: 0 12px 0 8px; }
+.lhead, .lrow { display: grid; grid-template-columns: var(--gw, 112px) minmax(0, 1fr) var(--aw, 130px) var(--dw, 104px) var(--hw, 64px); column-gap: 12px; align-items: center; padding: 0 12px 0 8px; }
 .lhead { height: 26px; background: var(--surface); border-bottom: 1px solid var(--border); color: var(--muted); font-size: var(--fs-sm); font-weight: 600; user-select: none; }
 .lhead .gh { display: flex; align-items: center; gap: 6px; position: relative; height: 100%; }
 .lhead .gh .grip { position: absolute; right: -8px; top: 3px; bottom: 3px; width: 7px; cursor: col-resize; border-radius: 2px; }
@@ -252,7 +252,6 @@ textarea.input { height: auto; padding: 6px 8px; resize: none; line-height: 1.5;
 .lrow.sel { --row-bg: var(--selection-inactive); }
 .lbody:focus-within .lrow.sel, .lrow.sel.active { --row-bg: var(--selection); color: var(--selection-fg); }
 .lbody:focus-within .lrow.sel .au, .lbody:focus-within .lrow.sel .dt, .lbody:focus-within .lrow.sel .hash { color: var(--selection-sub); }
-.lbody:focus-within .lrow.sel .g-h { stroke: var(--selection-fg); }
 .lbody:focus-visible .lrow.kf { outline: 2px solid var(--focus); outline-offset: -2px; }
 .lrow.head .txt { font-weight: 700; }
 .lrow .summary { display: flex; align-items: center; gap: 6px; min-width: 0; }
@@ -278,9 +277,9 @@ textarea.input { height: auto; padding: 6px 8px; resize: none; line-height: 1.5;
 .g-e { fill: none; stroke: hsl(var(--h) var(--graph-s) var(--graph-l)); stroke-width: var(--line-w); stroke-linecap: butt; stroke-linejoin: round; }
 .g-e.v { shape-rendering: crispEdges; } /* straight lane segments snap to the pixel grid (1/3px lines stay sharp); S-curves stay antialiased */
 .g-e.idle { stroke: var(--muted); stroke-dasharray: 2 3; opacity: .6; }
-.g-d { fill: hsl(var(--h) var(--graph-s) var(--graph-l)); stroke: var(--row-bg); stroke-width: 3; paint-order: stroke; }
-.g-d.m { fill: var(--row-bg); stroke: hsl(var(--h) var(--graph-s) var(--graph-l)); stroke-width: 2; paint-order: normal; }
-.g-h { fill: none; stroke: var(--text); stroke-width: 1.5; }
+.g-d { fill: hsl(var(--h) var(--graph-s) var(--graph-l)); stroke: none; }
+.g-halo, .g-mi { fill: var(--row-bg); stroke: none; } /* halo behind a plain dot, interior of a merge ring */
+.g-h { fill: none; stroke: hsl(var(--h) var(--graph-s) var(--graph-l)); stroke-width: 1.5; } /* HEAD ring: lane colour */
 .vs { pointer-events: none; }
 .rowstate { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
 
@@ -344,7 +343,6 @@ textarea.input { height: auto; padding: 6px 8px; resize: none; line-height: 1.5;
 .lhead, .lrow { column-gap: 18px; padding: 0 18px 0 14px; }
 .lbody { padding: 4px 0; }
 .lrow { margin: 0 6px; border-radius: var(--r-md); }
-.lbody:focus-within .lrow.sel .g-h { stroke: var(--text); }
 .node { margin: 0 6px; padding-right: 8px; border-radius: var(--r-sm); }
 .node.cur::before { left: -4px; }
 .node.sec { margin-top: 10px; }
@@ -369,34 +367,11 @@ textarea.input { height: auto; padding: 6px 8px; resize: none; line-height: 1.5;
 .dl .ln { background: transparent; }
 .tabs { background: var(--bg); }
 
-/* ---------- responsive toolbar: labels collapse to icons, counters and controls never disappear ---------- */
+/* responsive toolbar steps live at the end of shell.css */
 .titlebar { container-type: inline-size; container-name: tb; }
 .titlebar > * { flex-shrink: 0; }
 .titlebar > .od-fill { flex-shrink: 1; min-width: 0; }
-.titlebar .tb-search { flex: 0 1 270px; min-width: 150px; width: auto; }
-.titlebar .tb-search .input { min-width: 0; }
-.titlebar .tb-name { display: block; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lbl-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-/* step 1: drop the shortcut hint inside search */
-@container tb (max-width: 1080px) { .titlebar .tb-kbd { display: none; } }
-/* step 2: icon-only actions and view switch (text stays for screen readers + tooltip); counters stay visible */
-@container tb (max-width: 1000px) {
-  .titlebar .lbl { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-  .titlebar .btn-tool { gap: 4px; padding: 0 7px; }
-  .titlebar .seg > button { padding: 0 8px; gap: 4px; }
-  .titlebar .tb-name { max-width: 96px; }
-}
-/* step 3: tighter search and names */
-@container tb (max-width: 840px) {
-  .titlebar .tb-search { flex-basis: 180px; min-width: 120px; }
-  .titlebar .tb-name { max-width: 64px; }
-  .titlebar { gap: 2px; padding: 0 6px; }
-}
-/* step 4: search collapses to an icon button-sized field, repo name shows only its icon */
-@container tb (max-width: 700px) {
-  .titlebar .tb-search { flex-basis: 96px; min-width: 96px; }
-  .titlebar [data-tip="Switch repository"] .tb-name { display: none; }
-}
 
 /* author avatar: image, or generated initials badge (hue from email hash) */
 .avt { --av: 16px; flex: none; display: inline-flex; align-items: center; justify-content: center; width: var(--av); height: var(--av); border-radius: 50%; overflow: hidden; vertical-align: middle; }
@@ -482,3 +457,45 @@ textarea.input { height: auto; padding: 6px 8px; resize: none; line-height: 1.5;
 .bf-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 48px 24px; text-align: center; color: var(--muted); font-size: var(--fs-sm); }
 .bf-empty b { color: var(--text); font-size: var(--fs-md, 14px); }
 @media (prefers-reduced-motion: reduce) { .bf-bar .bf-into, .bf-bar .bf-x, .bf-empty .bf-x { transition: none; } }
+
+
+/* ---------- Planned marker (design-only elements the app does not ship yet; spec in design-parity common brief) ---------- */
+.planned-tag { display: inline-flex; align-items: center; flex: none; height: 16px; padding: 0 5px; border: 1px dashed var(--warning); border-radius: 3px; color: var(--warning); font-size: 10px; font-weight: 600; line-height: 1; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+.menu-item .planned-tag { margin-left: 8px; }
+
+/* ---------- PR badges and CI glyphs (same look as hosting.css; the main pages do not load hosting.css) ---------- */
+.prb { display: inline-flex; align-items: center; gap: 3px; height: 18px; padding: 0 5px; border: 1px solid var(--border-strong); border-radius: var(--r-sm); font-size: var(--fs-xs); font-weight: 600; line-height: 1; background: transparent; color: var(--muted); flex: none; cursor: default; }
+.prb:hover { background: var(--hover); }
+.prb.open { color: var(--success); border-color: color-mix(in srgb, var(--success) 50%, transparent); }
+.prb.draft { color: var(--muted); }
+.prb.merged { color: var(--st-untracked); border-color: color-mix(in srgb, var(--st-untracked) 50%, transparent); }
+.prb.closed { color: var(--error); border-color: color-mix(in srgb, var(--error) 50%, transparent); }
+.prb .rv { margin-left: 2px; }
+.ci { display: inline-flex; align-items: center; flex: none; }
+.ci.passed { color: var(--success); } .ci.failed { color: var(--error); } .ci.running { color: var(--warning); } .ci.pending, .ci.cancelled { color: var(--muted); }
+.wt-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--warning); flex: none; }
+.toast .toast-act { flex: none; }
+
+/* ---------- cascading menus and ref menus (R1, planned; owner: G.menu in app.js) ---------- */
+.menu { overflow-y: auto; }
+.menu.sub { min-width: 240px; }
+.menu-item .menu-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-item.has-sub .menu-label { flex: 0 1 auto; max-width: 220px; margin-right: auto; }
+.menu-hint { margin-left: 12px; color: var(--muted); font-size: var(--fs-sm); white-space: nowrap; flex: none; }
+.menu-item:hover .menu-hint, .menu-item.hi .menu-hint { color: var(--selection-sub); }
+.menu-item.disabled .menu-hint, .menu-item.disabled:hover .menu-hint { color: var(--disabled); }
+.menu-item .menu-chev { width: 12px; margin-left: 4px; }
+.menu-item .od-icon.acc { color: var(--accent); }
+.menu-item:hover .od-icon.acc, .menu-item.hi .od-icon.acc { color: var(--selection-sub); }
+/* a row whose submenu is open keeps the "open" fill and a bright chevron */
+.menu-item.open, .menu-item.open:hover, .menu-item.hi.open { background: var(--active); color: var(--text); }
+.menu-item.open .od-icon, .menu-item.open:hover .od-icon, .menu-item.open .menu-hint { color: var(--muted); }
+.menu-item.open .od-icon.acc, .menu-item.open:hover .od-icon.acc { color: var(--accent); }
+.menu-item.open .menu-chev, .menu-item.open:hover .menu-chev { color: var(--text); }
+.menu.kb .menu-item.hi { outline: 2px solid var(--focus); outline-offset: -2px; }
+.menu-head { display: flex; align-items: center; gap: 4px; padding: 6px 10px 4px; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.menu-head .mh-t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-head .btn { margin-right: -4px; text-transform: none; }
+.menu-head .btn.planned-ico { outline: 1px dashed var(--warning); outline-offset: -1px; color: var(--warning); }
+.menu-field { padding: 2px 4px 6px; }
+.menu-field .input-wrap { height: 28px; }

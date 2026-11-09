@@ -74,6 +74,9 @@ pub struct TextInput {
     last_bounds: Option<Bounds<Pixels>>,
     scroll_offset: f32,
     is_selecting: bool,
+    /// Left/Right at the edge of the text go on to the next binding (see
+    /// [`Self::propagate_edge_arrows`]).
+    propagate_edge_arrows: bool,
 }
 
 impl TextInput {
@@ -91,7 +94,16 @@ impl TextInput {
             last_bounds: None,
             scroll_offset: 0.,
             is_selecting: false,
+            propagate_edge_arrows: false,
         }
+    }
+
+    /// Opt in to passing Left at the start and Right at the end of the text on
+    /// to the next binding instead of swallowing them. Only a field wrapped by
+    /// something that uses those arrows should set it: the menu's filter field
+    /// opens and closes submenus with them.
+    pub fn propagate_edge_arrows(&mut self, on: bool) {
+        self.propagate_edge_arrows = on;
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -181,12 +193,27 @@ impl TextInput {
         self.after_edit(before, cx);
     }
 
+    // With the caret already at an edge (and no selection to collapse) ← / →
+    // have nowhere to go, so the key is passed on to the next binding: a menu
+    // around a filter field uses that to open and close submenus.
     fn move_left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        if self.propagate_edge_arrows && self.model.selection.is_empty() && self.model.cursor() == 0
+        {
+            cx.propagate();
+            return;
+        }
         self.model.move_left();
         cx.notify();
     }
 
     fn move_right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        if self.propagate_edge_arrows
+            && self.model.selection.is_empty()
+            && self.model.cursor() == self.model.text.len()
+        {
+            cx.propagate();
+            return;
+        }
         self.model.move_right();
         cx.notify();
     }

@@ -11,6 +11,7 @@ use gpui::{
 };
 
 use ui::focus::RingOffset;
+use ui::menu::{MenuHeader, MenuTool};
 use ui::metrics::{
     BAR, CTL, DOT_R, FONT_MONO, FONT_UI, FS_BASE, FS_LG, FS_MD, FS_SM, FS_XL, FS_XS, MONO, R_LG,
     R_MD, R_SM, R_XS,
@@ -71,6 +72,7 @@ impl Section {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpenOnStart {
     Menu,
+    RefMenu,
     Select,
     Dialog,
     Toasts,
@@ -80,6 +82,7 @@ impl OpenOnStart {
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
             "menu" => Self::Menu,
+            "refmenu" => Self::RefMenu,
             "select" => Self::Select,
             "dialog" => Self::Dialog,
             "toasts" => Self::Toasts,
@@ -1843,6 +1846,34 @@ fn floating_section(
                 )
                 .child(
                     div()
+                        .id("gallery-ref-menu-area")
+                        .h(px(48.))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(R_MD)
+                        .border_1()
+                        .border_color(colors.border_strong)
+                        .bg(colors.bg)
+                        .text_size(FS_SM)
+                        .text_color(colors.muted)
+                        .cursor_context_menu()
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|_, event: &MouseDownEvent, window, cx| {
+                                menu::open_context_menu(
+                                    event.position,
+                                    ref_menu_entries(),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child("Right-click here for the ref menu (header, hints, filter, 3-level cascade)"),
+                )
+                .child(
+                    div()
                         .flex()
                         .items_center()
                         .gap(px(12.))
@@ -1922,6 +1953,86 @@ fn history_menu_entries() -> Vec<MenuEntry> {
                 .disabled(true),
         ),
     ]
+}
+
+/// A ref menu: header with tools, hints, an accent icon and a filter field.
+fn ref_menu_entries() -> Vec<MenuEntry> {
+    let toast_item = |label: &'static str, message: &'static str| {
+        MenuItem::new(label)
+            .icon(IconName::Branch)
+            .action(move |window, cx| {
+                toast::show(ToastKind::Info, message, window, cx);
+            })
+    };
+    let mut entries = vec![
+        MenuEntry::Header(
+            MenuHeader::new("main")
+                .tool(
+                    MenuTool::new(IconName::Filter, "Show all commits of main")
+                        .selected(true)
+                        .action(|window, cx| {
+                            toast::show(ToastKind::Info, "Branch filter cleared", window, cx);
+                        }),
+                )
+                .tool(
+                    MenuTool::new(IconName::Eye, "Hide from graph").action(|window, cx| {
+                        toast::show(ToastKind::Info, "Hidden from graph", window, cx);
+                    }),
+                ),
+        ),
+        MenuEntry::Item(
+            toast_item("Check out", "Checked out main")
+                .accent_icon()
+                .hint("HEAD +origin"),
+        ),
+        MenuEntry::Item(
+            MenuItem::new("Pull")
+                .icon(IconName::Down)
+                .hint("↑2 ↓1")
+                .action(|window, cx| {
+                    toast::show(ToastKind::Info, "Pulled main", window, cx);
+                }),
+        ),
+        // Three levels: this row -> "Copy" -> "Link". Hover, click, → or Enter opens a level.
+        MenuEntry::Item(MenuItem::new("Copy").icon(IconName::Branch).submenu(|| {
+            let copy = |label: &'static str| {
+                MenuEntry::Item(MenuItem::new(label).action(move |window, cx| {
+                    toast::show(ToastKind::Info, format!("Copied {label}"), window, cx);
+                }))
+            };
+            vec![
+                copy("Branch name"),
+                copy("Commit hash"),
+                MenuEntry::Item(MenuItem::new("Link").submenu(|| {
+                    vec![
+                        MenuEntry::Item(MenuItem::new("Open on GitHub").action(|window, cx| {
+                            toast::show(ToastKind::Info, "Opened on GitHub", window, cx);
+                        })),
+                        MenuEntry::Item(MenuItem::new("Copy link").action(|window, cx| {
+                            toast::show(ToastKind::Info, "Copied link", window, cx);
+                        })),
+                    ]
+                })),
+            ]
+        })),
+        MenuEntry::Separator,
+        MenuEntry::Header(MenuHeader::new("More refs (6)")),
+        MenuEntry::Filter {
+            placeholder: "Filter refs…".into(),
+        },
+    ];
+    entries.extend(
+        [
+            "develop",
+            "feat/lanes",
+            "feat/ssh-keys",
+            "release/0.3",
+            "origin/main",
+            "origin/Hotfix-12",
+        ]
+        .map(|name| MenuEntry::Item(toast_item(name, "Checked out").icon(IconName::Branch))),
+    );
+    entries
 }
 
 /// The Select's options as menu entries, for the `--open select` review flag.
@@ -2018,6 +2129,9 @@ impl Gallery {
                     window.dispatch_action(Box::new(actions::SelectNext), cx);
                 });
                 window.refresh();
+            }
+            OpenOnStart::RefMenu => {
+                menu::open_context_menu(point(px(60.), px(40.)), ref_menu_entries(), window, cx);
             }
             OpenOnStart::Select => {
                 if let Some(anchor) = self.select_bounds.get() {
@@ -2729,7 +2843,7 @@ fn open_popover_button(colors: ThemeColors, cx: &mut Context<ModalPanel>) -> imp
         .child("Open nested popover")
 }
 
-/// `--theme dark|light|system`, `--section <name>`, `--open menu|select|dialog|toasts`;
+/// `--theme dark|light|system`, `--section <name>`, `--open menu|refmenu|select|dialog|toasts`;
 /// unknown values fall back.
 fn parse_args() -> (ThemeMode, Option<Section>, Option<OpenOnStart>) {
     let mut mode = ThemeMode::System;

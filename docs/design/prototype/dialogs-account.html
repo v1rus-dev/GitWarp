@@ -19,7 +19,7 @@
 (function () {
   const D = GLD, H = GLH;
   /* Each scene opens the real dialog in one state; flows also run live (type a token, pick a service, wait for the browser).
-     Hints for the live probe: an address containing "down" is unreachable, "tls" has an untrusted certificate, "gitlab" under GitHub is a different service.
+     Hints for the live probe: an address containing "down" is unreachable, "tls" has an untrusted certificate, "nosvc" is not a supported service, "gitlab" under GitHub is a different service. Browser sign-in exists for github.com only (as in the app); "Planned" marks what the app does not do yet.
      Hints for tokens: "bad" is rejected, "noperm" lacks permissions, "net" times out, anything else connects. */
   const T = 'ghp_9f3kL2xQ7mVb81aZ';
   const A = (st, o) => (w) => H.accountDialog(w, Object.assign({ existing: H.DEFAULT }, o || {}, { st: Object.assign({ static: true }, st) }));
@@ -33,37 +33,42 @@
     ['2 · Instance: self-hosted, empty URL', A(self('gitlab', ''))],
     ['2 · Instance: invalid URL', A(self('gitlab', 'gitlab modsen'))],
     ['2 · Probe: checking…', A(self('gitlab', 'https://gitlab.modsen.app', { probe: 'checking' }))],
-    ['2 · Probe: detected GitLab 18.4 self-managed', A(self('gitlab', 'https://gitlab.modsen.app', { probe: 'ok' }))],
-    ['2 · Probe: detected GitHub Enterprise Server', A(self('github', 'https://git.acme.corp', { probe: 'ok' }))],
+    ['2 · Probe: detected GitLab 18.4 (self-managed)', A(self('gitlab', 'https://gitlab.modsen.app', { probe: 'ok' }))],
+    ['2 · Probe: detected GitHub 3.14 (Enterprise Server)', A(self('github', 'https://git.acme.corp', { probe: 'ok' }))],
     ['2 · Probe: different service type', A(self('github', 'https://gitlab.modsen.app', { probe: 'other', probeSvc: 'gitlab' }))],
     ['2 · Probe: unreachable', A(self('gitlab', 'https://gitlab-down.modsen.app', { probe: 'unreach' }))],
+    ['2 · Probe: no supported service found', A(self('gitlab', 'https://nosvc.modsen.app', { probe: 'notrec' }))],
+    ['2 · Instance: plain HTTP warning', A(self('gitlab', 'http://gitlab.intranet', { probe: 'ok' }))],
     ['2 · Probe: certificate not trusted', A(self('gitea', 'https://git.internal.acme.corp', { probe: 'tls' }))],
     ['3 · Token: GitHub', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'token' })],
     ['3 · Token: GitHub, token pasted (masked)', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'token', token: T })],
     ['3 · Token: GitHub, token shown', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'token', token: T, show: true })],
+    ['3 · Token: plain HTTP warning', A({ svc: 'gitea', step: 3, inst: 'self', url: 'http://git.intranet', probe: 'ok', method: 'token' })],
+    ['3 · Token: keychain not available', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'token', token: T, storeErr: 'Secret Service: no secret service provider or dbus session found' })],
     ['3 · Token: GitLab self-hosted', A({ svc: 'gitlab', step: 3, inst: 'self', url: 'https://gitlab.modsen.app', probe: 'ok', method: 'token' })],
     ['3 · Token: Gitea / Forgejo', A({ svc: 'gitea', step: 3, inst: 'public', probe: 'ok', method: 'token' })],
     ['3 · Token: Bitbucket (browser not offered)', A({ svc: 'bitbucket', step: 3, inst: 'public', probe: 'ok', method: 'token' })],
     ['3 · Token: Azure DevOps (browser not offered)', A({ svc: 'azure', step: 3, inst: 'public', probe: 'ok', method: 'token' })],
-    ['3 · Browser: github.com ready', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'browser' })],
-    ['3 · Browser: gitlab.com ready', A({ svc: 'gitlab', step: 3, inst: 'public', probe: 'ok', method: 'browser' })],
-    ['3 · Browser: self-hosted, Client ID missing (off)', A({ svc: 'gitlab', step: 3, inst: 'self', url: 'https://gitlab.modsen.app', probe: 'ok', method: 'browser' })],
-    ['3 · Browser: self-hosted, Client ID entered', A({ svc: 'gitlab', step: 3, inst: 'self', url: 'https://gitlab.modsen.app', probe: 'ok', method: 'browser', clientId: '3f9a1c2e7b84d605' })],
-    ['3 · Browser: GitHub Enterprise, Client ID missing', A({ svc: 'github', step: 3, inst: 'self', url: 'https://git.acme.corp', probe: 'ok', method: 'browser' })],
+    ['3 · Browser: github.com ready (the only service with browser sign-in)', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'browser' })],
+    ['3 · Browser: gitlab.com (disabled, “Coming soon”)', A({ svc: 'gitlab', step: 3, inst: 'public', probe: 'ok', method: 'token' })],
+    ['3 · Browser: self-hosted GitLab (disabled)', A({ svc: 'gitlab', step: 3, inst: 'self', url: 'https://gitlab.modsen.app', probe: 'ok', method: 'token' })],
+    ['3 · Browser: GitHub Enterprise (disabled)', A({ svc: 'github', step: 3, inst: 'self', url: 'https://git.acme.corp', probe: 'ok', method: 'token' })],
     ['Waiting · device code (GitHub)', A(wait('github', 'public', '', 'device'))],
-    ['Waiting · device code (GitLab self-hosted)', A(wait('gitlab', 'self', 'https://gitlab.modsen.app', 'device', { secs: 312 }))],
-    ['Waiting · browser redirect (Forgejo)', A(wait('gitea', 'public', '', 'redirect'))],
+    ['Waiting · device code (GitLab self-hosted) — Planned', A(wait('gitlab', 'self', 'https://gitlab.modsen.app', 'device', { secs: 312 }))],
+    ['Waiting · browser redirect (Forgejo) — Planned', A(wait('gitea', 'public', '', 'redirect'))],
     ['Result · connected', A({ svc: 'bitbucket', step: 'res', inst: 'public', probe: 'ok', method: 'token', login: 'mira-k' })],
     ['Result · connected, label required (2nd account on host)', A({ svc: 'github', step: 'res', inst: 'public', probe: 'ok', method: 'browser', login: 'mira-k-oss' })],
     ['Result · label missing (validation)', A({ svc: 'github', step: 'res', inst: 'public', probe: 'ok', method: 'browser', login: 'mira-k-oss', labelErr: true })],
     ['Error · wrong token', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'token', token: 'ghp_bad_token', res: { k: 'wrong' } })],
     ['Error · missing permissions', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'token', token: T, res: { k: 'perms' }, miss: ['workflow', 'read:user'] })],
-    ['Error · denied in browser', A({ svc: 'gitlab', step: 3, inst: 'public', probe: 'ok', method: 'browser', res: { k: 'denied' } })],
+    ['Error · denied in browser', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'browser', res: { k: 'denied' } })],
     ['Error · code expired', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'browser', res: { k: 'expired' } })],
+    ['Error · could not check the token', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'token', token: T, res: { k: 'other' } })],
+    ['Result · token could not be saved', A({ svc: 'github', step: 'res', inst: 'public', probe: 'ok', method: 'token', login: 'mira-k', saveErr: 'Secret Service: the collection is locked' })],
     ['Error · network', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'token', token: T, res: { k: 'net' } })],
     ['Reconnect · token invalid (Forgejo, token)', A({ svc: 'gitea', step: 3, inst: 'public', probe: 'ok', method: 'token', login: 'mira-k' }, { mode: 'reconnect', existing: [] })],
     ['Reconnect · self-hosted GitLab, token', A({ svc: 'gitlab', step: 3, inst: 'self', url: 'https://gitlab.modsen.app', probe: 'ok', method: 'token', login: 'yegor.cheprasov' }, { mode: 'reconnect', existing: [] })],
-    ['Reconnect · GitHub, browser sign-in', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'browser', login: 'mira-k' }, { mode: 'reconnect', existing: [] })],
+    ['Reconnect · github.com, browser sign-in', A({ svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'browser', login: 'mira-k' }, { mode: 'reconnect', existing: [] })],
     ['Reconnect · connected', A({ svc: 'github', step: 'res', inst: 'public', probe: 'ok', method: 'browser', login: 'mira-k', mode: 'reconnect' }, { mode: 'reconnect', existing: [] })],
     ['LIVE · start from step 1 (interactive)', (w) => H.accountDialog(w, { existing: H.DEFAULT })]
   ], null, { label: 'Dialog state', reopen: 'Reopen dialog' });

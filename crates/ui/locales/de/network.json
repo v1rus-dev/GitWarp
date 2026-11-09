@@ -5,6 +5,7 @@
   "network.done.fetch": "Fetch abgeschlossen",
   "network.done.pull": "Pull abgeschlossen",
   "network.done.push": "Aktueller Branch gepusht",
+  "network.done.push_branch": "{branch} gepusht",
   "network.done.push_tag": "Tag {tag} gepusht",
   "network.done.push_tags": "Alle Tags gepusht",
   "network.done.up_to_date": "Bereits auf dem neuesten Stand",

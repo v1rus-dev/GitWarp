@@ -21,6 +21,8 @@
     ['Check out a tag', (w) => D.checkout(w, { origin: 'tag', target: 'v0.3.0' })],
     ['Check out a commit', (w) => D.checkout(w, { origin: 'commit', target: '8d41f6e' })],
     ['Bring changes → git refuses (error toast)', (w) => D.checkout(w, { origin: 'branch', target: 'fix/git-detect', conflict: true })],
+    ['Error fix · branch is in use', (w) => D.errorFix(w, { kind: 'worktree' })],
+    ['Error fix · local changes would be overwritten', (w) => D.errorFix(w, { kind: 'local' })],
     ['Clean work tree · no dialog, just a toast', (w) => D.toastStrip(w, [['ok', 'Switched to feat/palette']])]
   ]);
 })();

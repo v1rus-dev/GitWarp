@@ -19,14 +19,18 @@
 (function () {
   const S = GLS, G = GL, H = GLH, ic = G.ic, esc = G.esc;
   /* Presentation switcher only: which variant of the page to show. */
-  const SCN = { list: 'Accounts (6, all statuses)', import: 'Accounts + CLI import banner', empty: 'No accounts yet', emptyimp: 'No accounts + CLI import banner', one: 'One account, all connected' };
+  const SCN = { list: 'Accounts (6, all statuses)', import: 'Accounts + CLI import banner', empty: 'No accounts yet', emptyimp: 'No accounts + CLI import banner', one: 'One account, all connected', importerr: 'CLI import with errors', keychain: 'Keychain unusable' };
   let scn = new URLSearchParams(location.search).get('s') || 'list';
-  let accts = H.accounts(), imp = H.CLI.slice();
+  const EXTRA = { id: 'a7', svc: 'bitbucket', host: 'bitbucket.org', login: 'mira-k', label: 'mira-k', method: 'token', status: 'unchecked' }; /* local-only row: shows "Not checked" without touching the shared sample accounts */
+  const ERR = { 'mira-k@github.com': 'gh did not answer in time', 'yegor.cheprasov@gitlab.modsen.app': 'The token is missing permissions: api, write_repository' };
+  if (S.get('show-ci', undefined) === undefined) S.set('show-ci', true);
+  let accts = H.accounts(), imp = H.CLI.slice(), impSt = {};
   const load = () => {
-    imp = H.CLI.slice();
+    imp = H.CLI.slice(); impSt = {};
+    if (scn === 'importerr') Object.keys(ERR).forEach((k) => { impSt[k] = { fail: ERR[k] }; });
     if (scn === 'empty' || scn === 'emptyimp') accts = [];
     else if (scn === 'one') accts = [H.DEFAULT[0]].map((a) => Object.assign({}, a));
-    else accts = H.DEFAULT.map((a) => Object.assign({}, a));
+    else accts = H.DEFAULT.map((a) => Object.assign({}, a)).concat(scn === 'list' ? [Object.assign({}, EXTRA)] : []);
     if (scn === 'list' || scn === 'empty' || scn === 'one') imp = [];
   };
   load();
@@ -36,16 +40,17 @@
     return `${re}<button class="btn btn-icon btn-ghost btn-sm" data-ren="${a.id}" data-tip="Rename label" aria-label="Rename label of ${esc(H.label(a))}">${ic('edit', 14)}</button><button class="btn btn-icon btn-ghost btn-sm" data-prof="${a.id}" data-tip="Open profile in browser" aria-label="Open ${esc(a.login)} profile on ${esc(a.host)}">${ic('external', 14)}</button><button class="btn btn-icon btn-ghost btn-sm" data-rm="${a.id}" data-tip="Remove account" aria-label="Remove ${esc(H.label(a))}">${ic('trash', 14)}</button>`;
   };
   const row = (a) => `<div class="arow${a.status === 'expiring' ? ' warnrow' : ''}" data-id="${a.id}">${H.svcIcon(a.svc)}${H.avatar(a.login)}<div style="min-width:0"><div class="nm"><span class="od-truncate">${esc(H.label(a))}</span>${H.label(a) !== a.login ? `<span class="lg">@${esc(a.login)}</span>` : ''}</div><div class="meta"><span>${esc(a.host)}</span><span class="sep" aria-hidden="true">·</span><span style="display:inline-flex;gap:4px;align-items:center">${meth(a)}</span></div></div><div>${H.statHTML(a)}</div><div class="acts">${actions(a)}</div></div>`;
-  const impBanner = () => !imp.length ? '' : `<div class="impbanner" role="region" aria-label="Accounts found in command-line tools">${ic('info', 16)}<div><div class="b-title" style="font-weight:600">Found signed-in gh / glab CLI accounts</div><div class="muted" style="font-size:var(--fs-sm)">Import them to reuse the same access in GitWarp. The token is copied to the system keychain.</div></div>${imp.map((c) => `<div class="improw" style="grid-column:1/-1">${H.svcIcon(c.svc)}<div style="min-width:0"><b>${esc(c.login)}</b> <span class="muted">· ${esc(c.host)} · via ${c.tool}</span></div><div class="od-row"><button class="btn btn-sm btn-primary" data-imp="${c.login}@${c.host}">Import</button><button class="btn btn-sm" data-dis="${c.login}@${c.host}">Dismiss</button></div></div>`).join('')}</div>`;
+  const impBanner = () => !imp.length ? '' : `<div class="impbanner" role="region" aria-label="Accounts found in command-line tools">${ic('info', 16)}<div><div class="b-title" style="font-weight:600">Found signed-in gh / glab CLI accounts</div><div class="muted" style="font-size:var(--fs-sm)">Import them to reuse the same access in GitWarp. The token is copied to the system keychain.</div></div>${imp.map((c) => `<div class="improw" style="grid-column:1/-1">${H.svcIcon(c.svc)}<div style="min-width:0"><b>${esc(c.login)}</b> <span class="muted">· ${esc(c.host)} · via ${c.tool}</span></div><div class="od-row"><button class="btn btn-sm btn-primary" data-imp="${c.login}@${c.host}"${(impSt[c.login + '@' + c.host] || {}).busy ? ' disabled' : ''}>${(impSt[c.login + '@' + c.host] || {}).busy ? 'Importing…' : 'Import'}</button><button class="btn btn-sm" data-dis="${c.login}@${c.host}"${(impSt[c.login + '@' + c.host] || {}).busy ? ' disabled' : ''}>Dismiss</button></div>${(impSt[c.login + '@' + c.host] || {}).fail && !(impSt[c.login + '@' + c.host] || {}).busy ? `<div style="grid-column:1/-1;padding-left:30px;font-size:var(--fs-sm);color:var(--error)">${esc(impSt[c.login + '@' + c.host].fail)}</div>` : ''}</div>`).join('')}</div>`;
   const ctx = S.mount('settings-accounts.html', 'Accounts', () => {
-    const list = accts.length ? `<div class="slist" role="list" aria-label="Accounts">${accts.map(row).join('')}</div>` : `<div class="slist"><div class="empty"><div class="ei" style="width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--surface);border:1px solid var(--border)">${ic('org', 20)}</div><b>No accounts yet</b><p style="margin:0;max-width:52ch">Accounts let GitWarp clone private repositories, push and pull over HTTPS, and show pull requests and CI status. You can add several, even for the same service.</p><button class="btn btn-primary" data-add>${ic('plus', 14)}Add account</button></div></div>`;
+    const list = accts.length ? `<div class="slist" role="list" aria-label="Accounts">${accts.map(row).join('')}</div>` : `<div class="slist"><div class="empty"><div class="ei" style="width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--surface);border:1px solid var(--border)">${ic('cloud', 20)}</div><b>No accounts yet</b><p style="margin:0;max-width:52ch">Accounts let GitWarp clone private repositories, push and pull over HTTPS, and show pull requests and CI status. You can add several, even for the same service.</p><button class="btn btn-primary" data-add>${ic('plus', 14)}Add account</button></div></div>`;
+    const keyErr = scn === 'keychain' ? `<div style="max-width:760px;margin-bottom:12px">${S.dbanner('error', 'The system keychain cannot be used', 'Secret Service: no secret service provider or dbus session found')}</div>` : '';
     return `<h2>Accounts</h2><p class="lead">Sign in to GitHub, GitLab, Gitea / Forgejo, Bitbucket or Azure DevOps, on public or self-hosted instances. Used for private clones, HTTPS push and pull, pull requests and CI status.</p>
-      ${impBanner()}
+      ${keyErr}${impBanner()}
       <section class="sgroup"><div class="od-row" style="margin-bottom:6px"><h3 class="sgh od-fill">Accounts${accts.length ? ' · ' + accts.length : ''}</h3>${accts.length ? `<button class="btn btn-primary btn-sm" data-add>${ic('plus', 14)}Add account</button>` : ''}</div>${list}
-      <div class="kchain">${ic('lock', 14)}<span>Tokens are kept in the system keychain (libsecret on Linux, Credential Manager on Windows, Keychain on macOS), not in settings.json.</span></div></section>`;
+      <div class="kchain">${ic('lock', 14)}<span>Tokens are kept in the system keychain (libsecret on Linux, Credential Manager on Windows, Keychain on macOS), not in settings.json.</span></div></section>${S.group('CI status', [S.row('Show CI status', 'Checks for every commit row on screen, refreshed while they run. Off hides all CI indicators and sends no check requests.', S.sw('show-ci', S.get('show-ci', true), 'Show CI status'))])}`;
   }, null, { stagebar: `<label class="scn" style="display:inline-flex;gap:8px;align-items:center;font-size:12px">Page state <select id="scn" aria-label="Page state" style="height:24px;background:var(--bg);color:var(--text);border:1px solid var(--border-strong);border-radius:var(--r-sm)">${Object.entries(SCN).map(([k, v]) => `<option value="${k}"${k === scn ? ' selected' : ''}>${v}</option>`).join('')}</select></label>` });
   const win = ctx.win, pane = ctx.pane, by = (id) => accts.find((a) => a.id === id);
-  const save = () => { H.saveAccounts(accts); ctx.draw(); };
+  const save = () => { H.saveAccounts(accts.filter((a) => a.id !== EXTRA.id)); ctx.draw(); };
   document.getElementById('scn').addEventListener('change', (e) => { scn = e.target.value; load(); ctx.draw(); });
 
   const addDialog = (o) => H.accountDialog(win, Object.assign({ existing: accts, onDone: (a) => { accts.push(a); save(); ctx.toast(`Connected ${H.SVC[a.svc].name} account ${H.label(a)}`, 'ok'); } }, o || {}));
@@ -64,7 +69,7 @@
     const rn = t('[data-ren]'); if (rn) return rename(by(rn.dataset.ren));
     const pf = t('[data-prof]'); if (pf) { const a = by(pf.dataset.prof); return ctx.toast(`Opened https://${a.host}/${a.login} in your browser`, 'info'); }
     const rm = t('[data-rm]'); if (rm) return confirmRm(by(rm.dataset.rm));
-    const im = t('[data-imp]'); if (im) { const [l, h] = im.dataset.imp.split('@'); const c = imp.find((x) => x.login === l && x.host === h); imp = imp.filter((x) => x !== c); accts.push({ id: 'a' + Date.now(), svc: c.svc, host: c.host, login: c.login, label: c.login, method: 'token', from: c.tool, status: 'ok' }); save(); return ctx.toast(`Imported ${c.login} from ${c.tool}`, 'ok'); }
+    const im = t('[data-imp]'); if (im) { const [l, h] = im.dataset.imp.split('@'); const c = imp.find((x) => x.login === l && x.host === h); const k = l + '@' + h; if (impSt[k] && impSt[k].fail) { impSt[k].busy = true; ctx.draw(); setTimeout(() => { impSt[k].busy = false; ctx.draw(); }, 800); return; } imp = imp.filter((x) => x !== c); accts.push({ id: 'a' + Date.now(), svc: c.svc, host: c.host, login: c.login, label: c.login, method: 'token', from: c.tool, status: 'ok' }); save(); return ctx.toast(`Imported ${c.login} from ${c.tool}`, 'ok'); }
     const ds = t('[data-dis]'); if (ds) { const [l, h] = ds.dataset.dis.split('@'); imp = imp.filter((x) => !(x.login === l && x.host === h)); return ctx.draw(); }
   });
 })();

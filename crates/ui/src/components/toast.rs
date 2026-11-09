@@ -2,8 +2,9 @@
 //!
 //! Toasts are drawn by [`crate::overlay::render_overlays`] above every layer,
 //! bottom-right and newest last. Errors stay until dismissed, and so does any
-//! toast with a button (five seconds are too short to press one); every other
-//! toast hides itself after five seconds.
+//! toast with a button (five seconds are too short to press one) unless the
+//! caller gives it an explicit lifetime; every other toast hides itself after
+//! five seconds.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, App, BorrowAppContext, ClipboardItem, Div, ElementId, FontWeight, Global,
+    div, px, App, BorrowAppContext, ClipboardItem, Div, ElementId, FocusHandle, FontWeight, Global,
     InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
     Styled, Window, WindowId,
 };
@@ -62,13 +63,21 @@ impl ToastKind {
     }
 }
 
-/// Whether a toast hides itself: not an error and without a button (the
-/// message button or any line button), which needs more than five seconds.
-fn auto_hides(kind: ToastKind, body: Option<&ToastBody>) -> bool {
+/// How long a toast stays, or `None` when it stays until dismissed. Errors
+/// never hide; a toast with a button (the message button or any line button)
+/// stays too, since five seconds are too short to press it, unless the caller
+/// sets an explicit [`ToastBody::lifetime`] (e.g. an Undo toast that lives 8 s).
+fn lifetime_of(kind: ToastKind, body: Option<&ToastBody>) -> Option<Duration> {
+    if !kind.auto_hide() {
+        return None;
+    }
+    if let Some(lifetime) = body.and_then(|body| body.lifetime) {
+        return Some(lifetime);
+    }
     let has_button = body.is_some_and(|body| {
         body.action.is_some() || body.lines.iter().any(|line| line.action.is_some())
     });
-    kind.auto_hide() && !has_button
+    (!has_button).then_some(TOAST_LIFETIME)
 }
 
 /// What a toast button runs.
@@ -127,6 +136,9 @@ pub struct ToastLine {
 pub struct ToastBody {
     pub lines: Vec<ToastLine>,
     pub action: Option<ToastAction>,
+    /// How long the toast stays, also when it has a button (which otherwise
+    /// never hides). Errors still stay until dismissed.
+    pub lifetime: Option<Duration>,
 }
 
 /// One visible toast.
@@ -145,6 +157,11 @@ struct QueuedToast {
     remaining: Option<Duration>,
     hovered: bool,
     selected: bool,
+    /// The whole lifetime, restarted while keyboard focus is inside the toast.
+    lifetime: Option<Duration>,
+    /// Tracks focus inside the toast (its buttons are tab stops); `None` for a
+    /// queue used without a window.
+    focus: Option<FocusHandle>,
 }
 
 /// The pure toast state of one window: ordering, expiry and dismissal.
@@ -179,7 +196,7 @@ impl ToastQueue {
     ) -> ToastId {
         self.next_id += 1;
         let id = ToastId(self.next_id);
-        let auto_hide = auto_hides(kind, body.as_ref());
+        let lifetime = lifetime_of(kind, body.as_ref());
         self.entries.push(QueuedToast {
             toast: Toast {
                 id,
@@ -187,12 +204,21 @@ impl ToastQueue {
                 message: message.into(),
                 body,
             },
-            deadline: auto_hide.then(|| now + TOAST_LIFETIME),
+            deadline: lifetime.map(|lifetime| now + lifetime),
             remaining: None,
             hovered: false,
             selected: false,
+            lifetime,
+            focus: None,
         });
         id
+    }
+
+    /// Lets the queue see whether keyboard focus is inside toast `id`.
+    fn set_focus_handle(&mut self, id: ToastId, focus: FocusHandle) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.toast.id == id) {
+            entry.focus = Some(focus);
+        }
     }
 
     /// Pauses or resumes the timer when the pointer enters, leaves or selects
@@ -307,9 +333,12 @@ pub fn show_with(
     cx: &mut App,
 ) -> ToastId {
     let now = cx.background_executor().now();
-    let auto_hide = auto_hides(kind, body.as_ref());
+    let auto_hide = lifetime_of(kind, body.as_ref()).is_some();
+    let focus = cx.focus_handle();
     let id = with_queue(window, cx, |queue| {
-        queue.push_with(kind, message, body, now)
+        let id = queue.push_with(kind, message, body, now);
+        queue.set_focus_handle(id, focus);
+        id
     });
     window.refresh();
 
@@ -340,10 +369,28 @@ pub fn show_with(
 /// whether the toast is gone.
 fn expire_if_due(id: ToastId, window: &mut Window, cx: &mut App) -> bool {
     let now = cx.background_executor().now();
+    // Read before borrowing the queue: `contains_focused` needs the window.
+    let focused = with_queue(window, cx, |queue| {
+        queue
+            .entries
+            .iter()
+            .find(|entry| entry.toast.id == id)
+            .and_then(|entry| entry.focus.clone())
+    })
+    .is_some_and(|focus| focus.contains_focused(window, cx));
     let (present, removed) = with_queue(window, cx, |queue| {
-        let Some(entry) = queue.entries.iter().find(|entry| entry.toast.id == id) else {
+        let Some(entry) = queue.entries.iter_mut().find(|entry| entry.toast.id == id) else {
             return (false, false);
         };
+        // Keyboard focus inside the toast (on its Undo button) pauses it like the
+        // pointer does: the timer starts over until focus leaves.
+        if focused {
+            // (A toast paused by the pointer has no deadline to restart.)
+            if let (Some(lifetime), None) = (entry.lifetime, entry.remaining) {
+                entry.deadline = Some(now + lifetime);
+            }
+            return (true, false);
+        }
         let due = entry.deadline.is_some_and(|deadline| deadline <= now);
         if due {
             queue.dismiss(id);
@@ -419,8 +466,13 @@ pub(crate) fn render_stack(window: &Window, cx: &App) -> Option<Div> {
         .flex_col()
         .items_end()
         .gap(px(8.));
-    for toast in queue.iter() {
-        stack = stack.child(render_toast(toast, colors, shadows.clone()));
+    for entry in &queue.entries {
+        stack = stack.child(render_toast(
+            &entry.toast,
+            entry.focus.as_ref(),
+            colors,
+            shadows.clone(),
+        ));
     }
     Some(stack)
 }
@@ -443,6 +495,7 @@ fn toast_text(toast: &Toast) -> String {
 
 fn render_toast(
     toast: &Toast,
+    focus: Option<&FocusHandle>,
     colors: ThemeColors,
     shadows: Vec<gpui::BoxShadow>,
 ) -> impl IntoElement {
@@ -556,6 +609,7 @@ fn render_toast(
         .rounded(R_MD)
         .overflow_hidden()
         .shadow(shadows)
+        .when_some(focus, |this, focus| this.track_focus(focus))
         .on_hover(move |hovered, window, cx| {
             set_hovered(id, *hovered, window, cx);
         })
@@ -634,6 +688,7 @@ mod tests {
         let body = ToastBody {
             lines: Vec::new(),
             action: Some(ToastAction::new("View release", |_, _| {})),
+            ..Default::default()
         };
         let with_button = queue.push_with(ToastKind::Info, "update", Some(body), now);
         let line_body = ToastBody {
@@ -644,6 +699,7 @@ mod tests {
                 action: Some(ToastAction::new("Open", |_, _| {})),
             }],
             action: None,
+            ..Default::default()
         };
         let with_line_button = queue.push_with(ToastKind::Ok, "done", Some(line_body), now);
         let plain = queue.push(ToastKind::Info, "fetched", now);
@@ -651,6 +707,39 @@ mod tests {
         assert_eq!(expired, vec![plain]);
         let left: Vec<_> = queue.iter().map(|toast| toast.id).collect();
         assert_eq!(left, vec![with_button, with_line_button]);
+    }
+
+    #[test]
+    fn an_explicit_lifetime_makes_a_toast_with_a_button_expire() {
+        let mut queue = ToastQueue::new();
+        let now = Instant::now();
+        let body = ToastBody {
+            lines: Vec::new(),
+            action: Some(ToastAction::new("Undo", |_, _| {})),
+            lifetime: Some(Duration::from_secs(8)),
+        };
+        let id = queue.push_with(ToastKind::Ok, "removed", Some(body), now);
+        // Still up after the default five seconds, gone at eight.
+        assert!(queue.expire(now + Duration::from_millis(7999)).is_empty());
+        assert_eq!(queue.expire(now + Duration::from_secs(8)), vec![id]);
+    }
+
+    #[test]
+    fn an_explicit_lifetime_is_paused_by_hover() {
+        let mut queue = ToastQueue::new();
+        let now = Instant::now();
+        let body = ToastBody {
+            lines: Vec::new(),
+            action: Some(ToastAction::new("Undo", |_, _| {})),
+            lifetime: Some(Duration::from_secs(8)),
+        };
+        let id = queue.push_with(ToastKind::Ok, "removed", Some(body), now);
+        queue.set_paused(id, Some(true), None, now + Duration::from_secs(2));
+        assert!(queue.expire(now + Duration::from_secs(60)).is_empty());
+        let left = now + Duration::from_secs(60);
+        queue.set_paused(id, Some(false), None, left);
+        assert!(queue.expire(left + Duration::from_secs(5)).is_empty());
+        assert_eq!(queue.expire(left + Duration::from_secs(6)), vec![id]);
     }
 
     #[test]
@@ -725,6 +814,7 @@ mod tests {
                 action: Some(ToastAction::new("Reconnect", |_, _| {})),
             }],
             action: None,
+            ..Default::default()
         };
         let id = queue.push_with(
             ToastKind::Error,

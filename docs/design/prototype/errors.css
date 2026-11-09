@@ -1,0 +1,25 @@
+/* Errors, confirmations and notices: page-local styles (error_dialog.rs, toast.rs).
+   Everything else comes from gitwarp.css / dialogs.css. */
+
+  font: 12px/18px var(--font-mono, ui-monospace, monospace); white-space: pre-wrap; word-break: break-word; user-select: text; -webkit-user-select: text; cursor: text; }
+
+.err-expl { color: var(--text); user-select: text; }
+
+/* A toast with lines (multi-target push): icon stays beside the title, the title is semibold, lines are 13px rows. */
+.toast.has-lines { align-items: flex-start; max-width: 420px; }
+.toast.has-body { max-width: 420px; }
+.toast .toast-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-base); color: var(--text); }
+.toast.has-lines .toast-msg { font-weight: 600; flex: none; }
+.toast .tl { display: flex; align-items: center; gap: 6px; }
+.toast .tl .od-icon { flex: none; }
+.toast .tl.ok .od-icon { color: var(--success); } .toast .tl.bad .od-icon { color: var(--error); }
+.toast .tl .tl-d { flex: 1; min-width: 0; color: var(--muted); }
+.toast .toast-msg { user-select: text; -webkit-user-select: text; }
+.toast .btn-xs { flex: none; }
+
+.err-notes { max-width: 1200px; margin: 16px auto 32px; padding: 0 16px; color: var(--muted); font-size: var(--fs-sm); line-height: 1.6; }
+.err-notes code { font-family: var(--font-mono, ui-monospace, monospace); color: var(--text); }
+.err-notes ul { margin: 6px 0 0; padding-left: 18px; }
+/* Toast action button: ButtonSize::Xs with a label (h20, FS_SM); gitwarp.css .btn-xs is the square icon-only one. */
+.toast .tbtn { height: 20px; padding: 0 8px; font-size: var(--fs-sm); width: auto; }
+.toast .tl > span:first-of-type { flex: none; white-space: nowrap; }

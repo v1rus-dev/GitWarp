@@ -5,6 +5,7 @@
   "network.done.fetch": "Fetch завершён",
   "network.done.pull": "Pull завершён",
   "network.done.push": "Текущая ветка отправлена",
+  "network.done.push_branch": "Ветка {branch} отправлена",
   "network.done.push_tag": "Тег {tag} отправлен",
   "network.done.push_tags": "Все теги отправлены",
   "network.done.up_to_date": "Уже актуально",

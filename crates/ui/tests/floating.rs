@@ -196,61 +196,371 @@ fn menu_skips_disabled_items(cx: &mut TestAppContext) {
     assert_eq!(last.get(), 1, "down did not skip the disabled item");
 }
 
-/// The root rows of the submenu test: "Open" swaps in a page whose "Back" swaps the root back.
-fn submenu_root(root_hits: &Rc<Cell<u32>>, inner_hits: &Rc<Cell<u32>>) -> Vec<MenuEntry> {
-    let root = root_hits.clone();
-    let inner = inner_hits.clone();
-    let page_root = root_hits.clone();
-    let page_inner = inner_hits.clone();
-    vec![
-        MenuEntry::Item(MenuItem::new("Open").submenu(move || {
-            let root = page_root.clone();
-            let inner = page_inner.clone();
-            vec![
-                MenuEntry::Item(MenuItem::new("Back").submenu(move || submenu_root(&root, &inner))),
-                MenuEntry::Separator,
-                menu_item("Inner", true, &page_inner),
-            ]
-        })),
-        menu_item("Root item", true, &root),
-        menu_item("Unused", true, &inner),
-    ]
+#[gpui::test]
+fn menu_filter_hides_non_matching_rows_and_enter_runs_the_first_match(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let alpha = Rc::new(Cell::new(0));
+    let beta = Rc::new(Cell::new(0));
+    let gamma = Rc::new(Cell::new(0));
+    let entries = vec![
+        MenuEntry::Filter {
+            placeholder: "Filter refs…".into(),
+        },
+        menu_item("Alpha", true, &alpha),
+        menu_item("Beta", true, &beta),
+        menu_item("Gamma", true, &gamma),
+    ];
+
+    cx.update(|window, app| {
+        menu::open_context_menu(point(px(40.), px(40.)), entries, window, app);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("menu-0-0").is_some());
+    assert!(cx.debug_bounds("menu-0-1").is_some());
+    assert!(cx.debug_bounds("menu-0-2").is_some());
+
+    // Focus starts in the field, so typing narrows the list (case-insensitive).
+    cx.simulate_input("BET");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("menu-0-0").is_none(),
+        "Alpha stayed visible"
+    );
+    assert!(cx.debug_bounds("menu-0-1").is_some(), "Beta was hidden");
+    assert!(
+        cx.debug_bounds("menu-0-2").is_none(),
+        "Gamma stayed visible"
+    );
+
+    // Enter in the field activates the first visible row and closes the menu.
+    cx.simulate_keystrokes("enter");
+    assert_eq!(
+        (alpha.get(), beta.get(), gamma.get()),
+        (0, 1, 0),
+        "enter did not run the visible row"
+    );
+    assert_eq!(layer_count(cx), 0);
 }
 
 #[gpui::test]
-fn menu_submenu_replaces_the_rows_in_place_and_back_restores_them(cx: &mut TestAppContext) {
+fn menu_filter_arrows_skip_hidden_rows(cx: &mut TestAppContext) {
     let (_, cx) = start(cx);
-    let root_hits = Rc::new(Cell::new(0));
-    let inner_hits = Rc::new(Cell::new(0));
-    let entries = submenu_root(&root_hits, &inner_hits);
+    let hits: Vec<_> = (0..3).map(|_| Rc::new(Cell::new(0))).collect();
+    let entries = vec![
+        MenuEntry::Filter {
+            placeholder: "Filter".into(),
+        },
+        menu_item("one", true, &hits[0]),
+        menu_item("two", true, &hits[1]),
+        menu_item("three", true, &hits[2]),
+    ];
 
     cx.update(|window, app| {
         menu::open_context_menu(point(px(40.), px(40.)), entries, window, app);
     });
     cx.run_until_parked();
 
-    // "Open" keeps the menu open and shows the page: Back, then Inner.
-    cx.simulate_keystrokes("down enter");
-    assert_eq!(layer_count(cx), 1, "the submenu closed the menu");
-
-    // Back returns to the root rows, where the second item is "Root item".
-    cx.simulate_keystrokes("down enter");
-    assert_eq!(layer_count(cx), 1, "Back closed the menu");
+    // "o" matches one and two; three is hidden. The first match is
+    // highlighted, down moves to the second and wraps past the hidden row.
+    cx.simulate_input("o");
     cx.simulate_keystrokes("down down enter");
-    assert_eq!(root_hits.get(), 1, "Back did not restore the root rows");
-    assert_eq!(inner_hits.get(), 0);
-    assert_eq!(layer_count(cx), 0);
+    assert_eq!(
+        (hits[0].get(), hits[1].get(), hits[2].get()),
+        (1, 0, 0),
+        "navigation stopped on a hidden row"
+    );
+}
 
-    // The page's own item runs and closes the menu.
-    let entries = submenu_root(&root_hits, &inner_hits);
+/// In a level with a filter the focus is in the text field, which binds ←/→ itself:
+/// → opens the highlighted row's submenu when the caret is at the end of the text,
+/// ← closes the level when the caret is at 0; otherwise they move the caret.
+#[gpui::test]
+fn menu_filter_arrows_open_and_close_submenus_at_the_caret_edges(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    let leaf = hits.clone();
+    let entries = vec![
+        MenuEntry::Filter {
+            placeholder: "Filter".into(),
+        },
+        MenuEntry::Item(MenuItem::new("Branches").submenu(move || {
+            vec![
+                MenuEntry::Filter {
+                    placeholder: "Filter branches".into(),
+                },
+                menu_item("feature", true, &leaf),
+                menu_item("other", true, &leaf),
+            ]
+        })),
+        menu_item("Plain", true, &hits),
+    ];
     cx.update(|window, app| {
         menu::open_context_menu(point(px(40.), px(40.)), entries, window, app);
     });
     cx.run_until_parked();
-    cx.simulate_keystrokes("down enter down down enter");
-    assert_eq!(inner_hits.get(), 1, "the page item did not run");
-    assert_eq!(root_hits.get(), 1);
-    assert_eq!(layer_count(cx), 0);
+
+    // "bra" highlights "Branches"; the caret is at the end, so → opens its submenu.
+    cx.simulate_input("bra");
+    cx.simulate_keystrokes("left");
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("menu-1-0").is_none(),
+        "→ with the caret before the end opened the submenu instead of moving it"
+    );
+    cx.simulate_keystrokes("right");
+    settle(cx, Duration::from_millis(50));
+    assert!(
+        cx.debug_bounds("menu-1-0").is_some(),
+        "→ at the end of the text did not open the submenu"
+    );
+
+    // The submenu's field has the focus now: ← with text moves the caret, and at
+    // position 0 it closes the level.
+    cx.simulate_input("fe");
+    cx.simulate_keystrokes("left");
+    settle(cx, Duration::from_millis(50));
+    assert!(
+        cx.debug_bounds("menu-1-0").is_some(),
+        "← in the middle of the text closed the level"
+    );
+    cx.simulate_keystrokes("left");
+    settle(cx, Duration::from_millis(50));
+    assert!(
+        cx.debug_bounds("menu-1-0").is_some(),
+        "← that only reached position 0 closed the level"
+    );
+    cx.simulate_keystrokes("left");
+    settle(cx, Duration::from_millis(50));
+    assert!(
+        cx.debug_bounds("menu-1-0").is_none(),
+        "← at position 0 did not close the submenu"
+    );
+    assert_eq!(layer_count(cx), 1, "the whole menu closed");
+}
+
+#[gpui::test]
+fn menu_header_tool_runs_its_action_and_closes_the_menu(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let tool_hits = Rc::new(Cell::new(0));
+    let item_hits = Rc::new(Cell::new(0));
+    let entries = vec![
+        MenuEntry::Header(menu::MenuHeader::new("main").tool({
+            let hits = tool_hits.clone();
+            menu::MenuTool::new(ui::IconName::Filter, "Show only this branch")
+                .selected(true)
+                .action(move |_, _| hits.set(hits.get() + 1))
+        })),
+        menu_item("Item", true, &item_hits),
+    ];
+
+    cx.update(|window, app| {
+        menu::open_context_menu(point(px(40.), px(40.)), entries, window, app);
+    });
+    cx.run_until_parked();
+
+    let tool = cx.debug_bounds("menu-tool-0-0").expect("no header tool");
+    cx.simulate_click(tool.center(), Modifiers::default());
+
+    assert_eq!(tool_hits.get(), 1, "the tool did not run");
+    assert_eq!(item_hits.get(), 0);
+    assert_eq!(layer_count(cx), 0, "the tool left the menu open");
+}
+
+/// A three-level menu: "Branches" -> "feature" -> "Checkout" / "Delete", with
+/// siblings at each level. Every leaf counts its runs in `hits`.
+fn cascade_entries(hits: &Rc<Cell<u32>>) -> Vec<MenuEntry> {
+    let inner = hits.clone();
+    let outer = hits.clone();
+    vec![
+        MenuEntry::Item(MenuItem::new("Branches").submenu(move || {
+            let inner = inner.clone();
+            vec![
+                MenuEntry::Item(MenuItem::new("feature").submenu(move || {
+                    vec![
+                        menu_item("Checkout", true, &inner),
+                        menu_item("Delete", true, &inner),
+                    ]
+                })),
+                MenuEntry::Item(MenuItem::new("Closed").disabled(true)),
+                MenuEntry::Item(MenuItem::new("main")),
+            ]
+        })),
+        MenuEntry::Item(MenuItem::new("Plain")),
+        menu_item("Leaf", true, &outer),
+    ]
+}
+
+fn open_cascade(cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>, hits: &Rc<Cell<u32>>) {
+    let entries = cascade_entries(hits);
+    cx.update(|window, app| {
+        menu::open_context_menu(at, entries, window, app);
+    });
+    cx.run_until_parked();
+}
+
+fn hover(cx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("no row {selector}"));
+    cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+}
+
+/// Lets the delay pass and the child panel paint (it is placed one frame
+/// after it first appears).
+fn settle(cx: &mut VisualTestContext, delay: Duration) {
+    cx.executor().advance_clock(delay);
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        window.simulate_next_frame(app);
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn a_submenu_opens_after_the_hover_delay_not_before(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    open_cascade(cx, point(px(40.), px(40.)), &hits);
+    assert!(cx.debug_bounds("menu-1-0").is_none(), "child open at start");
+
+    hover(cx, "menu-0-0");
+    settle(cx, Duration::from_millis(100));
+    assert!(
+        cx.debug_bounds("menu-1-0").is_none(),
+        "the submenu opened before the delay"
+    );
+
+    settle(cx, Duration::from_millis(150));
+    let parent = cx.debug_bounds("menu-0-0").expect("parent row");
+    let child = cx
+        .debug_bounds("menu-1-0")
+        .expect("the submenu did not open");
+    assert!(
+        child.left() > parent.left() + px(100.),
+        "the child is not beside the parent"
+    );
+    assert_eq!(layer_count(cx), 1, "the child must share the menu's layer");
+}
+
+#[gpui::test]
+fn moving_to_a_plain_row_closes_the_submenu_after_the_delay(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    open_cascade(cx, point(px(40.), px(40.)), &hits);
+    hover(cx, "menu-0-0");
+    settle(cx, Duration::from_millis(250));
+    assert!(cx.debug_bounds("menu-1-0").is_some());
+
+    // Straight down: outside the safe triangle, so "Plain" takes over.
+    hover(cx, "menu-0-1");
+    settle(cx, Duration::from_millis(100));
+    assert!(cx.debug_bounds("menu-1-0").is_some(), "closed too early");
+    settle(cx, Duration::from_millis(150));
+    assert!(cx.debug_bounds("menu-1-0").is_none(), "child stayed open");
+}
+
+#[gpui::test]
+fn right_and_left_move_between_levels(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    open_cascade(cx, point(px(40.), px(40.)), &hits);
+
+    cx.simulate_keystrokes("down right");
+    cx.update(|window, app| {
+        window.simulate_next_frame(app);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("menu-1-0").is_some(), "right did not open");
+    assert_eq!(layer_count(cx), 1);
+
+    // The first enabled child row ("feature") is highlighted: right again
+    // opens level 2, whose first row is "Checkout".
+    cx.simulate_keystrokes("right");
+    assert!(cx.debug_bounds("menu-2-0").is_some(), "level 2 not open");
+
+    // Left closes level 2 only, then level 1; at the root it does nothing.
+    cx.simulate_keystrokes("left");
+    assert!(cx.debug_bounds("menu-2-0").is_none());
+    assert!(cx.debug_bounds("menu-1-0").is_some());
+    cx.simulate_keystrokes("left");
+    assert!(cx.debug_bounds("menu-1-0").is_none());
+    cx.simulate_keystrokes("left");
+    assert_eq!(layer_count(cx), 1, "left at the root closed the menu");
+
+    // Down in the child skips the disabled "Closed" row: feature -> main.
+    cx.simulate_keystrokes("right down");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(layer_count(cx), 0, "enter on a leaf closes everything");
+}
+
+#[gpui::test]
+fn escape_closes_one_level_at_a_time_then_the_menu(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    open_cascade(cx, point(px(40.), px(40.)), &hits);
+
+    cx.simulate_keystrokes("down right right");
+    assert!(cx.debug_bounds("menu-2-0").is_some());
+
+    cx.simulate_keystrokes("escape");
+    assert!(cx.debug_bounds("menu-2-0").is_none(), "level 2 stayed");
+    assert!(cx.debug_bounds("menu-1-0").is_some(), "level 1 closed too");
+    assert_eq!(layer_count(cx), 1);
+
+    cx.simulate_keystrokes("escape");
+    assert!(cx.debug_bounds("menu-1-0").is_none());
+    assert_eq!(layer_count(cx), 1, "second escape closed the menu");
+
+    cx.simulate_keystrokes("escape");
+    assert_eq!(layer_count(cx), 0, "third escape did not close the menu");
+    assert_eq!(hits.get(), 0);
+}
+
+#[gpui::test]
+fn clicking_a_deep_leaf_runs_it_and_closes_everything(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    open_cascade(cx, point(px(40.), px(40.)), &hits);
+
+    // A click on a submenu row opens it at once, without the hover delay.
+    let row = cx.debug_bounds("menu-0-0").expect("row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, app| {
+        window.simulate_next_frame(app);
+    });
+    cx.run_until_parked();
+    let row = cx.debug_bounds("menu-1-0").expect("click did not open");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, app| {
+        window.simulate_next_frame(app);
+    });
+    cx.run_until_parked();
+    let leaf = cx.debug_bounds("menu-2-1").expect("level 2 not open");
+    assert_eq!(layer_count(cx), 1, "a click inside a child closed the menu");
+
+    cx.simulate_click(leaf.center(), Modifiers::default());
+    assert_eq!(hits.get(), 1, "the leaf did not run");
+    assert_eq!(layer_count(cx), 0, "the leaf left the menu open");
+}
+
+#[gpui::test]
+fn a_submenu_near_the_right_edge_flips_to_the_left(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    let width = cx.update(|window, _| window.viewport_size().width);
+    open_cascade(cx, point(width - px(300.), px(40.)), &hits);
+    hover(cx, "menu-0-0");
+    settle(cx, Duration::from_millis(250));
+    settle(cx, Duration::from_millis(16));
+
+    let parent = cx.debug_bounds("menu-0-0").expect("parent row");
+    let child = cx.debug_bounds("menu-1-0").expect("child row");
+    assert!(
+        child.right() <= parent.left() + px(20.),
+        "the child did not flip left: child {child:?}, parent {parent:?}"
+    );
+    assert!(child.left() >= px(4.), "the child left the window");
 }
 
 #[gpui::test]
@@ -1082,4 +1392,142 @@ fn a_select_in_a_dialog_gets_focus_back_after_a_pick(cx: &mut TestAppContext) {
     assert_eq!(chosen.get(), Some(1));
     assert_eq!(layer_count(cx), 1, "only the dialog stays open");
     assert_focused(cx, &select);
+}
+
+#[gpui::test]
+fn a_menu_opened_from_the_keyboard_highlights_its_first_enabled_item(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let first = Rc::new(Cell::new(0));
+    let second = Rc::new(Cell::new(0));
+    let entries = vec![
+        menu_item("Off", false, &Rc::new(Cell::new(0))),
+        menu_item("First", true, &first),
+        menu_item("Second", true, &second),
+    ];
+    cx.update(|window, app| {
+        menu::open_context_menu_from_keyboard(point(px(40.), px(40.)), entries, window, app);
+    });
+    cx.run_until_parked();
+
+    // Enter at once runs the first enabled row, with no arrow pressed.
+    cx.simulate_keystrokes("enter");
+    assert_eq!((first.get(), second.get()), (1, 0));
+    assert_eq!(layer_count(cx), 0);
+}
+
+#[gpui::test]
+fn a_filter_with_no_matches_shows_a_disabled_no_matches_row(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    let entries = vec![
+        MenuEntry::Filter {
+            placeholder: "Filter refs…".into(),
+        },
+        menu_item("Alpha", true, &hits),
+    ];
+    cx.update(|window, app| {
+        menu::open_context_menu(point(px(40.), px(40.)), entries, window, app);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("menu-no-matches").is_none());
+
+    cx.simulate_input("zzz");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("menu-0-0").is_none());
+    assert!(
+        cx.debug_bounds("menu-no-matches").is_some(),
+        "an empty filtered list showed no `No matches` row"
+    );
+    // Enter has nothing to run.
+    cx.simulate_keystrokes("enter");
+    assert_eq!(hits.get(), 0);
+}
+
+#[gpui::test]
+fn a_menu_taller_than_the_window_is_capped_and_scrolls_to_the_highlight(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    let viewport = cx.update(|window, _| window.viewport_size());
+    // Each row is 28px: twice the window's height of rows.
+    let count = (f32::from(viewport.height) / 14.) as usize;
+    let mut entries = vec![MenuEntry::Header(menu::MenuHeader::new("Header"))];
+    entries.extend((0..count).map(|_| menu_item("Row", true, &hits)));
+    cx.update(|window, app| {
+        menu::open_context_menu(point(px(40.), px(0.)), entries, window, app);
+    });
+    cx.run_until_parked();
+
+    let last = format!("menu-0-{}", count - 1);
+    let last: &'static str = Box::leak(last.into_boxed_str());
+    let first = cx.debug_bounds("menu-0-0").expect("first row");
+    assert!(first.top() >= px(0.));
+    // The last row is below the window until the keyboard scrolls it in.
+    let before = cx.debug_bounds(last);
+    assert!(
+        before.is_none_or(|b| b.bottom() > viewport.height),
+        "the panel is not capped to the window: {before:?}"
+    );
+    // Up from nothing highlights the last row and reveals it.
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    let after = cx.debug_bounds(last).expect("the last row painted");
+    assert!(
+        after.bottom() <= viewport.height,
+        "the highlighted row is still below the window: {after:?}"
+    );
+}
+
+/// A toast with a button stays while keyboard focus is on the button, and
+/// goes once focus leaves (its timer starts over while focused).
+#[gpui::test]
+fn a_toast_is_kept_while_keyboard_focus_is_inside_it(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let show = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| {
+            toast::show_with(
+                ToastKind::Info,
+                "Removed",
+                Some(ui::ToastBody {
+                    lines: Vec::new(),
+                    action: Some(ui::ToastAction::new("Undo", |_, _| {})),
+                    lifetime: Some(Duration::from_secs(2)),
+                }),
+                window,
+                app,
+            )
+        })
+    };
+    let count = |cx: &mut VisualTestContext| cx.update(|window, app| toast::count(window, app));
+
+    // Tab until focus reaches the toast's button: only then the toast survives
+    // past its lifetime.
+    let mut kept = false;
+    for _ in 0..8 {
+        show(cx);
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        // The poll runs every 250 ms: step through the lifetime.
+        for _ in 0..16 {
+            cx.executor().advance_clock(Duration::from_millis(250));
+            cx.run_until_parked();
+        }
+        if count(cx) == 1 {
+            kept = true;
+            break;
+        }
+    }
+    assert!(
+        kept,
+        "no tab stop kept the toast alive: focus is not tracked"
+    );
+
+    // Focus leaves: the toast hides after its lifetime.
+    cx.update(|window, app| window.blur(app));
+    for _ in 0..16 {
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+    }
+    assert_eq!(count(cx), 0, "the toast stayed after focus left");
 }

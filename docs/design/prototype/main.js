@@ -12,8 +12,9 @@
   G.stagebar(`<label class="scn" style="display:inline-flex;gap:8px;align-items:center;font-size:12px">Window width <input type="range" id="ww" min="620" max="${W}" value="${W}" aria-label="Window width"> <span id="wv" class="mono">${W}px</span></label><span class="muted" style="font-size:12px;margin-left:12px">${W}×${H}</span>`);
   const sel = (id, label, opts) => `<label>${label} <select id="${id}" aria-label="${label}">${opts.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></label>`;
   const bar = G.h(`<div class="scenbar" role="toolbar" aria-label="Scenario">
-    <span class="grp"><b>State</b>${sel('s-hist', 'History', [['ok', 'Loaded'], ['loading', 'Loading (skeleton)'], ['loading-rows', 'Loading (rows + bar)'], ['empty', 'Empty repository'], ['notgit', 'Not a git repository'], ['nofolder', 'Folder not found'], ['cancelled', 'Loading cancelled'], ['strip-cancelled', 'Cancelled, with rows'], ['strip-failed', 'Failed, with rows (git)'], ['strip-failed-msg', 'Failed, with rows (message)'], ['giterr', 'git error'], ['nongit', 'Non-git failure'], ['nogit', 'git not found'], ['oldgit', 'git too old']])}${sel('s-det', 'Details', [['ok', 'Loaded'], ['select', 'Select a commit'], ['loading', 'Loading commit'], ['failed', 'Commit failed'], ['nofiles', 'No files changed'], ['d-select', 'Diff: select a file'], ['d-loading', 'Diff: loading'], ['d-failed', 'Diff: failed'], ['d-large', 'Diff: too large'], ['d-binary', 'Diff: binary'], ['d-none', 'Diff: no changes']])}${sel('s-side', 'Sidebar', [['loaded', 'Loaded'], ['loading', 'Loading refs']])}</span>
-    <span class="grp"><b>Toolbar</b>${sel('s-net', 'Network job', [['', 'Idle'], ['fetch', 'Fetching'], ['pull', 'Pulling'], ['push', 'Pushing'], ['tags', 'Pushing tags'], ['delbranch', 'Deleting remote branch']])}${sel('s-br', 'Branch menu', [['loaded', 'Branches'], ['loading', 'Loading branches…'], ['none', 'No local branches']])}${sel('s-dirty', 'Working tree', [['clean', 'Clean'], ['dirty', 'Dirty (6 changes)']])}</span>
+    <span class="grp"><b>State</b>${sel('s-hist', 'History', [['ok', 'Loaded'], ['loading', 'Loading (skeleton)'], ['loading-rows', 'Loading (rows + bar)'], ['empty', 'Empty repository'], ['notgit', 'Not a git repository'], ['nofolder', 'Folder not found'], ['cancelled', 'Loading cancelled'], ['strip-cancelled', 'Cancelled, with rows'], ['strip-failed', 'Failed, with rows (git)'], ['strip-failed-msg', 'Failed, with rows (message)'], ['giterr', 'git error'], ['nongit', 'Non-git failure'], ['nogit', 'git not found'], ['oldgit', 'git too old']])}${sel('s-det', 'Details', [['ok', 'Loaded'], ['select', 'Select a commit'], ['loading', 'Loading commit'], ['failed', 'Commit failed'], ['nofiles', 'No files changed'], ['d-select', 'Diff: select a file'], ['d-loading', 'Diff: loading'], ['d-failed', 'Diff: failed'], ['d-large', 'Diff: too large'], ['d-binary', 'Diff: binary'], ['d-none', 'Diff: no changes']])}${sel('s-side', 'Sidebar', [['loaded', 'Loaded'], ['loading', 'Loading refs'], ['collapsed', 'Collapsed (view switch moves to the toolbar)']])}${sel('s-chk', 'Checks', [['error', 'Couldn’t load checks'], ['loaded', 'Loaded'], ['loading', 'Loading'], ['none', 'No checks configured'], ['off', 'No hosting account']])}</span>
+    <span class="grp"><b>Activity</b>${sel('s-act', 'Strip', [['ok', 'Expanded'], ['collapsed', 'Collapsed'], ['large', 'Counting'], ['error', 'Error'], ['noemail', 'No user.email'], ['nomine', 'No commits by me'], ['day', 'Day filter'], ['dayempty', 'Day filter: no commits'], ['dayerror', 'Day filter: could not list']])}</span>
+    <span class="grp"><b>Toolbar</b>${sel('s-net', 'Network job', [['', 'Idle'], ['fetch', 'Fetching'], ['pull', 'Pulling'], ['push', 'Pushing'], ['tags', 'Pushing tags'], ['delbranch', 'Deleting remote branch'], ['submodule', 'Updating submodule']])}${sel('s-br', 'Branch menu', [['loaded', 'Branches'], ['loading', 'Loading branches…'], ['none', 'No local branches']])}${sel('s-dirty', 'Working tree', [['clean', 'Clean'], ['dirty', 'Dirty (6 changes)']])}${sel('s-plat', 'Platform', [['linux', 'Linux'], ['windows', 'Windows'], ['macos', 'macOS']])}</span>
     <span class="grp"><b>Appearance</b>${sel('s-date', 'Dates', [['relative', 'Relative'], ['absolute', 'Absolute (UTC)']])}${sel('s-dens', 'Row density', [['26', 'Normal 26'], ['22', 'Compact 22'], ['30', 'Roomy 30']])}${sel('s-col', 'Graph colors', [['on', 'Colored'], ['off', 'Monochrome']])}${sel('s-lw', 'Line width', [['2', '2px'], ['1', '1px'], ['3', '3px']])}${sel('s-ln', 'Diff line numbers', [['on', 'Shown'], ['off', 'Hidden']])}</span>
   </div>`);
   document.body.querySelector('.stagebar').after(bar);
@@ -25,7 +26,7 @@
 
   const sh = G.shell({ host: stage.firstChild, w: W, h: H, view: 'history' });
   const win = sh.win;
-  sh.center.innerHTML = `<div class="work dock-${dock}"><div class="hist-host" style="display:flex;flex-direction:column;flex:1;min-width:0;min-height:0"></div><div class="splitter ${dock === 'bottom' ? 'h' : 'v'}" role="separator" aria-label="Resize details"></div><section class="details" aria-label="Commit details"></section></div>`;
+  sh.center.innerHTML = `<div class="work dock-${dock}"><div class="histcol"><section class="act-strip" aria-label="Commit activity"></section><div class="dayfilter" hidden></div><div class="hist-host" style="display:flex;flex-direction:column;flex:1;min-width:0;min-height:0"></div></div><div class="splitter ${dock === 'bottom' ? 'h' : 'v'}" role="separator" aria-label="Resize details"></div><section class="details" aria-label="Commit details"></section></div>`;
   const work = sh.center.querySelector('.work'), histHost = work.querySelector('.hist-host'), details = work.querySelector('.details'), split = work.querySelector('.splitter');
 
   let cur = G.commits[0], curFile = 0, hist = null, hstate = 'ok', dstate = 'ok', row = 26, mono = false, lw = 2;
@@ -33,6 +34,22 @@
   /* ---------- details dock ---------- */
   function files(c) { const i = G.commits.indexOf(c); return G.FILES.slice(0, 2 + (i % 4)); }
   const bars = (ws, cls) => `<div class="sk-bars ${cls || ''}">${ws.map((w) => `<div class="skel" style="width:${w}px"></div>`).join('')}</div>`;
+  /* host tools under the meta grid ("Open on GitHub", "Copy link", PR badge) and the Checks block (repo_view.rs details info pane) */
+  let hostOn = true, chk = 'error';
+  const CHK_ROWS = [['build / linux-x86_64', 'passed', '3m 08s'], ['build / windows-x86_64', 'passed', '4m 51s'], ['test / unit', 'failed', '2m 03s'], ['lint', 'passed', '25s']];
+  function checksHTML() {
+    const op = `<button class="btn btn-sm chk-open" data-host="open">${ic('external', 12)}Open on GitHub</button>`;
+    if (chk === 'loading') return `<div class="chk"><div class="chk-h">Checks</div>${bars([200, 160, 180], 'tight')}</div>`;
+    if (chk === 'none') return `<div class="chk card"><div class="chk-t">No checks configured</div><p>This commit has no CI runs on GitHub. Add a workflow to see build and test results here.</p>${op}</div>`;
+    if (chk === 'error') return `<div class="chk card err"><div class="chk-t">${ic('err', 16)}<b>Couldn’t load checks</b></div><p>Rate limit reached (resets at Unix time 1794216975)</p><button class="btn btn-sm chk-retry" data-host="retry">${ic('fetch', 12)}Try again</button></div>`;
+    const ok = CHK_ROWS.filter((r) => r[1] === 'passed').length;
+    return `<div class="chk"><div class="chk-h">Checks · ${ok} of ${CHK_ROWS.length} passed</div>${CHK_ROWS.map((r) => `<div class="chk-row">${G.ciGlyph(r[1], 'Checks ' + r[1])}<span class="od-truncate">${esc(r[0])}</span><span class="muted">${r[2]}</span><button class="btn btn-icon btn-ghost btn-xs" data-host="open" aria-label="Open on GitHub" data-tip="Open on GitHub">${ic('external', 12)}</button></div>`).join('')}</div>`;
+  }
+  function hostBlock(c) {
+    if (!hostOn) return '';
+    const pr = c.refs.map((r) => (r.t === 'br' || r.t === 'head' ? G.prFor(r.n) : null)).find(Boolean);
+    return `<div class="hosttools"><button class="btn btn-sm" data-host="open">${ic('external', 12)}Open on GitHub</button><button class="btn btn-sm" data-host="link">${ic('copy', 12)}Copy link</button>${pr ? G.prBadge(pr) : ''}</div>${checksHTML()}`;
+  }
   function detailsHTML() {
     const c = cur, fl = dstate === 'nofiles' ? [] : files(c), noCommit = dstate === 'select';
     const par = c.parents.map((p) => { const pc = G.commits.find((x) => x.id === p); return `<a class="link" data-parent="${pc.id}" tabindex="0" role="link">${pc.hash}</a>`; }).join(' ');
@@ -44,7 +61,7 @@
     else if (dstate === 'loading') info = `<div class="dinfo dstate top pad18">${bars([190, 240, 150])}</div>`;
     else if (dstate === 'failed') info = `<div class="dinfo"><div class="dstate top" style="padding:0;gap:4px"><b>Could not load the commit</b><span class="errt">fatal: bad object ${c.full}</span></div></div>`;
     else info = `<div class="dinfo"><h3>${esc(c.summary)}</h3>${c.body ? `<p class="body">${esc(c.body)}</p>` : ''}
-        <dl class="meta"><dt>Author</dt><dd class="who">${G.avatar(c, 20)}<span class="od-truncate">${esc(c.author)} &lt;${esc(c.email)}&gt;</span></dd><dt>Authored</dt><dd>${G.abs(c.min)} <span class="muted">(${G.rel(c.min)})</span></dd><dt>Committer</dt><dd class="who">${G.avatar(c, 20)}<span class="od-truncate">${esc(c.author)}</span></dd><dt>Hash</dt><dd class="mono" data-tip="${c.full}">${c.full.slice(0, 20)}…</dd><dt>Parents</dt><dd>${par || '<span class="muted">none (root commit)</span>'}</dd></dl></div>`;
+        <dl class="meta"><dt>Author</dt><dd class="who">${G.avatar(c, 20)}<span class="od-truncate">${esc(c.author)} &lt;${esc(c.email)}&gt;</span></dd><dt>Authored</dt><dd>${G.abs(c.min)} <span class="muted">(${G.rel(c.min)})</span></dd><dt>Committer</dt><dd class="who">${G.avatar(c, 20)}<span class="od-truncate">${esc(c.author)}</span></dd><dt>Hash</dt><dd class="mono" data-tip="${c.full}">${c.full.slice(0, 20)}…</dd><dt>Parents</dt><dd>${par || '<span class="muted">none (root commit)</span>'}</dd></dl>${hostBlock(c)}</div>`;
     const sub = `<div class="sub"><b style="color:var(--text)">Changed files</b>${noCommit || dstate === 'loading' || dstate === 'failed' ? '' : `<span class="ncount">${fl.length}</span>`}<span class="od-fill"></span>${!noCommit && c.parents.length > 1 ? '<span data-tip="Combined diff against first parent">vs parent 1</span>' : ''}</div>`;
     let flist;
     if (noCommit) flist = '<div class="flist"></div>';
@@ -70,11 +87,27 @@
     details.style.width = details.style.height = ''; drawDetails();
   }
   details.addEventListener('click', (e) => {
-    const d = e.target.closest('[data-dock]'), m = e.target.closest('[data-mode]'), f = e.target.closest('[data-f]'), p = e.target.closest('[data-parent]');
-    if (d && d.dataset.dock !== dock) { userPicked = true; setDock(d.dataset.dock); }
+    const d = e.target.closest('[data-dock]'), m = e.target.closest('[data-mode]'), f = e.target.closest('[data-f]'), p = e.target.closest('[data-parent]'), hb = e.target.closest('[data-host]');
+    if (hb) {
+      if (hb.dataset.host === 'open') G.toast(win, 'Opened github.com in your browser', 'info');
+      else if (hb.dataset.host === 'link') { try { navigator.clipboard.writeText('https://github.com/mira-k/gitwarp/commit/' + cur.full); } catch (x) {} G.toast(win, 'Copied link', 'info'); }
+      else if (hb.dataset.host === 'retry') { chk = 'loading'; $('s-chk').value = 'loading'; drawDetails(); setTimeout(() => { chk = 'loaded'; $('s-chk').value = 'loaded'; drawDetails(); }, 900); }
+    }
+    else if (d && d.dataset.dock !== dock) { userPicked = true; setDock(d.dataset.dock); }
     else if (m) { mode = m.dataset.mode; drawDetails(); }
     else if (f) { curFile = +f.dataset.f; drawDetails(); }
     else if (p) { hist.selectCommit(G.commits.find((x) => x.id === p.dataset.parent)); }
+  });
+  /* right-click a changed file: host links (hidden for a deleted file: only Copy path) */
+  details.addEventListener('contextmenu', (e) => {
+    const r = e.target.closest('.frow[data-f]'); if (!r) return;
+    curFile = +r.dataset.f; drawDetails();
+    const f = files(cur)[curFile], cp = { label: 'Copy path', icon: 'copy', onClick: () => { try { navigator.clipboard.writeText(f.p); } catch (x) {} } };
+    G.menu(win, e, f.s === 'D' || !hostOn ? [cp] : [
+      { label: 'Open file on GitHub', icon: 'external', onClick: () => G.toast(win, 'Opened github.com in your browser', 'info') },
+      { label: 'Open blame on GitHub', icon: 'external', onClick: () => G.toast(win, 'Opened github.com in your browser', 'info') },
+      { label: 'Copy permalink', icon: 'link', onClick: () => { try { navigator.clipboard.writeText('https://github.com/mira-k/gitwarp/blob/' + cur.full + '/' + f.p); } catch (x) {} G.toast(win, 'Copied permalink', 'info'); } },
+      { sep: 1 }, cp]);
   });
   /* splitter: bottom 220-560 (default 340), right 220-900 (default 640, at most half of the space right of the sidebar); double-click resets */
   split.addEventListener('mousedown', (e) => {
@@ -86,21 +119,32 @@
   });
   split.addEventListener('dblclick', () => { details.style.width = details.style.height = ''; });
   /* Ctrl+J hides or shows the whole details dock */
-  addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'j') { e.preventDefault(); details.hidden = split.hidden = !details.hidden; } });
+  const toggleDock = () => { details.hidden = split.hidden = !details.hidden; sh.setDockHidden(details.hidden); };
+  addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'j') { e.preventDefault(); toggleDock(); } });
+  document.addEventListener('gl-dock-toggle', (e) => { if (e.detail && e.detail.win === win) toggleDock(); });
 
   /* ---------- history center: loaded list, in-list strips and full-pane states ---------- */
   const hasRows = (k) => ['ok', 'loading-rows', 'strip-cancelled', 'strip-failed', 'strip-failed-msg'].includes(k);
   function mountHist() {
     const keep = cur;
     histHost.className = 'hist-host';
-    hist = G.history(histHost, G.commits, { gw: 112, sel: Math.max(0, G.commits.indexOf(keep)), onSelect: (c) => { cur = c; curFile = 0; drawDetails(); } });
+    const list = act.list();
+    hist = G.history(histHost, list, { gw: 112, hosting: hostOn, sel: Math.max(0, list.indexOf(keep)), onSelect: (c) => { cur = c; curFile = 0; drawDetails(); } });
     hist.setRow(row); hist.setMono(mono); hist.setLine(lw);
     if (bfSel.value) hist.setBranch(bfSel.value);
     if (sh.search.value) searchRun();
   }
+  /* activity strip above History (activity_strip.rs); the day filter re-lists History. dayMode: '' | 'empty' | 'error' */
+  const A = G.activity;
+  let dayMode = '';
+  const act = A.mountStrip(win, histHost.parentNode.querySelector('.act-strip'), histHost.parentNode.querySelector('.dayfilter'), () => { if (A.S.day == null) dayMode = ''; hist = null; histHost.innerHTML = ''; setHist(hstate); });
+  const dayBody = () => `<div class="empty"><div class="ei"${dayMode === 'error' ? ' style="color:var(--error)"' : ''}>${ic(dayMode === 'error' ? 'err' : 'lanes', 22)}</div><h4>${dayMode === 'error' ? 'Could not list the commits of this day' : 'No commits on this day'}</h4><div class="row-btns"><button class="btn" data-act="clear-day">Clear filter</button></div></div>`;
   function setHist(k) {
     hstate = k;
-    if (hasRows(k)) {
+    if (A.S.day != null && dayMode && hasRows(k)) {
+      hist = null; histHost.className = 'hist-host hist';
+      histHost.innerHTML = `<div class="lhead" role="row"><div class="gh"><span>Graph</span></div><div>Summary</div><div>Author</div><div>Date</div><div>Hash</div></div><div class="hs-body" style="display:flex">${dayBody()}</div>`;
+    } else if (hasRows(k)) {
       if (!histHost.querySelector('.lbody')) mountHist();
       hist.strip(k === 'ok' ? '' : G.stateStrip(k === 'loading-rows' ? 'loading' : k));
     } else {
@@ -124,7 +168,8 @@
       init: () => { location.href = 'welcome.html'; },
       open: () => window.GLD && window.GLD.openIn('open', win),
       'remove-recent': () => { location.href = 'welcome.html'; },
-      copy: () => G.toast(win, 'Details copied', 'info')
+      copy: () => G.toast(win, 'Details copied', 'info'),
+      'clear-day': () => { A.S.day = null; dayMode = ''; document.getElementById('s-act').value = 'ok'; act.reset(); }
     })[b.dataset.act]();
   });
 
@@ -160,17 +205,36 @@
   bfSel.onchange = (e) => { if (hist) hist.setBranch(e.target.value || null); };
   $('s-hist').onchange = (e) => setHist(e.target.value);
   $('s-det').onchange = (e) => { dstate = e.target.value; curFile = 0; drawDetails(); };
-  $('s-side').onchange = (e) => sh.setSidebar(e.target.value);
+  $('s-side').onchange = (e) => {
+    const v = e.target.value, off = v === 'collapsed';
+    if (win.querySelector('.sidebar').classList.contains('collapsed') !== off) win.querySelector('[data-act=sidebar]').click();
+    if (!off) sh.setSidebar(v);
+  };
   $('s-net').onchange = (e) => { if (e.target.value) { sh.net.clear(); sh.net.set(e.target.value, 'Receiving objects: 38% (13/34)', e.target.value === 'push' ? null : 0.38); } else sh.net.clear(); };
   $('s-br').onchange = (e) => { G.state.branches = e.target.value; };
-  $('s-dirty').onchange = (e) => { G.state.dirty = e.target.value === 'dirty'; };
+  $('s-dirty').onchange = (e) => { G.state.dirty = e.target.value === 'dirty'; document.dispatchEvent(new Event('gl-dirty')); };
+  $('s-plat').onchange = (e) => sh.setPlatform(e.target.value);
+  $('s-chk').onchange = (e) => { if (e.target.value === 'off') hostOn = false; else { hostOn = true; chk = e.target.value; } hist = null; histHost.innerHTML = ''; setHist(hstate); drawDetails(); };
+  $('s-act').onchange = (e) => {
+    const v = e.target.value, S = A.S; dayMode = ''; S.day = null; S.collapsed = v === 'collapsed';
+    S.state = ['large', 'error', 'noemail', 'nomine'].includes(v) ? v : 'ok'; S.who = v === 'noemail' ? 'everyone' : 'me';
+    if (v.startsWith('day')) { S.day = A.TODAY - A.DAY; dayMode = v === 'dayempty' ? 'empty' : v === 'dayerror' ? 'error' : ''; }
+    act.reset();
+  };
   $('s-date').onchange = (e) => { G.dateMode = e.target.value; if (hist) hist.refresh(); };
   $('s-dens').onchange = (e) => { row = +e.target.value; win.style.setProperty('--row', row + 'px'); if (hist) hist.setRow(row); };
   $('s-col').onchange = (e) => { mono = e.target.value === 'off'; if (hist) hist.setMono(mono); };
   $('s-lw').onchange = (e) => { lw = +e.target.value; if (hist) hist.setLine(lw); };
   $('s-ln').onchange = (e) => { details.classList.toggle('nonum', e.target.value === 'off'); };
 
-  setHist('ok');
+  /* deep links for screenshots: ?platform=windows|macos  ?sidebar=collapsed  ?act=large|collapsed|...  ?chk=loaded|loading|none|off */
+  const Q = new URLSearchParams(location.search);
+  if (Q.get('platform')) { sh.setPlatform(Q.get('platform')); $('s-plat').value = sh.platform; }
+  if (Q.get('sidebar') === 'collapsed') { $('s-side').value = 'collapsed'; $('s-side').onchange({ target: $('s-side') }); }
+  if (Q.get('chk')) { $('s-chk').value = Q.get('chk'); $('s-chk').onchange({ target: $('s-chk') }); }
+  if (Q.get('settings')) sh.openSettings(Q.get('settings'));
+  if (Q.get('act')) { $('s-act').value = Q.get('act'); $('s-act').onchange({ target: $('s-act') }); }
+  else act.reset();
   drawDetails();
   G.fit(win);
   const ww = $('ww');

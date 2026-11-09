@@ -48,14 +48,14 @@
   };
   const ctx = S.mount('settings-ssh.html', 'SSH keys', () => {
     const demo = S.get('ssh-demo', 'keys'), agentUp = demo !== 'agent', shown = demo === 'empty' || demo === 'readerr' ? [] : keys;
-    return `<h2>SSH keys</h2><p class="lead">Keys GitWarp can use to clone, fetch and push over SSH. Private keys stay in <span class="mono">~/.ssh</span>; only fingerprints and public keys are shown here.</p>
+    return `<h2>SSH keys</h2><p class="lead">Keys GitWarp can use to clone, fetch and push over SSH. Private keys stay in ~/.ssh; only fingerprints and public keys are shown here.</p>
       <div class="od-row" style="margin-bottom:16px"><button class="btn btn-primary" data-a="gen">${ic('plus', 14)}Generate key…</button><button class="btn" data-a="imp">${ic('folder', 14)}Import…</button><span class="od-fill"></span><button class="btn" data-a="refresh"${loading ? ' disabled' : ''}>${ic('fetch', 14)}Refresh</button></div>
       ${demo === 'readerr' ? S.banner('error', 'Could not read ~/.ssh', 'Permission denied (os error 13)') : ''}
       ${demo === 'readerr' ? '' : agentUp ? S.banner('info', 'ssh-agent is running', shown.filter((k) => k.agent).length + ' of ' + shown.length + ' keys loaded. Loaded keys are offered to hosts automatically.') : S.banner('error', 'ssh-agent is not running', 'Keys protected by a passphrase cannot be used until it starts. Start it with eval "$(ssh-agent -s)" or enable the ssh-agent user service, then retry.')}
       ${agentUp || demo === 'readerr' ? '' : `<div style="margin:-4px 0 12px"><button class="btn" data-a="retry">${ic('fetch', 14)}Check again</button></div>`}
-      <section class="sgroup"><h3>Your keys</h3><div class="slist">${shown.length ? shown.map((k) => keyCard(k, agentUp)).join('') : `<div class="empty">${ic('key', 24)}<b>No SSH keys yet</b><span style="max-width:46ch">Create a key and add its public half to GitHub, GitLab or your own server to clone private repositories without typing a password.</span><div class="od-row"><button class="btn btn-primary" data-a="gen">${ic('plus', 14)}Generate key…</button><button class="btn" data-a="imp">${ic('folder', 14)}Import existing key…</button></div></div>`}</div></section>
-      <section class="sgroup"><h3>Trusted hosts</h3><div class="slist">${hosts.length ? hosts.map((h, i) => `<div class="hostrow"><div style="min-width:0"><div class="hn">${esc(h.host)}</div><div class="hf">${h.alg ? esc(h.alg) + ' ' + esc(h.fp) : '—'}</div></div><button class="btn btn-sm btn-ghost btn-icon" data-a="forget" data-i="${i}" aria-label="Forget ${esc(h.host)}" data-tip="Forget ${esc(h.host)}">${ic('trash', 14)}</button></div>`).join('') : '<div class="empty"><b>No trusted hosts</b><span>Hosts appear here after you confirm their fingerprint on first connection.</span></div>'}</div>
-        <div class="field-help" style="margin-top:6px">Stored in <span class="mono">~/.ssh/known_hosts</span>.</div></section>
+      <section class="sgroup"><h3>Your keys</h3><div class="slist bare">${shown.length ? shown.map((k) => keyCard(k, agentUp)).join('') : `<div class="empty">${ic('key', 24)}<b>No SSH keys yet</b><span style="max-width:46ch">Create a key and add its public half to GitHub, GitLab or your own server to clone private repositories without typing a password.</span><div class="od-row"><button class="btn btn-primary" data-a="gen">${ic('plus', 14)}Generate key…</button><button class="btn" data-a="imp">${ic('folder', 14)}Import existing key…</button></div></div>`}</div></section>
+      <section class="sgroup"><h3>Trusted hosts</h3><div class="slist bare">${hosts.length ? hosts.map((h, i) => `<div class="hostrow"><div style="min-width:0"><div class="hn">${esc(h.host)}</div><div class="hf">${h.alg ? 'ssh-' + esc(h.alg.toLowerCase()) + ' ' + esc(h.fp) : '—'}</div></div><button class="btn btn-sm btn-ghost btn-icon" data-a="forget" data-i="${i}" aria-label="Forget ${esc(h.host)}" data-tip="Forget ${esc(h.host)}">${ic('trash', 14)}</button></div>`).join('') : '<div class="empty"><b>No trusted hosts</b><span>Hosts appear here after you confirm their fingerprint on first connection.</span></div>'}</div>
+        <div class="sfoot" style="margin-top:6px">${ic('info', 12)}Stored in ~/.ssh/known_hosts.</div></section>
       <div class="sfoot">${ic('info', 12)}Caption: the agent buttons, Check again and Forget host act silently (no toast); the list just reloads.</div>`;
   }, null, { stagebar: `<label class="scn">Demo state <select id="demo" aria-label="Demo state">${DEMO.map(([v, l]) => `<option value="${v}"${S.get('ssh-demo', 'keys') === v ? ' selected' : ''}>${l}</option>`).join('')}</select></label>` });
   document.getElementById('demo').addEventListener('change', (e) => { S.set('ssh-demo', e.target.value); ctx.draw(); });
@@ -85,7 +85,7 @@
           ${s.usePass ? `${S.dfield('Passphrase', 'pass', S.din('pass', s.pass, 'Passphrase', { type: 'password' }))}${S.dfield('Repeat passphrase', 'pass2', S.din('pass2', s.pass2, 'Repeat passphrase', { type: 'password' }))}` : S.dbanner('warn', 'Anyone who can read the file can use this key', 'Without a passphrase, a stolen backup or laptop gives access to every host this key is registered on.')}
           ${S.dchk('addAgent', s.addAgent, 'Add the key to ssh-agent now')}
           ${s.err ? `<div class="derr" role="alert">${esc(s.err)}</div>` : ''}</div>`,
-        foot: S.dbtn('Cancel', { dis: s.busy }) + S.dbtn(s.busy ? 'Generating…' : 'Generate key', { kind: 'primary', act: 'gen', dis: s.busy, def: 1 }) }),
+        foot: S.dbtn('Cancel', { dis: s.busy }) + S.dbtn('Generate key', { kind: 'primary', act: 'gen', dis: s.busy, def: 1 }) }),
       actions: { gen: (s, api) => {
         /* validation runs only on press; one red line at the bottom of the body */
         const n = s.name.trim();
@@ -106,7 +106,7 @@
           ${S.dfield('Private key file', 'path', S.din('path', s.path, '~/.ssh/id_ed25519_old', { mono: 1 }), 'Choose the private file, for example id_ed25519, not the .pub file.')}
           ${S.dchk('copy', s.copy, 'Copy into ~/.ssh (the original stays where it is)')}
           ${s.err ? `<div class="derr" role="alert">${esc(s.err)}</div>` : ''}</div>`,
-        foot: S.dbtn('Cancel', { dis: s.busy }) + S.dbtn(s.busy ? 'Importing…' : 'Import key', { kind: 'primary', act: 'imp', dis: s.busy, def: 1 }) }),
+        foot: S.dbtn('Cancel', { dis: s.busy }) + S.dbtn('Import key', { kind: 'primary', act: 'imp', dis: s.busy, def: 1 }) }),
       actions: { imp: (s, api) => {
         const p = s.path.trim();
         if (!p) { s.err = 'Choose a private key file.'; return; }

@@ -29,8 +29,9 @@
   H.accounts = () => S.get('hosting-accounts', H.DEFAULT.map((a) => Object.assign({}, a)));
   H.saveAccounts = (l) => S.set('hosting-accounts', l);
   H.CLI = [{ svc: 'github', host: 'github.com', login: 'mira-k', tool: 'gh' }, { svc: 'gitlab', host: 'gitlab.modsen.app', login: 'yegor.cheprasov', tool: 'glab' }];
-  H.STAT = { ok: ['check', 'Connected', 'ok'], checking: ['fetch', 'Checking…', 'muted'], invalid: ['err', 'Token invalid or revoked', 'err'], expiring: ['warn', 'Token expires in 5 days', 'warn'], unreachable: ['err', 'Instance unreachable', 'err'] };
-  H.statHTML = (a) => { const s = H.STAT[a.status]; const t = a.status === 'expiring' ? `Token expires in ${a.days || 5} days` : s[1]; return `<span class="stat ${s[2]}">${ic(s[0], 12, a.status === 'checking' ? 'spin' : '')}${t}</span>`; };
+  H.STAT = { ok: ['check', 'Connected', 'ok'], checking: ['fetch', 'Checking…', 'muted'], invalid: ['err', 'Token invalid or revoked', 'err'], expiring: ['warn', 'Token expires in 5 days', 'warn'], unreachable: ['err', 'Instance unreachable', 'err'], unchecked: ['warn', 'Not checked', 'muted'] };
+  H.WHY = { unchecked: 'No token is stored in the system keychain for this account.', invalid: 'The service answered 401 Bad credentials.', unreachable: 'connection timed out' };
+  H.statHTML = (a) => { const s = H.STAT[a.status]; const t = a.status === 'expiring' ? `Token expires in ${a.days || 5} ${(a.days || 5) === 1 ? 'day' : 'days'}` : s[1]; const why = H.WHY[a.status]; return `<span class="stat ${s[2]}"${why ? ` data-tip="${esc(why)}"` : ''}>${ic(s[0], 12, a.status === 'checking' ? 'spin' : '')}${t}</span>`; };
   H.label = (a) => a.label || a.login;
   H.fp = 'SHA256:Zk4mT9vQ1pLx7bYdW3nR0aCeHs8UfJ2oGi6tNyVq5Xc7Ab1Ld3E';
   const fmt = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
@@ -44,10 +45,14 @@
     const existing = o.existing || H.accounts();
     const st = Object.assign({ step: 1, svc: null, inst: 'public', url: '', probe: null, probeSvc: null, trust: false, method: 'token', token: '', show: false, clientId: '', wait: null, res: null, label: '', mode: o.mode || 'add', static: false, secs: 900, login: 'mira-k', lockedHost: null, miss: [] }, o.st || {});
     const host = () => (st.inst === 'public' ? H.SVC[st.svc].pub : st.url.trim().replace(/^https?:\/\//, '').replace(/\/.*$/, ''));
-    const oauthOk = () => !!H.SVC[st.svc].oauth && (st.inst === 'public' || !!st.clientId.trim());
+    const oauthOk = () => !!H.SVC[st.svc].oauth && (st.inst === 'public' || browserOk());
     let timer = null;
     const stop = () => { clearInterval(timer); timer = null; };
     const busy = () => !!st.wait;
+    const browserOk = () => st.svc === 'github' && st.inst === 'public'; /* the app's OAuth app exists for github.com only (accounts.rs browser_available) */
+    if (st.method === 'browser' && !browserOk()) st.method = 'token';
+    const plainHttp = () => st.inst === 'self' && /^http:\/\//i.test(st.url.trim());
+    const httpWarn = () => (plainHttp() ? S.dbanner('warn', 'This address uses plain HTTP — the token would be sent unencrypted.') : '');
     const dupOnHost = () => existing.some((a) => a.host === host());
     const stepper = () => {
       if (st.mode === 'reconnect') return '';
@@ -63,10 +68,11 @@
     const probeBanner = () => {
       const h = esc(host());
       if (st.probe === 'checking') return S.dbanner('info', 'Checking ' + (st.inst === 'self' ? 'https://' : '') + host() + '…', 'Looking for the service type and API version.').replace('class="banner info"', 'class="banner info" aria-busy="true"');
-      if (st.probe === 'ok') return S.dbanner('ok', st.inst === 'public' ? `${H.SVC[st.svc].name} · ${host()}` : st.svc === 'gitlab' ? 'Detected: GitLab 18.4 self-managed' : st.svc === 'github' ? 'Detected: GitHub Enterprise Server 3.14' : st.svc === 'gitea' ? 'Detected: Forgejo 9.0' : 'Detected: ' + H.SVC[st.svc].ent, st.inst === 'public' ? 'Public instance, reachable.' : 'The address is reachable over HTTPS.');
+      if (st.probe === 'ok') return S.dbanner('ok', st.inst === 'public' ? `${H.SVC[st.svc].name} · ${host()}` : st.svc === 'gitlab' ? 'Detected: GitLab 18.4' : st.svc === 'github' ? 'Detected: GitHub 3.14' : st.svc === 'gitea' ? 'Detected: Gitea / Forgejo 9.0' : 'Detected: ' + H.SVC[st.svc].name, st.inst === 'public' ? 'Public instance, reachable.' : 'The address is reachable.');
       if (st.probe === 'other') return `<div class="banner warn" role="status">${ic('warn', 16)}<div style="min-width:0"><div class="b-title">${h} is a ${H.SVC[st.probeSvc].name} server, not ${H.SVC[st.svc].name}</div><div>The address answered like ${H.SVC[st.probeSvc].name}. Switch the service type to keep going.</div><div style="margin-top:8px">${S.dbtn('Switch to ' + H.SVC[st.probeSvc].name, { act: 'switchSvc', kind: 'primary' })}</div></div></div>`;
-      if (st.probe === 'unreach') return `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">Can’t reach ${h}</div><div>Check the address, your network or VPN, or the proxy settings. GitWarp tried https://${h}/api and got no answer.</div><div style="margin-top:8px">${S.dbtn('Try again', { act: 'probe', icon: 'sync' })}</div></div></div>`;
-      if (st.probe === 'tls') return `<div class="banner warn" role="alert">${ic('warn', 16)}<div style="min-width:0"><div class="b-title">The certificate of ${h} is not trusted</div><div>It is probably self-signed or issued by a private CA. If you know this server, compare the fingerprint with the one your administrator gave you.</div><div class="field-label" style="margin:8px 0 0">SHA-256 fingerprint</div><div class="fpr">${H.fp}</div><div style="margin-top:8px">${S.dbtn('Trust for this instance', { act: 'trust', kind: 'primary', icon: 'shield' })}</div></div></div>`;
+      if (st.probe === 'unreach') return `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">Can’t reach ${h}</div><div>Check the address, your network or VPN, or the proxy settings. connection refused (os error 111)</div><div style="margin-top:8px">${S.dbtn('Try again', { act: 'probe', icon: 'sync' })}</div></div></div>`;
+      if (st.probe === 'tls') return `<div class="banner warn" role="alert">${ic('warn', 16)}<div style="min-width:0"><div class="b-title">The certificate of ${h} is not trusted</div><div>invalid peer certificate: UnknownIssuer</div><div class="field-label" style="margin:8px 0 0">SHA-256 fingerprint <span class="planned-tag">Planned</span></div><div class="fpr">${H.fp}</div><div style="margin-top:8px">${S.dbtn('Trust for this instance', { act: 'trust', kind: 'primary', icon: 'shield' })} <span class="planned-tag">Planned</span></div></div></div>`;
+      if (st.probe === 'notrec') return `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">No supported service found at ${h}</div><div>Check that this is the web address of the service, without a path.</div></div></div>`;
       return '';
     };
     const step2 = () => {
@@ -76,7 +82,7 @@
         <button type="button" class="optcard wide" role="radio" data-do="inst" data-v="public" aria-checked="${st.inst === 'public'}">${H.svcIcon(st.svc)}<span class="t">${pub}</span><span class="d">Public instance</span></button>
         <button type="button" class="optcard wide" role="radio" data-do="inst" data-v="self" aria-checked="${st.inst === 'self'}">${ic('org', 16)}<span class="t">Self-hosted</span><span class="d">${esc(H.SVC[st.svc].ent)} on your own domain or intranet</span></button></div>
         ${st.inst === 'self' ? S.dfield('Instance URL', 'url', S.din('url', st.url, 'https://git.example.com', { mono: 1 }), 'The address you open in the browser, without a path.', showErr ? 'Enter a web address like https://git.example.com.' : '') : ''}
-        ${probeBanner()}`;
+        ${httpWarn()}${probeBanner()}`;
     };
 
     /* step 3 */
@@ -85,44 +91,41 @@
       const n = H.SVC[st.svc].name, h = esc(host());
       if (r.k === 'wrong') return S.dbanner('error', 'That token was rejected', `${n} answered 401 Bad credentials. Check that you pasted the whole token and that it has not been revoked or expired.`);
       if (r.k === 'perms') return `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">The token is missing permissions</div><div>${n} accepted the token, but it cannot do everything GitWarp needs. Create a new token that includes:</div><ul class="perms">${(st.miss.length ? st.miss : H.SVC[st.svc].perms.slice(-2)).map((p) => `<li class="miss">${esc(p)}</li>`).join('')}</ul></div></div>`;
-      if (r.k === 'denied') return S.dbanner('warn', 'Access was denied in the browser', 'You declined the request, or the account is not allowed to authorise apps. Nothing was saved.');
+      if (r.k === 'denied') return `<div class="banner warn" role="alert">${ic('warn', 16)}<div style="min-width:0"><div class="b-title">Access was denied in the browser</div><div>You declined the request, or the account is not allowed to authorise apps. Nothing was saved.</div><div style="margin-top:8px">${S.dbtn('Try again', { act: 'startWait', icon: 'sync' })}</div></div></div>`;
+      if (r.k === 'other') return S.dbanner('error', 'Could not check the token', 'unexpected response from the service (HTTP 500)');
       if (r.k === 'expired') return `<div class="banner warn" role="alert">${ic('warn', 16)}<div style="min-width:0"><div class="b-title">The code expired</div><div>Codes are valid for 15 minutes. Start again to get a new one.</div><div style="margin-top:8px">${S.dbtn('Restart', { act: 'startWait', kind: 'primary', icon: 'sync' })}</div></div></div>`;
-      if (r.k === 'net') return `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">Can’t reach ${h}</div><div>The request timed out. Check your network connection and try again.</div><div style="margin-top:8px">${S.dbtn('Try again', { act: 'submit', icon: 'sync' })}</div></div></div>`;
+      if (r.k === 'net') return `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">Can’t reach ${h}</div><div>Check your network connection and try again. request timed out</div><div style="margin-top:8px">${S.dbtn('Try again', { act: 'submit', icon: 'sync' })}</div></div></div>`;
       return '';
     };
     const step3 = () => {
-      const v = H.SVC[st.svc], canBrowser = !!v.oauth, self = st.inst === 'self';
+      const v = H.SVC[st.svc], canBrowser = browserOk(), self = st.inst === 'self';
       const tokenCard = `<button type="button" class="optcard wide" role="radio" data-do="method" data-v="token" aria-checked="${st.method === 'token'}">${ic('key', 16)}<span class="t">Token</span><span class="d">Paste a personal access token. Works everywhere.</span></button>`;
+      /* Browser sign-in is selectable for github.com only; other services keep it drawn disabled (accounts.rs:1693). */
       const brCard = canBrowser
-        ? `<button type="button" class="optcard wide" role="radio" data-do="method" data-v="browser" aria-checked="${st.method === 'browser'}"${self && !st.clientId.trim() ? ' aria-describedby="cid-h"' : ''}>${ic('browser', 16)}<span class="t">Sign in with browser</span><span class="d">${self ? 'Uses an OAuth app registered on this instance.' : 'Approve GitWarp in your browser, no token to copy.'}</span></button>`
-        : `<div class="optcard wide" role="radio" aria-checked="false" aria-disabled="true" aria-describedby="nb-h">${ic('browser', 16)}<span class="t">Sign in with browser</span><span class="d" id="nb-h">Not available for ${v.name}: it has no sign-in flow for desktop apps. Use a token.</span></div>`;
+        ? `<button type="button" class="optcard wide" role="radio" data-do="method" data-v="browser" aria-checked="${st.method === 'browser'}">${ic('browser', 16)}<span class="t">Sign in with browser</span><span class="d">Approve GitWarp in your browser, no token to copy.</span></button>`
+        : `<div class="optcard wide" role="radio" aria-checked="false" aria-disabled="true" aria-describedby="nb-h"${v.oauth ? ' data-tip="Coming soon"' : ''}>${ic('browser', 16)}<span class="t">Sign in with browser</span><span class="d" id="nb-h">${v.oauth ? (self ? 'Uses an OAuth app registered on this instance.' : 'Approve GitWarp in your browser, no token to copy.') : `Not available for ${v.name}: it has no sign-in flow for desktop apps. Use a token.`}</span></div>`;
       let panel = '';
       if (st.method === 'token' || !canBrowser) {
         panel = `${S.dfield('Access token', 'token', `<div class="tokrow"><input class="input masked" id="token" data-f="token" type="${st.show ? 'text' : 'password'}" value="${esc(st.token)}" placeholder="Paste the token here" autocomplete="off" spellcheck="false" aria-describedby="perm-h"><button type="button" class="btn btn-icon" data-do="show" aria-label="${st.show ? 'Hide token' : 'Show token'}" data-tip="${st.show ? 'Hide token' : 'Show token'}" aria-pressed="${st.show}">${ic(st.show ? 'eyeClosed' : 'eye', 14)}</button></div>`, '')}
           <div class="od-row" style="align-items:flex-start;gap:12px"><div id="perm-h" style="flex:1;min-width:0"><div class="field-label" style="margin:0">Required permissions${st.svc === 'github' ? ' (classic token scopes)' : ''}</div><ul class="perms">${v.perms.map((p) => `<li>${esc(p)}</li>`).join('')}</ul><div class="field-help" style="margin-top:6px">${esc(v.tokenWhere)}</div></div>${S.dbtn('Create a token', { act: 'createTok', icon: 'external' })}</div>`;
-      } else if (self) {
-        const ok = !!st.clientId.trim();
-        panel = `${S.dfield('Client ID', 'clientId', S.din('clientId', st.clientId, 'OAuth application Client ID', { mono: 1 }), '', '')}
-          <div class="field-help" id="cid-h" style="margin-top:-6px">${ok ? 'Ready. GitWarp will open ' + esc(host()) + ' to approve this app.' : 'Browser sign-in is off until you add a Client ID. Register an OAuth application on ' + esc(host()) + ' (' + esc(v.appWhere) + '), then paste its Client ID here.'}</div>
-          <dl class="kv" style="grid-template-columns:110px minmax(0,1fr)"><dt>Redirect URI</dt><dd>http://127.0.0.1</dd><dt>Scopes</dt><dd>${esc(v.redirScopes)}</dd></dl>`;
       } else {
         panel = `<div class="field-help">GitWarp opens ${esc(host())} in your browser, you approve access, and the token is stored in the system keychain.${v.oauth === 'device' ? ' You will enter a short code there.' : ''}</div>`;
       }
-      return `${st.mode === 'reconnect' ? lockLine() : ''}${resBanner()}
+      return `${st.mode === 'reconnect' ? lockLine() : ''}${httpWarn()}${st.storeErr ? S.dbanner('error', 'The system keychain is not available', st.storeErr + '. GitWarp does not store tokens anywhere else.') : ''}${resBanner()}
         <div class="od-stack" style="--od-gap:8px" role="radiogroup" aria-label="Sign-in method">${tokenCard}${brCard}</div>${panel}`;
     };
 
     /* waiting */
     const waitView = () => {
-      const h = esc(host());
+      const h = esc(host()), plan = browserOk() ? '' : '<div><span class="planned-tag">Planned</span> <span class="muted" style="font-size:var(--fs-sm)">The app signs in with the browser on github.com only.</span></div>';
       if (st.wait === 'device') {
         const url = h + (st.svc === 'github' ? '/login/device' : '/oauth/device'), code = CODE[st.svc] || 'WDJB-MJHT';
-        return `${S.dbanner('info', 'Approve GitWarp in your browser', 'Enter the code below on ' + host() + ' and confirm the permissions.')}
+        return `${plan}${S.dbanner('info', 'Approve GitWarp in your browser', 'Enter the code below on ' + host() + ' and confirm the permissions.')}
           <div class="devcode"><span class="code" aria-label="Device code ${code.split('').join(' ')}">${code}</span><button type="button" class="btn" data-do="copyCode">${ic('copy', 14)}Copy code</button></div>
           <div class="od-row">${S.dbtn('Open browser', { act: 'openBrowser', kind: 'primary', icon: 'external', af: 1, def: 1 })}<span class="muted" style="font-size:var(--fs-sm)">or go to <span class="mono" style="user-select:all">https://${url}</span></span></div>
           <div class="waitline" role="status">${ic('fetch', 14, 'spin')}<span>Waiting for approval… code expires in ${fmt(st.secs)}</span></div>`;
       }
-      return `${S.dbanner('info', 'Continue in your browser', 'GitWarp opened ' + host() + '. Sign in there and approve the request, then come back.')}
+      return `${plan}${S.dbanner('info', 'Continue in your browser', 'GitWarp opened ' + host() + '. Sign in there and approve the request, then come back.')}
         <div class="od-row">${S.dbtn('Open again', { act: 'openBrowser', icon: 'external', af: 1 })}<span class="muted" style="font-size:var(--fs-sm)">GitWarp listens on http://127.0.0.1 for the answer.</span></div>
         <div class="waitline" role="status">${ic('fetch', 14, 'spin')}<span>Waiting for ${h}…</span></div>`;
     };
@@ -130,7 +133,7 @@
     /* result: connected */
     const doneView = () => {
       const dup = dupOnHost() && st.mode !== 'reconnect';
-      return `<div class="donecard">${H.avatar(st.login, 1)}<div style="min-width:0"><div class="t">Connected as ${esc(st.login)}</div><div class="d">${esc(H.SVC[st.svc].name)} · ${esc(host())} · ${st.method === 'browser' ? 'browser sign-in' : 'token'}</div></div></div>
+      return `<div class="donecard">${H.avatar(st.login, 1)}<div style="min-width:0"><div class="t">Connected as ${esc(st.login)}</div><div class="d">${esc(H.SVC[st.svc].name)} · ${esc(host())} · ${st.method === 'browser' ? 'browser sign-in' : 'token'}</div></div></div>${st.saveErr ? S.dbanner('error', 'The token could not be saved', st.saveErr) : ''}
         ${dup ? S.dfield('Label <span class="req" aria-hidden="true">*</span>', 'label', S.din('label', st.label, 'e.g. Personal, Acme work'), `You already have an account on ${esc(host())}. A label tells them apart in clone, push and pull-request menus.`, st.labelErr ? 'Enter a label for this account.' : '') : S.dfield('Label (optional)', 'label', S.din('label', st.label, st.login), 'Defaults to the login name.')}`;
     };
 
@@ -146,19 +149,19 @@
         else if (s.step === 2) {
           const pub = s.inst === 'public', urlOk = /^(https?:\/\/)?[^\s/]+\.[^\s/]+/.test(s.url.trim());
           const label = s.probe === 'ok' ? 'Continue' : s.probe === 'checking' ? 'Checking…' : pub ? 'Continue' : 'Check address';
-          foot = S.dbtn('Back', { act: 'back' }) + S.dbtn(label, { kind: 'primary', act: 'next', dis: s.probe === 'checking' || (!pub && !urlOk) || s.probe === 'tls' || s.probe === 'other', def: 1 }); body = step2();
+          foot = S.dbtn('Back', { act: 'back' }) + S.dbtn(label, { kind: 'primary', act: 'next', dis: s.probe === 'checking' || (!pub && !urlOk) || s.probe === 'tls' || s.probe === 'other' || s.probe === 'notrec', def: 1 }); body = step2();
         } else {
-          const tokenMode = s.method === 'token' || !H.SVC[s.svc].oauth;
+          const tokenMode = s.method === 'token' || !(s.svc === 'github' && s.inst === 'public');
           const can = tokenMode ? s.token.trim().length > 0 : oauthOk();
-          foot = (reco ? S.dbtn('Cancel') : S.dbtn('Back', { act: 'back' })) + S.dbtn(tokenMode ? (reco ? 'Reconnect' : 'Connect') : (H.SVC[s.svc].oauth === 'device' ? 'Get code' : 'Continue in browser'), { kind: 'primary', act: tokenMode ? 'submit' : 'startWait', dis: !can || s.verifying, def: 1 });
+          foot = (reco ? S.dbtn('Cancel') : S.dbtn('Back', { act: 'back' })) + S.dbtn(tokenMode ? (reco ? 'Reconnect' : 'Connect') : 'Get code', { kind: 'primary', act: tokenMode ? 'submit' : 'startWait', dis: !can || s.verifying, def: 1 });
           body = step3();
         }
         return { title, icon: 'key', body: `<div class="col10">${stepper()}${body}</div>`, foot };
       },
       onInput: (s, f) => { if (f === 'url') { s.probe = null; } if (f === 'token') { s.res = null; } },
       actions: {
-        pick: (s, api, d) => { s.svc = d.dataset.v; s.step = 2; s.inst = 'public'; s.probe = 'ok'; s.url = ''; s.method = H.SVC[s.svc].oauth ? 'browser' : 'token'; },
-        inst: (s, api, d) => { s.inst = d.dataset.v; s.probe = s.inst === 'public' ? 'ok' : null; s.method = H.SVC[s.svc].oauth && s.inst === 'public' ? 'browser' : 'token'; },
+        pick: (s, api, d) => { s.svc = d.dataset.v; s.step = 2; s.inst = 'public'; s.probe = 'ok'; s.url = ''; s.method = s.svc === 'github' ? 'browser' : 'token'; },
+        inst: (s, api, d) => { s.inst = d.dataset.v; s.probe = s.inst === 'public' ? 'ok' : null; s.method = s.svc === 'github' && s.inst === 'public' ? 'browser' : 'token'; },
         method: (s, api, d) => { s.method = d.dataset.v; s.res = null; },
         show: (s) => { s.show = !s.show; },
         createTok: (s, api) => api.toast('Opened ' + host() + ' in your browser to create a token', 'info'),
@@ -178,7 +181,7 @@
           s.probe = 'checking'; const h = host().toLowerCase();
           setTimeout(() => {
             if (!api.el.isConnected) return;
-            s.probe = /down|unreach|offline/.test(h) ? 'unreach' : /tls|selfsigned|internal/.test(h) ? 'tls' : (s.svc === 'github' && /gitlab/.test(h)) ? 'other' : (s.svc === 'gitlab' && /gitea|forgejo|codeberg/.test(h)) ? 'other' : 'ok';
+            s.probe = /nosvc|unknownsvc/.test(h) ? 'notrec' : /down|unreach|offline/.test(h) ? 'unreach' : /tls|selfsigned|internal/.test(h) ? 'tls' : (s.svc === 'github' && /gitlab/.test(h)) ? 'other' : (s.svc === 'gitlab' && /gitea|forgejo|codeberg/.test(h)) ? 'other' : 'ok';
             if (s.probe === 'other') s.probeSvc = /gitlab/.test(h) ? 'gitlab' : 'gitea';
             api.redraw();
           }, 700);
