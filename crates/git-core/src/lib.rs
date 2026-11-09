@@ -53,7 +53,7 @@ pub use diff::{
 };
 pub use error::{Error, ErrorClass, Result};
 pub use git::{Git, GitChoice, GitEngine, GitSource, GitVersion, Resolution};
-pub use location::{probe_repo_path, PathProbe};
+pub use location::{is_linked_worktree, probe_repo_path, PathProbe};
 pub use log::{commits_on_day, CommitCount, CommitInfo, LogKiller, LogOptions, LogStream};
 pub use oid::Oid;
 pub use ops::{MergeOutcome, MergePreview, MergeType, Operation, PreviewUnavailable, ResetMode};

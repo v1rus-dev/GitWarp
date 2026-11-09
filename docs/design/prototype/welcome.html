@@ -80,18 +80,18 @@
       <div class="muted" id="hint" style="font-size:12px"><span class="kbd arr"><svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-label="Up" style="vertical-align:-1px"><path d="M6 10.2V1.8M2.6 5.2L6 1.8l3.4 3.4"/></svg></span> <span class="kbd arr"><svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-label="Down" style="vertical-align:-1px"><path d="M6 1.8v8.4M2.6 6.8L6 10.2l3.4-3.4"/></svg></span> select · <span class="kbd">Enter</span> open · <span class="kbd">Del</span> remove from list</div></main></div>
     <footer class="statusbar"><span class="sb-btn" id="appver" data-tip="GitWarp version">GitWarp v0.2.1</span><span class="od-fill"></span><span class="sb-btn" id="gitlabel"></span></footer></div>`);
   stage.firstChild.appendChild(win);
+  /* Design note (outside the app window). */
+  stage.appendChild(G.h('<p class="muted" style="max-width:960px;margin:12px auto 0;font-size:12px">Linked worktrees are never listed in Recent; open them from their repository (Ctrl+Alt+W, Worktrees view).</p>'));
   G.initTips(win);
   const list = win.querySelector('#recent');
-  /* ---- R2 (planned): unavailable recents. Row = [name, path, branch, time, state, extra]; state: ok | checking | missing | notrepo | wt | unread (undefined = ok) ---- */
+  /* ---- R2 (planned): unavailable recents. Row = [name, path, branch, time, state, extra]; state: ok | checking | missing | notrepo | unread (undefined = ok) ---- */
   const REAL = [['gitwarp', '~/Projects/Personal/RustProjects/gitwarp', 'main', '12 min ago'], ['SystemLab', '~/Projects/Work/SystemLab', 'develop', '1 h ago'],
-    ['agent-a41f92', '~/Projects/Work/SystemLab/.claude/worktrees/agent-a41f92', '—', '2 h ago', 'missing'], ['open-design', '~/develop/open-design', 'feat/prompt-bundle', '3 h ago'],
-    ['agent-7c03de', '~/Projects/Work/SystemLab/.claude/worktrees/agent-7c03de', '—', 'yesterday', 'missing'], ['gitwarp-demo', '/tmp/gitwarp-demo', '—', 'yesterday', 'missing'],
-    ['some_improvements', '~/orca/workspaces/gitwarp/some_improvements', '—', '2 d ago', 'wt', '~/Projects/Personal/RustProjects/gitwarp'], ['zed-themes', '~/Projects/Personal/zed-themes', 'main', '3 d ago'],
-    ['fix-login', '~/orca/workspaces/systemlab/fix-login', '—', '4 d ago', 'wt', '~/Projects/Work/SystemLab'], ['tmp.k3Jd8s', '/tmp/tmp.k3Jd8s', '—', '5 d ago', 'missing'],
+    ['open-design', '~/develop/open-design', 'feat/prompt-bundle', '3 h ago'], ['gitwarp-demo', '/tmp/gitwarp-demo', '—', 'yesterday', 'missing'],
+    ['zed-themes', '~/Projects/Personal/zed-themes', 'main', '3 d ago'], ['tmp.k3Jd8s', '/tmp/tmp.k3Jd8s', '—', '5 d ago', 'missing'],
     ['dotfiles', '~/.dotfiles', 'master', '1 week ago'], ['scratch', '~/scratch', '—', '1 week ago', 'notrepo'],
     ['notes', '/mnt/data/notes', '—', '2 weeks ago', 'unread', 'Permission denied (os error 13)'], ['tree-sitter-rust', '~/src/tree-sitter-rust', 'master', '2 weeks ago'],
-    ['agent-19be0a', '~/Projects/Work/SystemLab/.claude/worktrees/agent-19be0a', '—', '3 weeks ago', 'missing'], ['old-prototype', '~/Projects/Personal/old-prototype', '—', '1 month ago', 'missing']];
-  const ST = { missing: ['Folder not found', 'err', (r) => `${r[1]} no longer exists`], notrepo: ['Not a repository', 'warn', (r) => `${r[1]} exists but is not a git repository any more`], wt: ['Worktree removed', 'warn', (r) => `The worktree was removed from its repository (${r[5]})`], unread: ["Can't read", 'warn', (r) => r[5]] };
+    ['old-prototype', '~/Projects/Personal/old-prototype', '—', '1 month ago', 'missing']];
+  const ST = { missing: ['Folder not found', 'err', (r) => `${r[1]} no longer exists`], notrepo: ['Not a repository', 'warn', (r) => `${r[1]} exists but is not a git repository any more`], unread: ["Can't read", 'warn', (r) => r[5]] };
   const bad = (r) => !!ST[r[4]];
   window.__reason = (r) => (ST[r[4]] ? ST[r[4]][0] : 'Folder not found'); /* same wording as the row chip, reused by the Activity "skipped" tooltip */
   let sel_ = 0, rec = R.slice(), onlyBad = false, S = new Set(), cp = null, anchor = null, snapshot = null;
@@ -161,10 +161,10 @@
     if (k === 'onlybad') onlyBad = true;
     draw();
     const at = (p) => view().findIndex((r) => r[1] === p);
-    if (k === 'multi') { pick(at(REAL[2][1])); ['open-design', 'agent-7c03de', 'gitwarp-demo', 'some_improvements'].forEach((n) => pick(at(rec.find((r) => r[0] === n)[1]), 'toggle')); }
-    if (k === 'selbad') pick(at(REAL[2][1]));
+    if (k === 'multi') { pick(at(REAL[3][1])); ['open-design', 'tmp.k3Jd8s', 'scratch', 'old-prototype'].forEach((n) => pick(at(rec.find((r) => r[0] === n)[1]), 'toggle')); }
+    if (k === 'selbad') pick(at(REAL[3][1]));
     if (k === 'undo') remove(rec.filter(bad).map((r) => r[1]), true);
-    if (k === 'ctx') { pick(at(REAL[2][1])); const el = list.querySelector('.rrow.cur'), rc = el.getBoundingClientRect(); ctxMenu({ target: el, preventDefault() {} }, G.pos(win, { clientX: rc.left + 300, clientY: rc.top + 30 })); }
+    if (k === 'ctx') { pick(at(REAL[3][1])); const el = list.querySelector('.rrow.cur'), rc = el.getBoundingClientRect(); ctxMenu({ target: el, preventDefault() {} }, G.pos(win, { clientX: rc.left + 300, clientY: rc.top + 30 })); }
   };
   win.querySelector('#flt').addEventListener('input', draw);
   document.getElementById('lst').addEventListener('change', (e) => setList(e.target.value));

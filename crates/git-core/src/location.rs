@@ -75,6 +75,33 @@ pub fn probe_repo_path(path: &Path) -> PathProbe {
     }
 }
 
+/// Whether `path` is a linked worktree: its `.git` is a file whose `gitdir:`
+/// points at `<something>/worktrees/<name>`, whether or not that directory still
+/// exists. A submodule's pointer (`.git/modules/<name>`) and a main worktree
+/// (`.git` is a directory) are not linked worktrees. File system only.
+pub fn is_linked_worktree(path: &Path) -> bool {
+    let dot_git = path.join(".git");
+    if !fs::metadata(&dot_git).is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let Ok(text) = fs::read_to_string(&dot_git) else {
+        return false;
+    };
+    let Some(target) = text
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    else {
+        return false;
+    };
+    // Matches `<main>/.git/worktrees/<name>` and `<bare>/worktrees/<name>`.
+    normalize(&path.join(target))
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "worktrees")
+}
+
 /// `<main>/.git/worktrees/<name>` -> `<main>`.
 fn main_repo_of(gitdir: &Path) -> Option<PathBuf> {
     let worktrees = gitdir.parent()?;
@@ -207,6 +234,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".git"), "garbage\n").unwrap();
         assert_eq!(probe_repo_path(dir.path()), PathProbe::Candidate);
+    }
+
+    #[test]
+    fn linked_worktree_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        fs::create_dir(&wt).unwrap();
+        let pointer = |text: &str| fs::write(wt.join(".git"), text).unwrap();
+
+        // Removed worktree: the gitdir does not exist.
+        pointer("gitdir: ../main/.git/worktrees/wt\n");
+        assert!(is_linked_worktree(&wt));
+        // Alive worktree.
+        fs::create_dir_all(dir.path().join("main/.git/worktrees/wt")).unwrap();
+        assert!(is_linked_worktree(&wt));
+        // Submodule.
+        pointer("gitdir: ../.git/modules/x\n");
+        assert!(!is_linked_worktree(&wt));
+        // Not a pointer.
+        pointer("garbage\n");
+        assert!(!is_linked_worktree(&wt));
+        // Normal repository and plain folder.
+        fs::remove_file(wt.join(".git")).unwrap();
+        assert!(!is_linked_worktree(&wt));
+        fs::create_dir(wt.join(".git")).unwrap();
+        assert!(!is_linked_worktree(&wt));
+        assert!(!is_linked_worktree(&dir.path().join("missing")));
     }
 
     #[cfg(unix)]

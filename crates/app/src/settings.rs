@@ -434,6 +434,15 @@ impl Settings {
         }
     }
 
+    /// Drops the recent entries for which `is_worktree` holds (linked worktrees
+    /// are never listed in Recent), keeping the order of the rest. Returns
+    /// whether anything was removed.
+    pub fn prune_recent_worktrees(&mut self, is_worktree: impl Fn(&Path) -> bool) -> bool {
+        let before = self.recent.len();
+        self.recent.retain(|repo| !is_worktree(&repo.path));
+        self.recent.len() != before
+    }
+
     /// Removes `path` from the recent list, if present.
     pub fn remove_recent(&mut self, path: &Path) {
         self.recent.retain(|repo| repo.path != path);
@@ -1500,6 +1509,21 @@ mod tests {
             load_json(dir.path(), r#"{"diff_layout":"diagonal"}"#).diff_layout,
             DiffLayout::Unified
         );
+    }
+
+    #[test]
+    fn pruning_worktrees_keeps_the_order_of_the_rest() {
+        let mut settings = Settings::default();
+        for (i, name) in ["/a", "/wt1", "/b", "/wt2", "/c"].iter().enumerate() {
+            settings.touch_recent(PathBuf::from(name), i as u64);
+        }
+        let is_wt = |p: &Path| p.to_string_lossy().starts_with("/wt");
+        assert!(settings.prune_recent_worktrees(is_wt));
+        assert_eq!(
+            paths(&settings),
+            vec![Path::new("/c"), Path::new("/b"), Path::new("/a")]
+        );
+        assert!(!settings.prune_recent_worktrees(is_wt));
     }
 
     #[test]

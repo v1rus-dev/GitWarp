@@ -201,13 +201,23 @@ fn main() {
         };
 
     let config_path = settings::config_dir().map(|dir| dir.join("settings.json"));
-    let loaded = match &config_path {
+    let mut loaded = match &config_path {
         Some(path) => SettingsStore::new(path.clone()).load(),
         None => {
             log::warn!("no configuration directory found; using default settings");
             Settings::default()
         }
     };
+    // Linked worktrees are never listed in Recent: drop the ones recorded by
+    // older versions so they stop taking slots of RECENT_LIMIT. At most
+    // RECENT_LIMIT small file reads, before any window exists.
+    if loaded.prune_recent_worktrees(git_core::is_linked_worktree) {
+        if let Some(path) = &config_path {
+            if let Err(e) = SettingsStore::new(path.clone()).save(&loaded) {
+                log::warn!("failed to save the pruned recent list: {e}");
+            }
+        }
+    }
     // Kept alive until `main` returns: dropping the guard flushes queued events.
     let _sentry = telemetry::init(loaded.telemetry);
     // Before the first window renders, so every view reads the chosen language.
