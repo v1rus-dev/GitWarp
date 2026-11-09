@@ -11,7 +11,8 @@
   .ktool { display: flex; align-items: center; gap: 8px; max-width: 760px; margin-bottom: 12px; }
   .ktool .kq { flex: 1; min-width: 0; width: auto; height: 26px; }
   .ktool .input, .ktool .btn { height: 26px; }
-  .krow { display: grid; grid-template-columns: minmax(0, 1fr) 190px 72px; gap: 8px; align-items: center; padding: 0 12px; min-height: 36px; border-bottom: 1px solid var(--border); }
+  .krow { display: grid; grid-template-columns: minmax(0, 1fr) 190px 72px; gap: 8px; align-items: center; padding: 0 12px; min-height: 36px; border-bottom: 1px solid transparent; } /* the app list has no visible border or row separators (border without colour) */
+  .klist { border-color: transparent; background: transparent; }
   .krow:last-child { border-bottom: 0; }
   .krow .grp { color: var(--muted); font-size: var(--fs-sm); }
   .krow .keys { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
@@ -34,7 +35,7 @@
   const DEF = [
     ['palette', 'General', 'Command palette', 'Ctrl+P'], ['search', 'General', 'Search commits', 'Ctrl+K'], ['settings', 'General', 'Open settings', 'Ctrl+,'],
     ['sidebar', 'View', 'Toggle sidebar', 'Ctrl+B'], ['dock', 'View', 'Toggle details dock', 'Ctrl+J'],
-    ['branch', 'Repository', 'Switch branch', 'Ctrl+Shift+B'], ['fetch', 'Repository', 'Fetch', 'Ctrl+Shift+F'], ['pull', 'Repository', 'Pull', 'Ctrl+Shift+L'], ['push', 'Repository', 'Push', 'Ctrl+Shift+P'],
+    ['branch', 'Repository', 'Switch branch', 'Ctrl+Shift+B'], ['worktree', 'Repository', 'Switch worktree', 'Ctrl+Alt+W'], ['fetch', 'Repository', 'Fetch', 'Ctrl+Shift+F'], ['pull', 'Repository', 'Pull', 'Ctrl+Shift+L'], ['push', 'Repository', 'Push', 'Ctrl+Shift+P'],
     ['next', 'History', 'Next commit', 'J'], ['prev', 'History', 'Previous commit', 'K'],
     ['stage', 'Changes', 'Stage / unstage file', 'Space'], ['commit', 'Changes', 'Commit', 'Ctrl+Enter'], ['discard', 'Changes', 'Discard changes', 'Ctrl+Shift+Z']
   ];
@@ -68,7 +69,7 @@
         <select class="input" style="width:150px;flex:none" aria-label="Group" data-kg>${GROUPS.map((x) => `<option${x === grp ? ' selected' : ''}>${x}</option>`).join('')}</select>
         <button class="btn" data-kall${changed ? '' : ' disabled'}>Reset all</button><button class="btn" data-kexp>${ic('copy', 14)}Export</button></div>
       ${flash ? S.banner(flash[0], flash[1], '') : ''}
-      <div class="sgroup"><div class="khead" style="margin-bottom:6px">${rows.length} of ${DEF.length} actions${changed ? ` · ${changed} modified` : ''}</div><div class="slist">${body || `<div class="kempty">No actions match “${esc(q)}”.</div>`}</div></div>
+      <div class="sgroup"><div class="khead" style="margin-bottom:6px">${rows.length} of ${DEF.length} actions${changed ? ` · ${changed} modified` : ''}</div><div class="slist klist">${body || `<div class="kempty">No actions match “${esc(q)}”.</div>`}</div></div>
       <div class="sfoot">${ic('info', 12)}Caption: record Ctrl+B on another action to see the conflict row.</div>`;
   }, null, { stagebar: `<label class="scn">Export result <select id="exp" aria-label="Export result">${Object.entries(EXP).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select></label>` });
   document.getElementById('exp').addEventListener('change', (e) => { expMode = e.target.value; });

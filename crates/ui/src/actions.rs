@@ -30,6 +30,8 @@ actions!(
         HeatmapActivate,
         SegmentPrev,
         SegmentNext,
+        MenuOpenSubmenu,
+        MenuCloseSubmenu,
     ]
 );
 
@@ -71,6 +73,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("space", HeatmapActivate, Some("ui-heatmap")),
         KeyBinding::new("left", SegmentPrev, Some("ui-segmented")),
         KeyBinding::new("right", SegmentNext, Some("ui-segmented")),
+        KeyBinding::new("right", MenuOpenSubmenu, Some("ui-menu")),
+        KeyBinding::new("left", MenuCloseSubmenu, Some("ui-menu")),
     ]);
 
     // Root handlers cannot run while nothing is focused: the dispatch path is

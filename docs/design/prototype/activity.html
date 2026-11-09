@@ -12,10 +12,10 @@
 <body>
 <script>GL.stagebar();</script>
 <div class="page" style="padding-bottom:0">
-  <h1>Commit activity — heatmap (proposal)</h1>
-  <p class="lead">A GitHub-style contribution graph: one square per day for the last 52 weeks, colour by number of commits. Two placements are drawn below; switch with <b>Placement</b>, and walk the states with <b>State</b>. Hover or focus a day for its count; click a day to act on it.</p>
+  <h1>Commit activity — heatmap (shipped)</h1>
+  <p class="lead">A GitHub-style contribution graph: one square per day for the last 52 weeks, colour by number of commits. Both placements ship (activity_strip.rs, welcome_activity.rs) and are drawn below; switch with <b>Placement</b>, and walk the states with <b>State</b>. Hover or focus a day for its count; click a day to act on it.</p>
   <div class="panel rec">
-    <p><b>Recommendation: B — a collapsible “Activity” strip above History in the repository window.</b></p>
+    <p><b>Shipped: B — a collapsible “Activity” strip above History in the repository window (also drawn on main-1200.html / main-1600.html), and A — the “Your activity” card on the Welcome screen (drawn on welcome.html).</b> Why B is the primary placement:</p>
     <ul>
       <li>It is where people already are: the Welcome screen only shows with no repository open, and GitWarp reopens the last repository on start.</li>
       <li>Clicking a day has an obvious, useful result — History filters to that day, in the same window. On Welcome a click has to open a repository first.</li>
@@ -23,7 +23,7 @@
       <li>Cost stays to one repository, and the counts can come from history already being loaded. Welcome would run <span class="mono">git log</span> in every recent repository on start, including slow or unmounted paths.</li>
       <li>The strip collapses to a 34px header, so History keeps its rows. It is not in the details dock: the dock belongs to the selected commit, and the 666px grid does not fit a right-hand dock.</li>
     </ul>
-    <p class="cap" style="margin:6px 0 0">A stays a valid later addition: a compact “Your activity” card on Welcome, reusing the same component in compact size.</p>
+    <p class="cap" style="margin:6px 0 0">A ships as well: a compact “Your activity” card on Welcome, reusing the same component in compact size.</p>
   </div>
   <div class="ctrls" id="act-ctrls"></div>
 </div>

@@ -22,7 +22,7 @@
     return `<h2>Worktrees</h2><p class="lead">Where new worktrees go and what happens after you create one. Applies to quick create and the switcher; the Add worktree dialog still lets you pick any folder.</p>
       ${S.group('Location', [
         S.row('Base folder', 'New worktrees are created inside this folder, never inside the repository.', S.sel('wt-base', base, BASES, 'Base folder')),
-        S.row('Folder name', `Example: <span class="mono">${example}</span>`, S.sel('wt-tpl', tpl, TPLS, 'Folder name template'))
+        S.row('Folder name', `Example: ${example}`, S.sel('wt-tpl', tpl, TPLS, 'Folder name template'))
       ])}
       ${S.group('After creating', [
         S.row('When the worktree is ready', 'Switching keeps your current worktree untouched — its changes stay where they are.', S.seg('wt-after', S.get('wt-after', 'switch'), [['switch', 'Switch to it'], ['stay', 'Stay here']])),

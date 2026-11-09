@@ -23,7 +23,7 @@ use ui::{
     Icon, IconName, SegmentItem, Segmented, Select, TextInput, TextInputEvent, ToastKind,
 };
 
-use crate::format::{display_path, expand_home};
+use crate::format::{display_path, expand_home, same_path};
 use crate::ref_ops::ref_name_error;
 use crate::workspace::Workspace;
 use crate::worktrees_model::git_message;
@@ -792,13 +792,6 @@ fn trim_trailing_separators(path: &Path) -> PathBuf {
         PathBuf::from("/")
     } else {
         PathBuf::from(trimmed)
-    }
-}
-
-fn same_path(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
     }
 }
 

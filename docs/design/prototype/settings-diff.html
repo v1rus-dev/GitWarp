@@ -61,7 +61,7 @@
   pane.addEventListener('click', (e) => {
     const st = t(e, '[data-dstep]');
     if (st) { S.set('diff-ctx', num('diff-ctx', 3, 0, 20) + (+st.dataset.dstep)); ctx.draw(); }
-    if (t(e, '[data-mtest]')) { testMsg = 'Merge tool started with sample files'; ctx.draw(); }
+    if (t(e, '[data-mtest]')) { testMsg = 'Started ' + (S.get('merge-tool', 'builtin') === 'custom' ? (S.get('merge-cmd', '').trim().split(/\s+/)[0] || '') : (PRESET[S.get('merge-tool', 'builtin')] || '').split(' ')[0]) + ' with sample files'; ctx.draw(); }
   });
   pane.addEventListener('change', (e) => {
         if (e.target.matches('[data-mcmd]')) { S.set('merge-cmd', e.target.value); testMsg = ''; ctx.draw(); }

@@ -22,6 +22,8 @@
     { id: 'w5', name: 'gitwarp-old', path: '~/develop/gitwarp-old', branch: 'feat/idle-lanes', hash: '19d8e4f', msg: 'Collapse idle lanes in the graph', missing: true, ahead: 0, behind: 0, dirty: [], last: 20000 }
   ];
   const BRANCHES = ['main', 'feat/idle-lanes', 'feat/palette', 'feat/ssh-keys', 'fix/git-detect', 'fix/old-experiment'];
+  /* branches that exist only on a remote: quick create shows "tracks {remote}" for them */
+  const REMOTE_ONLY = ['feat/remote-only'];
   let cur = 'w1', sel = 'w1', view = 'ready', hi = 0, popQuery = '', creating = false;
   let quickName = '', quickTouched = false;
 
@@ -52,7 +54,7 @@
 
   /* switcher button, right after the branch button */
   const brBtn = q('[data-act=branch]');
-  const wtBtn = G.h(`<button class="btn btn-tool wt-btn" data-act="worktree" data-tip="Switch worktree" data-kbd="Ctrl Alt W" aria-haspopup="listbox" aria-expanded="false"></button>`);
+  const wtBtn = G.h(`<button class="btn btn-tool wt-btn" data-act="worktree" data-tip="Switch worktree" data-kbd="Ctrl+Alt+W" aria-haspopup="listbox" aria-expanded="false"></button>`);
   brBtn.after(wtBtn);
   const drawBtn = () => {
     const w = byId(cur);
@@ -147,7 +149,7 @@
         return `<div class="wtpop-sec">${errMsg ? 'Not available' : 'Create'}</div><div class="wtitem${i === hi ? ' hi' : ''}${errMsg ? ' gone' : ''}" role="option" data-i="${i}" aria-selected="${i === hi}" ${errMsg ? 'aria-disabled="true"' : ''}>${ic('plus', 16)}<div style="min-width:0"><div class="nm od-truncate">${errMsg ? esc(errMsg) : (exists ? 'Open ' : 'Create ') + '“' + esc(it.name) + '” in a new worktree'}</div><div class="sub"><span class="od-truncate mono">${errMsg ? '' : esc(pathFor(it.name))}</span></div></div><span class="tail">${errMsg ? '' : '<span class="kbd">Enter</span>'}</span></div>`;
       }
       const w = it.w; n++;
-      return `${i === 0 ? '<div class="wtpop-sec">Worktrees</div>' : ''}<div class="wtitem${w.id === cur ? ' cur' : ''}${i === hi ? ' hi' : ''}${w.missing ? ' gone' : ''}" role="option" data-i="${i}" aria-selected="${w.id === cur}">${ic(w.main ? 'git' : 'worktree', 16)}<div style="min-width:0"><div class="nm-row"><span class="nm od-truncate">${mark(w.name, t)}</span>${w.main ? '<span class="chip">default</span>' : ''}</div><div class="sub"><span class="od-truncate mono">${mark(label(w), t)}</span></div></div><span class="tail">${glyphs(w)}${n <= 9 && !t ? `<span class="kbd" data-tip="Alt+${n}">Alt ${n}</span>` : ''}</span></div>`;
+      return `${i === 0 ? '<div class="wtpop-sec">Worktrees</div>' : ''}<div class="wtitem${w.id === cur ? ' cur' : ''}${i === hi ? ' hi' : ''}${w.missing ? ' gone' : ''}" role="option" data-i="${i}" aria-selected="${w.id === cur}">${ic(w.main ? 'git' : 'worktree', 16)}<div style="min-width:0"><div class="nm-row"><span class="nm od-truncate">${mark(w.name, t)}</span>${w.main ? '<span class="chip">default</span>' : ''}</div><div class="sub"><span class="od-truncate mono">${mark(label(w), t)}</span></div></div><span class="tail">${glyphs(w)}${n <= 9 && !t ? `<span class="kbd" data-tip="Alt+${n}">Alt+${n}</span>` : ''}</span></div>`;
     }).join('') : `<div class="wtpop-empty">No worktree matches. Type a branch name to create one.</div>`;
     const stale = WT.filter((w) => w.missing).length;
     pop.querySelector('.wtpop-foot').innerHTML = `<button class="btn btn-sm btn-ghost" data-pa="add">${ic('plus', 14)}Add worktree…</button>${stale ? `<button class="btn btn-sm btn-ghost" data-pa="prune">${ic('trash', 14)}Prune ${stale} missing</button>` : ''}<span class="od-fill"></span><span class="kbd">↑↓</span><span class="kbd">Enter</span><span class="kbd">Esc</span>`;
@@ -234,16 +236,16 @@
   const center = sh.center;
   center.innerHTML = '<div class="wtwork" aria-live="polite"></div>';
   const work = center.firstChild;
-  function focusQuick() { const i = work.querySelector('#quick'); if (i) { i.focus(); i.select(); } else toast('The worktree list is not available yet', 'info'); }
+  function focusQuick() { const i = work.querySelector('#quick'); if (i) { i.focus(); i.select(); } else toast('The worktree list is still loading', 'info'); }
 
   function quickHTML() {
     const n = quickName.trim(), err = branchErr(n), used = n && usedBy(n);
-    const exists = n && BRANCHES.includes(n);
+    const exists = n && (BRANCHES.includes(n) || REMOTE_ONLY.includes(n)); /* a remote-only branch is created as a tracking branch */
     const showErr = quickTouched && (err || used);
     const free = BRANCHES.filter((b) => !usedBy(b));
     let hint;
     if (showErr) hint = `<span class="quick-err">${ic('warn', 12)}${used ? `“${esc(n)}” is already checked out in <b>${esc(used.name)}</b>. ` : esc(err)}</span>${used ? `<button class="btn btn-sm btn-ghost" data-q="goto" data-id="${used.id}">Go to ${esc(used.name)}</button>` : ''}`;
-    else if (n) hint = `${ic('folder', 12)}<span class="od-truncate mono">${esc(pathFor(n))}</span><span class="od-nowrap">· ${exists ? 'existing branch' : 'new branch from main'}</span>`;
+    else if (n) hint = `${ic('folder', 12)}<span class="od-truncate mono">${esc(pathFor(n))}</span><span class="od-nowrap">· ${REMOTE_ONLY.includes(n) ? 'tracks origin' : exists ? 'existing branch' : byId(cur).branch ? 'new branch from ' + esc(byId(cur).branch) : 'new branch from the current commit'}</span>`;
     else hint = `Folder is filled from your template <span class="mono od-nowrap">${esc(cfg().base + '/' + cfg().tpl)}</span>`;
     return `<section class="quick" aria-label="Quick create"><div class="quick-row"><label class="input-wrap" ${showErr ? 'style="border-color:var(--error)"' : ''}>${ic('branch', 14)}<input id="quick" class="input mono" value="${esc(quickName)}" placeholder="Branch to work on — existing or new" aria-label="Branch name" ${creating ? 'disabled' : ''} ${showErr ? 'aria-invalid="true"' : ''} autocomplete="off" spellcheck="false"></label><button class="btn btn-primary" data-q="go" ${!n || err || used || creating ? 'disabled' : ''}>${creating ? ic('fetch', 14, 'spin') + 'Creating…' : ic('plus', 14) + 'Create worktree'}</button><button class="btn" data-q="dlg" ${creating ? 'disabled' : ''}>Add worktree…</button></div><div class="quick-hint">${hint}</div>${free.length ? `<div class="quick-chips"><span class="lbl">Branches without a worktree</span>${free.map((b) => `<button class="bchip" data-q="chip" data-b="${esc(b)}" aria-label="Open ${esc(b)} in a new worktree">${ic('branch', 12)}${esc(b)}</button>`).join('')}</div>` : ''}</section>`;
   }
@@ -257,7 +259,7 @@
       ${w.missing ? `<div style="padding:12px 16px"><div class="banner warn" role="status">${ic('warn', 16)}<div><div class="b-title">The folder no longer exists</div><div>git still lists this worktree. Prune the record, or restore the folder and it will reappear as clean.</div></div></div></div>` : ''}
       <div class="detail-grid"><div><span class="k">Branch</span><span class="v">${ic('branch', 14)}<span class="od-truncate mono">${esc(label(w))}</span></span></div><div><span class="k">HEAD</span><span class="v"><span class="mono">${w.hash}</span><span class="od-truncate muted" style="font-size:var(--fs-sm)">${esc(w.msg)}</span></span></div><div><span class="k">Remote</span><span class="v">${w.ahead || w.behind ? `<span class="st-ab" style="font-size:var(--fs-base);color:var(--text)">${w.ahead ? '↑ ' + w.ahead + ' ahead' : ''}${w.ahead && w.behind ? ' · ' : ''}${w.behind ? '↓ ' + w.behind + ' behind' : ''}</span>` : `<span class="muted">${w.branch ? 'Up to date' : 'No upstream (detached)'}</span>`}</span></div></div>
       ${w.missing ? '' : `<div class="detail-sec"><h4>Local changes</h4>${w.dirty.length ? files : `<div class="muted" style="font-size:var(--fs-base)">Nothing to commit — safe to remove or switch away.</div>`}</div>`}
-      <div class="detail-foot"><button class="btn btn-ghost btn-sm" data-d="reveal" ${w.missing ? 'disabled' : ''}>${ic('folder', 14)}Reveal in file manager</button><button class="btn btn-ghost btn-sm" data-d="lock" ${w.main || w.missing ? 'disabled' : ''}>${ic('lock', 14)}${w.locked ? 'Unlock' : 'Lock'}</button><span class="od-fill"></span>${w.main ? '<span class="hint">The main worktree cannot be removed.</span>' : ''}<button class="btn btn-sm" data-d="remove" ${w.main ? 'disabled' : ''} style="${w.main ? '' : 'color:var(--error)'}">${ic('trash', 14)}Remove…</button></div></section>`;
+      <div class="detail-foot"><button class="btn btn-ghost btn-sm" data-d="reveal" ${w.missing ? 'disabled' : ''}>${ic('folder', 14)}Reveal in file manager</button><button class="btn btn-ghost btn-sm" data-d="lock" ${w.main || w.missing ? 'disabled' : ''}>${ic('lock', 14)}${w.locked ? 'Unlock' : 'Lock'}</button><span class="od-fill"></span>${w.main ? '<span class="hint">The main worktree cannot be removed.</span>' : ''}<button class="btn btn-sm" data-d="remove" ${w.main ? 'disabled' : ''} style="${w.main ? '' : 'color:var(--error);border-color:var(--error)'}">${ic('trash', 14)}Remove…</button></div></section>`;
   }
   function drawCenter() {
     const keep = document.activeElement && document.activeElement.id === 'quick' ? document.activeElement.selectionStart : null;
@@ -268,7 +270,7 @@
       ${quickHTML()}
       ${WT.length === 1 ? `<div class="banner info" role="status">${ic('info', 16)}<div><div class="b-title">This is your only worktree</div><div>A worktree is a second working folder for this repository. Start a hotfix or a review without stashing — type a branch name above.</div></div></div>` : ''}
       ${detailHTML(w)}
-      <div class="kbhint"><span><span class="kbd">Ctrl</span><span class="kbd">Alt</span><span class="kbd">W</span> switcher</span><span><span class="kbd">Alt</span><span class="kbd">1–9</span> jump in the switcher</span><span><span class="kbd">Enter</span> switch in the sidebar</span><span><span class="kbd">Del</span> remove</span></div>`;
+      <div class="kbhint"><span><span class="kbd">Ctrl+Alt+W</span> switcher</span><span><span class="kbd">Alt+1–9</span> jump in the switcher</span><span><span class="kbd">Enter</span> switch in the sidebar</span><span><span class="kbd">Del</span> remove</span></div>`;
     if (keep != null) { const i = work.querySelector('#quick'); if (i) { i.focus(); i.setSelectionRange(keep, keep); } }
   }
   work.addEventListener('input', (e) => { if (e.target.id !== 'quick') return; quickName = e.target.value; quickTouched = true; drawCenter(); });

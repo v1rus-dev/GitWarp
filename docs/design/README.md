@@ -6,7 +6,14 @@ reviewed without that tool. It is the source of truth for UI acceptance: where t
 implementation and the prototype disagree, the prototype wins. On 2026-11-02 the prototype was
 re-synced with the app as shipped through stage 10, so it
 now also shows the dialogs, states and menus the app gained without a design page, and the
-decisions listed below are drawn in it. The product name is GitWarp; the OpenDesign project is
+decisions listed below are drawn in it. On 2026-11-09 it was brought to pixel parity with the
+app as released in v0.2.1 (window shell with sidebar navigation, activity strip, graph metrics,
+CI and PR on history rows, settings pages, palette, hosting, welcome activity card, error-fix
+dialogs). Since then the rule is: for anything the app already ships, the app is the reference
+and a difference is a prototype bug; anything drawn that the app does not have yet carries a
+dashed **Planned** tag, so new features are designed here first and then implemented.
+
+The product name is GitWarp; the OpenDesign project is
 still named "gitlane". To view it, open `prototype/index.html` in a browser —
 the pages are self-contained and link to each other by relative path — and use the theme
 button at the top right to switch between dark and light. Static screenshots of every page in
@@ -18,7 +25,7 @@ both themes are in `screens/` (`<page>.dark.png` and `<page>.light.png`).
 | `components.html` | Component set: buttons, inputs, tabs, tree, rows, menus, tooltips, dialogs, toasts — with states. | 1 — UI foundation |
 | `main-1200.html` | Main window 1200×800: history + details docked bottom, unified diff. Interactive. | 2 — window shell, welcome, states |
 | `main-1600.html` | Main window 1600×1000: details docked right, side-by-side diff. Interactive. | 2 — window shell, welcome, states |
-| `welcome.html` | Welcome / repo picker: recent repos, Open, Clone, Init dialogs. | 2 — window shell, welcome, states |
+| `welcome.html` | Welcome / repo picker: "Your activity" card, unavailable recent entries with bulk removal and Undo (shipped; linked worktrees are never listed in Recent), recent repos, Open, Clone, Init dialogs. | 2 — window shell, welcome, states |
 | `history-states.html` | History states: loading, empty repo, not a repo, git missing / too old, generic git error. | 2 — window shell, welcome, states |
 | `dialogs-repo.html` | Dialogs: clone / open — clone from URL (HTTPS/SSH, progress, errors) and open from folder, with all states. | 2 — Open tab; 8 — Clone tab |
 | `graph.html` | Commit graph spec: geometry, golden-angle lanes on both themes, clipping, widening, idle-lane collapse. | 3 — history |
@@ -38,12 +45,14 @@ both themes are in `screens/` (`<page>.dark.png` and `<page>.light.png`).
 | `remotes-accounts.html` | Sidebar remotes with service + account, account picker per remote, Add account for host, remote with several push URLs. | H6 — remotes ↔ accounts |
 | `hosting-features.html` | Open on host, Clone From account, PR badges and popover, CI status and checks, Create PR, PR panel. | H7–H10 — hosting features |
 | `settings-ssh.html` | Settings → SSH keys: key list, generate / import / delete, connection test, trusted hosts. | 10 — settings |
-| `palette.html` | Command palette: Ctrl+P quick launcher for commands, branches, commits, files. | 11 — command palette |
+| `palette.html` | Command palette: Ctrl+P launcher with the app's full command list, branches, commits, files, prefixes `>` `@` `#`. | 11 — command palette |
+| `menus-refs.html` | Cascading ref menus (shipped): each ref of a commit is a row with a hover submenu (local, remote, tag sections; merged `main +origin` row), commit actions, Copy submenu, badge right-click, overflow, flip, keyboard (Shift+F10 / Menu key on the selected row). Still **Planned** and not in the app: Rebase onto, Fast-forward, Compare with HEAD, Hide from graph, Interactive rebase from here. | History — ref menus |
+| `dialogs-errors.html` | Errors and notices: error-fix dialogs with a remedy button, confirmations, update notice, error toast with Copy, account and multi-target push toasts. | 7–8, post-10 |
 | `dialogs-checkout.html` | Checkout with uncommitted changes: stash / bring changes / discard, for branch, remote branch, tag and commit. | 7 — ref operations |
 | `dialogs-merge.html` | Dialogs: merge / rebase — merge dialog with conflict preview and merge types, rebase dialog, new branch-menu items; the Merge / Rebase in progress banner and Conflicts group are states of `changes.html` (Operation switcher, `?op=`). | 12 — merge / rebase |
 | `conflicts.html` | Conflict editor: resolve a conflicted file chunk by chunk — two side panes (optional base), per-chunk checkboxes, live editable result (picked / both / edited / auto), binary and modify/delete cards, rebase side labelling. Opened from Changes (Resolve…). | 12 — conflict editor |
 | `dialogs-network.html` | Network prompts: HTTPS credentials, SSH host key (first connection, key changed), result toasts. | 8 — network |
-| `activity.html` | Proposal, not scheduled: commit-activity heatmap; placement A (Welcome) vs B (strip above History, recommended), all states. | — |
+| `activity.html` | Commit-activity heatmap: strip above History (shipped, also drawn in the main windows) and the Welcome "Your activity" card (shipped, drawn in `welcome.html`), all states. | post-10 |
 | `icons.html` | Icon set: the app's own icons next to their Primer Octicons replacement (adopted in the prototype). | 1 — UI foundation |
 | `index.html` | Overview and keyboard model. | Overview |
 
@@ -73,6 +82,12 @@ Both themes share one geometry and differ only in colour.
 - Icons are Primer Octicons 19.42.0 (MIT, 16px fill set) instead of the hand-drawn stroke set;
   the Git mark, keyboard, command and window-control icons stay our own (`icons.html`).
 - Settings opens as a centred modal card over the repository window, not as a separate window.
+- History / Changes / Worktrees are rows at the top of the sidebar; the toolbar segmented switch
+  appears only while the sidebar is collapsed.
+- Graph metrics follow the app: lane 16px, dot radius 5, halo 6.5, HEAD ring 8.
+- A local branch and its remote counterpart share one ref badge with a muted `+origin` suffix.
+- Rebase, fast-forward from the sidebar, push branch, and "Open in merge tool" on conflicted rows are
+  drawn but **Planned** (not in the app yet).
 
 ## Roadmap
 

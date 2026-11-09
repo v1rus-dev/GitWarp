@@ -8,13 +8,18 @@
 <link rel="stylesheet" href="gitwarp.css">
 <link rel="stylesheet" href="settings.css">
 <style>
-  .themes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 12px; }
-  .tcard { display: flex; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg); cursor: default; }
+  .themes { border-bottom: 1px solid var(--border); display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 12px; }
+  .tcard { display: flex; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); cursor: default; }
   .tcard:hover { border-color: var(--border-strong); }
   .tcard.on { border-color: var(--accent); background: var(--accent-soft); }
   .tcard:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .tcard .dotbox { width: 12px; height: 12px; }
+  .tcard.on .dotbox { border-color: var(--accent); }
   .tcard .tl { display: flex; align-items: center; gap: 6px; font-weight: 500; }
-  .thumb { height: 64px; border-radius: var(--r-sm); border: 1px solid var(--border); display: grid; grid-template-columns: 28% 1fr; overflow: hidden; }
+  .thumb { height: 64px; border-radius: var(--r-sm); border: 1px solid var(--border); display: grid; grid-template-columns: 56px 1fr; overflow: hidden; }
+  .thumb.sys { grid-template-columns: 1fr 1fr; }
+  .thumb.sys > div { padding: 6px; display: flex; flex-direction: column; gap: 4px; }
+  .thumb.sys > div b { display: block; height: 4px; border-radius: 2px; }
   .thumb i { display: block; }
   .thumb .a { padding: 6px; display: flex; flex-direction: column; gap: 4px; }
   .thumb .a b, .thumb .b b { display: block; height: 4px; border-radius: 2px; }
@@ -41,8 +46,8 @@
   const sys = () => (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
   /* One place applies persisted appearance to the document root; the other pages only read the theme. */
   function apply() {
-    const th = S.get('theme-pref', G.theme), real = th === 'system' ? sys() : th;
-    G.setTheme(real);
+    const th = S.get('theme-pref', 'system'), real = th === 'system' ? sys() : th;
+    if (S.get('theme-pref', null) !== null) G.setTheme(real); /* default System: leave the stage theme toggle in charge until the user picks a card */
     const a = ACC.find((x) => x[0] === S.get('accent', 'blue')) || ACC[0], r = document.documentElement.style;
     if (a[0] === 'blue') { r.removeProperty('--accent'); r.removeProperty('--accent-hover'); r.removeProperty('--accent-soft'); r.removeProperty('--focus'); }
     else { r.setProperty('--accent', a[3]); r.setProperty('--accent-hover', a[3]); r.setProperty('--accent-soft', `color-mix(in srgb, ${a[3]} 16%, transparent)`); r.setProperty('--focus', a[3]); }
@@ -52,17 +57,18 @@
   apply();
   const ROWH = { compact: 22, normal: 26, roomy: 30 };
   const ctx = S.mount('settings-appearance.html', 'Appearance', () => {
-    const th = S.get('theme-pref', G.theme), acc = S.get('accent', 'blue'), den = S.get('density', 'normal');
+    const th = S.get('theme-pref', 'system'), acc = S.get('accent', 'blue'), den = S.get('density', 'normal');
     const ms = S.get('mono-size', 12), lw = +S.get('line-w', '2'), colored = S.get('colored', true);
-    const tcard = (v, label, thumb) => `<div class="tcard${th === v ? ' on' : ''}" role="radio" aria-checked="${th === v}" tabindex="0" data-theme-pick="${v}"><div class="thumb ${thumb}"><div class="a"><b></b><b></b><b></b></div><div class="b"><b></b><b></b><b></b></div></div><div class="tl"><span class="dotbox">${th === v ? '<i style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></i>' : ''}</span>${label}</div></div>`;
-    const sysThumb = '<div class="thumb lt" style="background:linear-gradient(90deg,#ffffff 50%,#181b20 50%)"><div class="a"><b></b><b></b></div><div class="b"><b></b><b></b></div></div>';
+    const tcard = (v, label, thumb) => `<div class="tcard${th === v ? ' on' : ''}" role="radio" aria-checked="${th === v}" tabindex="0" data-theme-pick="${v}"><div class="thumb ${thumb}"><div class="a"></div><div class="b"><b></b><b></b><b></b></div></div><div class="tl"><span class="dotbox">${th === v ? '<i style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></i>' : ''}</span>${label}</div></div>`;
+    /* System: split light / dark halves, each with its own bars (app theme_thumb) */
+    const sysThumb = '<div class="thumb sys"><div style="background:#ffffff"><b style="background:#2a66d6"></b><b style="background:#b9c0cb"></b><b style="background:#b9c0cb"></b></div><div style="background:#181b20"><b style="background:#6ea4f7"></b><b style="background:#4a515d"></b><b style="background:#4a515d"></b></div></div>';
     const sysCard = `<div class="tcard${th === 'system' ? ' on' : ''}" role="radio" aria-checked="${th === 'system'}" tabindex="0" data-theme-pick="system">${sysThumb}<div class="tl"><span class="dotbox">${th === 'system' ? '<i style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></i>' : ''}</span>System</div></div>`;
     const date = S.get('datefmt', 'rel');
     const h = ROWH[den];
     const pvRow = (sel, hash, msg, min) => `<div class="pv-row${sel ? ' sel' : ''}" style="height:${h}px"><span class="mono">${hash}</span><span class="od-fill od-truncate">${msg}</span><span class="muted od-nowrap">${date === 'rel' ? G.rel(min) : G.abs(min)}</span></div>`;
     const lane = (c) => `<svg width="30" height="${h}" aria-hidden="true"><line x1="8" y1="0" x2="8" y2="${h}" stroke="${colored ? 'var(--info)' : 'var(--muted)'}" stroke-width="${lw}"/><line x1="22" y1="0" x2="22" y2="${h}" stroke="${colored ? 'var(--st-untracked)' : 'var(--muted)'}" stroke-width="${lw}"/><circle cx="${c}" cy="${h / 2}" r="4.5" fill="${c === 8 ? (colored ? 'var(--info)' : 'var(--muted)') : (colored ? 'var(--st-untracked)' : 'var(--muted)')}"/></svg>`;
     return `<h2>Appearance</h2><p class="lead">Theme, accent colour, density and type. Changes apply immediately.</p>
-      <section class="sgroup"><h3>Theme</h3><div class="slist"><div class="themes" role="radiogroup" aria-label="Theme">${tcard('dark', 'Dark', 'dk')}${tcard('light', 'Light', 'lt')}${sysCard}</div>
+      <section class="sgroup"><h3>Theme</h3><div class="slist" style="border-color:transparent"><div class="themes" role="radiogroup" aria-label="Theme">${tcard('dark', 'Dark', 'dk')}${tcard('light', 'Light', 'lt')}${sysCard}</div>
         ${S.row('Accent colour', 'Selection, focus ring and primary buttons.', `<div class="swatches" role="radiogroup" aria-label="Accent colour">${ACC.map(([k, l, , v]) => `<button class="swatch${acc === k ? ' on' : ''}" style="background:${v}" role="radio" aria-checked="${acc === k}" aria-label="${l}" data-acc="${k}">${acc === k ? ic('check', 12) : ''}</button>`).join('')}</div>`)}</div></section>
       ${S.group('Lists and type', [
         S.row('Row density', 'Height of rows in history, changes and the sidebar.', S.seg('density', den, [['compact', 'Compact'], ['normal', 'Normal'], ['roomy', 'Roomy']])),
@@ -74,7 +80,7 @@
         S.row('Line width', '', S.seg('line-w', String(lw), [['1', '1 px'], ['2', '2 px'], ['3', '3 px']])),
         S.row('Dates', 'Hover always shows the exact timestamp.', S.seg('datefmt', date, [['rel', 'Relative'], ['abs', 'Absolute']]))
       ])}
-      <section class="sgroup"><h3>Preview</h3><div class="preview" aria-label="History preview"><div class="pv-list">
+      <section class="sgroup"><h3>Preview</h3><div class="preview" aria-label="History preview"><div class="ph">History · graph, rows and type</div><div class="pv-list">
         <div class="pv-row sel" style="height:${h}px">${lane(8)}<span class="mono">8d41f6e</span><span class="od-fill od-truncate">fix(settings): list both reasons when bundled and system git fail</span><span class="muted od-nowrap">${date === 'rel' ? G.rel(600) : G.abs(600)}</span></div>
         <div class="pv-row" style="height:${h}px">${lane(22)}<span class="mono">b7a3d15</span><span class="od-fill od-truncate">feat(settings): validate custom git path, require git ≥ 2.31</span><span class="muted od-nowrap">${date === 'rel' ? G.rel(1100) : G.abs(1100)}</span></div>
         <div class="pv-row" style="height:${h}px">${lane(8)}<span class="mono">c19e0a4</span><span class="od-fill od-truncate">refactor(history): extract lane collapse into its own module</span><span class="muted od-nowrap">${date === 'rel' ? G.rel(2900) : G.abs(2900)}</span></div>

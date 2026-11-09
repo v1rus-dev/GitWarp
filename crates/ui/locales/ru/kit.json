@@ -27,6 +27,7 @@
   "kit.heatmap.weekday.thu": "Чт",
   "kit.heatmap.weekday.tue": "Вт",
   "kit.heatmap.weekday.wed": "Ср",
+  "kit.menu.no_matches": "Нет совпадений",
   "kit.toast.dismiss": "Скрыть",
   "kit.toast.copy": "Копировать"
 }

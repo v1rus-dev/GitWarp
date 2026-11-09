@@ -20,7 +20,7 @@ use std::time::SystemTime;
 use gpui::prelude::*;
 use gpui::{div, px, App, Context, FontWeight, Global, SharedString, Task, WeakEntity, Window};
 
-use git_core::{Error, Git, Repo};
+use git_core::{Error, Git, PathProbe, Repo};
 use ui::i18n;
 use ui::metrics::{FS_LG, FS_SM, R_MD, SP_4, SP_5};
 use ui::{
@@ -31,6 +31,7 @@ use ui::{
 use crate::activity_strip::{commits, range_days, LAST_YEAR_DAYS, WEEKS};
 use crate::format::{display_path, format_count, home_dir};
 use crate::history_view::DayFilter;
+use crate::recent_state::RowState;
 use crate::text_runs::{mono, strong};
 use crate::welcome::recent_name;
 use crate::workspace::Workspace;
@@ -446,6 +447,26 @@ fn head_stamp(path: &Path) -> Option<SystemTime> {
     Some(head.map_or(dir, |head| head.max(dir)))
 }
 
+/// The chip wording of why `path` is skipped, or `None` when it is a usable repository.
+/// "Can't read" carries the underlying error ("Can't read — <error>"): that text is
+/// what tells the user how to fix it, and the chip label alone hides it.
+fn unavailable_reason(
+    path: &Path,
+    probe: PathProbe,
+    open: Option<crate::recent_state::OpenResult>,
+) -> Option<String> {
+    match crate::recent_state::classify(path, probe, open) {
+        RowState::Unavailable(crate::recent_state::Unavailable::Unreadable(error)) => {
+            Some(format!(
+                "{} — {error}",
+                crate::recent_state::Unavailable::Unreadable(String::new()).chip_label()
+            ))
+        }
+        RowState::Unavailable(reason) => Some(reason.chip_label().to_string()),
+        _ => None,
+    }
+}
+
 /// My commits per day over the last 12 months in one repository. Runs on the
 /// background executor.
 fn count_repo(
@@ -454,8 +475,11 @@ fn count_repo(
     me: &str,
     cached: Option<&CacheEntry>,
 ) -> Result<CacheEntry, String> {
-    if !path.is_dir() {
-        return Err(ui::t!("welcome.activity.folder_missing").to_string());
+    // The same classification and wording as the recent list's chips.
+    let probe = git_core::probe_repo_path(path);
+    if !matches!(probe, PathProbe::Candidate { .. }) {
+        let reason = unavailable_reason(path, probe, None);
+        return Err(reason.unwrap_or_else(|| ui::t!("welcome.recent.state.unreadable").to_string()));
     }
     let stamp = head_stamp(path);
     if let Some(cached) = cached {
@@ -463,7 +487,28 @@ fn count_repo(
             return Ok(cached.clone());
         }
     }
-    let repo = Repo::open(git, path).map_err(|e| e.to_string())?;
+    // `Repo::open` searches upward: a folder that lost its `.git` but sits
+    // inside another repository opens that parent, which is not this entry.
+    let repo = match Repo::open(git, path) {
+        Ok(repo) => {
+            let open = Ok((repo.root().to_path_buf(), None));
+            if let Some(reason) =
+                unavailable_reason(path, PathProbe::Candidate { linked: false }, Some(open))
+            {
+                return Err(reason);
+            }
+            repo
+        }
+        Err(error) => {
+            let text = error.to_string();
+            let reason = unavailable_reason(
+                path,
+                PathProbe::Candidate { linked: false },
+                Some(Err(error)),
+            );
+            return Err(reason.unwrap_or(text));
+        }
+    };
     let group = git_core::common_dir(&repo).map_err(|e| e.to_string())?;
     let today = git_core::today(&repo).map_err(|e| e.to_string())?;
     // Padded by a day on each side so no timezone can cut a day.
@@ -847,17 +892,14 @@ mod tests {
     fn skipped_repositories_are_listed_in_recent_order() {
         let (paths, repos) = states(&[
             ("/r/one", ready(&[(1, 1)])),
-            (
-                "/r/gone",
-                RepoState::Skipped("the folder does not exist".into()),
-            ),
+            ("/r/gone", RepoState::Skipped("Folder not found".into())),
             ("/r/busy", RepoState::Loading),
-            ("/r/bad", RepoState::Skipped("not a git repository".into())),
+            ("/r/bad", RepoState::Skipped("Not a repository".into())),
         ]);
         let skipped = skipped(&paths, &repos);
         let names: Vec<&str> = skipped.iter().map(|(p, _)| p.to_str().unwrap()).collect();
         assert_eq!(names, ["/r/gone", "/r/bad"]);
-        assert_eq!(skipped[0].1, "the folder does not exist");
+        assert_eq!(skipped[0].1, "Folder not found");
     }
 
     #[test]
@@ -920,8 +962,56 @@ mod tests {
         let nobody = count_repo(git.clone(), repo.path(), "nobody@x.io", Some(&entry)).unwrap();
         assert!(nobody.counts.is_empty());
 
+        // Skipped repositories carry the same wording as the recent list's chips.
         let gone = repo.path().join("does-not-exist");
-        assert!(count_repo(git, &gone, "me@x.io", None).is_err());
+        assert_eq!(
+            count_repo(git.clone(), &gone, "me@x.io", None)
+                .err()
+                .as_deref(),
+            Some("Folder not found")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_repository_keeps_its_error_text() {
+        let path = Path::new("/r/locked");
+        assert_eq!(
+            unavailable_reason(
+                path,
+                PathProbe::Unreadable("Permission denied".into()),
+                None
+            )
+            .as_deref(),
+            Some("Can't read — Permission denied")
+        );
+        let boom = git_core::Error::Spawn(std::io::Error::other("boom"));
+        let reason = unavailable_reason(
+            path,
+            PathProbe::Candidate { linked: false },
+            Some(Err(boom)),
+        )
+        .unwrap();
+        assert!(reason.starts_with("Can't read — "), "{reason}");
+        assert!(reason.contains("boom"), "{reason}");
+        // The other reasons stay the bare chip label.
+        assert_eq!(
+            unavailable_reason(path, PathProbe::Missing, None).as_deref(),
+            Some("Folder not found")
+        );
+    }
+
+    #[test]
+    fn a_folder_inside_another_repository_is_skipped_as_not_a_repository() {
+        let repo = crate::test_support::TempRepo::new("welcome-activity-parent");
+        let inner = repo.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        // `Repo::open` finds the parent from here; the entry itself is not a repository.
+        assert_eq!(
+            count_repo(crate::test_support::git(), &inner, "me@x.io", None)
+                .err()
+                .as_deref(),
+            Some("Not a repository")
+        );
     }
 
     #[test]

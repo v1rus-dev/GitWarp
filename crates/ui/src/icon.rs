@@ -74,11 +74,12 @@ pub enum IconName {
     Repo,
     RepoForked,
     Archive,
+    Filter,
 }
 
 impl IconName {
-    /// All 63 icons, in the design's order.
-    pub const ALL: [IconName; 63] = [
+    /// All 64 icons, in the design's order.
+    pub const ALL: [IconName; 64] = [
         Self::Branch,
         Self::Tag,
         Self::Cloud,
@@ -142,6 +143,7 @@ impl IconName {
         Self::RepoForked,
         Self::Archive,
         Self::Restore,
+        Self::Filter,
     ];
 
     /// Asset path, e.g. `icons/chev-r.svg`.
@@ -210,6 +212,7 @@ impl IconName {
             Self::Repo => "icons/repo.svg",
             Self::RepoForked => "icons/repo-forked.svg",
             Self::Archive => "icons/archive.svg",
+            Self::Filter => "icons/filter.svg",
         }
     }
 }

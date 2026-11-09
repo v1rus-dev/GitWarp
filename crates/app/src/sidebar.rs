@@ -26,6 +26,11 @@ use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_SM, FS_XS, R_SM};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{Button, Chip, CountPill, Icon, IconName, Skeleton, Tooltip, TreeNodeData};
 
+pub use crate::menu_model::SidebarAction;
+pub use crate::menu_model::SidebarMenuItem;
+pub(crate) use crate::menu_model::{
+    can_merge, can_push_tag, head_label, is_current, open_item, SidebarActionHandler,
+};
 use crate::remote_accounts::{self, RemoteDisplay, RemoteTargets};
 use crate::web_links::{self, HostLink};
 use crate::worktree_glyphs::{main_worktree_tip, worktree_glyphs};
@@ -211,122 +216,6 @@ pub fn commit_for(key: &str, refs: &[Ref], extras: Option<&SidebarExtras>) -> Op
     None
 }
 
-/// What a sidebar context-menu item does when it is enabled.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SidebarAction {
-    /// Nothing yet: the item arrives with a later stage.
-    None,
-    /// Writes this text to the clipboard.
-    CopyText(String),
-    /// Opens `url` in the browser and toasts that `host` was opened.
-    OpenUrl {
-        url: String,
-        host: String,
-    },
-    /// Reloads the sidebar's lists ([`RepositoryView::refresh`]).
-    ///
-    /// [`RepositoryView::refresh`]: crate::repo_view::RepositoryView::refresh
-    Refresh,
-    /// Checks out a local branch.
-    CheckoutBranch(String),
-    /// Checks out a remote branch, creating a local tracking branch if needed.
-    CheckoutRemoteBranch(String),
-    /// Checks out a tag with a detached HEAD.
-    CheckoutTag(String),
-    /// Opens the Merge dialog for a local branch or a remote-tracking ref
-    /// (`origin/feat/x`), merging it into the current branch.
-    Merge(String),
-    /// Opens "Create branch here" at `oid`.
-    CreateBranchAt(Oid),
-    /// Opens "Create pull request" for a local branch.
-    CreatePullRequest(String),
-    RenameBranch(String),
-    DeleteBranch(String),
-    RenameTag(String),
-    DeleteTag(String),
-    /// Applies a stash by index without dropping it.
-    ApplyStash(usize),
-    PopStash(usize),
-    DropStash(usize),
-    /// Opens "Create tag" at HEAD.
-    CreateTag,
-    /// Opens the add-remote dialog.
-    AddRemote,
-    /// Account… of a remote: picker, Add account dialog or an info toast.
-    RemoteAccount(String),
-    /// "Accounts for push URLs…" of a multi-push remote: an info toast.
-    RemotePushAccounts(String),
-    /// "Add account for <host>" row under a remote.
-    AddAccountFor(String),
-    EditRemote(String),
-    RemoveRemote(String),
-    /// Fetches one remote (`origin`, `upstream`, …).
-    FetchRemote(String),
-    /// Fetches every remote with tags and pruning.
-    FetchAll,
-    /// Prunes stale remote-tracking branches while fetching.
-    FetchPrune,
-    /// Makes `origin/<name>` (or the default remote's branch) the upstream.
-    SetUpstream(String),
-    /// Pushes one tag to the default remote.
-    PushTag(String),
-    /// Pushes all tags to the default remote.
-    PushTags,
-    /// Deletes a remote branch, e.g. `origin/feat/x`.
-    DeleteRemoteBranch(String),
-    /// Shows a stash's files and diff in the details dock.
-    ViewStash(usize),
-    /// Initialises and updates a submodule, by path.
-    UpdateSubmodule(String),
-    /// Opens an initialised submodule's folder in a second window.
-    OpenSubmodule(String),
-    /// Narrows the History list to one branch's own commits (local name or
-    /// `<remote>/<name>`).
-    ShowBranchCommits(String),
-    /// Shows the Worktrees page.
-    ShowWorktrees,
-    /// Opens the add-worktree dialog.
-    AddWorktree,
-    /// Opens a worktree in a second window.
-    OpenWorktree(String),
-    /// Moves a worktree's folder. The path is the current location.
-    RenameWorktree(String),
-    /// Locks a worktree by path.
-    LockWorktree(String),
-    /// Unlocks a worktree by path.
-    UnlockWorktree(String),
-    /// Opens the remove-worktree dialog for a path.
-    RemoveWorktree(String),
-    /// Drops the records of worktrees whose folders are gone.
-    PruneWorktrees,
-}
-
-/// One item of a sidebar context menu, free of GPUI so the labels, order and
-/// enabled state are unit-testable.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SidebarMenuItem {
-    pub label: String,
-    pub icon: IconName,
-    pub shortcut: Option<String>,
-    pub danger: bool,
-    pub enabled: bool,
-    pub action: SidebarAction,
-}
-
-impl SidebarMenuItem {
-    /// A shown-but-disabled item: no later stage has wired it yet.
-    fn new(label: impl Into<String>, icon: IconName) -> Self {
-        Self {
-            label: label.into(),
-            icon,
-            shortcut: None,
-            danger: false,
-            enabled: false,
-            action: SidebarAction::None,
-        }
-    }
-}
-
 /// One row of a sidebar context menu: an item or a rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SidebarMenuEntry {
@@ -359,7 +248,6 @@ impl SidebarMenuEntry {
     fn action(self, action: SidebarAction) -> Self {
         match self {
             SidebarMenuEntry::Item(mut item) => {
-                item.enabled = !matches!(action, SidebarAction::None);
                 item.action = action;
                 SidebarMenuEntry::Item(item)
             }
@@ -393,20 +281,14 @@ pub fn sidebar_menu(
     sidebar_menu_with_links(key, head, extras, refs, &[], operation)
 }
 
-/// "Open on <Service>" for `target` on the host of `link`; `None` when the
-/// service has no such page.
-fn open_item(link: &HostLink, target: &forge::WebTarget) -> Option<SidebarMenuEntry> {
-    let url = link.url(target)?;
-    Some(
-        item(
-            &ui::t!("sidebar.menu.open_on_host", service = link.service_name()),
-            IconName::External,
-        )
-        .action(SidebarAction::OpenUrl {
-            url,
-            host: link.host().to_owned(),
-        }),
+/// The sidebar's "Open on <Service>" entry.
+fn open_on_host(link: &HostLink, target: &forge::WebTarget) -> Option<SidebarMenuEntry> {
+    open_item(
+        link,
+        target,
+        ui::t!("sidebar.menu.open_on_host", service = link.service_name()),
     )
+    .map(SidebarMenuEntry::Item)
 }
 
 /// [`sidebar_menu`] plus the "Open on <Service>" items of the repository's
@@ -424,20 +306,15 @@ pub fn sidebar_menu_with_links(
     // local branch without an upstream.
     let branch_open = |key: &str| {
         let (link, target) = web_links::branch_target(links, targets, refs.unwrap_or(&[]), key)?;
-        open_item(link, &target)
+        open_on_host(link, &target)
     };
-    // Merging needs a branch to merge into: not on a detached or unread HEAD.
-    // ... and not while another operation is stopped (git refuses to start one).
-    let can_merge = matches!(head, Some(Head::Branch { .. })) && operation == Operation::None;
-    let head = match head {
-        Some(Head::Branch { name, .. }) => name.as_str(),
-        Some(Head::Detached(_)) | None => "HEAD",
-    };
+    let can_merge = can_merge(head, operation);
+    let head_name = head_label(head);
     // Stage 7 wires checkout, rename/delete and the stash/remote dialogs; the
     // network (stage 8), worktree (stage 9) and merge/rebase (stage 12) items
     // stay shown-but-disabled.
     if let Some(name) = key.strip_prefix("local:") {
-        let current = name == head;
+        let current = is_current(head, name);
         let mut entries = vec![
             item(&ui::t!("sidebar.menu.checkout"), IconName::Check)
                 .shortcut("Enter")
@@ -448,12 +325,12 @@ pub fn sidebar_menu_with_links(
             )
             .action(SidebarAction::ShowBranchCommits(name.to_owned())),
             item(
-                &ui::t!("sidebar.menu.merge_into", name = name, head = head),
+                &ui::t!("sidebar.menu.merge_into", name = name, head = head_name),
                 IconName::Merge,
             )
             .maybe_action((can_merge && !current).then(|| SidebarAction::Merge(name.to_owned()))),
             item(
-                &ui::t!("sidebar.menu.rebase_onto", name = name, head = head),
+                &ui::t!("sidebar.menu.rebase_onto", name = name, head = head_name),
                 IconName::Branch,
             ),
             SidebarMenuEntry::Separator,
@@ -492,7 +369,7 @@ pub fn sidebar_menu_with_links(
             )
             .action(SidebarAction::ShowBranchCommits(name.to_owned())),
             item(
-                &ui::t!("sidebar.menu.merge_into", name = name, head = head),
+                &ui::t!("sidebar.menu.merge_into", name = name, head = head_name),
                 IconName::Merge,
             )
             .maybe_action(can_merge.then(|| SidebarAction::Merge(name.to_owned()))),
@@ -528,14 +405,19 @@ pub fn sidebar_menu_with_links(
                 .action(SidebarAction::CheckoutTag(name.to_owned())),
             item(&ui::t!("sidebar.menu.create_branch_here"), IconName::Branch)
                 .maybe_action(target.map(SidebarAction::CreateBranchAt)),
-            item(&ui::t!("sidebar.menu.push_tag_to_origin"), IconName::Up)
-                .action(SidebarAction::PushTag(name.to_owned())),
-            SidebarMenuEntry::Separator,
         ];
+        // Hidden without a remote, like the History's tag menu.
+        if can_push_tag(&remote_names(extras)) {
+            entries.push(
+                item(&ui::t!("sidebar.menu.push_tag_to_origin"), IconName::Up)
+                    .action(SidebarAction::PushTag(name.to_owned())),
+            );
+        }
+        entries.push(SidebarMenuEntry::Separator);
         // Tags are opened on the first host (the upstream's, else origin's).
         if let Some(open) = links
             .first()
-            .and_then(|link| open_item(link, &forge::WebTarget::Tag(name.to_owned())))
+            .and_then(|link| open_on_host(link, &forge::WebTarget::Tag(name.to_owned())))
         {
             entries.push(open);
             entries.push(SidebarMenuEntry::Separator);
@@ -587,7 +469,7 @@ pub fn sidebar_menu_with_links(
         ];
         // The repository page of the remote's own host.
         let remote_link = links.iter().find(|link| link.fetches(name));
-        entries.extend(remote_link.and_then(|link| open_item(link, &forge::WebTarget::Repo)));
+        entries.extend(remote_link.and_then(|link| open_on_host(link, &forge::WebTarget::Repo)));
         entries.push(SidebarMenuEntry::Separator);
         entries.extend(
             [item(&ui::t!("sidebar.menu.remove_remote"), IconName::Trash)
@@ -695,6 +577,13 @@ pub fn sidebar_menu_with_links(
     }
 }
 
+/// The configured remote names, empty while the extras are unread.
+fn remote_names(extras: Option<&SidebarExtras>) -> Vec<String> {
+    extras
+        .map(|e| e.remote_targets.iter().map(|t| t.name.clone()).collect())
+        .unwrap_or_default()
+}
+
 /// The action a keyboard shortcut runs on a sidebar row: the enabled menu item
 /// whose shortcut hint is `hint` (`Enter`, `F2` or `Del`), so the key and the
 /// menu can never disagree. `None` when the row's menu has no such item or it
@@ -711,7 +600,7 @@ pub fn shortcut_action(
         .into_iter()
         .find_map(|entry| match entry {
             SidebarMenuEntry::Item(item)
-                if item.enabled && item.shortcut.as_deref() == Some(hint) =>
+                if item.enabled() && item.shortcut.as_deref() == Some(hint) =>
             {
                 Some(item.action)
             }
@@ -2935,7 +2824,7 @@ mod tests {
         let SidebarMenuEntry::Item(item) = &without[n - 3] else {
             panic!("an item")
         };
-        assert!(item.enabled);
+        assert!(item.enabled());
         assert_eq!(
             item.action,
             SidebarAction::CreatePullRequest("loose".to_owned())
@@ -3113,8 +3002,8 @@ mod tests {
             SidebarAction::OpenSubmodule("vendor/a".to_owned())
         );
         let missing = sidebar_menu("sub:vendor/b", None, Some(&extras), None, Operation::None);
-        assert!(menu_item(&missing, "Update submodule").enabled);
-        assert!(!menu_item(&missing, "Open in new window").enabled);
+        assert!(menu_item(&missing, "Update submodule").enabled());
+        assert!(!menu_item(&missing, "Open in new window").enabled());
     }
 
     fn menu_item<'a>(entries: &'a [SidebarMenuEntry], label: &str) -> &'a SidebarMenuItem {
@@ -3134,6 +3023,7 @@ mod tests {
             target: None,
         };
         let extras = SidebarExtras {
+            remote_targets: vec![targets("origin", "https://github.com/o/r.git", &[])],
             worktrees: vec![
                 worktree("/tmp/plain", None),
                 worktree("/tmp/locked", Some("busy")),
@@ -3367,10 +3257,10 @@ mod tests {
         };
         let menu = sidebar_menu("local:feat/x", Some(&head), None, None, Operation::None);
         let merge = menu_item(&menu, "Merge feat/x into main…");
-        assert!(merge.enabled);
+        assert!(merge.enabled());
         assert_eq!(merge.action, SidebarAction::Merge("feat/x".to_owned()));
         // Rebase stays disabled until its own stage.
-        assert!(!menu_item(&menu, "Rebase main onto feat/x").enabled);
+        assert!(!menu_item(&menu, "Rebase main onto feat/x").enabled());
     }
 
     #[test]
@@ -3381,7 +3271,7 @@ mod tests {
         };
         let menu = sidebar_menu("local:main", Some(&head), None, None, Operation::None);
         let merge = menu_item(&menu, "Merge main into main…");
-        assert!(!merge.enabled);
+        assert!(!merge.enabled());
         assert_eq!(merge.action, SidebarAction::None);
     }
 
@@ -3393,19 +3283,19 @@ mod tests {
         };
         for operation in [Operation::Merge, Operation::Squash, Operation::CherryPick] {
             let local = sidebar_menu("local:feat/x", Some(&head), None, None, operation);
-            assert!(!menu_item(&local, "Merge feat/x into main…").enabled);
+            assert!(!menu_item(&local, "Merge feat/x into main…").enabled());
             let remote = sidebar_menu("rbranch:origin/feat/x", Some(&head), None, None, operation);
-            assert!(!menu_item(&remote, "Merge origin/feat/x into main…").enabled);
+            assert!(!menu_item(&remote, "Merge origin/feat/x into main…").enabled());
         }
         let local = sidebar_menu("local:feat/x", Some(&head), None, None, Operation::None);
-        assert!(menu_item(&local, "Merge feat/x into main…").enabled);
+        assert!(menu_item(&local, "Merge feat/x into main…").enabled());
     }
 
     #[test]
     fn merge_is_disabled_on_a_detached_head() {
         let detached = Head::Detached(oid());
         let local = sidebar_menu("local:feat/x", Some(&detached), None, None, Operation::None);
-        assert!(!menu_item(&local, "Merge feat/x into HEAD…").enabled);
+        assert!(!menu_item(&local, "Merge feat/x into HEAD…").enabled());
         let remote = sidebar_menu(
             "rbranch:origin/feat/x",
             Some(&detached),
@@ -3413,9 +3303,9 @@ mod tests {
             None,
             Operation::None,
         );
-        assert!(!menu_item(&remote, "Merge origin/feat/x into HEAD…").enabled);
+        assert!(!menu_item(&remote, "Merge origin/feat/x into HEAD…").enabled());
         let unread = sidebar_menu("local:feat/x", None, None, None, Operation::None);
-        assert!(!menu_item(&unread, "Merge feat/x into HEAD…").enabled);
+        assert!(!menu_item(&unread, "Merge feat/x into HEAD…").enabled());
     }
 
     #[test]
@@ -3432,7 +3322,7 @@ mod tests {
             Operation::None,
         );
         let merge = menu_item(&menu, "Merge origin/feat/x into main…");
-        assert!(merge.enabled);
+        assert!(merge.enabled());
         assert_eq!(
             merge.action,
             SidebarAction::Merge("origin/feat/x".to_owned())
@@ -3501,6 +3391,7 @@ mod tests {
         };
         let extras = SidebarExtras {
             remotes: vec!["origin".into()],
+            remote_targets: vec![targets("origin", "https://github.com/o/r.git", &[])],
             worktrees: vec![worktree("/tmp/wt", None)],
             ..Default::default()
         };
@@ -3521,7 +3412,7 @@ mod tests {
             let enabled: Vec<&str> = entries
                 .iter()
                 .filter_map(|entry| match entry {
-                    SidebarMenuEntry::Item(item) if item.enabled => Some(item.label.as_str()),
+                    SidebarMenuEntry::Item(item) if item.enabled() => Some(item.label.as_str()),
                     _ => None,
                 })
                 .collect();
@@ -3874,6 +3765,26 @@ mod tests {
             fetch_url: fetch.to_owned(),
             push_urls: push.iter().map(|s| (*s).to_owned()).collect(),
         }
+    }
+
+    #[test]
+    fn push_tag_is_hidden_without_a_remote() {
+        let none = sidebar_menu("tag:v1", None, None, None, Operation::None);
+        assert!(!menu_labels(&none).contains(&"Push tag to origin"));
+        let extras = SidebarExtras {
+            remote_targets: vec![targets("origin", "https://github.com/o/r.git", &[])],
+            ..Default::default()
+        };
+        let some = sidebar_menu("tag:v1", None, Some(&extras), None, Operation::None);
+        assert!(menu_item(&some, "Push tag to origin").enabled());
+    }
+
+    #[test]
+    fn a_branch_named_head_is_not_current_when_detached() {
+        let detached = Head::Detached(Oid::from_hex(&"ab".repeat(20)).unwrap());
+        let menu = sidebar_menu("local:HEAD", Some(&detached), None, None, Operation::None);
+        assert!(menu_item(&menu, "Checkout").enabled());
+        assert!(menu_item(&menu, "Delete branch").enabled());
     }
 
     #[test]

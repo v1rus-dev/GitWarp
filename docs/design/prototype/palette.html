@@ -3,24 +3,27 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GitWarp — command palette (future work)</title>
+<title>GitWarp — command palette</title>
 <link rel="stylesheet" href="tokens.css">
 <link rel="stylesheet" href="gitwarp.css">
 <style>
+  /* Geometry from crates/app/src/palette/mod.rs: panel w600 / max-h 480 / 72px from the top, input row h40, rows h28, list max-h 380. */
   .pal { width: 600px; margin-top: 72px; max-height: 480px; overflow: hidden; }
-  .pal .pin { display: flex; align-items: center; gap: 8px; padding: 0 12px; height: 40px; border-bottom: 1px solid var(--border); color: var(--muted); }
-  .pal .pin .input { border: 0; box-shadow: none; background: transparent; height: 100%; font-size: var(--fs-md); padding: 0; }
+  .pal .pin { display: flex; align-items: center; gap: 8px; padding: 0 12px; height: 40px; border-bottom: 1px solid var(--border); color: var(--muted); flex: none; }
+  .pal .pin .input { border: 0; box-shadow: none; background: transparent; height: 100%; font-size: var(--fs-md); padding: 0; flex: 1; min-width: 0; }
   .pal .pin .input:focus { box-shadow: none; }
-  .pal .res { overflow: auto; padding: 4px; max-height: 380px; }
+  .pal .res { overflow: auto; padding: 4px; max-height: 380px; scrollbar-width: thin; }
   .pal .gh { padding: 8px 8px 2px; font-size: var(--fs-xs); font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
   .pal .it { display: flex; align-items: center; gap: 10px; height: 28px; padding: 0 8px; border-radius: var(--r-sm); cursor: default; }
   .pal .it.sel { background: var(--selection); }
   .pal .it:hover { background: var(--hover); } .pal .it.sel:hover { background: var(--selection); }
-  .pal .it .od-icon { color: var(--muted); }
+  .pal .it > .od-icon { color: var(--muted); flex: none; }
   .pal .it .t { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .pal .it .keys { display: inline-flex; gap: 4px; }
   .pal .it mark { background: transparent; color: var(--accent); font-weight: 700; }
-  .pal .pfoot { display: flex; gap: 16px; padding: 6px 12px; border-top: 1px solid var(--border); color: var(--muted); font-size: var(--fs-sm); }
-  .win-dim > .win-body, .win-dim > .titlebar, .win-dim > .statusbar { filter: saturate(.8); }
+  .pal .pfoot { display: flex; align-items: center; gap: 16px; padding: 6px 12px; border-top: 1px solid var(--border); color: var(--muted); font-size: var(--fs-sm); flex: none; }
+  .pal .pfoot > span { display: inline-flex; align-items: center; gap: 4px; }
+  .pal .empty { min-height: 120px; }
 </style>
 <script src="app.js"></script>
 </head>
@@ -28,33 +31,107 @@
 <script>
 (function () {
   const G = GL, ic = G.ic, esc = G.esc;
-  G.stagebar('<span class="muted" style="font-size:12px">type to filter · ↑ ↓ · Enter · Esc</span>');
+  /* The commands in the app's own order of titles (sources.rs title(), alphabetical when nothing was used recently);
+     key caps from Command::key_cap (keybindings defaults + the fixed Stash / Open / Clone bindings). */
+  const COMMANDS = [
+    ['Fetch all remotes', 'Ctrl+Shift+F'], ['Pull current branch', 'Ctrl+Shift+L'], ['Push current branch', 'Ctrl+Shift+P'], ['Stash local changes', 'Ctrl+Shift+S'],
+    ['Switch branch…', 'Ctrl+Shift+B'], ['Create branch here…', ''], ['Create tag here…', ''],
+    ['Add remote…', ''], ['Add worktree…', ''], ['Refresh repository', ''],
+    ['Toggle sidebar', 'Ctrl+B'], ['Toggle details dock', 'Ctrl+J'], ['Hide Activity strip', ''], ['Search commits', 'Ctrl+K'],
+    ['Switch to History', ''], ['Switch to Local changes', ''], ['Switch to Worktrees', ''],
+    ['Collapse idle lanes in graph', ''], ['Fit graph to its lanes', ''], ['Show all commits of current branch', ''],
+    ['Open repository…', 'Ctrl+O'], ['Clone repository…', 'Ctrl+Shift+O'], ['Close repository', ''],
+    ['Open Settings', 'Ctrl+,'],
+    ...['Appearance', 'Git', 'Worktrees', 'SSH keys', 'Keybindings', 'Diff & merge', 'Identity', 'Accounts'].map((p) => ['Open Settings → ' + p, ''])
+  ].map(([t, k]) => ({ g: 'Commands', icon: 'command', t, k }));
+  /* Only listed while a remote with an account exists (ViewState.pull_requests); "Create merge request…" on GitLab. */
+  const PR = { g: 'Commands', icon: 'command', t: 'Create pull request…', k: '' };
+  const BRANCHES = ['main', 'feat/idle-lanes', 'feat/palette', 'fix/git-detect', 'release/0.3', 'docs/readme', 'origin/main', 'origin/feat/palette', 'origin/fix/git-detect']
+    .map((t) => ({ g: 'Branches', icon: 'branch', t, cur: t === G.state.head }));
+  const COMMITS = G.commits.slice(0, 40).map((c) => ({ g: 'Commits', icon: 'hash', t: c.hash.slice(0, 7) + '  ' + c.summary, hl: 9 }));
+  const FILES = ['Cargo.toml', 'README.md', 'src/history/graph.rs', 'src/history/lanes.rs', 'src/history/mod.rs', 'src/palette/matcher.rs', 'src/palette/sources.rs', 'src/settings/git_exec.rs', 'src/sidebar/branches.rs']
+    .map((t) => ({ g: 'Files', icon: 'file', t }));
+  const EMPTY_COMMANDS = 8, EMPTY_BRANCHES = 5, CAP = 50;
+
+  /* Fuzzy: a contiguous hit scores best, else a left-to-right subsequence (matcher.rs ranks the same way, simplified). */
+  function fuzzy(q, text) {
+    const ql = q.toLowerCase(), tl = text.toLowerCase(), i = tl.indexOf(ql);
+    if (i >= 0) return { score: 1000 - i - text.length / 100, pos: Array.from({ length: ql.length }, (_, k) => i + k) };
+    const pos = []; let from = 0;
+    for (const ch of ql) { const j = tl.indexOf(ch, from); if (j < 0) return null; pos.push(j); from = j + 1; }
+    return { score: 500 - (pos[pos.length - 1] - pos[0]) - text.length / 100, pos };
+  }
+  function search(raw, forge) {
+    const q = raw.trim(); let scope = '';
+    let query = q; if ('>@#'.includes(q[0] || ' ')) { scope = q[0]; query = q.slice(1).trim(); }
+    const allCmds = COMMANDS.concat(forge ? [PR] : []).sort((a, b) => a.t.toLowerCase().localeCompare(b.t.toLowerCase()));
+    const inScope = (g) => !scope || (scope === '>' && g === 'Commands') || (scope === '@' && g === 'Branches') || (scope === '#' && g === 'Commits');
+    if (!query) {
+      const out = [];
+      if (inScope('Commands')) out.push(...allCmds.slice(0, EMPTY_COMMANDS));
+      if (inScope('Branches')) out.push(...BRANCHES.filter((b) => !b.t.startsWith('origin/')).slice(0, EMPTY_BRANCHES));
+      return out.map((x) => Object.assign({ pos: [] }, x));
+    }
+    const rank = (list, g) => (inScope(g) ? list : []).map((x, order) => {
+      let m = fuzzy(query, x.t);
+      if (g === 'Commits') { const m2 = fuzzy(query, x.t.slice(x.hl)); m = m2 && { score: m2.score, pos: m2.pos.map((p) => p + x.hl) }; const h = x.t.slice(0, 7).startsWith(query.toLowerCase()) ? { score: 2000, pos: Array.from({ length: query.length }, (_, k) => k) } : null; m = h || m; }
+      return m && Object.assign({ order }, m, x);
+    }).filter(Boolean).sort((a, b) => b.score - a.score || a.order - b.order).slice(0, CAP);
+    return [].concat(rank(allCmds, 'Commands'), rank(BRANCHES, 'Branches'), rank(COMMITS, 'Commits'), rank(FILES, 'Files'));
+  }
+  const mark = (t, pos) => { const s = new Set(pos); let o = '', open = false; for (let i = 0; i < t.length; i++) { const on = s.has(i); if (on && !open) { o += '<mark>'; open = true; } if (!on && open) { o += '</mark>'; open = false; } o += esc(t[i]); } return o + (open ? '</mark>' : ''); };
+
+  const SCENES = [
+    ['Empty query · 8 commands + 5 branches', '', false],
+    ['Empty query · remote with an account (adds “Create pull request…”)', '', true],
+    ['Typed query “pu” · highlighted matches', 'pu', true],
+    ['Prefix > · commands only', '> set', false],
+    ['Prefix @ · branches only', '@feat', false],
+    ['Prefix # · commits (hash prefix or summary)', '#e4f', false],
+    ['Query across all groups, incl. files', 'graph', false],
+    ['Open Settings → {page} commands', 'settings', false],
+    ['No results', 'zzq', false]
+  ];
+  G.stagebar(`<label style="display:inline-flex;gap:8px;align-items:center;font-size:12px">Palette state <select id="scn" aria-label="Palette state" style="height:24px;background:var(--bg);color:var(--text);border:1px solid var(--border-strong);border-radius:var(--r-sm)">${SCENES.map((s, i) => `<option value="${i}">${esc(s[0])}</option>`).join('')}</select></label><span class="muted" style="font-size:12px">↑ ↓ · PgUp PgDn · Enter · Esc</span>`);
   const stage = G.h('<div class="stage"><div class="winwrap"></div></div>'); document.body.appendChild(stage);
   const sh = G.shell({ host: stage.firstChild, w: 1200, h: 800 });
   const win = sh.win;
   sh.center.innerHTML = '<div class="work dock-bottom"><div class="hist-host" style="display:flex;flex:1;min-width:0;min-height:0"></div></div>';
   G.history(sh.center.querySelector('.hist-host'), G.commits, {});
-  const items = [
-    ['Commands', 'command', 'Fetch all remotes', 'Ctrl+Shift+F'], ['Commands', 'command', 'Push current branch', 'Ctrl+Shift+P'], ['Commands', 'command', 'Toggle sidebar', 'Ctrl+B'], ['Commands', 'command', 'Collapse idle lanes in graph', ''], ['Commands', 'command', 'Open Settings → Git', 'Ctrl+,'],
-    ['Branches', 'branch', 'main', 'current'], ['Branches', 'branch', 'feat/idle-lanes', ''], ['Branches', 'branch', 'feat/palette', ''], ['Branches', 'branch', 'fix/git-detect', ''],
-    ['Commits', 'hash', 'e4f2a91  Merge branch ‘feat/idle-lanes’', ''], ['Commits', 'hash', '19d8e4f  feat(graph): collapse idle lanes into a single gap lane', ''], ['Commits', 'hash', 'f3a71c9  feat(graph): clip wide graphs with an edge fade', ''],
-    ['Files', 'file', 'src/history/graph.rs', ''], ['Files', 'file', 'src/settings/git_exec.rs', '']
-  ];
-  const scrim = G.h(`<div class="scrim"><div class="dialog pal" role="dialog" aria-modal="true" aria-label="Command palette"><div class="pin">${ic('search', 16)}<input class="input" placeholder="Type a command, branch, commit hash or file…" aria-label="Command palette input" value=""><span class="kbd">Esc</span></div><div class="res" role="listbox"></div><div class="pfoot"><span><span class="kbd">↑</span> <span class="kbd">↓</span> navigate</span><span><span class="kbd">Enter</span> run</span><span><span class="kbd">&gt;</span> commands</span><span><span class="kbd">@</span> branches</span><span><span class="kbd">#</span> commits</span><span class="od-fill"></span><span>14 results</span></div></div></div>`);
+  const scrim = G.h(`<div class="scrim"><div class="dialog pal" role="dialog" aria-modal="true" aria-label="Command palette"><div class="pin">${ic('search', 16)}<input class="input" placeholder="Type a command, branch, commit hash or file…" aria-label="Command palette input" value="" autocomplete="off" spellcheck="false"><span class="kbd">Esc</span></div><div class="res" role="listbox"></div><div class="pfoot"><span><span class="kbd">↑</span><span class="kbd">↓</span>navigate</span><span><span class="kbd">Enter</span>run</span><span><span class="kbd">&gt;</span>commands</span><span><span class="kbd">@</span>branches</span><span><span class="kbd">#</span>commits</span><span class="od-fill"></span><span id="cnt"></span></div></div></div>`);
   G.layer(win).appendChild(scrim);
-  const inp = scrim.querySelector('input'), res = scrim.querySelector('.res'); let sel = 0, vis = items;
-  const mark = (t, q) => { if (!q) return esc(t); const i = t.toLowerCase().indexOf(q.toLowerCase()); return i < 0 ? esc(t) : esc(t.slice(0, i)) + '<mark>' + esc(t.slice(i, i + q.length)) + '</mark>' + esc(t.slice(i + q.length)); };
+  const inp = scrim.querySelector('input'), res = scrim.querySelector('.res'), cnt = scrim.querySelector('#cnt'), scn = document.getElementById('scn');
+  let sel = 0, vis = [], forge = false;
+  const run = (x) => G.toast(win, `Ran: ${x.t}`, 'ok');
   function draw() {
-    const q = inp.value.trim(); vis = items.filter((x) => !q || x[2].toLowerCase().includes(q.toLowerCase()));
-    sel = Math.min(sel, Math.max(0, vis.length - 1)); let last = '', h = '';
-    vis.forEach((x, i) => { if (x[0] !== last) { h += `<div class="gh" role="presentation">${x[0]}</div>`; last = x[0]; } h += `<div class="it${i === sel ? ' sel' : ''}" role="option" aria-selected="${i === sel}" data-i="${i}">${ic(x[1], 14)}<span class="t">${mark(x[2], q)}</span>${x[3] ? (x[3] === 'current' ? '<span class="ref head">current</span>' : `<span class="kbd">${x[3]}</span>`) : ''}</div>`; });
-    res.innerHTML = vis.length ? h : `<div class="empty" style="min-height:120px"><p>No results for “${esc(q)}”</p></div>`;
+    const q = inp.value.trim(); vis = search(inp.value, forge);
+    sel = Math.max(0, Math.min(sel, vis.length - 1)); let last = '', h = '';
+    vis.forEach((x, i) => {
+      if (x.g !== last) { h += `<div class="gh" role="presentation">${x.g}</div>`; last = x.g; }
+      const tail = x.k ? `<span class="keys"><span class="kbd">${esc(x.k)}</span></span>` : x.cur ? `<span class="ref head">${ic('branch', 12)}current</span>` : '';
+      h += `<div class="it${i === sel ? ' sel' : ''}" role="option" aria-selected="${i === sel}" data-i="${i}">${ic(x.icon, 14)}<span class="t">${mark(x.t, x.pos)}</span>${tail}</div>`;
+    });
+    const body = q.replace(/^[>@#]\s*/, '');
+    res.innerHTML = vis.length ? h : `<div class="empty"><p>No results for “${esc(q)}”</p></div>`;
+    res.style.display = ''; cnt.textContent = vis.length === 1 ? '1 result' : `${vis.length} results`;
     const s = res.querySelector('.sel'); if (s) s.scrollIntoView({ block: 'nearest' });
   }
+  function scene() { const s = SCENES[+scn.value]; inp.value = s[1]; forge = s[2]; sel = 0; draw(); inp.focus(); }
+  scn.addEventListener('change', scene);
   inp.addEventListener('input', () => { sel = 0; draw(); });
-  inp.addEventListener('keydown', (e) => { if (e.key === 'ArrowDown') { sel = Math.min(vis.length - 1, sel + 1); draw(); e.preventDefault(); } else if (e.key === 'ArrowUp') { sel = Math.max(0, sel - 1); draw(); e.preventDefault(); } else if (e.key === 'Enter' && vis[sel]) G.toast(win, `Ran: ${vis[sel][2]}`, 'ok'); });
-  res.addEventListener('click', (e) => { const it = e.target.closest('.it'); if (it) G.toast(win, `Ran: ${vis[+it.dataset.i][2]}`, 'ok'); });
-  draw(); inp.focus(); G.fit(win);
+  inp.addEventListener('keydown', (e) => {
+    const n = vis.length;
+    if (e.key === 'ArrowDown') { sel = Math.min(n - 1, sel + 1); draw(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { sel = Math.max(0, sel - 1); draw(); e.preventDefault(); }
+    else if (e.key === 'PageDown') { sel = Math.min(n - 1, sel + 10); draw(); e.preventDefault(); }
+    else if (e.key === 'PageUp') { sel = Math.max(0, sel - 10); draw(); e.preventDefault(); }
+    else if (e.key === 'Enter' && vis[sel]) run(vis[sel]);
+  });
+  res.addEventListener('click', (e) => { const it = e.target.closest('.it'); if (it) run(vis[+it.dataset.i]); });
+  const qp = new URLSearchParams(location.search);
+  if (qp.has('s') && SCENES[+qp.get('s')]) scn.value = qp.get('s');
+  if (qp.get('t') && G.THEMES[qp.get('t')]) G.setTheme(qp.get('t'));
+  scene(); G.fit(win);
 })();
 </script>
 </body>

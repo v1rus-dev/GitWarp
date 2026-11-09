@@ -169,6 +169,10 @@ const FILES: &[(&str, &[u8])] = &[
         "icons/archive.svg",
         include_bytes!("../assets/icons/archive.svg"),
     ),
+    (
+        "icons/filter.svg",
+        include_bytes!("../assets/icons/filter.svg"),
+    ),
 ];
 
 /// The embedded asset source.

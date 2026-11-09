@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui::{App, ClipboardItem, Context, EventEmitter, WeakEntity, Window};
+use gpui::{App, Context, EventEmitter, WeakEntity, Window};
 
 use git_core::{ChangedEntry, Error, Git, Head, Oid, RefKind, Repo, Worktree};
 use ui::{toast, ToastKind};
@@ -771,13 +771,8 @@ impl WorktreesModel {
     /// Copies the folder path to the clipboard.
     pub fn copy_path(&self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let text = path.display().to_string();
-        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-        toast::show(
-            ToastKind::Ok,
-            ui::t!("worktrees.toast.copied", text = text),
-            window,
-            cx,
-        );
+        let message = ui::t!("worktrees.toast.copied", text = text);
+        crate::copy_with_toast(text, message, window, cx);
     }
 }
 

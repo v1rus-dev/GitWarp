@@ -157,3 +157,12 @@
 .prpanel .flt .seg > button { flex: 1 1 auto; padding: 0 8px; }
 /* sidebar badges drop the review glyph to leave room for the branch name; the review state stays in the tooltip, the accessible name and the popover */
 .sidebar .tree .node .prb .rv { display: none; }
+
+/* PR panel: stale line + “Showing the latest n” footer (pr_panel.rs stale_line / rows) */
+.prpanel .stale { flex: none; display: flex; align-items: center; gap: 6px; padding: 4px 10px; font-size: var(--fs-xs); color: var(--warning); }
+.prpanel .more { padding: 6px 10px; font-size: var(--fs-xs); color: var(--muted); }
+/* Planned marker (same spec as gitwarp.css; kept here so the page renders it even before that file defines it) */
+.planned-tag { display: inline-flex; align-items: center; height: 16px; padding: 0 5px; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .02em; color: var(--warning); border: 1px dashed var(--warning); border-radius: 3px; white-space: nowrap; vertical-align: middle; }
+/* Create PR: reviewers help + no-base note */
+.noteerr { display: flex; align-items: flex-start; gap: 4px; font-size: var(--fs-sm); color: var(--error); }
+.noteerr .od-icon { flex: none; margin-top: 2px; }

@@ -28,7 +28,8 @@
   S.setGit = (g) => { Object.assign(S.GIT, g); const el = document.querySelector('.gw-sb-git'); if (el) { el.innerHTML = S.gitHTML(); el.dataset.tip = S.GIT.tip; } };
 
   /* row builders */
-  S.row = (title, sub, ctl, off) => `<div class="srow${off ? ' off' : ''}"><div class="st">${title}</div>${sub ? `<div class="sd">${sub}</div>` : ''}<div class="ctl">${ctl}</div></div>`;
+  /* the app row always draws the description line, even when it is empty (the row keeps its two-line height) */
+  S.row = (title, sub, ctl, off) => `<div class="srow${off ? ' off' : ''}"><div class="st">${title}</div><div class="sd">${sub || '&nbsp;'}</div><div class="ctl">${ctl}</div></div>`;
   S.sw = (k, on, label, dis) => `<span class="switch${on ? ' on' : ''}" role="switch" aria-checked="${!!on}" aria-label="${esc(label)}" ${dis ? 'aria-disabled="true"' : 'tabindex="0"'} data-sw="${k}"><span class="track"></span></span>`;
   S.seg = (k, cur, opts, dis) => `<div class="seg${dis ? ' dis' : ''}" role="group" data-seg="${k}">${opts.map(([v, l]) => `<button aria-pressed="${cur === v}" data-v="${v}"${dis ? ' tabindex="-1"' : ''}>${l}</button>`).join('')}</div>`;
   S.sel = (k, cur, opts, label, dis) => `<select class="input" data-sel="${k}" aria-label="${esc(label)}"${dis ? ' disabled' : ''}>${opts.map(([v, l]) => `<option value="${v}"${v === cur ? ' selected' : ''}>${l}</option>`).join('')}</select>`;

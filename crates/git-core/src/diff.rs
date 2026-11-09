@@ -74,6 +74,10 @@ pub struct CommitDetails {
     /// The message after the subject, without its leading or trailing blank
     /// lines.
     pub body: String,
+    /// The raw full message (`%B`) without trailing newlines. Unlike `summary`
+    /// (`%s`, which joins a wrapped first paragraph into one line) it is the text
+    /// exactly as written, so copying it reproduces the commit message.
+    pub message: String,
 }
 
 /// How a commit changed one file, as `git diff --name-status` reports it.
@@ -392,6 +396,7 @@ fn parse_details(raw: &[u8]) -> Result<CommitDetails> {
         .collect::<Vec<_>>()
         .join("\u{1f}");
     let body = message_body(&message);
+    let message = message.trim_end_matches(['\n', '\r']).to_string();
     Ok(CommitDetails {
         id,
         parents,
@@ -403,6 +408,7 @@ fn parse_details(raw: &[u8]) -> Result<CommitDetails> {
         committer_time: time(7)?,
         summary,
         body,
+        message,
     })
 }
 
@@ -706,6 +712,24 @@ mod tests {
         assert_eq!(details.committer_time, 1_700_000_100);
         assert_eq!(details.summary, "Add a thing");
         assert_eq!(details.body, "Why it exists.\n\nCloses #1");
+        assert_eq!(
+            details.message,
+            "Add a thing\n\nWhy it exists.\n\nCloses #1"
+        );
+    }
+
+    #[test]
+    fn full_message_keeps_a_wrapped_subject_verbatim() {
+        // `%s` joins the wrapped first paragraph into one line; `%B` does not.
+        let raw = format!(
+            "{}\x1f\x1fAnn\x1fann@x.dev\x1f1700000000\x1fBob\x1fbob@x.dev\x1f1700000100\x1fA long subject wrapped over two lines\x1fA long subject wrapped\nover two lines\n\nBody\n",
+            "a".repeat(40),
+        );
+        let details = parse_details(raw.as_bytes()).unwrap();
+        assert_eq!(
+            details.message,
+            "A long subject wrapped\nover two lines\n\nBody"
+        );
     }
 
     #[test]
