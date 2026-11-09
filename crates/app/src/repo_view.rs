@@ -2274,20 +2274,14 @@ impl RepositoryView {
     /// `origin` when configured, otherwise the first remote, otherwise
     /// `origin` (the operation then reports the missing remote).
     fn default_remote_name(&self) -> String {
-        let remotes = self
+        let names: Vec<String> = self
             .sidebar_extras
             .as_ref()
-            .map(|extras| &extras.remote_urls)
-            .filter(|urls| !urls.is_empty());
-        let Some(remotes) = remotes else {
-            return "origin".to_owned();
-        };
-        remotes
-            .iter()
-            .find(|(name, _)| name == "origin")
-            .or_else(|| remotes.first())
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| "origin".to_owned())
+            .map(|extras| extras.remote_urls.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default();
+        network_ops::default_remote_of(&names)
+            .unwrap_or("origin")
+            .to_owned()
     }
 
     /// Runs one history-row action.

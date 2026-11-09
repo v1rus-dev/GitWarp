@@ -9,8 +9,8 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     anchored, canvas, deferred, div, point, px, App, AppContext, BorrowAppContext, Bounds, Context,
     Div, ElementId, Entity, FocusHandle, FontWeight, Global, IntoElement, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, SharedString, Size, Stateful, Styled, Subscription, Task,
-    Window, WindowId,
+    ParentElement, Pixels, Point, Render, ScrollHandle, SharedString, Size, Stateful, Styled,
+    Subscription, Task, Window, WindowId,
 };
 use gpui::{InteractiveElement, StatefulInteractiveElement};
 
@@ -307,6 +307,26 @@ pub fn open_context_menu(
     open_at(position, entries, None, window, cx)
 }
 
+/// [`open_context_menu`] for a menu opened from the keyboard (Shift+F10, the
+/// Menu key): the first enabled item is highlighted, so Enter and the arrows
+/// work at once and the focus ring shows.
+pub fn open_context_menu_from_keyboard(
+    position: Point<Pixels>,
+    entries: Vec<MenuEntry>,
+    window: &mut Window,
+    cx: &mut App,
+) -> LayerId {
+    let first_enabled = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            MenuEntry::Item(item) => Some(!item.disabled),
+            MenuEntry::Separator | MenuEntry::Header(_) | MenuEntry::Filter { .. } => None,
+        })
+        .position(|enabled| enabled);
+    // The highlight came from a key: the focus ring shows right away.
+    open_with(position, entries, first_enabled, true, window, cx)
+}
+
 /// Opens a menu 2px below the bottom-left corner of `anchor`.
 pub fn open_dropdown(
     anchor: Bounds<Pixels>,
@@ -338,9 +358,21 @@ fn open_at(
     window: &mut Window,
     cx: &mut App,
 ) -> LayerId {
+    open_with(position, entries, highlight, false, window, cx)
+}
+
+fn open_with(
+    position: Point<Pixels>,
+    entries: Vec<MenuEntry>,
+    highlight: Option<usize>,
+    keyboard: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> LayerId {
     close_previous(window, cx);
     let view = cx.new(|cx| {
         let mut menu = MenuView::new(entries, window, cx);
+        menu.keyboard = keyboard;
         let enabled = menu.levels[0].enabled();
         if let Some(index) = highlight.filter(|index| enabled.get(*index) == Some(&true)) {
             menu.levels[0].nav.set(index);
@@ -466,6 +498,10 @@ struct Level {
     row_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
     /// Window bounds of the panel, written by a canvas while painting.
     panel_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Scroll state of the item area (a level taller than the window scrolls).
+    scroll: ScrollHandle,
+    /// The highlight moved by key: the next render scrolls it into view.
+    reveal: Cell<bool>,
 }
 
 impl Level {
@@ -486,7 +522,10 @@ impl Level {
             .map(|placeholder| {
                 let input = cx.new(|cx| TextInput::new(window, cx));
                 input.update(cx, |input, cx| {
-                    input.set_placeholder(placeholder.clone(), cx)
+                    input.set_placeholder(placeholder.clone(), cx);
+                    // → at the end of the query opens a submenu, ← at the start
+                    // closes the level.
+                    input.propagate_edge_arrows(true);
                 });
                 let _subscription = cx.subscribe_in(
                     &input,
@@ -515,6 +554,8 @@ impl Level {
             opened_from,
             row_bounds: Rc::default(),
             panel_bounds: Rc::default(),
+            scroll: ScrollHandle::new(),
+            reveal: Cell::new(false),
         }
     }
 
@@ -621,6 +662,7 @@ impl MenuView {
         } else {
             level.nav.prev(&enabled);
         }
+        level.reveal.set(true);
         cx.notify();
     }
 
@@ -687,6 +729,7 @@ impl MenuView {
             child.nav.clear();
             let enabled = child.enabled();
             child.nav.next(&enabled);
+            child.reveal.set(true);
             window.focus(&self.entry_focus(cx), cx);
         }
         cx.notify();
@@ -901,7 +944,11 @@ impl MenuView {
     }
 
     /// The panel of `level`: its rows, and a canvas recording its bounds.
-    fn render_level(&self, level: usize, cx: &mut Context<Self>) -> Div {
+    ///
+    /// The panel is at most as tall as the window (`max_height`); what comes
+    /// before the first item (the leading header and filter field) stays at the
+    /// top, the items scroll below it.
+    fn render_level(&self, level: usize, max_height: Pixels, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors;
         let state = &self.levels[level];
         let panel_bounds = state.panel_bounds.clone();
@@ -909,6 +956,7 @@ impl MenuView {
             .relative()
             .flex()
             .flex_col()
+            .max_h(max_height)
             .min_w(px(if level == 0 { 220. } else { 240. }))
             .p(px(6.))
             .bg(colors.surface)
@@ -935,32 +983,66 @@ impl MenuView {
         }
 
         let visible = visible_items(&state.entries, &state.query);
+        // The first item starts the scrolling area; entries before it are fixed.
+        let first_item = state
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, MenuEntry::Item(_)))
+            .unwrap_or(state.entries.len());
+        let mut fixed = div().flex().flex_col().flex_none();
+        let mut rows = div()
+            .id(SharedString::from(format!("menu-rows-{level}")))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&state.scroll);
+        // The scroll area's child index of the highlighted row.
+        let mut children = 0;
+        let mut highlighted_child = None;
         let mut item_index = 0;
         for (entry_index, entry) in state.entries.iter().enumerate() {
+            let in_fixed = entry_index < first_item;
             match entry {
                 MenuEntry::Header(header) => {
-                    panel = panel.child(menu_header_row(header, entry_index, colors, cx));
+                    let row = menu_header_row(header, entry_index, colors, cx);
+                    if in_fixed {
+                        fixed = fixed.child(row);
+                    } else {
+                        rows = rows.child(row);
+                        children += 1;
+                    }
                 }
                 MenuEntry::Filter { .. } => {
                     if let Some(filter) = &state.filter {
-                        panel =
-                            panel.child(div().flex_none().px(px(4.)).pt(px(2.)).pb(px(6.)).child(
-                                SearchField::new(
-                                    SharedString::from(format!("menu-filter-{level}")),
-                                    filter.input.clone(),
-                                ),
-                            ));
+                        let field = div().flex_none().px(px(4.)).pt(px(2.)).pb(px(6.)).child(
+                            SearchField::new(
+                                SharedString::from(format!("menu-filter-{level}")),
+                                filter.input.clone(),
+                            ),
+                        );
+                        if in_fixed {
+                            fixed = fixed.child(field);
+                        } else {
+                            rows = rows.child(field);
+                            children += 1;
+                        }
                     }
                 }
                 MenuEntry::Separator => {
-                    panel = panel.child(
-                        div()
-                            .h(px(1.))
-                            .flex_none()
-                            .my(px(4.))
-                            .mx(px(2.))
-                            .bg(colors.border),
-                    );
+                    let rule = div()
+                        .h(px(1.))
+                        .flex_none()
+                        .my(px(4.))
+                        .mx(px(2.))
+                        .bg(colors.border);
+                    if in_fixed {
+                        fixed = fixed.child(rule);
+                    } else {
+                        rows = rows.child(rule);
+                        children += 1;
+                    }
                 }
                 MenuEntry::Item(item) => {
                     let index = item_index;
@@ -969,6 +1051,9 @@ impl MenuView {
                         continue;
                     }
                     let highlighted = !item.disabled && state.nav.highlight() == Some(index);
+                    if highlighted {
+                        highlighted_child = Some(children);
+                    }
                     let row = menu_item_row(
                         item,
                         RowState {
@@ -984,7 +1069,7 @@ impl MenuView {
                         colors,
                         cx,
                     );
-                    panel = panel.child(if item.disabled {
+                    rows = rows.child(if item.disabled {
                         row
                     } else {
                         row.on_mouse_move(cx.listener(
@@ -998,16 +1083,43 @@ impl MenuView {
                             },
                         ))
                     });
+                    children += 1;
                 }
             }
         }
-        panel
+        // A filtered list with nothing left says so instead of a bare field.
+        if state.filter.is_some() && !visible.iter().any(|shown| *shown) {
+            rows = rows.child(no_matches_row(colors));
+        }
+        if state.reveal.take() {
+            if let Some(child) = highlighted_child {
+                state.scroll.scroll_to_item(child);
+            }
+        }
+        panel.child(fixed).child(rows)
     }
+}
+
+/// The disabled "No matches" row of a filtered menu with nothing left to show.
+fn no_matches_row(colors: crate::theme::ThemeColors) -> Div {
+    div()
+        .debug_selector(|| "menu-no-matches".to_owned())
+        .h(px(28.))
+        .flex_none()
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .font_family(FONT_UI)
+        .text_size(FS_BASE)
+        .text_color(colors.disabled)
+        .child(crate::i18n::t("kit.menu.no_matches"))
 }
 
 impl Render for MenuView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
+        // A panel never grows past the window: its items scroll instead.
+        let max_height = viewport.height - px(2. * WINDOW_MARGIN);
         let mut measuring = false;
         let mut children = Vec::new();
         for level in 1..self.levels.len() {
@@ -1038,11 +1150,10 @@ impl Render for MenuView {
                     anchored()
                         .position(origin)
                         .snap_to_window_with_margin(px(WINDOW_MARGIN))
-                        .child(self.render_level(level, cx).opacity(if size.is_some() {
-                            1.
-                        } else {
-                            0.
-                        })),
+                        .child(
+                            self.render_level(level, max_height, cx)
+                                .opacity(if size.is_some() { 1. } else { 0. }),
+                        ),
                 )
                 .with_priority(level),
             );
@@ -1070,7 +1181,7 @@ impl Render for MenuView {
             .on_action(cx.listener(|_, _: &FocusNext, _, _| {}))
             .on_action(cx.listener(|_, _: &FocusPrev, _, _| {}))
             .on_action(cx.listener(|this, _: &Confirm, window, cx| this.confirm(window, cx)))
-            .child(self.render_level(0, cx))
+            .child(self.render_level(0, max_height, cx))
             .children(children)
     }
 }

@@ -2322,10 +2322,12 @@ impl HistoryView {
     }
 
     /// Right-clicking a row selects it and opens the row menu at the pointer.
+    /// `from_keyboard` (Shift+F10, the Menu key) highlights the first item.
     fn open_row_menu(
         &mut self,
         index: usize,
         position: Point<Pixels>,
+        from_keyboard: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2358,7 +2360,12 @@ impl HistoryView {
             on_action: self.on_action.clone(),
             on_sidebar: self.sidebar_action.clone(),
         };
-        menu::open_context_menu(position, Rc::new(menu).entries(), window, cx);
+        let entries = Rc::new(menu).entries();
+        if from_keyboard {
+            menu::open_context_menu_from_keyboard(position, entries, window, cx);
+        } else {
+            menu::open_context_menu(position, entries, window, cx);
+        }
     }
 
     /// Shift+F10 / the Menu key: the row menu of the selected row, anchored
@@ -2384,7 +2391,7 @@ impl HistoryView {
         }
         let left = bounds.left() + px(SIDE_MARGIN + PAD_LEFT + self.columns.graph + COL_GAP);
         let position = point(left, top_on_screen + row_height);
-        self.open_row_menu(index, position, window, cx);
+        self.open_row_menu(index, position, true, window, cx);
     }
 
     /// Installs how the shell finds the service "Create pull request…" names
@@ -2403,14 +2410,6 @@ impl HistoryView {
     /// What the ref menus are built from: a snapshot of HEAD and the refs, the
     /// hosts, the stopped operation and the active branch filter.
     fn ref_menu_ctx(&self, cx: &App) -> RefMenuCtx {
-        // The remote a branch without upstream is pushed to: `origin`, else
-        // the first one (what `git_core::network::default_remote` answers).
-        let default_remote = self
-            .remote_targets
-            .iter()
-            .find(|target| target.name == "origin")
-            .or_else(|| self.remote_targets.first())
-            .map(|target| target.name.clone());
         RefMenuCtx {
             head: self.head().cloned(),
             refs: self.shared_refs(),
@@ -2418,7 +2417,6 @@ impl HistoryView {
             targets: self.remote_targets.clone(),
             operation: self.operation,
             filter: self.branch_filter().map(str::to_owned),
-            default_remote,
         }
     }
 
@@ -3694,7 +3692,7 @@ impl HistoryView {
                             let focus = view.focus.clone();
                             window.focus(&focus, cx);
                             view.select_row(ix, cx);
-                            view.open_row_menu(ix, event.position, window, cx);
+                            view.open_row_menu(ix, event.position, false, window, cx);
                             // Keep the menu that just took focus.
                             window.prevent_default();
                         }),
@@ -5022,7 +5020,6 @@ mod tests {
             targets,
             operation: Operation::None,
             filter: None,
-            default_remote: Some("origin".to_owned()),
         };
         Rc::new(RowMenu {
             hash: commit.to_string(),
@@ -6337,12 +6334,15 @@ mod tests {
             );
         });
 
-        // The first enabled item of the HEAD branch's menu (no remote here) is
-        // "New branch from main…".
+        // The first enabled item of the HEAD branch's menu (Switch and Merge are
+        // off for the current branch) is "Show only commits of main".
         cx.simulate_keystrokes("down enter");
         cx.run_until_parked();
         assert!(
-            matches!(seen.borrow().as_slice(), [SidebarAction::CreateBranchAt(_)]),
+            matches!(
+                seen.borrow().as_slice(),
+                [SidebarAction::ShowBranchCommits(name)] if name == "main"
+            ),
             "the badge menu is not the branch's section: {:?}",
             seen.borrow()
         );

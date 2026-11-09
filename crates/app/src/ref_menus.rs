@@ -12,8 +12,9 @@ use forge::{ServiceKind, WebTarget};
 use git_core::{Head, Oid, Operation, Ref, RefKind};
 use ui::IconName;
 
+use crate::menu_model::{self, SidebarAction, SidebarMenuItem};
+use crate::network_ops;
 use crate::remote_accounts::RemoteTargets;
-use crate::sidebar::{self, SidebarAction, SidebarMenuItem};
 use crate::web_links::{self, HostLink};
 
 /// With more refs than this a commit menu shows [`SHOWN_WHEN_OVERFLOWING`] rows
@@ -214,70 +215,74 @@ pub struct RefMenuCtx {
     pub operation: Operation,
     /// The branch the History is narrowed to.
     pub filter: Option<String>,
-    /// The remote a tag or a branch without upstream is pushed to; `None`
-    /// when the repository has no remote.
-    pub default_remote: Option<String>,
 }
 
 impl RefMenuCtx {
-    /// The current branch's name, `None` when detached or still unread.
-    fn head_branch(&self) -> Option<&str> {
-        match &self.head {
-            Some(Head::Branch { name, .. }) => Some(name),
-            _ => None,
-        }
+    /// The configured remote names.
+    fn remote_names(&self) -> Vec<String> {
+        self.targets.iter().map(|t| t.name.clone()).collect()
     }
 
     /// What "Merge … into {head}" names: the branch, or `HEAD` when detached.
     fn head_label(&self) -> &str {
-        sidebar::head_label(self.head.as_ref())
+        menu_model::head_label(self.head.as_ref())
     }
 
     fn can_merge(&self) -> bool {
-        sidebar::can_merge(self.head.as_ref(), self.operation)
+        menu_model::can_merge(self.head.as_ref(), self.operation)
     }
 
     fn find(&self, kind: RefKind, name: &str) -> Option<&Ref> {
         self.refs.iter().find(|r| r.kind == kind && r.name == name)
     }
 
-    fn has_remote(&self) -> bool {
-        !self.targets.is_empty() || self.default_remote.is_some()
-    }
-
     /// "Open on <Service>" for the branch `key` (`local:<name>` or
     /// `rbranch:<remote>/<name>`).
     fn open_branch(&self, key: &str) -> Option<SidebarMenuItem> {
         let (link, target) = web_links::branch_target(&self.links, &self.targets, &self.refs, key)?;
-        sidebar::open_item(
+        menu_model::open_item(
             link,
             &target,
             ui::t!("history.menu.open_on_host", service = link.service_name()),
         )
     }
 
-    /// The filter tool of a branch header: narrows the History to the branch, or,
-    /// when that filter is already active, clears it (re-applying it would reset
-    /// the rows, selection and scroll for nothing).
-    fn filter_tool(&self, name: &str) -> RefMenuTool {
-        let selected = self.filter.as_deref() == Some(name);
-        let (tooltip, action) = if selected {
+    /// The label and action of the branch filter for `name`: narrows the
+    /// History to the branch, or, when that filter is already active, clears it
+    /// (re-applying it would reset the rows, selection and scroll for nothing).
+    /// The header tool and the "Show only commits…" item share it, so the
+    /// keyboard has the same action as the mouse.
+    fn filter_action(&self, name: &str) -> (bool, String, SidebarAction) {
+        if self.filter.as_deref() == Some(name) {
             (
-                ui::t!("history.action.show_all_commits").into(),
+                true,
+                ui::t!("history.refmenu.clear_filter").into(),
                 SidebarAction::ShowAllCommits,
             )
         } else {
             (
-                ui::t!("history.refmenu.show_only_tip", name = name).into(),
+                false,
+                ui::t!("history.refmenu.show_only", name = name).into(),
                 SidebarAction::ShowBranchCommits(name.to_owned()),
             )
-        };
+        }
+    }
+
+    /// The filter tool of a branch header.
+    fn filter_tool(&self, name: &str) -> RefMenuTool {
+        let (selected, tooltip, action) = self.filter_action(name);
         RefMenuTool {
             icon: IconName::Filter,
             tooltip,
             selected,
             action,
         }
+    }
+
+    /// The regular item with the filter tool's action.
+    fn filter_item(&self, name: &str) -> Option<SidebarMenuItem> {
+        let (_, label, action) = self.filter_action(name);
+        Some(SidebarMenuItem::new(label, IconName::Filter).action(action))
     }
 }
 
@@ -344,16 +349,13 @@ pub fn local_section(
     name: &str,
     pr_kind: Option<ServiceKind>,
 ) -> Vec<RefMenuEntry> {
-    let current = ctx.head_branch() == Some(name);
+    let current = menu_model::is_current(ctx.head.as_ref(), name);
     let branch = ctx.find(RefKind::LocalBranch, name);
     let oid = branch.map(|r| r.target);
-    // Where the branch is pushed: its upstream's remote, else the default one.
-    let push_remote = branch
-        .and_then(|r| r.upstream.as_deref())
-        .and_then(|upstream| split_remote(upstream, &ctx.targets))
-        .map(|(remote, _)| remote.to_owned())
-        .or_else(|| ctx.default_remote.clone());
-    let remote_known = ctx.has_remote();
+    let remotes = ctx.remote_names();
+    // `None` without a remote: Push and Set upstream are hidden then.
+    let push_remote = network_ops::push_remote_for(&ctx.refs, name, &remotes);
+    let remote_known = !remotes.is_empty();
 
     let switch = {
         let item = SidebarMenuItem::new(
@@ -416,6 +418,7 @@ pub fn local_section(
             IconName::Trash,
         )
         .danger()
+        .shortcut("Del")
         .maybe_action((!current).then(|| SidebarAction::DeleteBranch(name.to_owned()))),
     );
 
@@ -425,7 +428,7 @@ pub fn local_section(
             tools: vec![ctx.filter_tool(name)],
         },
         vec![
-            items(vec![switch, merge]),
+            items(vec![switch, merge, ctx.filter_item(name)]),
             items(vec![pull, push, set_upstream]),
             items(vec![new_branch, new_tag]),
             items(vec![rename, open, create_pr]),
@@ -470,7 +473,7 @@ pub fn remote_section(ctx: &RefMenuCtx, name: &str) -> Vec<RefMenuEntry> {
             tools: vec![ctx.filter_tool(name)],
         },
         vec![
-            items(vec![checkout, merge]),
+            items(vec![checkout, merge, ctx.filter_item(name)]),
             items(vec![fetch, new_branch]),
             items(vec![open, copy]),
             items(vec![delete]),
@@ -487,17 +490,20 @@ pub fn tag_section(ctx: &RefMenuCtx, name: &str) -> Vec<RefMenuEntry> {
             .action(SidebarAction::CheckoutTag(name.to_owned())),
     );
     let new_branch = new_branch_item(name, oid);
-    let push = ctx.default_remote.as_ref().map(|remote| {
-        SidebarMenuItem::new(
-            ui::t!("history.refmenu.push_tag", remote = remote),
-            IconName::Up,
-        )
-        .action(SidebarAction::PushTag(name.to_owned()))
-    });
+    let remotes = ctx.remote_names();
+    let push = network_ops::default_remote_of(&remotes)
+        .filter(|_| menu_model::can_push_tag(&remotes))
+        .map(|remote| {
+            SidebarMenuItem::new(
+                ui::t!("history.refmenu.push_tag", remote = remote),
+                IconName::Up,
+            )
+            .action(SidebarAction::PushTag(name.to_owned()))
+        });
     // Tags are opened on the first host (the upstream's, else origin's), as
     // the sidebar does.
     let open = ctx.links.first().and_then(|link| {
-        sidebar::open_item(
+        menu_model::open_item(
             link,
             &WebTarget::Tag(name.to_owned()),
             ui::t!(
@@ -515,6 +521,7 @@ pub fn tag_section(ctx: &RefMenuCtx, name: &str) -> Vec<RefMenuEntry> {
     let delete = Some(
         SidebarMenuItem::new(ui::t!("history.refmenu.delete_tag"), IconName::Trash)
             .danger()
+            .shortcut("Del")
             .action(SidebarAction::DeleteTag(name.to_owned())),
     );
 
@@ -637,7 +644,6 @@ mod tests {
             targets: targets(&["origin"]),
             operation: Operation::None,
             filter: None,
-            default_remote: Some("origin".to_owned()),
         }
     }
 
@@ -828,7 +834,7 @@ mod tests {
                 label: "feat".to_owned(),
                 tools: vec![RefMenuTool {
                     icon: IconName::Filter,
-                    tooltip: "Show all commits of feat".to_owned(),
+                    tooltip: "Show only commits of feat".to_owned(),
                     selected: false,
                     action: SidebarAction::ShowBranchCommits("feat".to_owned()),
                 }],
@@ -839,6 +845,7 @@ mod tests {
             [
                 "Switch to feat",
                 "Merge feat into main…",
+                "Show only commits of feat",
                 "Push feat to origin",
                 "Set upstream…",
                 "New branch from feat…",
@@ -952,11 +959,35 @@ mod tests {
     }
 
     #[test]
+    fn delete_shows_the_del_shortcut_like_the_sidebar() {
+        let c = oid(1);
+        let ctx = ctx(vec![local("feat", c), tag("v1", c)]);
+        let local_menu = local_section(&ctx, "feat", PR);
+        assert_eq!(
+            item(&local_menu, "Delete feat…").shortcut.as_deref(),
+            Some("Del")
+        );
+        let tag_menu = tag_section(&ctx, "v1");
+        assert_eq!(
+            item(&tag_menu, "Delete tag…").shortcut.as_deref(),
+            Some("Del")
+        );
+    }
+
+    #[test]
+    fn a_branch_named_head_is_not_current_when_detached() {
+        let c = oid(1);
+        let mut ctx = ctx(vec![local("HEAD", c)]);
+        ctx.head = Some(Head::Detached(c));
+        let menu = local_section(&ctx, "HEAD", PR);
+        assert!(item(&menu, "Switch to HEAD").enabled());
+    }
+
+    #[test]
     fn without_a_remote_push_upstream_fetch_and_tag_push_are_hidden() {
         let c = oid(1);
         let mut ctx = ctx(vec![local("feat", c), tag("v1", c)]);
         ctx.targets.clear();
-        ctx.default_remote = None;
         let local_labels = labels(&local_section(&ctx, "feat", PR));
         assert!(local_labels
             .iter()
@@ -1027,7 +1058,21 @@ mod tests {
         assert!(tools[0].selected);
         // Already filtered: the tool clears the filter instead of re-applying it.
         assert_eq!(tools[0].action, SidebarAction::ShowAllCommits);
-        assert_eq!(tools[0].tooltip, "Show all commits");
+        assert_eq!(tools[0].tooltip, "Clear branch filter");
+        // The keyboard-reachable item does the same.
+        let section = local_section(&ctx, "feat", PR);
+        assert_eq!(
+            item(&section, "Clear branch filter").action,
+            SidebarAction::ShowAllCommits
+        );
+        assert_eq!(
+            item(
+                &local_section(&ctx, "main", PR),
+                "Show only commits of main"
+            )
+            .action,
+            SidebarAction::ShowBranchCommits("main".to_owned())
+        );
         let RefMenuEntry::Header { tools, .. } = &local_section(&ctx, "main", PR)[0] else {
             panic!("a section starts with its header");
         };
@@ -1048,6 +1093,7 @@ mod tests {
             [
                 "Checkout as local branch",
                 "Merge origin/feat/x into main…",
+                "Show only commits of origin/feat/x",
                 "Fetch origin",
                 "New branch from origin/feat/x…",
                 "Open on GitHub",

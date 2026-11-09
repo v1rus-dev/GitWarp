@@ -26,6 +26,7 @@
   "kit.heatmap.weekday.thu": "Jue",
   "kit.heatmap.weekday.tue": "Mar",
   "kit.heatmap.weekday.wed": "Mié",
+  "kit.menu.no_matches": "Sin coincidencias",
   "kit.toast.dismiss": "Cerrar",
   "kit.toast.copy": "Copiar"
 }

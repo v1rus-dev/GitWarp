@@ -5,7 +5,7 @@
 //! the background, one repository at a time, and arrives after the list is
 //! already on screen.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -48,7 +48,9 @@ actions!(
         RemoveSelected,
         SelectAllRecent,
         ExtendNext,
-        ExtendPrev
+        ExtendPrev,
+        OpenRowMenu,
+        UndoRemoval
     ]
 );
 
@@ -69,6 +71,10 @@ const REMOVE_SLOT_W: f32 = 20.;
 const UNDO_LIFETIME: Duration = Duration::from_secs(8);
 /// The least time between two re-checks of the whole list on window activation.
 const REPROBE_INTERVAL: Duration = Duration::from_secs(30);
+/// How many background checks run at once. A dead network mount blocks its
+/// check until the OS gives up, so without a cap a long list could occupy
+/// the whole background pool; the rest wait in `probe_queue`.
+const MAX_PROBES: usize = 4;
 
 /// A recent repository row, resolved for one frame.
 struct RecentRow {
@@ -95,15 +101,18 @@ pub struct WelcomeView {
     /// The cursor row (an index into the filtered rows, never past the end)
     /// and the explicit multi-selection.
     selection: RecentSelection,
-    /// The Undo toast of the last removal, replaced by the next one.
-    undo_toast: Option<ToastId>,
+    /// The Undo toast of the last removal, replaced by the next one, and what
+    /// it restores (Ctrl+Z does the same as its button while it is visible).
+    undo_toast: Option<(ToastId, Vec<(usize, RecentRepo)>)>,
     /// The cleanup bar's "Show only these": the list shows unavailable rows only.
     only_unavailable: bool,
     /// What the background check found for each recent path; a path without an
     /// entry is still being checked (see `probing`).
     states: HashMap<PathBuf, RowState>,
-    /// Paths with a background check in flight.
+    /// Paths with a background check in flight (at most [`MAX_PROBES`]).
     probing: HashSet<PathBuf>,
+    /// Paths waiting for a free check slot, in order.
+    probe_queue: VecDeque<PathBuf>,
     /// When the whole list was last re-checked on window activation.
     last_reprobe: Option<Instant>,
     /// Bumped whenever `recent` changes, so the activity card is only told
@@ -184,6 +193,7 @@ impl WelcomeView {
             only_unavailable: false,
             states: HashMap::new(),
             probing: HashSet::new(),
+            probe_queue: VecDeque::new(),
             last_reprobe: None,
             recent_revision: 0,
             activity_sent: None,
@@ -271,7 +281,33 @@ impl WelcomeView {
             .cloned()
             .collect();
         for path in missing {
+            self.queue_probe(path, window, cx);
+        }
+    }
+
+    /// [`Self::start_probe`] when a check slot is free, else the path waits its
+    /// turn (at most [`MAX_PROBES`] checks run at once).
+    fn queue_probe(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.probing.contains(&path) || self.probe_queue.contains(&path) {
+            return;
+        }
+        if self.probing.len() < MAX_PROBES {
             self.start_probe(path, window, cx);
+        } else {
+            self.probe_queue.push_back(path);
+        }
+    }
+
+    /// Starts queued checks while slots are free; entries removed from the list
+    /// meanwhile are skipped.
+    fn drain_probe_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while self.probing.len() < MAX_PROBES {
+            let Some(path) = self.probe_queue.pop_front() else {
+                break;
+            };
+            if self.recent.iter().any(|repo| repo.path == path) {
+                self.start_probe(path, window, cx);
+            }
         }
     }
 
@@ -312,6 +348,7 @@ impl WelcomeView {
         cx: &mut Context<Self>,
     ) {
         self.probing.remove(&path);
+        self.drain_probe_queue(window, cx);
         if linked {
             // Linked worktrees are never listed; older versions recorded them,
             // so the entry is dropped from the settings (a one-off migration).
@@ -326,6 +363,12 @@ impl WelcomeView {
             return;
         }
         let available = matches!(state, RowState::Available { .. });
+        let was_unavailable = self.is_unavailable(&path);
+        // The chip label of the reason, for the "still unavailable" toast.
+        let still_unavailable = state
+            .unavailable()
+            .filter(|_| was_unavailable)
+            .map(|reason| reason.chip_label());
         self.states.insert(path.clone(), state);
         // An Enter / double click waited for this result. Unavailable: the row
         // stays selected, showing its chip and inline actions.
@@ -333,6 +376,14 @@ impl WelcomeView {
             self.open_when_ready = None;
             if available {
                 self.open_path(path, window, cx);
+            } else if let Some(reason) = still_unavailable {
+                // The re-check changed nothing: say so, or Enter looks dead.
+                toast::show(
+                    ToastKind::Info,
+                    ui::t!("welcome.recent.toast.still_unavailable", reason = reason),
+                    window,
+                    cx,
+                );
             }
         }
         cx.notify();
@@ -353,7 +404,7 @@ impl WelcomeView {
         self.last_reprobe = Some(now);
         let paths: Vec<PathBuf> = self.recent.iter().map(|repo| repo.path.clone()).collect();
         for path in paths {
-            self.start_probe(path, window, cx);
+            self.queue_probe(path, window, cx);
         }
     }
 
@@ -558,6 +609,7 @@ impl WelcomeView {
             many => ui::i18n::t_count("welcome.recent.toast.removed_many", many.len() as u64, &[]),
         };
         let view = cx.entity().downgrade();
+        let restorable = removed.clone();
         let undo = ToastAction::new(ui::t!("welcome.recent.toast.undo"), move |_, cx| {
             // The toast outlives the view (a repository opened within the
             // lifetime replaces the welcome screen), so the entries go back
@@ -570,10 +622,10 @@ impl WelcomeView {
             .ok();
         });
         // One Undo at a time: a newer removal replaces the older toast.
-        if let Some(previous) = self.undo_toast.take() {
+        if let Some((previous, _)) = self.undo_toast.take() {
             toast::dismiss(previous, window, cx);
         }
-        self.undo_toast = Some(toast::show_with(
+        let id = toast::show_with(
             ToastKind::Info,
             message,
             Some(ToastBody {
@@ -583,15 +635,62 @@ impl WelcomeView {
             }),
             window,
             cx,
-        ));
+        );
+        self.undo_toast = Some((id, restorable));
+    }
+
+    /// Ctrl+Z: does what the Undo button of the removal toast does, while that
+    /// toast is still visible; afterwards (or without one) the key is left alone.
+    fn undo_removal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = self
+            .undo_toast
+            .as_ref()
+            .is_some_and(|(id, _)| toast::toasts(window, cx).iter().any(|t| t.id == *id));
+        let Some((id, removed)) = self.undo_toast.take().filter(|_| visible) else {
+            cx.propagate();
+            return;
+        };
+        toast::dismiss(id, window, cx);
+        restore_recent(cx, removed);
+        self.sync_recent(cx);
+        cx.notify();
+    }
+
+    /// Shift+F10 / the Menu key: the menu of the cursor row (of the selection
+    /// when the cursor row is part of it), anchored below the row. Rows have a
+    /// fixed height, so the anchor comes from the list's bounds and scroll
+    /// offset; a row off screen is scrolled to the nearest edge first.
+    fn open_cursor_row_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.selection.cursor;
+        if index >= self.filtered_len() {
+            return;
+        }
+        let (bounds, offset) = {
+            let scroll = self.list_scroll.0.borrow();
+            (scroll.base_handle.bounds(), scroll.base_handle.offset())
+        };
+        let row_height = px(ROW_H);
+        let top = bounds.top() + row_height * index as f32 + offset.y;
+        let lowest = (bounds.bottom() - row_height).max(bounds.top());
+        let top_on_screen = top.clamp(bounds.top(), lowest);
+        if top_on_screen != top {
+            self.list_scroll
+                .scroll_to_item(index, ScrollStrategy::Nearest);
+            cx.notify();
+        }
+        // Past the folder icon, level with the name.
+        let position = gpui::point(bounds.left() + px(48.), top_on_screen + row_height);
+        self.open_row_menu(index, position, true, window, cx);
     }
 
     /// Right click on a row: selects it unless it is already part of the
-    /// selection, then opens the row's menu at the pointer.
+    /// selection, then opens the row's menu at the pointer. `from_keyboard`
+    /// (Shift+F10, the Menu key) highlights the menu's first item.
     fn open_row_menu(
         &mut self,
         index: usize,
         position: gpui::Point<gpui::Pixels>,
+        from_keyboard: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -621,7 +720,11 @@ impl WelcomeView {
             })
         });
         cx.notify();
-        menu::open_context_menu(position, entries, window, cx);
+        if from_keyboard {
+            menu::open_context_menu_from_keyboard(position, entries, window, cx);
+        } else {
+            menu::open_context_menu(position, entries, window, cx);
+        }
     }
 
     fn run_menu_command(
@@ -1026,7 +1129,7 @@ impl WelcomeView {
             .child("·")
             .child(footer_link(
                 "recent-footer-remove",
-                ui::t!("welcome.recent.remove_n", n = selected_count),
+                ui::i18n::t_count("welcome.recent.menu.remove_n", selected_count as u64, &[]),
                 colors,
                 move |window, cx| {
                     let paths = remove.clone();
@@ -1228,6 +1331,12 @@ impl Render for WelcomeView {
                 }),
             )
             .on_action(cx.listener(|view, _: &SelectAllRecent, _, cx| view.select_all(cx)))
+            .on_action(cx.listener(|view, _: &OpenRowMenu, window, cx| {
+                view.open_cursor_row_menu(window, cx)
+            }))
+            .on_action(
+                cx.listener(|view, _: &UndoRemoval, window, cx| view.undo_removal(window, cx)),
+            )
             .on_action(
                 cx.listener(|view, _: &ExtendNext, window, cx| {
                     view.extend_selection(1, window, cx)
@@ -1916,7 +2025,7 @@ fn render_recent_row(
             let position = event.position;
             weak_menu
                 .update(cx, |view, cx| {
-                    view.open_row_menu(index, position, window, cx)
+                    view.open_row_menu(index, position, false, window, cx)
                 })
                 .ok();
         }
@@ -2403,9 +2512,16 @@ fn cleanup_bar(
             div()
                 .debug_selector(|| "recent-cleanup-remove".to_string())
                 .child(
-                    Button::danger("recent-cleanup-remove")
+                    // Neutral, not the danger fill: this only drops list entries and
+                    // must not read as deleting files (the design's danger outline
+                    // is deliberately not followed, see F2 report).
+                    Button::new("recent-cleanup-remove")
                         .size(ButtonSize::Small)
-                        .label(ui::t!("welcome.recent.cleanup.remove", n = count))
+                        .label(ui::i18n::t_count(
+                            "welcome.recent.menu.remove_n",
+                            count as u64,
+                            &[],
+                        ))
                         .on_click(move |_, window, cx| {
                             let paths = unavailable.clone();
                             weak.update(cx, |view, cx| view.remove_paths(paths, window, cx))
@@ -2421,10 +2537,15 @@ fn cleanup_bar(
 ///
 /// The flag says the entry is a linked worktree (never listed in Recent).
 fn check_recent(git: Option<Arc<Git>>, path: &Path) -> (RowState, bool) {
-    let (probe, linked) = git_core::probe_repo_path_linked(path);
+    let probe = git_core::probe_repo_path(path);
+    let linked = matches!(
+        probe,
+        git_core::PathProbe::Candidate { linked: true }
+            | git_core::PathProbe::BrokenWorktree { .. }
+    );
     let open: Option<OpenResult> = match (&probe, git) {
         // A linked worktree is dropped from the list, so it is not opened.
-        (git_core::PathProbe::Candidate, Some(git)) if !linked => {
+        (git_core::PathProbe::Candidate { linked: false }, Some(git)) => {
             Some(Repo::open(git, path).map(|repo| (repo.root().to_path_buf(), repo.head().ok())))
         }
         _ => None,
@@ -3085,10 +3206,24 @@ mod tests {
             "not unavailable"
         );
 
-        // Still gone: Enter keeps the row selected and the screen open.
+        // Still gone: Enter keeps the row selected and the screen open, and
+        // says why nothing happened.
         cx.update(|window, cx| window.dispatch_action(Box::new(ui::actions::Confirm), cx));
         cx.run_until_parked();
         assert!(cx.debug_bounds("recent-chip-0").is_some());
+        let messages: Vec<String> = cx.update(|window, cx| {
+            toast::toasts(window, cx)
+                .iter()
+                .map(|t| t.message.to_string())
+                .collect()
+        });
+        assert_eq!(
+            messages,
+            vec![format!(
+                "Still unavailable: {}",
+                ui::t!("welcome.recent.state.missing")
+            )]
+        );
         assert!(workspace.read_with(&cx, |w, _| w.repository_for_test().is_none()));
 
         // The folder comes back (a remounted share).
@@ -3233,5 +3368,88 @@ mod tests {
             cx.debug_bounds("recent-footer-selected").is_some(),
             "Shift+Down in the list did not extend the selection"
         );
+    }
+
+    /// Shift+F10 / the Menu key open the cursor row's menu with its first item
+    /// highlighted, so Enter runs it (Open) at once.
+    #[gpui::test]
+    fn the_menu_key_opens_the_cursor_rows_menu_and_enter_runs_its_first_item(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = crate::test_support::TempRepo::new("recent-menu-key");
+        let (mut cx, workspace) =
+            open_with_paths_in_workspace(cx, std::slice::from_ref(&repo.path().to_path_buf()));
+        cx.run_until_parked();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.dispatch_action(Box::new(OpenRowMenu), cx));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|window, cx| overlay::layer_count(window, cx)), 1);
+        assert!(workspace.read_with(&cx, |w, _| w.repository_for_test().is_none()));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(
+            workspace.read_with(&cx, |w, _| w.repository_for_test().is_some()),
+            "Enter did not run the menu's first item"
+        );
+    }
+
+    /// Ctrl+Z restores the last removal while its toast is visible, and only once.
+    #[gpui::test]
+    fn undo_removal_restores_the_entries_once(cx: &mut gpui::TestAppContext) {
+        let (mut cx, paths) = open_with_recent(cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.dispatch_action(Box::new(RemoveSelected), cx));
+        cx.run_until_parked();
+        assert_eq!(recent_paths(&mut cx), paths[1..].to_vec());
+
+        cx.update(|window, cx| window.dispatch_action(Box::new(UndoRemoval), cx));
+        cx.run_until_parked();
+        assert_eq!(recent_paths(&mut cx), paths);
+        assert_eq!(
+            cx.update(|window, cx| toast::count(window, cx)),
+            0,
+            "the Undo toast stayed after Ctrl+Z"
+        );
+        // Nothing left to undo: a second press changes nothing.
+        cx.update(|window, cx| window.dispatch_action(Box::new(RemoveSelected), cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(UNDO_LIFETIME);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|window, cx| toast::count(window, cx)), 0);
+        cx.update(|window, cx| window.dispatch_action(Box::new(UndoRemoval), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            recent_paths(&mut cx),
+            paths[1..].to_vec(),
+            "Ctrl+Z restored after the toast had expired"
+        );
+    }
+
+    /// At most `MAX_PROBES` checks run at once; the rest wait and still finish.
+    #[gpui::test]
+    fn only_a_few_checks_run_at_once(cx: &mut gpui::TestAppContext) {
+        let paths: Vec<PathBuf> = (0..10)
+            .map(|n| PathBuf::from(format!("/nonexistent-recent/{n}")))
+            .collect();
+        let (mut cx, workspace) = open_with_paths_in_workspace(cx, &paths);
+        let view = workspace.read_with(&cx, |w, _| w.welcome_for_test().expect("welcome"));
+        // Window activation re-checks every row: the slots fill, the rest queue.
+        view.update_in(&mut cx, |view, window, cx| {
+            view.states.clear();
+            view.probing.clear();
+            view.probe_queue.clear();
+            view.last_reprobe = None;
+            view.reprobe_all(window, cx);
+            assert_eq!(view.probing.len(), MAX_PROBES);
+            assert_eq!(view.probe_queue.len(), paths.len() - MAX_PROBES);
+        });
+        cx.run_until_parked();
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(view.probing.is_empty() && view.probe_queue.is_empty());
+            assert_eq!(view.states.len(), paths.len(), "a queued check never ran");
+        });
     }
 }

@@ -447,6 +447,15 @@ impl Workspace {
         }
     }
 
+    /// The welcome screen's view, for its tests.
+    #[cfg(test)]
+    pub(crate) fn welcome_for_test(&self) -> Option<Entity<WelcomeView>> {
+        match &self.content {
+            Content::Welcome(view) => Some(view.clone()),
+            Content::Repository(_) | Content::Empty => None,
+        }
+    }
+
     /// Runs `f` on the open repository, if there is one.
     fn with_repository<R>(
         &self,

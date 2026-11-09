@@ -1393,3 +1393,141 @@ fn a_select_in_a_dialog_gets_focus_back_after_a_pick(cx: &mut TestAppContext) {
     assert_eq!(layer_count(cx), 1, "only the dialog stays open");
     assert_focused(cx, &select);
 }
+
+#[gpui::test]
+fn a_menu_opened_from_the_keyboard_highlights_its_first_enabled_item(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let first = Rc::new(Cell::new(0));
+    let second = Rc::new(Cell::new(0));
+    let entries = vec![
+        menu_item("Off", false, &Rc::new(Cell::new(0))),
+        menu_item("First", true, &first),
+        menu_item("Second", true, &second),
+    ];
+    cx.update(|window, app| {
+        menu::open_context_menu_from_keyboard(point(px(40.), px(40.)), entries, window, app);
+    });
+    cx.run_until_parked();
+
+    // Enter at once runs the first enabled row, with no arrow pressed.
+    cx.simulate_keystrokes("enter");
+    assert_eq!((first.get(), second.get()), (1, 0));
+    assert_eq!(layer_count(cx), 0);
+}
+
+#[gpui::test]
+fn a_filter_with_no_matches_shows_a_disabled_no_matches_row(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    let entries = vec![
+        MenuEntry::Filter {
+            placeholder: "Filter refs…".into(),
+        },
+        menu_item("Alpha", true, &hits),
+    ];
+    cx.update(|window, app| {
+        menu::open_context_menu(point(px(40.), px(40.)), entries, window, app);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("menu-no-matches").is_none());
+
+    cx.simulate_input("zzz");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("menu-0-0").is_none());
+    assert!(
+        cx.debug_bounds("menu-no-matches").is_some(),
+        "an empty filtered list showed no `No matches` row"
+    );
+    // Enter has nothing to run.
+    cx.simulate_keystrokes("enter");
+    assert_eq!(hits.get(), 0);
+}
+
+#[gpui::test]
+fn a_menu_taller_than_the_window_is_capped_and_scrolls_to_the_highlight(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    let viewport = cx.update(|window, _| window.viewport_size());
+    // Each row is 28px: twice the window's height of rows.
+    let count = (f32::from(viewport.height) / 14.) as usize;
+    let mut entries = vec![MenuEntry::Header(menu::MenuHeader::new("Header"))];
+    entries.extend((0..count).map(|_| menu_item("Row", true, &hits)));
+    cx.update(|window, app| {
+        menu::open_context_menu(point(px(40.), px(0.)), entries, window, app);
+    });
+    cx.run_until_parked();
+
+    let last = format!("menu-0-{}", count - 1);
+    let last: &'static str = Box::leak(last.into_boxed_str());
+    let first = cx.debug_bounds("menu-0-0").expect("first row");
+    assert!(first.top() >= px(0.));
+    // The last row is below the window until the keyboard scrolls it in.
+    let before = cx.debug_bounds(last);
+    assert!(
+        before.is_none_or(|b| b.bottom() > viewport.height),
+        "the panel is not capped to the window: {before:?}"
+    );
+    // Up from nothing highlights the last row and reveals it.
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    let after = cx.debug_bounds(last).expect("the last row painted");
+    assert!(
+        after.bottom() <= viewport.height,
+        "the highlighted row is still below the window: {after:?}"
+    );
+}
+
+/// A toast with a button stays while keyboard focus is on the button, and
+/// goes once focus leaves (its timer starts over while focused).
+#[gpui::test]
+fn a_toast_is_kept_while_keyboard_focus_is_inside_it(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let show = |cx: &mut VisualTestContext| {
+        cx.update(|window, app| {
+            toast::show_with(
+                ToastKind::Info,
+                "Removed",
+                Some(ui::ToastBody {
+                    lines: Vec::new(),
+                    action: Some(ui::ToastAction::new("Undo", |_, _| {})),
+                    lifetime: Some(Duration::from_secs(2)),
+                }),
+                window,
+                app,
+            )
+        })
+    };
+    let count = |cx: &mut VisualTestContext| cx.update(|window, app| toast::count(window, app));
+
+    // Tab until focus reaches the toast's button: only then the toast survives
+    // past its lifetime.
+    let mut kept = false;
+    for _ in 0..8 {
+        show(cx);
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        // The poll runs every 250 ms: step through the lifetime.
+        for _ in 0..16 {
+            cx.executor().advance_clock(Duration::from_millis(250));
+            cx.run_until_parked();
+        }
+        if count(cx) == 1 {
+            kept = true;
+            break;
+        }
+    }
+    assert!(
+        kept,
+        "no tab stop kept the toast alive: focus is not tracked"
+    );
+
+    // Focus leaves: the toast hides after its lifetime.
+    cx.update(|window, app| window.blur(app));
+    for _ in 0..16 {
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+    }
+    assert_eq!(count(cx), 0, "the toast stayed after focus left");
+}

@@ -25,6 +25,7 @@ mod history_view;
 mod host_key_dialog;
 mod hosting_status;
 mod init_flow;
+mod menu_model;
 mod merge_dialog;
 mod network_ops;
 mod network_service;
@@ -65,7 +66,7 @@ use gpui::{
 };
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use git_core::{Git, GitChoice};
@@ -191,6 +192,22 @@ Options:
 
 Without REPO the welcome screen opens.";
 
+/// The first recent entry to reopen on launch: an existing folder that is not a
+/// linked worktree (older versions recorded those; Recent never lists them
+/// now, so reopening one would be a surprise). Both checks are cheap file-system
+/// reads on the candidates up to the first match, run before the window exists.
+fn last_repository(
+    recent: &[settings::RecentRepo],
+    is_dir: impl Fn(&Path) -> bool,
+    is_linked: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    recent
+        .iter()
+        .map(|repo| &repo.path)
+        .find(|path| is_dir(path) && !is_linked(path))
+        .cloned()
+}
+
 fn main() {
     // git starts this same executable as its askpass helper. That happens
     // before any window exists, so it must be the first thing `main` checks.
@@ -238,11 +255,9 @@ fn main() {
 
     let path = match path {
         Some(path) => Some(path),
-        None if loaded.on_launch == settings::OnLaunch::Last => loaded
-            .recent
-            .iter()
-            .map(|repo| repo.path.clone())
-            .find(|path| path.is_dir()),
+        None if loaded.on_launch == settings::OnLaunch::Last => {
+            last_repository(&loaded.recent, |p| p.is_dir(), git_core::is_linked_worktree)
+        }
         None => None,
     };
 
@@ -364,6 +379,11 @@ fn main() {
                     welcome::SelectAllRecent,
                     Some("welcome"),
                 ),
+                // Shift+F10 / Menu: the row menu of the cursor row. Ctrl+Z restores
+                // the last removal while its Undo toast is visible.
+                ui::actions::key_binding(cx, "shift-f10", welcome::OpenRowMenu, Some("welcome")),
+                ui::actions::key_binding(cx, "menu", welcome::OpenRowMenu, Some("welcome")),
+                ui::actions::key_binding(cx, "secondary-z", welcome::UndoRemoval, Some("welcome")),
                 KeyBinding::new("shift-down", welcome::ExtendNext, Some("welcome")),
                 KeyBinding::new("shift-up", welcome::ExtendPrev, Some("welcome")),
             ];
@@ -477,6 +497,25 @@ mod tests {
             path: path.map(Into::into),
             git,
         })
+    }
+
+    #[test]
+    fn launch_skips_missing_folders_and_linked_worktrees() {
+        let recent: Vec<settings::RecentRepo> = ["/gone", "/wt", "/repo", "/later"]
+            .iter()
+            .map(|path| settings::RecentRepo {
+                path: PathBuf::from(path),
+                last_opened: 0,
+            })
+            .collect();
+        let is_dir = |path: &Path| path != Path::new("/gone");
+        let is_linked = |path: &Path| path == Path::new("/wt");
+        assert_eq!(
+            last_repository(&recent, is_dir, is_linked),
+            Some(PathBuf::from("/repo"))
+        );
+        // Nothing usable: the welcome screen opens.
+        assert_eq!(last_repository(&recent[..2], is_dir, is_linked), None);
     }
 
     #[test]

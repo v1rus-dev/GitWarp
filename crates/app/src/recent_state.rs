@@ -52,7 +52,7 @@ pub fn classify(path: &Path, probe: PathProbe, open: Option<OpenResult>) -> RowS
         PathProbe::BrokenWorktree { main_repo, .. } => {
             RowState::Unavailable(Unavailable::WorktreeRemoved { main_repo })
         }
-        PathProbe::Candidate => match open {
+        PathProbe::Candidate { .. } => match open {
             None => RowState::Available { branch: None },
             Some(Ok((root, head))) => {
                 // `Repo::open` searches upward: a folder that is no longer a
@@ -301,7 +301,7 @@ mod tests {
         );
         // Git could not start: the file system found nothing wrong.
         assert_eq!(
-            state(PathProbe::Candidate),
+            state(PathProbe::Candidate { linked: false }),
             RowState::Available { branch: None }
         );
     }
@@ -316,7 +316,7 @@ mod tests {
         assert_eq!(
             classify(
                 &path,
-                PathProbe::Candidate,
+                PathProbe::Candidate { linked: false },
                 Some(Ok((path.clone(), Some(branch))))
             ),
             RowState::Available {
@@ -324,30 +324,44 @@ mod tests {
             }
         );
         assert_eq!(
-            classify(&path, PathProbe::Candidate, Some(Ok((path.clone(), None)))),
+            classify(
+                &path,
+                PathProbe::Candidate { linked: false },
+                Some(Ok((path.clone(), None)))
+            ),
             RowState::Available { branch: None }
         );
         // Parent-repository trap: the folder opened a different (enclosing) root.
         assert_eq!(
-            classify(&path, PathProbe::Candidate, Some(Ok((p("parent"), None)))),
-            RowState::Unavailable(Unavailable::NotARepository)
-        );
-        assert_eq!(
-            classify(&path, PathProbe::Candidate, Some(Err(not_a_repo("x")))),
+            classify(
+                &path,
+                PathProbe::Candidate { linked: false },
+                Some(Ok((p("parent"), None)))
+            ),
             RowState::Unavailable(Unavailable::NotARepository)
         );
         assert_eq!(
             classify(
                 &path,
-                PathProbe::Candidate,
+                PathProbe::Candidate { linked: false },
+                Some(Err(not_a_repo("x")))
+            ),
+            RowState::Unavailable(Unavailable::NotARepository)
+        );
+        assert_eq!(
+            classify(
+                &path,
+                PathProbe::Candidate { linked: false },
                 Some(Err(git_core::Error::PathNotFound { path: p("x") }))
             ),
             RowState::Unavailable(Unavailable::FolderMissing)
         );
         let other = git_core::Error::Spawn(std::io::Error::other("boom"));
-        let RowState::Unavailable(Unavailable::Unreadable(text)) =
-            classify(&path, PathProbe::Candidate, Some(Err(other)))
-        else {
+        let RowState::Unavailable(Unavailable::Unreadable(text)) = classify(
+            &path,
+            PathProbe::Candidate { linked: false },
+            Some(Err(other)),
+        ) else {
             panic!("expected Unreadable");
         };
         assert!(text.contains("boom"), "{text}");
@@ -363,7 +377,11 @@ mod tests {
             let link = dir.join("link");
             std::fs::create_dir_all(&real).unwrap();
             std::os::unix::fs::symlink(&real, &link).unwrap();
-            let state = classify(&link, PathProbe::Candidate, Some(Ok((real, None))));
+            let state = classify(
+                &link,
+                PathProbe::Candidate { linked: false },
+                Some(Ok((real, None))),
+            );
             let _ = std::fs::remove_dir_all(&dir);
             assert_eq!(state, RowState::Available { branch: None });
         }

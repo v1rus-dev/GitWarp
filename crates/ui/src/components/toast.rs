@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, App, BorrowAppContext, ClipboardItem, Div, ElementId, FontWeight, Global,
+    div, px, App, BorrowAppContext, ClipboardItem, Div, ElementId, FocusHandle, FontWeight, Global,
     InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
     Styled, Window, WindowId,
 };
@@ -157,6 +157,11 @@ struct QueuedToast {
     remaining: Option<Duration>,
     hovered: bool,
     selected: bool,
+    /// The whole lifetime, restarted while keyboard focus is inside the toast.
+    lifetime: Option<Duration>,
+    /// Tracks focus inside the toast (its buttons are tab stops); `None` for a
+    /// queue used without a window.
+    focus: Option<FocusHandle>,
 }
 
 /// The pure toast state of one window: ordering, expiry and dismissal.
@@ -203,8 +208,17 @@ impl ToastQueue {
             remaining: None,
             hovered: false,
             selected: false,
+            lifetime,
+            focus: None,
         });
         id
+    }
+
+    /// Lets the queue see whether keyboard focus is inside toast `id`.
+    fn set_focus_handle(&mut self, id: ToastId, focus: FocusHandle) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.toast.id == id) {
+            entry.focus = Some(focus);
+        }
     }
 
     /// Pauses or resumes the timer when the pointer enters, leaves or selects
@@ -320,8 +334,11 @@ pub fn show_with(
 ) -> ToastId {
     let now = cx.background_executor().now();
     let auto_hide = lifetime_of(kind, body.as_ref()).is_some();
+    let focus = cx.focus_handle();
     let id = with_queue(window, cx, |queue| {
-        queue.push_with(kind, message, body, now)
+        let id = queue.push_with(kind, message, body, now);
+        queue.set_focus_handle(id, focus);
+        id
     });
     window.refresh();
 
@@ -352,10 +369,28 @@ pub fn show_with(
 /// whether the toast is gone.
 fn expire_if_due(id: ToastId, window: &mut Window, cx: &mut App) -> bool {
     let now = cx.background_executor().now();
+    // Read before borrowing the queue: `contains_focused` needs the window.
+    let focused = with_queue(window, cx, |queue| {
+        queue
+            .entries
+            .iter()
+            .find(|entry| entry.toast.id == id)
+            .and_then(|entry| entry.focus.clone())
+    })
+    .is_some_and(|focus| focus.contains_focused(window, cx));
     let (present, removed) = with_queue(window, cx, |queue| {
-        let Some(entry) = queue.entries.iter().find(|entry| entry.toast.id == id) else {
+        let Some(entry) = queue.entries.iter_mut().find(|entry| entry.toast.id == id) else {
             return (false, false);
         };
+        // Keyboard focus inside the toast (on its Undo button) pauses it like the
+        // pointer does: the timer starts over until focus leaves.
+        if focused {
+            // (A toast paused by the pointer has no deadline to restart.)
+            if let (Some(lifetime), None) = (entry.lifetime, entry.remaining) {
+                entry.deadline = Some(now + lifetime);
+            }
+            return (true, false);
+        }
         let due = entry.deadline.is_some_and(|deadline| deadline <= now);
         if due {
             queue.dismiss(id);
@@ -431,8 +466,13 @@ pub(crate) fn render_stack(window: &Window, cx: &App) -> Option<Div> {
         .flex_col()
         .items_end()
         .gap(px(8.));
-    for toast in queue.iter() {
-        stack = stack.child(render_toast(toast, colors, shadows.clone()));
+    for entry in &queue.entries {
+        stack = stack.child(render_toast(
+            &entry.toast,
+            entry.focus.as_ref(),
+            colors,
+            shadows.clone(),
+        ));
     }
     Some(stack)
 }
@@ -455,6 +495,7 @@ fn toast_text(toast: &Toast) -> String {
 
 fn render_toast(
     toast: &Toast,
+    focus: Option<&FocusHandle>,
     colors: ThemeColors,
     shadows: Vec<gpui::BoxShadow>,
 ) -> impl IntoElement {
@@ -568,6 +609,7 @@ fn render_toast(
         .rounded(R_MD)
         .overflow_hidden()
         .shadow(shadows)
+        .when_some(focus, |this, focus| this.track_focus(focus))
         .on_hover(move |hovered, window, cx| {
             set_hovered(id, *hovered, window, cx);
         })

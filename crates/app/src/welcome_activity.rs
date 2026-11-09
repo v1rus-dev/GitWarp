@@ -477,7 +477,7 @@ fn count_repo(
 ) -> Result<CacheEntry, String> {
     // The same classification and wording as the recent list's chips.
     let probe = git_core::probe_repo_path(path);
-    if !matches!(probe, PathProbe::Candidate) {
+    if !matches!(probe, PathProbe::Candidate { .. }) {
         let reason = unavailable_reason(path, probe, None);
         return Err(reason.unwrap_or_else(|| ui::t!("welcome.recent.state.unreadable").to_string()));
     }
@@ -492,14 +492,20 @@ fn count_repo(
     let repo = match Repo::open(git, path) {
         Ok(repo) => {
             let open = Ok((repo.root().to_path_buf(), None));
-            if let Some(reason) = unavailable_reason(path, PathProbe::Candidate, Some(open)) {
+            if let Some(reason) =
+                unavailable_reason(path, PathProbe::Candidate { linked: false }, Some(open))
+            {
                 return Err(reason);
             }
             repo
         }
         Err(error) => {
             let text = error.to_string();
-            let reason = unavailable_reason(path, PathProbe::Candidate, Some(Err(error)));
+            let reason = unavailable_reason(
+                path,
+                PathProbe::Candidate { linked: false },
+                Some(Err(error)),
+            );
             return Err(reason.unwrap_or(text));
         }
     };
@@ -979,7 +985,12 @@ mod tests {
             Some("Can't read — Permission denied")
         );
         let boom = git_core::Error::Spawn(std::io::Error::other("boom"));
-        let reason = unavailable_reason(path, PathProbe::Candidate, Some(Err(boom))).unwrap();
+        let reason = unavailable_reason(
+            path,
+            PathProbe::Candidate { linked: false },
+            Some(Err(boom)),
+        )
+        .unwrap();
         assert!(reason.starts_with("Can't read — "), "{reason}");
         assert!(reason.contains("boom"), "{reason}");
         // The other reasons stay the bare chip label.
