@@ -240,11 +240,43 @@ fn abs_existing(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// `canonicalize` yields `\\?\C:\x` (or `\\?\UNC\srv\x`) on Windows, and git for Windows does
+/// not open such a path from `GIT_INDEX_FILE`: it silently treats the file as an empty index.
+/// Drops the verbatim prefix (`\\?\C:\x` -> `C:\x`, `\\?\UNC\srv\x` -> `\\srv\x`); a no-op
+/// for every other path, so it is plain string logic that runs on any platform.
+pub(crate) fn strip_verbatim(path: &Path) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{GitChoice, GitEngine};
     use std::sync::Arc;
+
+    #[test]
+    fn strip_verbatim_drops_the_windows_prefix() {
+        let strip = |s: &str| strip_verbatim(Path::new(s));
+        assert_eq!(
+            strip(r"\\?\C:\r\.git\index"),
+            PathBuf::from(r"C:\r\.git\index")
+        );
+        assert_eq!(
+            strip(r"\\?\UNC\srv\share\r"),
+            PathBuf::from(r"\\srv\share\r")
+        );
+        assert_eq!(strip(r"C:\r\.git"), PathBuf::from(r"C:\r\.git"));
+        assert_eq!(strip("/r/.git"), PathBuf::from("/r/.git"));
+    }
 
     fn git(engine: GitEngine) -> Git {
         Git::resolve(GitChoice::System)

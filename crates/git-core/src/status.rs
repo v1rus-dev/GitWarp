@@ -389,7 +389,8 @@ impl ScratchIndex {
     }
 
     fn apply(&self, command: &mut std::process::Command) {
-        command.env("GIT_INDEX_FILE", &self.0);
+        // Windows: git cannot open a `\\?\` path here and would read an empty index.
+        command.env("GIT_INDEX_FILE", crate::runner::strip_verbatim(&self.0));
     }
 }
 

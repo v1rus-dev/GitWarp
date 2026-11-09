@@ -1300,6 +1300,22 @@ fn keeps_the_no_newline_marker_and_marks_a_huge_diff_too_large() {
 }
 
 #[test]
+fn clean_tracked_repo_reports_nothing_through_the_private_index() {
+    // If the private index copy were not read, git would see an empty index and list the
+    // tracked file as untracked.
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q"]);
+    write(d, "a.txt", "one\n");
+    commit_all(d, "one");
+
+    let status = open(d).unwrap().working_status().unwrap();
+    assert!(status.unstaged.is_empty(), "{status:?}");
+    assert_eq!(status.staged_count(), 0);
+    assert!(status.conflicted.is_empty());
+}
+
+#[test]
 fn reads_the_working_status_and_moves_files_between_the_sides() {
     let tmp = tempfile::tempdir().unwrap();
     let d = tmp.path();
