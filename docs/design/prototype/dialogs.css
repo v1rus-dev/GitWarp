@@ -103,3 +103,27 @@ a.link:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .filelist.oneline li { display: flex; gap: 8px; min-width: 0; }
 .filelist.oneline .hash { flex: none; }
 .filelist.oneline .sum { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* error-fix dialog: raw git output, selectable mono box, max 180px (error_dialog.rs) */
+.errbox { max-height: 180px; overflow: auto; padding: 8px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--bg); font-size: 12px; line-height: 18px; white-space: pre-wrap; user-select: text; }
+/* multi-target push toast: one row per target, glyph + text + muted detail (+ action) */
+.tlines { display: grid; gap: 4px; margin-top: 6px; }
+.tline { display: flex; align-items: center; gap: 6px; font-size: var(--fs-sm); }
+.tline .tl-text { flex: none; }
+.tline .tl-detail { color: var(--muted); flex: 1; min-width: 0; text-align: right; }
+.toast-msg { white-space: pre-line; }
+/* Planned marker fallback until gitwarp.css defines it (same values as the common brief) */
+:where(.planned-tag) { display: inline-flex; align-items: center; height: 16px; padding: 0 5px; border: 1px dashed var(--warning); border-radius: 3px; color: var(--warning); font-size: 10px; font-weight: 600; text-transform: uppercase; line-height: 1; flex: none; }
+.dialog-head .planned-tag { margin-left: 8px; }
+.tline .btn { width: auto; padding: 0 8px; flex: none; }
+
+/* fix round: error box fills the body; toast with lines per toast.rs */
+.dialog .errbox { max-width: none; }
+.toast.has-lines, .toast:has(.tbtn) { max-width: 420px; }
+.toast.has-lines { align-items: flex-start; }
+.toast .tl-title { font-weight: 600; }
+.tlines { gap: 4px; margin-top: 4px; }
+.tline { font-size: 13px; }
+.tline .tl-text { flex: none; }
+.tline .tl-detail { flex: 1; min-width: 0; text-align: left; }
+.toast .tbtn { width: auto; height: 20px; padding: 0 8px; font-size: var(--fs-sm); flex: none; }

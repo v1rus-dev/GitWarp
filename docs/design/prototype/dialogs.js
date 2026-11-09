@@ -60,10 +60,22 @@
     if (kind === 'error') { const c = G.layer(win).querySelector('.toasts'), t = c && c.lastElementChild; if (t) { const k = t.cloneNode(true); k.querySelector('button').onclick = () => k.remove(); c.replaceChild(k, t); } }
   };
   /* A static strip of toasts for gallery scenes: [[kind, text], ...]; nothing auto-hides so the drawing stays put. */
+  /* Items: [kind, text] | [kind, text, {action:'Reconnect', lines:[{ok, text, detail, action}], copy:true}].
+     lines = the multi-target push toast body (ui::ToastBody): one row per target, ok/err glyph, text, muted detail, optional action.
+     Error toasts carry a "Copy" action (copies the text); the toast stays while hovered (G.toast / app.js own the live behaviour). */
   D.toastStrip = (win, list) => {
     const layer = G.layer(win); let c = layer.querySelector('.toasts'); if (c) c.remove();
     c = G.h('<div class="toasts"></div>'); layer.appendChild(c);
-    list.forEach(([kind, msg]) => { const t = G.h(`<div class="toast ${kind}" role="status">${ic(kind === 'error' ? 'err' : kind === 'warn' ? 'warn' : kind === 'ok' ? 'check' : 'info', 14)}<span class="toast-msg">${esc(msg)}</span><button class="btn btn-icon btn-ghost btn-xs" aria-label="Dismiss">${ic('x', 12)}</button></div>`); t.querySelector('button').onclick = () => t.remove(); c.appendChild(t); });
+    list.forEach(([kind, msg, o]) => {
+      o = o || {};
+      const lines = (o.lines || []).map((l) => `<div class="tline">${ic(l.ok ? 'check' : 'err', 12)}<span class="tl-text">${esc(l.text)}</span>${l.detail ? `<span class="tl-detail">${esc(l.detail)}</span>` : ''}${l.action ? `<button type="button" class="btn btn-xs tbtn">${esc(l.action)}</button>` : ''}</div>`).join('');
+      const act = o.action ? `<button type="button" class="btn btn-xs tbtn">${esc(o.action)}</button>` : '';
+      const copy = kind === 'error' ? `<button type="button" class="btn btn-icon btn-ghost btn-xs" data-copy data-tip="Copy" aria-label="Copy">${ic('copy', 12)}</button>` : '';
+      const t = G.h(`<div class="toast ${kind}${lines ? ' has-lines' : ''}" role="status">${ic(kind === 'error' ? 'err' : kind === 'warn' ? 'warn' : kind === 'ok' ? 'check' : 'info', 14)}<span class="toast-msg">${lines ? `<b class="tl-title">${esc(msg)}</b>` : esc(msg)}${lines ? `<span class="tlines">${lines}</span>` : ''}</span>${copy}${act}<button class="btn btn-icon btn-ghost btn-xs" aria-label="Dismiss" data-x>${ic('x', 12)}</button></div>`);
+      t.querySelector('[data-x]').onclick = () => t.remove();
+      const cb = t.querySelector('[data-copy]'); if (cb) cb.onclick = () => { try { navigator.clipboard.writeText(msg); } catch (e) {} };
+      c.appendChild(t);
+    });
   };
 
   /* ---------- controller ---------- */
@@ -174,8 +186,9 @@
         foot: D.btn('Cancel clone', { act: 'cancelClone', dis: !!st.cancelling }).replace('class="btn"', 'class="btn" style="min-width:96px"') };
     }
     if (st.phase === 'done') {
-      return { title: 'Clone complete', icon: 'check', width: 520, body: `${D.banner('ok', 'Cloned ' + esc(name), '21 commits · 4 branches · 2 tags')}<dl class="kv" style="grid-template-columns:84px minmax(0,1fr)"><dt>Location</dt><dd>${esc(st.dest)}/${esc(name)}</dd><dt>Branch</dt><dd>${esc(st.branch || 'HEAD')}</dd><dt>Remote</dt><dd>origin → ${esc(st.url)}</dd></dl>`,
-        foot: D.btn('Close') + D.btn('Open', { kind: 'primary', act: 'openRepo', def: 1 }) };
+      /* app (clone_dialog.rs): banner "Cloned {name}" + "{commits} · {branches} · {tags}", footer is just Close */
+      return { title: 'Clone complete', icon: 'check', width: 520, body: `${D.banner('ok', 'Cloned ' + esc(name), '21 commits · 4 branches · 2 tags')}`,
+        foot: D.btn('Close', { kind: 'primary', def: 1 }) };
     }
     /* form (a failed clone keeps the form and appends a banner at the bottom of the body) */
     const urlErr = t.url && p.kind === 'bad' ? 'Not a Git address. Use https://host/user/repo.git, git@host:user/repo.git or ssh://…' : '';
@@ -187,7 +200,7 @@
     const f = st.failed;
     return { title: 'Clone repository', icon: 'clone', width: 560, body: `<div class="od-stack" style="--od-gap:12px">
       ${D.f('Repository URL', 'url', D.in('url', st.url, 'https://host/user/repo.git', { err: urlErr, mono: 1 }) + (urlErr ? `<div class="field-error" id="url-e">${ic('err', 12)}<span>${esc(urlErr)}</span></div>` : ''), { req: 1, help: proto ? `<span class="od-row" style="gap:6px;color:var(--muted)">${ic(proto[0], 12)}${proto[1]}</span>` : '' })}
-      <div class="od-row" style="align-items:flex-start;gap:12px"><div style="flex:1;min-width:0">${D.f('Folder', 'dest', `<div class="od-row">${D.in('dest', st.dest, '~/develop', { mono: 1 })}${D.btn('Browse…', { act: 'browse', icon: 'folder' })}</div>`, { req: 1 })}</div><div style="width:200px">${D.f('Folder name', 'name', D.in('name', name, 'repo', { err: nameErr, mono: 1 }), { req: 1, err: nameErr })}</div></div>
+      <div class="od-row" style="align-items:flex-start;gap:12px"><div style="flex:1;min-width:0">${D.f('Location', 'dest', `<div class="od-row">${D.in('dest', st.dest, '~/develop', { mono: 1 })}${D.btn('Browse…', { act: 'browse', icon: 'folder' })}</div>`, { req: 1 })}</div><div style="width:200px">${D.f('Folder name', 'name', D.in('name', name, 'repo', { err: nameErr, mono: 1 }), { req: 1, err: nameErr })}</div></div>
       <div class="od-row" style="align-items:flex-start;gap:12px"><div style="flex:1;min-width:0">${D.f('Branch (optional)', 'branch', D.in('branch', st.branch, 'Default branch'))}</div><div style="width:96px">${D.f('Depth', 'depth', D.in('depth', st.depth, '1', { err: depthBad, mono: 1 }), { err: depthBad ? 'Use a number above 0.' : '' })}</div></div>
       <div class="od-stack" style="--od-gap:6px">${D.chk('recurse', st.recurse, 'Clone submodules recursively')}${D.chk('shallow', st.shallow, 'Shallow clone — only recent history')}</div></div>
       ${f ? D.banner(f.cancelled ? 'info' : 'error', f.cancelled ? 'Clone cancelled' : 'Clone failed', esc(f.text).replace(/\n/g, '<br>')) : ''}`,
@@ -344,7 +357,7 @@
         const nshow = t.newName && nerr;
         const nobr = s.mode === 'existing' && s.noBranches;
         const bad = !path || !!perr || !!used || nobr || (s.mode === 'new' && (!s.newName.trim() || !!nerr));
-        const brOpts = BRANCHES.map((b) => [b, b + (WT_USED[b] ? `  — checked out in ${WT_USED[b]}` : '')]);
+        const brOpts = BRANCHES.map((b) => [b, b + (WT_USED[b] ? ` — checked out in ${WT_USED[b]}` : '')]);
         const hint = run ? '' : !path ? 'Choose a folder for the worktree' : perr ? 'Fix the folder to continue' : nobr ? 'Choose a branch to check out' : used ? 'Choose a branch that is not in use' : s.mode === 'new' && !s.newName.trim() ? 'Enter a branch name' : nerr ? 'Fix the name to continue' : '';
         return { title: 'Add worktree', icon: 'worktree', body: `<div class="muted" style="font-size:var(--fs-sm)">A worktree is a second working folder for this repository, so you can work on another branch without stashing.</div>
           ${D.f('Folder', 'path', `<div class="od-row">${D.in('path', s.path, '~/develop/gitwarp-hotfix', { err: pshow, mono: 1, dis: run })}${D.btn('Browse…', { act: 'browse', icon: 'folder', dis: run })}</div>`, { req: 1, err: pshow ? perr : '', help: 'Pick a folder outside the repository. It is created if it does not exist.' })}
@@ -362,7 +375,8 @@
     });
   };
   D.worktreeRemove = function (win, init, onDone) {
-    const st = Object.assign({ wt: { path: '~/develop/gitwarp-hotfix', branch: 'fix/git-detect', dirty: ['src/settings/git.rs', 'src/settings/detect.rs', 'Cargo.lock'], locked: false, missing: false, main: false }, force: false, delBranch: false, phase: 'idle', err: '' }, init || {});
+    const st = Object.assign({ wt: { path: '~/develop/gitwarp-hotfix', branch: 'fix/git-detect', dirty: ['src/settings/git.rs', 'src/settings/detect.rs', 'Cargo.lock'], locked: false, missing: false, main: false }, force: false, delBranch: false, unmerged: false, forceBranch: false, phase: 'idle', err: '' }, init || {});
+    /* unmerged: git says the branch has commits not merged elsewhere; "(fully merged)" is claimed only when git confirmed the opposite */
     return D.open(win, {
       st, width: 500, busy: (s) => s.phase === 'running' || s.phase === 'unlocking',
       view: (s) => {
@@ -377,10 +391,12 @@
           if (w.locked) body += D.banner('warn', 'This worktree is locked', `Locked with reason “${esc(w.lockReason || 'review in progress')}”. Unlock it before removing.`) + `<div>${D.btn('Unlock', { act: 'unlock', icon: 'lock', dis: busy })}</div>`;
           if (dirty) body += D.banner('warn', `${w.dirty.length} ${w.dirty.length === 1 ? 'file has' : 'files have'} uncommitted changes`, 'Removing the worktree discards them for good.', `<ul class="filelist">${w.dirty.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>`) + D.chk('force', s.force, 'Discard these changes and remove the worktree', busy);
           if (!w.missing && !dirty && !w.locked) body += `<div class="muted" style="font-size:var(--fs-sm)">The folder is deleted from disk. ${w.branch ? `The branch <span class="mono">${esc(w.branch)}</span> and its commits stay in the repository.` : 'Its commits stay in the repository.'}</div>`;
-          if (w.branch) body += D.chk('delBranch', s.delBranch, `Also delete branch <span class="mono">${esc(w.branch)}</span> (fully merged)`, busy);
-          const blocked = w.locked || (dirty && !s.force);
+          if (w.branch) body += D.chk('delBranch', s.delBranch, `Also delete branch <span class="mono">${esc(w.branch)}</span>${s.unmerged ? '' : ' (fully merged)'}`, busy);
+          const askBranch = !!(w.branch && s.delBranch && s.unmerged);
+          if (askBranch) body += D.banner('warn', `${esc(w.branch)} is not merged`, 'Unmerged commits stay reachable from the reflog for 30 days.') + D.chk('forceBranch', s.forceBranch, `Delete <span class="mono">${esc(w.branch)}</span> anyway`, busy);
+          const blocked = w.locked || (dirty && !s.force) || (askBranch && !s.forceBranch);
           primary = D.btn(dirty && s.force ? 'Discard and remove' : 'Remove worktree', { kind: 'danger', act: 'remove', dis: !!blocked || busy }).replace('class="btn btn-danger"', 'class="btn btn-danger" style="min-width:96px"');
-          hint = s.phase === 'unlocking' ? 'Unlocking…' : run ? 'Working…' : w.locked ? 'Unlock the worktree first' : dirty && !s.force ? 'Confirm to discard changes' : '';
+          hint = s.phase === 'unlocking' ? 'Unlocking…' : run ? 'Working…' : w.locked ? 'Unlock the worktree first' : dirty && !s.force ? 'Confirm to discard changes' : askBranch ? 'Confirm deleting the unmerged branch' : '';
         }
         return { title: 'Remove worktree', icon: 'trash', body: body + D.rerr(s), foot: `${hint ? `<span class="foot-hint">${hint}</span>` : ''}${D.btn('Cancel', { dis: busy })}${primary}` };
       },
@@ -614,6 +630,26 @@
     function done(s) { return { branch: `Switched to ${s.target}`, remote: `Checked out ${s.target}`, tag: `Checked out tag ${s.target} (detached HEAD)`, commit: `Checked out ${s.target} (detached HEAD)` }[s.origin]; }
   };
 
+  /* Error-fix dialog (error_dialog.rs, 560): a failed git operation the app can explain. Body = explanation + the raw git output in a selectable mono box
+     (max 180px, scrolls); footer = Cancel (autofocus, the default button) + one plain button per fix. Actions run after the dialog closes. */
+  const ERRS = {
+    worktree: { title: 'Branch is in use', text: 'Branch feat/idle-lanes is checked out in another worktree (~/develop/gitwarp-hotfix). Switch to that worktree to use it, or pick another branch.', out: "fatal: 'feat/idle-lanes' is already checked out at '/home/mira/develop/gitwarp-hotfix'", action: 'Open that worktree', toast: 'Switched to gitwarp-hotfix · feat/idle-lanes' },
+    local: { title: 'Local changes would be overwritten', text: 'Switching would overwrite files with uncommitted changes. Stash or commit them first.', out: 'error: Your local changes to the following files would be overwritten by checkout:\n\tsrc/settings/git.rs\n\tsrc/ui/sidebar.rs\nPlease commit your changes or stash them before you switch branches.\nAborting', action: 'Stash and switch', toast: 'Stashed local changes' },
+    push: { title: 'Push rejected', text: 'The remote has commits your branch does not. Pull the remote changes first, then push again.', out: "To github.com:acme/gitwarp.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs to 'github.com:acme/gitwarp.git'\nhint: Updates were rejected because the remote contains work that you do\nhint: not have locally.", action: 'Pull, then push', toast: 'Pull complete' },
+    diverged: { title: 'Branch has diverged', text: 'This pull is not a fast-forward, and GitWarp only pulls fast-forward. Merge or rebase the branch, then pull again.', out: 'fatal: Not possible to fast-forward, aborting.', action: '' },
+    other: { title: 'Repository operation failed', text: '', out: "fatal: unable to read tree (9f3c1a2e0b7d4c55a1e8f2d6b3c4a7e9d0f1b2c3)", action: '' }
+  };
+  D.errorFix = function (win, init) {
+    const st = Object.assign({ kind: 'worktree' }, init || {});
+    return D.open(win, {
+      st, width: 560,
+      view: (s) => { const e = ERRS[s.kind];
+        return { title: e.title, icon: 'warn', body: `<div class="od-stack" style="--od-gap:10px">${e.text ? `<div>${esc(e.text)}</div>` : ''}<div class="errbox mono" tabindex="0" aria-label="Git output">${esc(e.out)}</div></div>`,
+          foot: `<button type="button" class="btn" data-do="close" data-autofocus data-default>Cancel</button>${e.action ? D.btn(e.action, { act: 'fix' }) : ''}` }; },
+      actions: { fix: (s, api) => { api.close(); api.toast(ERRS[s.kind].toast, 'ok'); return false; } }
+    });
+  };
+
   /* ====================================================================
      Network: credential prompt (git askpass)
      ==================================================================== */
@@ -653,7 +689,7 @@
   /* the dialog's derived state for the current merge type: { kind } */
   D.mergeStatus = (s) => {
     const p = s.preview, t = s.type;
-    if (p === 'checking' || p === 'failed' || p === 'uptodate') return { kind: p };
+    if (p === 'checking' || p === 'failed' || p === 'oldgit' || p === 'uptodate') return { kind: p };
     if (t === 'ffonly' && (p === 'clean' || p === 'conflicts' || p === 'diverged')) return { kind: 'ffonly-diverged' };
     if (p === 'ff') return { kind: t === 'noff' ? 'ff-noff' : t === 'squash' ? 'clean' : 'ff' };
     if (p === 'conflicts') return { kind: 'conflicts' };
@@ -661,7 +697,7 @@
   };
   const kvRow = (label, val) => `<dt>${label}</dt><dd>${val}</dd>`;
   D.merge = function (win, init) {
-    const st = Object.assign({ branch: 'feat/palette', head: 'main', type: 'ff-if', preview: 'clean', n: 4, files: MERGE_FILES.slice(0, 3), reason: 'git 2.37 is too old for a conflict preview', dirty: 0, expanded: false, phase: 'idle', err: '' }, init || {});
+    const st = Object.assign({ branch: 'feat/palette', head: 'main', type: 'ff-if', preview: 'clean', n: 4, files: MERGE_FILES.slice(0, 3), reason: 'merge-tree exited with status 128', dirty: 0, expanded: false, phase: 'idle', err: '' }, init || {});
     return D.open(win, {
       st, width: 520, busy: (s) => s.phase === 'running',
       onOpen: (s, api) => { if (s.preview === 'checking' && s.resolve) setTimeout(() => { if (!api.el.isConnected) return; s.preview = s.resolve; api.redraw(); }, 700); },
@@ -670,6 +706,7 @@
         let status = '', label = s.type === 'squash' ? 'Squash' : 'Merge', dis = false, hint = '';
         if (stt.kind === 'checking') status = `<div class="muted od-row" style="gap:8px;font-size:var(--fs-sm)">${ic('fetch', 14, 'spin')}<span>Checking for conflicts…</span></div>`;
         else if (stt.kind === 'failed') status = `<div class="muted od-row" style="gap:8px;font-size:var(--fs-sm)">${ic('err', 14)}<span>Could not check for conflicts: ${esc(s.reason)}</span></div>`;
+        else if (stt.kind === 'oldgit') status = `<div class="muted od-row" style="gap:8px;font-size:var(--fs-sm)">${ic('err', 14)}<span>Could not check for conflicts: git 2.37.0 is older than the required 2.38.0</span></div>`;
         else if (stt.kind === 'clean') status = D.banner('ok', 'Merge can be done without conflicts', `${plural(s.n, 'commit')} from <span class="mono">${b}</span> will be merged.`);
         else if (stt.kind === 'ff') status = D.banner('ok', `<span class="mono">${h}</span> will fast-forward to <span class="mono">${b}</span>`, 'No merge commit is needed.');
         else if (stt.kind === 'ff-noff') status = D.banner('info', 'A merge commit will be created', `<span class="mono">${h}</span> can fast-forward to <span class="mono">${b}</span>, but No fast-forward always adds a merge commit.`);
@@ -678,7 +715,7 @@
         else if (stt.kind === 'conflicts') {
           const shown = s.expanded ? s.files : s.files.slice(0, 5), more = nf - shown.length;
           status = D.banner('warn', `Merging will cause conflicts in ${plural(nf, 'file')}`, 'GitWarp merges what it can and opens Changes, where the conflicted files wait under Conflicts.',
-            `<ul class="filelist">${shown.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>${more > 0 ? `<button type="button" class="linkbtn" data-do="more">Show ${more} more</button>` : nf > 5 ? '<button type="button" class="linkbtn" data-do="more">Show less</button>' : ''}`);
+            `<ul class="filelist">${shown.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>${more > 0 ? `<div><button type="button" class="btn btn-xs btn-ghost" data-do="more">Show ${more} more</button></div>` : nf > 5 ? '<div><button type="button" class="btn btn-xs btn-ghost" data-do="more">Show less</button></div>' : ''}`);
           if (s.type !== 'squash') label = 'Merge with conflicts';
         }
         const local = s.dirty > 0 ? D.banner('info', `${plural(s.dirty, 'local change')} stay${s.dirty === 1 ? 's' : ''} in the work tree`, 'Git stops before touching a file that has local changes.') : '';
@@ -717,7 +754,8 @@
         if (up) hint = 'Nothing to rebase';
         const dirtyBn = blocked ? D.banner('warn', 'Rebase needs a clean work tree', `Commit or stash your ${plural(s.dirty, 'local change')} first, or turn on the stash option.`) : '';
         const pub = s.published && !up ? D.banner('warn', `These commits are already on <span class="mono">${esc(s.upstream)}</span>`, 'Rebasing rewrites them; you will need to force-push.') : '';
-        return { title: 'Rebase branch', icon: 'branch', body: `<dl class="kv" style="grid-template-columns:88px minmax(0,1fr);align-items:center;gap:8px 12px">
+        /* the app has no rebase dialog (menu item always disabled): Planned */
+        return { title: 'Rebase branch <span class="planned-tag">Planned</span>', icon: 'branch', body: `<dl class="kv" style="grid-template-columns:88px minmax(0,1fr);align-items:center;gap:8px 12px">
             ${kvRow('Rebase:', `<span class="od-row" style="gap:6px">${ic('branch', 14)}<span>${h}</span><span class="chip">HEAD</span></span>`)}
             ${kvRow('Onto:', `<span class="od-row" style="gap:6px">${ic('branch', 14)}<span>${b}</span></span>`)}</dl>
           <div class="od-stack" style="--od-gap:8px">

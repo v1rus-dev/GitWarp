@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitWarp — Errors, confirmations and notices</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="gitwarp.css">
+<link rel="stylesheet" href="dialogs.css">
+<link rel="stylesheet" href="errors.css">
+<script src="app.js"></script>
+<script src="dialogs.js"></script>
+<script src="errors.js"></script>
+</head>
+<body>
+<script>
+(function () {
+  const D = GLD, G = GL, E = GLE;
+  /* app.js is not mine to edit: add this page to the stage bar page-locally (the nav list lives in G.PAGES). */
+  if (!G.PAGES.some((p) => p[0] === 'dialogs-errors.html')) G.PAGES.push(['dialogs-errors.html', 'Errors & notices']);
+  const T = (fn) => (w) => fn(w);
+  const ED = (k, o) => (w) => E.errorDialog(w, Object.assign({ k }, o || {}));
+  const { win } = D.page('Errors, confirmations and notices', [
+    ['Error-fix · Branch is in use → Open that worktree', ED('worktree')],
+    ['Error-fix · Local changes would be overwritten → Stash and switch', ED('local')],
+    ['Error-fix · Push rejected → Pull, then push', ED('push')],
+    ['Error-fix · Branch has diverged (Cancel only)', ED('diverged')],
+    ['Error-fix · Repository operation failed (fallback title)', ED('fallback')],
+    ['Confirm · Delete origin/feat/old-spike?', (w) => D.confirmRemoteBranch(w)],
+    ['Confirm · empty shell with the fallback title “Confirm”', (w) => E.confirmShell(w)],
+    ['Toast · update notice (Info, stays until dismissed)', E.updateNotice],
+    ['Toast · error with Copy', E.errorToast],
+    ['Toast · token rejected with Reconnect', E.tokenRejected],
+    ['Toasts · account notices (1/2)', E.accountToasts],
+    ['Toasts · account / upstream notices (2/2)', E.accountToasts2],
+    ['Toast · multi-target push, all pushed', E.pushAll],
+    ['Toast · multi-target push, partly refused', E.pushSome],
+    ['Toasts · push line details: new tag / new branch / deleted', E.pushKinds]
+  ], null, { label: 'Scenario', reopen: 'Reset' });
+  const notes = G.h(`<div class="err-notes"><b>Source files.</b> Everything here is shipped; strings are the English locale verbatim.
+    <ul>
+      <li><code>crates/app/src/error_dialog.rs</code> — error-fix dialog, width 560, warn icon, explanation + selectable mono git output (max-h 180, 12px/18px), Cancel focused, one optional remedy button. Classifier: <code>classify_git_message</code>.</li>
+      <li><code>crates/app/src/confirm_dialog.rs</code> — generic confirm, width 440, Cancel (min 72) + danger primary (min 96), Cancel focused; its only caller is the remote-branch delete (<code>repo.delete_remote_branch.*</code>).</li>
+      <li><code>crates/app/src/update_check.rs</code> — Info toast “GitWarp v{version} is available” with “View release”; stays until dismissed, each version is announced once.</li>
+      <li><code>crates/ui/src/components/toast.rs</code> — bottom-right 12/12, min-w 260, max-w 380 (420 with a body), 3px kind bar, 14px icon; 5 s lifetime, paused while hovered or selected; Error toasts get a Copy button and never expire; a toast with an action stays until dismissed.</li>
+      <li><code>crates/app/src/repo_view.rs</code> — <code>show_git_error</code> (error-fix dialogs), <code>show_job_error</code> (token rejected + Reconnect), <code>show_push_result</code> (multi-target push), account toasts (<code>repo.toast.*</code>).</li>
+      <li>“Repository operation failed” (<code>dialogs.error.title_fallback</code>) exists in the locales; the app currently sends unclassified git errors to an Error toast instead of this dialog.</li>
+    </ul></div>`);
+  document.body.appendChild(notes);
+})();
+</script>
+</body>
+</html>

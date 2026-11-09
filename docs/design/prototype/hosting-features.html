@@ -32,7 +32,7 @@
     { n: 137, t: 'docs: describe the account model', branch: 'docs/accounts', author: 'jonas-b', st: 'open', rv: 'required', ci: 'passed', base: 'main', upd: '2 days ago' }
   ];
   const ST = { open: ['pr', 'Open'], draft: ['prDraft', 'Draft'], merged: ['merge', 'Merged'], closed: ['prClosed', 'Closed'] };
-  const RV = { approved: ['check', 'Approved'], changes: ['comment', 'Changes requested'], required: ['eye', 'Review required'], none: null };
+  const RV = { approved: ['check', 'Approved'], changes: ['comment', 'Changes requested'], required: null, none: null }; /* the app knows only Approved / Changes requested; anything else reads "No reviews yet" (hosting_status.rs review_label) */
   const CI = { passed: ['checkFill', 'passed'], failed: ['xFill', 'failed'], running: ['sync', 'running'], pending: ['hourglass', 'pending'], cancelled: ['skip', 'cancelled'] };
   const ciG = (s, tip) => (CI[s] ? `<span class="ci ${s}" role="img" aria-label="Checks ${CI[s][1]}" data-tip="${esc(tip || 'Checks ' + CI[s][1])}">${ic(CI[s][0], 12, s === 'running' ? 'spin' : '')}</span>` : '');
   const prFor = (b) => PRS.find((p) => p.branch === b);
@@ -49,7 +49,7 @@
   const overall = (l) => (l.some((x) => x[1] === 'failed') ? 'failed' : l.some((x) => x[1] === 'running') ? 'running' : l.some((x) => x[1] === 'pending') ? 'pending' : l.some((x) => x[1] === 'cancelled') ? 'cancelled' : 'passed');
   const sumTxt = (l) => `${l.filter((x) => x[1] === 'passed').length} of ${l.length} passed`;
 
-  const V = { cur: G.commits[0], idx: 0, tab: 'repo', flt: 'mine', pstate: 'list', sel: null, cstate: null };
+  const V = { svc: 'github', cur: G.commits[0], idx: 0, tab: 'repo', flt: 'mine', pstate: 'list', sel: null, cstate: null };
   const toast = (w, m, k) => G.toast(w, m, k || 'info');
   const opened = (w, what) => toast(w, `Opened ${what} in your browser`, 'info');
 
@@ -88,12 +88,13 @@
 
   /* ---------- PR popover ---------- */
   function closePop(w) { w.querySelectorAll('.pop').forEach((p) => p.remove()); }
-  function openPop(w, el, p) {
+  function openPop(w, el, p, o) {
+    o = o || {};
     closePop(w);
-    const l = CHECKS(p.ci), rv = RV[p.rv];
+    const l = o.nochecks ? [] : CHECKS(p.ci), rv = RV[p.rv];
     const pop = G.h(`<div class="pop" role="dialog" aria-label="Pull request #${p.n}"><div class="head"><span class="prb ${p.st}" style="cursor:default">${ic(ST[p.st][0], 11)}${ST[p.st][1]}</span><span class="muted">#${p.n} on ${GH}</span></div><h4>${esc(p.t)}</h4>
       <div class="row2"><span>${esc(p.author)}</span><span aria-hidden="true">·</span><span style="overflow-wrap:anywhere">${esc(p.branch.length > 34 ? p.branch.slice(0, 33) + '…' : p.branch)} → ${esc(p.base)}</span><span aria-hidden="true">·</span><span>updated ${p.upd}</span></div>
-      <div class="row2" style="color:var(--text)">${rv ? `<span style="display:inline-flex;gap:4px;align-items:center">${ic(rv[0], 12)}${rv[1]}</span>` : '<span class="muted">No reviews yet</span>'}<span class="muted" aria-hidden="true">·</span><span style="display:inline-flex;gap:4px;align-items:center">${ciG(p.ci)}Checks ${l.length ? sumTxt(l) : CI[p.ci][1]}${p.ci === 'running' || p.ci === 'pending' ? ' so far' : ''}</span></div>
+      <div class="row2" style="color:var(--text)">${o.loading ? '<span class="muted">Loading review…</span>' : rv ? `<span style="display:inline-flex;gap:4px;align-items:center">${ic(rv[0], 12)}${rv[1]}</span>` : '<span class="muted">No reviews yet</span>'}${o.loading ? '' : `<span class="muted" aria-hidden="true">·</span><span style="display:inline-flex;gap:4px;align-items:center">${l.length ? ciG(p.ci) + 'Checks ' + sumTxt(l) + (p.ci === 'running' || p.ci === 'pending' ? ' so far' : '') : '<span class="muted">No checks</span>'}</span>`}</div>
       <div class="btns"><button class="btn btn-sm" data-pop="open">${ic('external', 12)}Open on ${GH}</button><button class="btn btn-sm btn-primary" data-pop="co"${p.st === 'merged' ? ' disabled data-tip="A merged pull request has no branch to check out"' : ''}>Checkout</button></div></div>`);
     G.layer(w).appendChild(pop);
     const r = el.getBoundingClientRect(), wr = w.getBoundingClientRect(), s = wr.width / w.offsetWidth || 1;
@@ -105,25 +106,33 @@
     const esc_ = (e) => { if (e.key === 'Escape') { pop.remove(); document.removeEventListener('mousedown', out, true); document.removeEventListener('keydown', esc_, true); } };
     setTimeout(() => { document.addEventListener('mousedown', out, true); document.addEventListener('keydown', esc_, true); }, 0);
   }
-  const checkout = (w, p) => toast(w, `Created local branch pr/${p.n} tracking origin/${p.branch.length > 30 ? p.branch.slice(0, 29) + '…' : p.branch} and checked it out`, 'ok');
+  const checkout = (w, p) => toast(w, `Checked out ${p.branch.length > 30 ? p.branch.slice(0, 29) + '…' : p.branch} from pull request #${p.n}`, 'ok');
 
   /* ---------- sidebar: tabs + pull requests panel ---------- */
+  /* nouns per service: pull requests (GitHub, Gitea) / merge requests (GitLab); pr_logic.rs noun / nouns / noun_short */
+  const NN = () => (V.svc === 'gitlab' ? { svc: 'GitLab', host: 'gitlab.modsen.app', login: 'yegor.cheprasov', pl: 'merge requests', sh: 'MRs', one: 'merge request' } : { svc: 'GitHub', host: 'github.com', login: 'mira-k', pl: 'pull requests', sh: 'PRs', one: 'pull request' });
+  const emptyBlock = (icn, cls, title, text, btn) => `<div class="prlist"><div class="empty"><div class="ei">${ic(icn, 20)}</div><b${cls ? ` class="${cls}"` : ''}>${title}</b><p>${text}</p>${btn || ''}</div></div>`;
+  const STALE = { stale: 'connection timed out', 'stale-rate': 'Rate limit reached', 'stale-revoked': 'the token was revoked' };
   function panelHTML() {
+    const nn = NN();
     const mine = PRS.filter((p) => p.author === 'mira-k'), rr = PRS.filter((p) => p.rr);
     const list = V.flt === 'mine' ? mine : V.flt === 'rr' ? rr : PRS;
     let body;
     if (V.pstate === 'loading') body = `<div class="prlist" aria-busy="true">${[70, 55, 80, 62, 74, 50].map((w) => `<div class="skrow"><span class="skel" style="width:14px;height:14px;border-radius:50%"></span><span class="skel" style="width:${w}%"></span></div>`).join('')}</div>`;
-    else if (V.pstate === 'error') body = `<div class="prlist"><div class="empty"><div class="ei">${ic('err', 20)}</div><b>Can’t load pull requests</b><p>The token for mira-k on github.com was revoked.</p><button class="btn btn-sm btn-primary" data-reco>Reconnect</button></div></div>`;
-    else if (V.pstate === 'empty' || !list.length) body = `<div class="prlist"><div class="empty"><div class="ei">${ic('pr', 20)}</div><b>${V.flt === 'rr' ? 'Nothing to review' : 'No pull requests'}</b><p>${V.flt === 'rr' ? 'No one has asked for your review in this repository.' : 'This repository has no pull requests yet.'}</p></div></div>`;
-    else body = `<div class="prlist" role="listbox" aria-label="Pull requests">${list.map((p) => `<button type="button" class="prrow${V.sel === p.n ? ' sel' : ''}" role="option" aria-selected="${V.sel === p.n}" data-prrow="${p.n}" data-tip="#${p.n} · ${esc(p.t)} · ${esc(p.author)} · ${ST[p.st][1]} · updated ${p.upd}">${ic(ST[p.st][0], 14, 's-' + p.st)}<span class="num">#${p.n}</span><span class="ttl">${esc(p.t)}</span>${ciG(p.ci)}</button>`).join('')}</div>`;
-    const sp = V.pstate === 'list' && V.sel ? PRS.find((p) => p.n === V.sel) : null;
-    const det = sp && list.includes(sp) ? `<div class="prdet"><h4>${esc(sp.t)}</h4><div class="muted" style="font-size:var(--fs-sm)">${esc(sp.author)} · ${ST[sp.st][1]} · ${esc(sp.branch.length > 26 ? sp.branch.slice(0, 25) + '…' : sp.branch)} → ${esc(sp.base)} · ${sp.upd}</div><div style="display:flex;gap:8px;align-items:center;font-size:var(--fs-sm)">${RV[sp.rv] ? ic(RV[sp.rv][0], 12) + RV[sp.rv][1] : '<span class="muted">No reviews yet</span>'}<span class="muted">·</span>${ciG(sp.ci)}<span>Checks ${CI[sp.ci][1]}</span></div><div class="btns"><button class="btn btn-sm" data-prop>${ic('external', 12)}Open on ${GH}</button><button class="btn btn-sm btn-primary" data-prco${sp.st === 'merged' ? ' disabled data-tip="A merged pull request has no branch to check out"' : ''}>Checkout</button></div></div>` : '';
+    else if (V.pstate === 'error') body = emptyBlock('err', '', `Can’t load ${nn.pl}`, `The token for ${nn.login} on ${nn.host} was revoked.`, '<button class="btn btn-sm btn-primary" data-reco>Reconnect</button>');
+    else if (V.pstate === 'rate') body = emptyBlock('warn', '', 'Rate limit reached', `${nn.host} is limiting requests. Try again in a few minutes.`, '<button class="btn btn-sm" data-retry>Try again</button>');
+    else if (V.pstate === 'offline') body = emptyBlock('err', '', `Can’t reach ${nn.host}`, 'connection refused (os error 111)', '<button class="btn btn-sm" data-retry>Try again</button>');
+    else if (V.pstate === 'other') body = emptyBlock('err', '', `Can’t load ${nn.pl}`, `${nn.svc} answered 503 Service Unavailable.`, '<button class="btn btn-sm" data-retry>Try again</button>');
+    else if (V.pstate === 'empty' || !list.length) body = emptyBlock('pr', '', V.flt === 'rr' ? 'Nothing to review' : `No ${nn.pl}`, V.flt === 'rr' ? 'No one has asked for your review in this repository.' : `This repository has no ${nn.pl} yet.`);
+    else body = `${STALE[V.pstate] ? `<div class="stale">${ic('warn', 12)}<span class="od-truncate">Couldn’t refresh: ${STALE[V.pstate]}</span></div>` : ''}<div class="prlist" role="listbox" aria-label="${nn.pl[0].toUpperCase() + nn.pl.slice(1)}">${list.map((p) => `<button type="button" class="prrow${V.sel === p.n ? ' sel' : ''}" role="option" aria-selected="${V.sel === p.n}" data-prrow="${p.n}" data-tip="#${p.n} · ${esc(p.t)} · ${esc(p.author)} · ${ST[p.st][1]} · updated ${p.upd}">${ic(ST[p.st][0], 14, 's-' + p.st)}<span class="num">#${p.n}</span><span class="ttl">${esc(p.t)}</span>${ciG(p.ci)}</button>`).join('')}${V.pstate === 'more' ? `<div class="more">Showing the latest ${list.length}. Open on ${nn.svc} to see more.</div>` : ''}</div>`;
+    const sp = (V.pstate === 'list' || STALE[V.pstate] || V.pstate === 'more') && V.sel ? PRS.find((p) => p.n === V.sel) : null;
+    const det = sp && list.includes(sp) ? `<div class="prdet"><h4>${esc(sp.t)}</h4><div class="muted" style="font-size:var(--fs-sm)">${esc(sp.author)} · ${ST[sp.st][1]} · ${esc(sp.branch.length > 26 ? sp.branch.slice(0, 25) + '…' : sp.branch)} → ${esc(sp.base)} · ${sp.upd}</div><div style="display:flex;gap:8px;align-items:center;font-size:var(--fs-sm)"><span class="planned-tag">Planned</span>${RV[sp.rv] ? ic(RV[sp.rv][0], 12) + RV[sp.rv][1] : '<span class="muted">No reviews yet</span>'}<span class="muted">·</span>${ciG(sp.ci)}<span>Checks ${CI[sp.ci][1]}</span></div><div class="btns"><button class="btn btn-sm" data-prop>${ic('external', 12)}Open on ${GH}</button><button class="btn btn-sm btn-primary" data-prco${sp.st === 'merged' ? ' disabled data-tip="A merged ${nn.one} has no branch to check out"' : ''}>Checkout</button></div></div>` : '';
     return `<div class="flt"><div class="seg" role="group" aria-label="Filter">${[['mine', 'Mine', mine.length], ['rr', 'Review requested', rr.length], ['all', 'All', PRS.length]].map(([k, l, n]) => `<button aria-pressed="${V.flt === k}" data-flt="${k}">${l}</button>`).join('')}</div></div>${body}${det}`;
   }
   function setupSidebar(win) {
     const sb = win.querySelector('.sidebar'), flt = sb.querySelector('.sbfilter'), tree = sb.querySelector('.tree');
     const nOpen = PRS.filter((p) => p.st === 'open' || p.st === 'draft').length;
-    const tabs = G.h(`<div class="sbtabs"><div class="seg" role="group" aria-label="Sidebar view"><button data-tab="repo" aria-pressed="true">Repository</button><button data-tab="pr" aria-pressed="false" data-tip="Pull requests" aria-label="Pull requests, ${nOpen} open">PRs <span class="counter">${nOpen}</span></button></div></div>`);
+    const tabs = G.h(`<div class="sbtabs"><div class="seg" role="group" aria-label="Sidebar view"><button data-tab="repo" aria-pressed="true">Repository</button><button data-tab="pr" aria-pressed="false" aria-label="Pull requests, ${nOpen} open">${NN().sh} ${nOpen}</button></div></div>`);
     sb.insertBefore(tabs, flt);
     const panel = G.h('<div class="prpanel" hidden></div>'); sb.appendChild(panel);
     tree.querySelectorAll('.node[data-kind=branch]').forEach((n) => { const p = prFor(n.dataset.name); if (p) { n.insertAdjacentHTML('beforeend', prBadge(p)); n.classList.add('hrem'); n.dataset.tip = n.dataset.name; /* label truncates, badge stays visible */ } });
@@ -137,6 +146,7 @@
       else if (r) { V.sel = +r.dataset.prrow; draw(); }
       else if (e.target.closest('[data-prop]')) opened(win, 'github.com');
       else if (e.target.closest('[data-prco]')) checkout(win, PRS.find((p) => p.n === V.sel));
+      else if (e.target.closest('[data-retry]')) { V.pstate = 'loading'; draw(); setTimeout(() => { V.pstate = 'list'; draw(); }, 900); }
       else if (e.target.closest('[data-reco]')) H.accountDialog(win, { mode: 'reconnect', existing: [], st: { svc: 'github', step: 3, inst: 'public', probe: 'ok', method: 'token', login: 'mira-k' }, onDone: () => { V.pstate = 'list'; draw(); toast(win, 'Reconnected github.com · mira-k', 'ok'); } });
     });
   }
@@ -162,49 +172,73 @@
       const a = A(); let list;
       const rep = (REPOS[a.id] || []).filter((r) => !s.q.trim() || (r.o + '/' + r.n + ' ' + r.d).toLowerCase().includes(s.q.trim().toLowerCase()));
       if (s.phase === 'loading') list = `<div class="repolist" aria-busy="true">${[58, 72, 44, 66].map((w) => `<div class="repoitem" style="pointer-events:none"><span class="skel" style="width:16px;height:16px"></span><span class="skel" style="width:${w}%"></span><span class="skel" style="width:48px"></span></div>`).join('')}</div><div class="waitline" role="status">${ic('fetch', 14, 'spin')}<span>Loading repositories from ${esc(a.host)}…</span></div>`;
+      else if (s.phase === 'unsupported') list = `<div class="repolist"><div class="empty"><p style="margin:0">Listing repositories is not supported for ${esc(s.svcName || H.SVC[a.svc].name)} yet.</p></div></div>`;
+      else if (s.phase === 'network') list = `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">Couldn’t load repositories</div><div>${esc(a.host)} did not answer. Check the connection and try again.</div><div style="margin-top:8px">${S.dbtn('Retry', { act: 'retry', kind: 'primary' })}</div></div></div>`;
       else if (s.phase === 'error' || a.status === 'invalid') list = `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">Couldn’t load repositories</div><div>The token for ${esc(a.login)} on ${esc(a.host)} was revoked. Reconnect the account to see its repositories.</div><div style="margin-top:8px">${S.dbtn('Reconnect', { act: 'reco', kind: 'primary' })}</div></div></div>`;
       else if (!(REPOS[a.id] || []).length) list = `<div class="repolist"><div class="empty"><b>No repositories yet</b><p style="margin:0">${esc(a.login)} has no repositories on ${esc(a.host)}. Paste an address on the URL tab to clone someone else’s.</p></div></div>`;
       else if (!rep.length) list = `<div class="repolist"><div class="empty"><b>No repositories match “${esc(s.q)}”</b><p style="margin:0">Check the spelling, or clear the search to see all ${(REPOS[a.id] || []).length}.</p></div></div>`;
-      else list = `<div class="repolist" role="listbox" aria-label="Repositories">${rep.map(repoRow).join('')}</div>`;
+      else list = `<div class="repolist" role="listbox" aria-label="Repositories">${rep.map(repoRow).join('')}</div>${s.phase === 'truncated' ? `<div class="field-help" style="margin-top:6px">Showing the ${(REPOS[a.id] || []).length} most recently updated repositories. Use the URL tab for others.</div>` : ''}`;
       const sel = s.sel && (REPOS[a.id] || []).find((r) => r.o + '/' + r.n === s.sel);
       return `<div class="col10">${tabs()}
-        <div class="pair">${S.dfield('Account', 'acct', `<select class="input select" id="acct" data-f="acct" aria-label="Account">${accts.map((x) => `<option value="${x.id}"${x.id === s.acct ? ' selected' : ''}>${esc(H.label(x))} · ${esc(x.host)}</option>`).join('')}</select>`)}${S.dfield('Search', 'q', `<input class="input" id="q" data-f="q" value="${esc(s.q)}" placeholder="Search repositories" autocomplete="off"${s.phase === 'loading' || (a.status === 'invalid') ? ' disabled' : ''}>`)}</div>
+        <div class="pair">${S.dfield('Account', 'acct', `<select class="input select" id="acct" data-f="acct" aria-label="Account">${accts.map((x) => `<option value="${x.id}"${x.id === s.acct ? ' selected' : ''}>${esc(H.label(x))} · ${esc(x.host)}</option>`).join('')}</select>`)}${S.dfield('Search', 'q', `<input class="input" id="q" data-f="q" value="${esc(s.q)}" placeholder="Search repositories" autocomplete="off"${s.phase === 'loading' || s.phase === 'unsupported' || s.phase === 'network' || (a.status === 'invalid') ? ' disabled' : ''}>`)}</div>
         ${list}
         ${sel ? `${S.dfield('Repository URL', 'u', `<input class="input mono" id="u" value="${esc(urlOf(sel))}" readonly style="font-family:var(--font-mono);font-size:12px">`)}<div class="pair">${S.dfield('Folder', 'dest', S.din('dest', s.dest, '~/develop', { mono: 1 }))}${S.dfield('Folder name', 'name', S.din('name', s.name || sel.n, sel.n))}</div>` : `<div class="field-help">Select a repository to fill in the address and folder.</div>`}</div>`;
     };
     return S.dialog(w, { st, width: 600,
       view: (s) => { if (s.acct !== s._a) { s._a = s.acct; s.sel = null; s.q = ''; if (s.phase !== 'loading') s.phase = 'list'; } const ok = s.tab === 'acct' ? !!s.sel : /^(https?:\/\/|git@)\S+/.test(s.url.trim()); return { title: 'Clone repository', icon: 'clone', body: body(s), foot: S.dbtn('Cancel') + S.dbtn('Clone', { kind: 'primary', act: 'clone', dis: !ok, def: 1 }) }; },
-      actions: { tab: (s, api, d) => { s.tab = d.dataset.v; }, repo: (s, api, d) => { s.sel = d.dataset.v; s.name = ''; }, clone: (s, api) => { api.close(); toast(w, 'Cloning ' + (s.tab === 'acct' ? s.sel : s.url.trim()) + '…', 'info'); return false; },
+      actions: { retry: (s, api) => { s.phase = 'loading'; api.redraw(); setTimeout(() => { if (!api.el.isConnected) return; s.phase = 'list'; api.redraw(); }, 900); }, tab: (s, api, d) => { s.tab = d.dataset.v; }, repo: (s, api, d) => { s.sel = d.dataset.v; s.name = ''; }, clone: (s, api) => { api.close(); toast(w, 'Cloning ' + (s.tab === 'acct' ? s.sel : s.url.trim()) + '…', 'info'); return false; },
         reco: (s, api) => H.accountDialog(w, { mode: 'reconnect', existing: [], st: { svc: A().svc, step: 3, inst: H.isPublic(A().svc, A().host) ? 'public' : 'self', url: 'https://' + A().host, probe: 'ok', method: 'token', login: A().login }, onDone: () => { A().status = 'ok'; REPOS[s.acct] = REPOS[s.acct].length ? REPOS[s.acct] : [{ o: A().login, n: 'dotfiles', d: 'Shell and editor configs', priv: 1, u: '1 week ago' }]; s.phase = 'list'; api.redraw(); toast(w, 'Reconnected ' + A().host + ' · ' + A().login, 'ok'); } }) } });
   }
 
   /* ---------- Create pull request / merge request ---------- */
   const REM = { origin: { svc: 'github', host: 'github.com', acc: 'mira-k', name: 'GitHub', term: 'pull request' }, work: { svc: 'gitlab', host: 'gitlab.modsen.app', acc: 'yegor.cheprasov', name: 'GitLab', term: 'merge request' } };
   function createPR(w, o) {
-    const st = Object.assign({ head: 'feat/idle-lanes', remote: 'origin', base: 'main', title: 'feat(graph): collapse idle lanes into a single gap lane', body: '- feat(graph): collapse idle lanes into a single gap lane\n- feat(graph): clip wide graphs with an edge fade and +N badge', draft: false, rv: [], notpushed: false, phase: 'form', err: null, touched: false, n: 147 }, o || {});
+    /* need: none | notpushed | unpushed | diverged (PushNeed); range: ready | loading | failed; nc: commits in the range; nobase: no other branch to merge into */
+    const st = Object.assign({ head: 'feat/idle-lanes', remote: 'origin', base: 'main', title: 'feat(graph): collapse idle lanes into a single gap lane', body: '- feat(graph): collapse idle lanes into a single gap lane\n- feat(graph): clip wide graphs with an edge fade and +N badge', draft: false, rvtext: '', need: 'none', range: 'ready', nc: 2, nobase: false, phase: 'form', err: null, touched: false, n: 147 }, o || {});
+    if (st.notpushed) st.need = 'notpushed'; /* older scenes */
     const R = () => REM[st.remote], cap = (t) => t[0].toUpperCase() + t.slice(1);
+    const pushes = (s) => s.need === 'notpushed' || s.need === 'unpushed';
     const body = (s) => {
       const r = R();
-      if (s.phase === 'done') return `<div class="donecard"><span style="display:flex;justify-content:center;color:var(--success)">${ic(s.draft ? 'prDraft' : 'pr', 24)}</span><div style="min-width:0"><div class="t">#${s.n} ${esc(s.title)}</div><div class="d">${s.draft ? 'Draft ' : ''}${r.term} on ${esc(r.host)} · ${esc(s.head.length > 30 ? s.head.slice(0, 29) + '…' : s.head)} → ${esc(s.base)}</div></div></div>${s.pushed ? '<div class="field-help">The branch was pushed to origin first.</div>' : ''}`;
-      const errs = s.err === 'exists' ? S.dbanner('error', `A ${r.term} already exists`, `#142 already covers ${s.head} → ${s.base}. Open it instead of creating a duplicate.`).replace('</div></div>', `</div><div style="margin-top:8px">${S.dbtn('Open #142 on ' + r.name, { act: 'openex', icon: 'external' })}</div></div>`) : s.err === 'pushfail' ? `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">Could not push ${esc(s.head)}</div><div>Nothing was created. git said:</div><div class="errbox" style="margin-top:6px;max-width:none">! [rejected] ${esc(s.head)} -> ${esc(s.head)} (non-fast-forward)\nerror: failed to push some refs to 'origin'</div></div></div>` : '';
+      if (s.phase === 'done') return `<div class="donecard"><span style="display:flex;justify-content:center;color:var(--success)">${ic(s.draft ? 'prDraft' : 'pr', 24)}</span><div style="min-width:0"><div class="t">#${s.n} ${esc(s.title)}</div><div class="d">${s.draft ? 'Draft ' : ''}${r.term} on ${esc(r.host)} · ${esc(s.head.length > 30 ? s.head.slice(0, 29) + '…' : s.head)} → ${esc(s.base)}</div></div></div>${s.pushed ? `<div class="field-help">The branch was pushed to ${esc(s.remote)} first.</div>` : ''}${s.rverr ? S.dbanner('warn', `The ${r.term} was created, but asking for a review failed`, s.rverr) : ''}`;
+      const rbtn = (id) => `<div style="margin-top:8px">${S.dbtn('Reconnect', { act: 'reco', icon: null })}</div>`;
+      const bn = (kind, t, d, extra) => `<div class="banner ${kind}" role="${kind === 'error' ? 'alert' : 'status'}">${ic(kind === 'error' ? 'err' : kind === 'info' ? 'info' : 'warn', 16)}<div style="min-width:0"><div class="b-title">${esc(t)}</div>${d ? `<div>${esc(d)}</div>` : ''}${extra || ''}</div></div>`;
+      const err = { exists: () => bn('error', `A ${r.term} already exists`, `#142 already covers ${s.head} → ${s.base}. Open it instead of creating a duplicate.`, `<div style="margin-top:8px">${S.dbtn('Open #142 on ' + r.name, { act: 'openex', icon: 'external' })}</div>`),
+        pushfail: () => bn('error', `Could not push ${s.head}`, 'Nothing was created. git said:', `<div class="errbox" style="margin-top:6px;max-width:none;white-space:pre-wrap">! [rejected] ${esc(s.head)} -> ${esc(s.head)} (non-fast-forward)\nerror: failed to push some refs to '${esc(s.remote)}'</div>`),
+        pushtoken: () => bn('error', `Could not push ${s.head}`, 'Nothing was created. git said:', `<div class="errbox" style="margin-top:6px;max-width:none;white-space:pre-wrap">remote: Invalid username or password.\nfatal: Authentication failed for 'https://${esc(r.host)}/'</div>${rbtn()}`),
+        token: () => bn('error', 'The token was rejected', `${r.acc} on ${r.host} is no longer signed in. Reconnect the account, then try again.`, rbtn()),
+        rejected: () => bn('error', `${r.name} did not accept the ${r.term}`, 'Validation Failed: head sha can’t be blank; base branch is protected'),
+        rate: () => bn('error', 'Rate limit reached', `${r.host} is limiting requests. Try again in a few minutes.`),
+        offline: () => bn('error', `Can’t reach ${r.host}`, 'connection refused (os error 111)'),
+        other: () => bn('error', `Couldn’t create the ${r.term}`, `${r.name} answered 500 Internal Server Error.`) }[s.err];
+      const errs = err ? err() : '';
+      let need = '';
+      if (s.range === 'ready' && s.err !== 'pushfail' && s.err !== 'pushtoken') {
+        if (s.need === 'notpushed') need = bn('info', 'Branch is not pushed', `${s.head} will be pushed to ${s.remote} first, then the ${r.term} is created.`);
+        else if (s.need === 'unpushed') need = bn('info', 'Branch has unpushed commits', `${s.head} has commits that ${s.remote} lacks. They are pushed first, then the ${r.term} is created.`);
+        else if (s.need === 'diverged') need = bn('error', `Branch has diverged from ${s.remote}`, `${s.head} and ${s.remote}/${s.head} each have commits the other lacks. Pull or rebase first, then create the ${r.term}.`);
+      } else if (s.range === 'failed') need = `<div class="banner error" role="alert">${ic('err', 16)}<div style="min-width:0"><div class="b-title">Could not read the branch</div><div class="mono" style="font-size:var(--fs-sm)">fatal: bad revision 'origin/main..feat/idle-lanes'</div></div></div>`;
+      const help = s.range === 'loading' ? 'Reading the commits…' : s.range === 'failed' || (s.range === 'ready' && s.nobase) ? '' : s.nc === 0 ? `No new commits compared with ${s.base}.` : `${s.nc} commit${s.nc === 1 ? '' : 's'} will be included.`;
       const titleErr = s.touched && !s.title.trim() ? 'Enter a title.' : '';
-      return `<div class="col10">${errs}${s.notpushed && s.err !== 'pushfail' ? S.dbanner('info', 'Branch is not pushed', `${s.head} will be pushed to ${s.remote} first, then the ${r.term} is created.`) : ''}
-        <div class="pair">${S.dfield('From', 'h', `<div class="lockline">${ic('branch', 14)}<span class="od-truncate mono" style="font-size:var(--fs-sm)">${esc(s.head)}</span></div>`, '2 commits will be included.')}${S.dfield('Into', 'rem', `<div class="od-row"><select class="input select" id="rem" data-f="remote" aria-label="Target remote" style="flex:1.4">${Object.entries(REM).map(([k, v]) => `<option value="${k}"${k === s.remote ? ' selected' : ''}>${k} · ${esc(v.host)}</option>`).join('')}</select><select class="input select" id="base" data-f="base" aria-label="Target branch" style="flex:1">${['main', 'release/0.3'].map((b) => `<option${b === s.base ? ' selected' : ''}>${b}</option>`).join('')}</select></div>`, `As ${esc(r.acc)} on ${esc(r.host)}.`)}</div>
+      return `<div class="col10">${errs}${need}
+        <div class="pair">${S.dfield('From', 'h', `<div class="lockline">${ic('branch', 14)}<span class="od-truncate mono" style="font-size:var(--fs-sm)">${esc(s.head)}</span></div>`, help)}${S.dfield('Into', 'rem', `<div class="od-row"><select class="input select" id="rem" data-f="remote" aria-label="Target remote" style="flex:1.4">${Object.entries(REM).map(([k, v]) => `<option value="${k}"${k === s.remote ? ' selected' : ''}>${k} · ${esc(v.host)}</option>`).join('')}</select><select class="input select" id="base" data-f="base" aria-label="Target branch" style="flex:1">${['main', 'release/0.3'].map((b) => `<option${b === s.base ? ' selected' : ''}>${b}</option>`).join('')}</select></div>`, `As ${esc(r.acc)} on ${esc(r.host)}.`)}</div>
+        ${s.nobase ? `<div class="noteerr">${ic('err', 12)}<span>There is no other branch of ${esc(s.remote)} to merge ${esc(s.head)} into.</span></div>` : ''}
         ${S.dfield('Title <span class="req" aria-hidden="true">*</span>', 'title', S.din('title', s.title, 'Summarise the change'), '', titleErr)}
-        ${S.dfield('Description', 'body', `<textarea class="input" id="body" data-f="body" rows="${s.err ? 3 : 5}" placeholder="What changed and why?" style="font-family:var(--font-mono);font-size:12px">${esc(s.body)}</textarea>`, 'Filled in from the commit messages.')}
-        <div class="fld2"><span class="field-label" id="rvl">Reviewers (optional)</span><div class="rvlist" role="list" aria-labelledby="rvl">${s.rv.map((x) => `<span class="rvchip" role="listitem">${ic('user', 12)}${esc(x)}<button type="button" data-do="rmrv" data-v="${x}" aria-label="Remove ${esc(x)}" data-tip="Remove">${ic('x', 12)}</button></span>`).join('')}${['lin-zhao', 'priya-n', 'tomas-r'].filter((x) => !s.rv.includes(x)).map((x) => `<button type="button" class="btn btn-sm btn-ghost" data-do="addrv" data-v="${x}">${ic('plus', 12)}${x}</button>`).join('')}</div></div>
+        ${S.dfield('Description', 'body', `<textarea class="input" id="body" data-f="body" rows="${s.err || need ? 3 : 5}" placeholder="What changed and why?" style="font-family:var(--font-mono);font-size:12px">${esc(s.body)}</textarea>`, 'Filled in from the commit messages.')}
+        ${S.dfield('Reviewers (optional)', 'rvtext', S.din('rvtext', s.rvtext, 'Logins, separated by commas or spaces'), 'User names on the service, for example lin-zhao.')}
         ${S.dchk('draft', s.draft, 'Create as draft')}</div>`;
     };
     return S.dialog(w, { st, width: 600, busy: (s) => s.phase === 'creating',
       view: (s) => {
         const r = R(), busy = s.phase === 'creating';
         if (s.phase === 'done') return { title: `${cap(r.term)} created`, icon: 'check', body: body(s), foot: S.dbtn('Close') + S.dbtn('Open on ' + r.name, { kind: 'primary', act: 'open', icon: 'external', def: 1, af: 1 }) };
-        return { title: `Create ${r.term}`, icon: s.draft ? 'prDraft' : 'pr', body: body(s), foot: `<span class="foot-hint">${esc(r.acc)} · ${esc(r.host)}</span>` + S.dbtn('Cancel', { dis: busy }) + S.dbtn(busy ? (s.notpushed ? 'Pushing and creating…' : 'Creating…') : `Create ${s.draft ? 'draft ' : ''}${r.term}`, { kind: 'primary', act: 'create', dis: busy || (s.touched && !s.title.trim()), def: 1 }) };
+        const blocked = s.need === 'diverged' || s.range !== 'ready' || s.nc === 0 || s.nobase;
+        return { title: `Create ${r.term}`, icon: s.draft ? 'prDraft' : 'pr', body: body(s), foot: `<span class="foot-hint">${esc(r.acc)} · ${esc(r.host)}</span>` + S.dbtn('Cancel', { dis: busy }) + S.dbtn(busy ? (pushes(s) ? 'Pushing and creating…' : 'Creating…') : `Create ${s.draft ? 'draft ' : ''}${r.term}`, { kind: 'primary', act: 'create', dis: busy || blocked || (s.touched && !s.title.trim()), def: 1 }) };
       },
       actions: {
-        addrv: (s, api, d) => { s.rv.push(d.dataset.v); }, rmrv: (s, api, d) => { s.rv = s.rv.filter((x) => x !== d.dataset.v); },
+        reco: (s, api) => H.accountDialog(w, { mode: 'reconnect', existing: [], st: { svc: R().svc, step: 3, inst: 'public', probe: 'ok', method: 'token', login: R().acc }, onDone: () => { s.err = null; api.redraw(); toast(w, 'Reconnected ' + R().host + ' · ' + R().acc, 'ok'); } }),
         openex: () => opened(w, REM[st.remote].host), open: (s, api) => { api.close(); opened(w, R().host + '/pull/' + s.n); return false; },
-        create: (s, api) => { if (!s.title.trim()) { s.touched = true; return; } s.err = null; s.phase = 'creating'; api.redraw(); setTimeout(() => { if (!api.el.isConnected) return; s.phase = 'done'; s.pushed = s.notpushed; api.redraw(); }, 1100); return false; }
+        create: (s, api) => { if (!s.title.trim()) { s.touched = true; return; } s.err = null; s.phase = 'creating'; api.redraw(); setTimeout(() => { if (!api.el.isConnected) return; s.phase = 'done'; s.pushed = pushes(s); if (/\S/.test(s.rvtext) && s.rvFail) s.rverr = 'lin-zhao is not a collaborator on this repository.'; api.redraw(); }, 1100); return false; }
       } });
   }
 
@@ -220,9 +254,9 @@
     new MutationObserver(deco).observe(lb, { childList: true }); deco();
     setupSidebar(win); renderDetails(win);
   };
-  const base = (w, o) => { o = o || {}; closePop(w); V.tab = o.tab || 'repo'; V.flt = o.flt || 'mine'; V.pstate = o.pstate || 'list'; V.sel = o.sel || null; V.cstate = o.cstate || null; w._sbDraw(); if (o.row != null) w._hist.select(o.row, false); else if (V.idx !== 0) w._hist.select(0, false); renderDetails(w); };
+  const base = (w, o) => { o = o || {}; closePop(w); V.tab = o.tab || 'repo'; V.flt = o.flt || 'mine'; V.pstate = o.pstate || 'list'; V.sel = o.sel || null; V.cstate = o.cstate || null; V.svc = o.svc || 'github'; w._sbDraw(); if (o.row != null) w._hist.select(o.row, false); else if (V.idx !== 0) w._hist.select(0, false); renderDetails(w); };
   const tick = (ms, f) => setTimeout(f, ms);
-  const popAt = (w, n) => { const el = w.querySelector(`.lbody .prb[data-pr="${n}"]`) || w.querySelector(`.tree .prb[data-pr="${n}"]`); openPop(w, el, PRS.find((p) => p.n === n)); };
+  const popAt = (w, n, o) => { const el = w.querySelector(`.lbody .prb[data-pr="${n}"]`) || w.querySelector(`.tree .prb[data-pr="${n}"]`); openPop(w, el, PRS.find((p) => p.n === n), o); };
   const scenes = [
     ['Menu: commit row, Open on GitHub', (w) => { base(w, { row: 2 }); G.menu(w, anchor(w, '.lbody .lrow[data-i="2"]', 120), commitItems(w)); }],
     ['Menu: commit that has a pull request', (w) => { base(w, { row: 2 }); G.menu(w, anchor(w, '.lbody .lrow[data-i="2"]', 120), commitItems(w)); }],
@@ -244,6 +278,9 @@
     ['Clone: From account, search with no match', (w) => { base(w); cloneDlg(w, { q: 'zzz' }); }],
     ['Clone: From account, work account (private repos)', (w) => { base(w); cloneDlg(w, { acct: 'a2' }); }],
     ['Clone: From account, no repositories', (w) => { base(w); cloneDlg(w, { acct: 'a6' }); }],
+    ['Clone: From account, listing not supported (Bitbucket / Azure DevOps)', (w) => { base(w); cloneDlg(w, { phase: 'unsupported', svcName: 'Bitbucket' }); }],
+    ['Clone: From account, list truncated (most recent only)', (w) => { base(w); cloneDlg(w, { phase: 'truncated' }); }],
+    ['Clone: From account, host did not answer', (w) => { base(w); cloneDlg(w, { phase: 'network' }); }],
     ['Clone: From account, token revoked (error)', (w) => { base(w); cloneDlg(w, { acct: 'a5' }); }],
     ['Clone: URL tab (existing) next to From account', (w) => { base(w); cloneDlg(w, { tab: 'url', url: 'https://github.com/nexu-io/open-design.git' }); }],
     ['PR badges: sidebar + history (open, draft, merged, closed)', (w) => base(w)],
@@ -251,15 +288,32 @@
     ['PR popover: draft, checks running', (w) => { base(w); tick(0, () => popAt(w, 139)); }],
     ['PR popover: merged', (w) => { base(w); tick(0, () => popAt(w, 131)); }],
     ['PR popover: closed, changes requested', (w) => { base(w); tick(0, () => popAt(w, 128)); }],
+    ['PR popover: review still loading', (w) => { base(w); tick(0, () => popAt(w, 142, { loading: true })); }],
+    ['PR popover: no reviews yet, no checks', (w) => { base(w); tick(0, () => popAt(w, 139, { nochecks: true })); }],
     ['Create pull request: ready', (w) => { base(w); createPR(w); }],
-    ['Create pull request: branch not pushed', (w) => { base(w); createPR(w, { notpushed: true }); }],
-    ['Create pull request: draft with reviewers', (w) => { base(w); createPR(w, { draft: true, rv: ['lin-zhao'] }); }],
+    ['Create pull request: branch not pushed', (w) => { base(w); createPR(w, { need: 'notpushed' }); }],
+    ['Create pull request: branch has unpushed commits', (w) => { base(w); createPR(w, { need: 'unpushed', nc: 3 }); }],
+    ['Create pull request: branch has diverged', (w) => { base(w); createPR(w, { need: 'diverged' }); }],
+    ['Create pull request: no new commits compared with base', (w) => { base(w); createPR(w, { nc: 0 }); }],
+    ['Create pull request: no other branch to merge into', (w) => { base(w); createPR(w, { nobase: true }); }],
+    ['Create pull request: reading the commits', (w) => { base(w); createPR(w, { range: 'loading' }); }],
+    ['Create pull request: could not read the branch', (w) => { base(w); createPR(w, { range: 'failed' }); }],
+    ['Create pull request: draft with reviewers', (w) => { base(w); createPR(w, { draft: true, rvtext: 'lin-zhao, priya-n' }); }],
     ['Create pull request: title missing', (w) => { base(w); createPR(w, { title: '', touched: true }); }],
-    ['Create pull request: creating', (w) => { base(w); createPR(w, { phase: 'creating', notpushed: true }); }],
+    ['Create pull request: creating', (w) => { base(w); createPR(w, { phase: 'creating', need: 'notpushed' }); }],
     ['Create pull request: created', (w) => { base(w); createPR(w, { phase: 'done' }); }],
+    ['Create pull request: created after pushing', (w) => { base(w); createPR(w, { phase: 'done', pushed: true }); }],
+    ['Create pull request: created, asking for a review failed', (w) => { base(w); createPR(w, { phase: 'done', rvtext: 'lin-zhao', rverr: 'lin-zhao is not a collaborator on this repository.' }); }],
     ['Create pull request: already exists', (w) => { base(w); createPR(w, { err: 'exists' }); }],
-    ['Create pull request: push failed', (w) => { base(w); createPR(w, { err: 'pushfail', notpushed: true }); }],
-    ['Create merge request (GitLab remote)', (w) => { base(w); createPR(w, { remote: 'work', head: 'fix/git-detect', title: 'fix(settings): list both reasons when git fails', notpushed: true }); }],
+    ['Create pull request: push failed', (w) => { base(w); createPR(w, { err: 'pushfail', need: 'notpushed' }); }],
+    ['Create pull request: push failed, token rejected', (w) => { base(w); createPR(w, { err: 'pushtoken', need: 'notpushed' }); }],
+    ['Create pull request: token rejected', (w) => { base(w); createPR(w, { err: 'token' }); }],
+    ['Create pull request: service did not accept it', (w) => { base(w); createPR(w, { err: 'rejected' }); }],
+    ['Create pull request: rate limit reached', (w) => { base(w); createPR(w, { err: 'rate' }); }],
+    ['Create pull request: host unreachable', (w) => { base(w); createPR(w, { err: 'offline' }); }],
+    ['Create pull request: service error', (w) => { base(w); createPR(w, { err: 'other' }); }],
+    ['Create merge request (GitLab remote)', (w) => { base(w); createPR(w, { remote: 'work', head: 'fix/git-detect', title: 'fix(settings): list both reasons when git fails', need: 'notpushed' }); }],
+    ['Create merge request: created (GitLab)', (w) => { base(w); createPR(w, { remote: 'work', head: 'fix/git-detect', title: 'fix(settings): list both reasons when git fails', phase: 'done', pushed: true }); }],
     ['Pull requests panel: Mine', (w) => base(w, { tab: 'pr' })],
     ['Pull requests panel: Review requested', (w) => base(w, { tab: 'pr', flt: 'rr' })],
     ['Pull requests panel: All', (w) => base(w, { tab: 'pr', flt: 'all' })],
@@ -267,7 +321,17 @@
     ['Pull requests panel: merged selected', (w) => base(w, { tab: 'pr', flt: 'all', sel: 131 })],
     ['Pull requests panel: loading', (w) => base(w, { tab: 'pr', pstate: 'loading' })],
     ['Pull requests panel: empty', (w) => base(w, { tab: 'pr', flt: 'rr', pstate: 'empty' })],
-    ['Pull requests panel: token revoked (error)', (w) => base(w, { tab: 'pr', pstate: 'error' })]
+    ['Pull requests panel: token revoked (error)', (w) => base(w, { tab: 'pr', pstate: 'error' })],
+    ['Pull requests panel: rate limit reached', (w) => base(w, { tab: 'pr', pstate: 'rate' })],
+    ['Pull requests panel: host unreachable', (w) => base(w, { tab: 'pr', pstate: 'offline' })],
+    ['Pull requests panel: service error', (w) => base(w, { tab: 'pr', pstate: 'other' })],
+    ['Pull requests panel: stale list, “Couldn’t refresh”', (w) => base(w, { tab: 'pr', flt: 'all', pstate: 'stale' })],
+    ['Pull requests panel: stale list, rate limit', (w) => base(w, { tab: 'pr', flt: 'all', pstate: 'stale-rate' })],
+    ['Pull requests panel: stale list, token revoked', (w) => base(w, { tab: 'pr', flt: 'all', pstate: 'stale-revoked' })],
+    ['Pull requests panel: more than one page (“Showing the latest 8”)', (w) => base(w, { tab: 'pr', flt: 'all', pstate: 'more' })],
+    ['Pull requests panel: another network operation is running (toast)', (w) => { base(w, { tab: 'pr', flt: 'all' }); toast(w, 'Another network operation is running. Try again when it has finished.', 'warn'); }],
+    ['Merge requests panel (GitLab remote: MRs)', (w) => base(w, { tab: 'pr', flt: 'all', svc: 'gitlab', sel: 142 })],
+    ['Merge requests panel: empty (GitLab)', (w) => base(w, { tab: 'pr', flt: 'all', svc: 'gitlab', pstate: 'empty' })]
   ];
   const page = D.page('Hosting features', scenes, centerFn, { label: 'Feature state', reopen: 'Replay state' });
   const win = page.win;

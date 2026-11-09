@@ -68,3 +68,11 @@
 .chg-wrap .dl.cf-m > span { background: color-mix(in srgb, var(--warning) 18%, transparent); color: var(--warning); font-weight: 600; }
 .chg-wrap .dl.cf-a > span.c { background: var(--diff-del-bg); }
 .chg-wrap .dl.cf-b > span.c { background: var(--diff-add-bg); }
+
+/* the primary commit button truncates a long label with an ellipsis inside itself (the shipped app clips it instead: app bug, see the notes) */
+.cb-side .btn-trunc { display: flex; width: 100%; min-width: 0; justify-content: center; }
+.cb-side .btn-trunc .lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chg-op .b-title .planned-tag { margin-left: 6px; vertical-align: 1px; }
+.scen .planned-tag { margin-left: 4px; }
+/* fallback for the Planned marker until gitwarp.css defines it (W1); same values as the common brief */
+:where(.planned-tag) { display: inline-flex; align-items: center; height: 16px; padding: 0 5px; border: 1px dashed var(--warning); border-radius: 3px; color: var(--warning); font-size: 10px; font-weight: 600; text-transform: uppercase; line-height: 1; flex: none; }

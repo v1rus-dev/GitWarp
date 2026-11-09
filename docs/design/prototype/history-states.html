@@ -36,10 +36,12 @@
     board('3 · Not a git repository', 'Shown when the opened folder has no .git ancestor. The path is selectable.', full('notgit')),
     board('4 · Folder not found', 'A recent entry or CLI path that no longer exists. “Remove from recent” drops the entry and returns to the welcome screen.', full('nofolder')),
     board('5 · Loading cancelled (no rows)', 'Cancel before the first page arrived: nothing to show, so the whole pane explains it and offers Retry. The status bar reads “Loading cancelled”.', full('cancelled')),
-    board('6a · Git not found', 'Blocking state. Open Git settings opens Settings (Git page) as the modal card; the status-bar git label reads “git not found” and is not clickable.', full('nogit')),
+    board('6a · Git not found', 'Blocking state. Open Git settings opens Settings (Git page) as the modal card; the status-bar git chip reads “git not found”; clicking the chip opens Settings → Git.', full('nogit')),
     board('6b · Unsupported git version', 'Distinct from “not found”: the executable works but is too old. Same actions.', full('oldgit')),
     board('7 · Generic git error', 'git’s own message is shown verbatim in a selectable monospace block, with the command that failed. Without stderr the box is omitted; if git was killed the body reads “was stopped.” instead of “failed with exit code N.”. Copy details copies the command, exit code and stderr.', full('giterr')),
-    board('8 · Non-git failure', 'An I/O or parse error with no git command: title “GitWarp could not read the history”, the message in the box.', full('nongit'))
+    board('8 · Non-git failure', 'An I/O or parse error with no git command: title “GitWarp could not read the history”, the message in the box.', full('nongit')),
+    board('13 · Day filter: no commits', 'The Activity strip filtered History to a day and git returned nothing (history.empty.day_none). The strip and the “Showing N commits on {date}” bar stay above; Clear filter (or Esc) returns to the full graph.', full('dayempty')),
+    board('14 · Day filter: could not list', 'The day’s commit list failed (history.empty.day_failed); git’s message is shown as selectable text.', full('dayerror'))
   ];
   const B = [
     board('9 · Loading bar above the rows', 'Once the first page has arrived the bar sits under the column header and the loaded rows stay below it.', rows('loading')),

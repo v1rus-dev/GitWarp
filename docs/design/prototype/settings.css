@@ -18,7 +18,7 @@
 .spane { overflow: auto; padding: 20px 28px 28px; }
 .spwrap { max-width: 760px; margin: 0 auto; } /* content is centred in the pane, max 760px */
 .spane h2 { margin: 0 0 4px; font-size: var(--fs-xl); }
-.spane .lead { margin: 0 0 16px; max-width: 70ch; color: var(--muted); }
+.spane .lead { margin: 0 0 16px; color: var(--muted); } /* the app subtitle is not width-limited: wraps only at the 760px content width */
 .sgroup { margin-bottom: 20px; }
 .sgroup > h3 { margin: 0 0 6px; font-size: var(--fs-xs); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .slist { border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); }
@@ -40,7 +40,7 @@ select.input[disabled], .seg.dis { opacity: .5; pointer-events: none; }
 .stepper .rv { display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 26px; border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--bg); font-family: var(--font-mono); font-size: var(--fs-sm); } /* read-only value box */
 .scn { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; }
 .scn select { height: 24px; background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--r-sm); }
-.preview { border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg); overflow: hidden; }
+.preview { border: 1px solid transparent; /* app preview frames use a colourless border: invisible */ border-radius: var(--r-md); background: var(--bg); overflow: hidden; }
 .preview .ph { padding: 6px 12px; font-size: var(--fs-sm); color: var(--muted); border-bottom: 1px solid var(--border); background: var(--surface); }
 .preview .pnote { padding: 6px 12px; font-size: var(--fs-sm); color: var(--muted); border-top: 1px solid var(--border); background: var(--surface); }
 .sline { display: flex; gap: 4px; align-items: center; font-size: var(--fs-sm); margin-top: 4px; }
@@ -69,12 +69,14 @@ select.input[disabled], .seg.dis { opacity: .5; pointer-events: none; }
 .chip { display: inline-flex; align-items: center; gap: 4px; height: 18px; padding: 0 6px; border: 1px solid var(--border-strong); border-radius: 5px; font-size: var(--fs-xs); font-weight: 400; color: var(--muted); white-space: nowrap; background: transparent; }
 .chip.ok { color: var(--success); border-color: color-mix(in srgb, var(--success) 50%, transparent); }
 .chip.warn { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 50%, transparent); }
+.slist.bare { border-color: transparent; background: transparent; } /* app lists with a colourless border: no frame, no row separators */
+.slist.bare .kcard, .slist.bare .hostrow { border-bottom-color: transparent; }
 .kcard { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 12px; padding: 12px; border-bottom: 1px solid var(--border); }
 .kcard:last-child { border-bottom: 0; }
 .kcard .kic { width: 28px; height: 28px; border-radius: 50%; background: var(--active); display: inline-flex; align-items: center; justify-content: center; color: var(--muted); }
 .kcard .kname { font-weight: 500; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .kcard .kmeta { color: var(--muted); font-size: var(--fs-sm); }
-.kcard .kfp { font-family: var(--font-mono); font-size: var(--fs-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kcard .kfp { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .kcard .kact { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
 .kcard .ktest { display: grid; gap: 4px; font-size: var(--fs-sm); }
 .kcard .ktest div { display: flex; gap: 6px; align-items: center; }

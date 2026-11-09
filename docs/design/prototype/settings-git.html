@@ -10,6 +10,7 @@
   .opt { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 4px 10px; align-items: start; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); cursor: default; }
   .opt:hover { border-color: var(--border-strong); }
   .opt.on { border-color: var(--accent); background: var(--accent-soft); }
+  .opt b { font-weight: 500; }
   .opt .pth { display: block; margin-top: 2px; font-family: var(--font-mono); font-size: var(--fs-sm); overflow-wrap: anywhere; }
   .opt:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
   .opt .dotbox { margin-top: 2px; }
@@ -56,7 +57,7 @@
     const why = (p) => p.err;
     if (S.mode === 'auto') {
       if (b.ok) use('bundled', b);
-      else if (s.ok) { out.banners.push({ k: 'warn', t: 'Bundled git is broken — using system git', d: `Auto fell back to ${s.path} (${s.v}). Bundled git ${b.exists ? 'failed to start' : 'is unusable'}: ${why(b)}.` }); use('system', s); }
+      else if (s.ok) { out.banners.push({ k: 'warn', t: 'Bundled git is broken — using system git', d: `Auto fell back to ${s.path} (${s.v}). Bundled git is unusable: ${why(b)}` }); use('system', s); }
       else { out.banners.push({ k: 'error', t: 'No usable git found', d: 'Both bundled and system git are unusable.', list: [`Bundled (${b.path || 'not shipped with this build'}): ${why(b)}`, `System (PATH): ${why(s)}`] }); out.tooOld = b.old || s.old || null; }
     } else if (S.mode === 'bundled') { if (b.ok) use('bundled', b); else { out.banners.push({ k: 'error', t: 'Bundled git is unusable', d: `${b.path || 'not shipped with this build'}: ${why(b)}` }); out.tooOld = b.old; } }
     else if (S.mode === 'system') { if (s.ok) use('system', s); else { out.banners.push({ k: 'error', t: 'System git is unusable', d: why(s) }); out.tooOld = s.old; } }

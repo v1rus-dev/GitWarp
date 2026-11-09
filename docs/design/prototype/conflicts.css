@@ -110,6 +110,8 @@
 .cfe-choice h2 { margin: 0; font-size: var(--fs-lg); }
 .cfe-choice p { margin: 0; color: var(--muted); max-width: 70ch; }
 .cfe-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.cfe-cards.one { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.cfe-cards.one .cfe-opt { grid-column: 1; }
 .cfe-opt { display: flex; flex-direction: column; gap: 8px; text-align: left; padding: 14px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r-md); color: var(--text); cursor: default; min-width: 0; }
 .cfe-opt:hover { background: var(--hover); }
 .cfe-opt:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
@@ -127,3 +129,15 @@
 .cfe-thumb.del { background: repeating-linear-gradient(135deg, var(--hover) 0 6px, transparent 6px 12px); }
 .cfe-done { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; text-align: center; color: var(--muted); }
 .cfe-done b { color: var(--text); font-size: var(--fs-md); }
+
+/* disk-changed bar (changes.editor.changed_after_merge): surface, border-bottom, warn icon, 12px side padding */
+.cfe-disk { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); font-size: var(--fs-sm); flex: none; }
+.cfe-disk svg { color: var(--warning); flex: none; }
+/* load states: three skeleton lines (Loading the conflict…) and the failure with Take buttons */
+.cfe-loading { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 12px; }
+.cfe-failed { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; }
+.cfe-failed .msg { max-width: 560px; color: var(--error); }
+.cfe-head .planned-tag, .cfe-note .planned-tag { margin-left: 4px; }
+.scen .planned-tag { margin-left: 4px; }
+:where(.planned-tag) { display: inline-flex; align-items: center; height: 16px; padding: 0 5px; border: 1px dashed var(--warning); border-radius: 3px; color: var(--warning); font-size: 10px; font-weight: 600; text-transform: uppercase; line-height: 1; flex: none; }
+.cfe-rch .btn-xs { flex: none; }
