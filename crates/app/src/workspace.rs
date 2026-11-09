@@ -45,7 +45,11 @@ actions!(
         OpenRepositoryDialog,
         OpenCloneDialog,
         OpenSettings,
-        OpenGitSettings
+        OpenGitSettings,
+        CloseWindow,
+        MinimizeWindow,
+        ZoomWindow,
+        CloseRepository
     ]
 );
 
@@ -816,6 +820,20 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenGitSettings, window, cx| {
                 this.open_settings_at(Page::Git, window, cx);
+            }))
+            .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
+                window.remove_window();
+            }))
+            .on_action(cx.listener(|_, _: &MinimizeWindow, window, _| {
+                window.minimize_window();
+            }))
+            .on_action(cx.listener(|_, _: &ZoomWindow, window, _| {
+                window.zoom_window();
+            }))
+            .on_action(cx.listener(|this, _: &CloseRepository, window, cx| {
+                if matches!(this.content, Content::Repository(_)) {
+                    this.show_welcome(window, cx);
+                }
             }));
 
         ui::focus::track_pointer(ui::actions::tab_navigation(root))

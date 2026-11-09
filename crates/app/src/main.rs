@@ -6,6 +6,7 @@
 mod accounts;
 mod activity_strip;
 mod app_icon;
+mod app_menu;
 mod changes_view;
 mod checkout_dialog;
 mod cli_import;
@@ -62,7 +63,7 @@ mod worktrees_model;
 mod worktrees_view;
 
 use gpui::{
-    actions, prelude::*, px, size, App, Bounds, Global, KeyBinding, Menu, MenuItem,
+    actions, prelude::*, px, size, App, Bounds, Global, KeyBinding, Menu, MenuItem, SystemMenuType,
     TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
 
@@ -75,6 +76,32 @@ use std::sync::Arc;
 use git_core::{Git, GitChoice};
 use settings::{Settings, SettingsStore, ThemePref};
 use workspace::Workspace;
+
+/// The native macOS menu bar: the app menu, then the shared menu model.
+fn macos_menus() -> Vec<Menu> {
+    fn convert(spec: app_menu::MenuSpec) -> Menu {
+        Menu::new(spec.name).items(spec.entries.into_iter().map(|entry| match entry {
+            app_menu::Entry::Separator => MenuItem::separator(),
+            app_menu::Entry::Item { label, action } => MenuItem::Action {
+                name: label,
+                action,
+                os_action: None,
+                checked: false,
+                disabled: false,
+            },
+            app_menu::Entry::Submenu(sub) => MenuItem::submenu(convert(sub)),
+        }))
+    }
+    let mut menus = vec![Menu::new("GitWarp").items([
+        MenuItem::action(ui::t!("app.menu.settings"), workspace::OpenSettings),
+        MenuItem::separator(),
+        MenuItem::os_submenu("Services", SystemMenuType::Services),
+        MenuItem::separator(),
+        MenuItem::action(ui::t!("app.menu.quit_app"), Quit),
+    ])];
+    menus.extend(app_menu::menus(true).into_iter().map(convert));
+    menus
+}
 
 /// The loaded settings and where they are saved.
 struct AppSettings {
@@ -391,15 +418,14 @@ fn main() {
                 KeyBinding::new("shift-up", welcome::ExtendPrev, Some("welcome")),
                 // gpui has no default Cmd+Q, so quit must be bound explicitly.
                 ui::actions::key_binding(cx, "secondary-q", Quit, None),
+                ui::actions::key_binding(cx, "secondary-w", workspace::CloseWindow, None),
+                ui::actions::key_binding(cx, "secondary-shift-w", workspace::CloseRepository, None),
+                ui::actions::key_binding(cx, "f5", repo_view::Refresh, None),
             ];
             cx.bind_keys(shortcuts);
             cx.on_action(|_: &Quit, cx| cx.quit());
             if cfg!(target_os = "macos") {
-                cx.set_menus([Menu {
-                    name: "GitWarp".into(),
-                    items: vec![MenuItem::action("Quit GitWarp", Quit)],
-                    disabled: false,
-                }]);
+                cx.set_menus(macos_menus());
             }
             // The search field's own keys (Shift+Enter, F3, Esc, ↓) live in
             // its key context.
