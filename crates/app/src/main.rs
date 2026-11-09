@@ -32,6 +32,7 @@ mod open_dialog;
 mod palette;
 mod pr_logic;
 mod pr_panel;
+mod recent_state;
 mod ref_dialog;
 mod ref_ops;
 mod remote_accounts;
