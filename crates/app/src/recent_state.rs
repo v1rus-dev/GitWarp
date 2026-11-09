@@ -397,17 +397,22 @@ mod tests {
             Unavailable::FolderMissing.chip_label().as_ref(),
             "Folder not found"
         );
+        // The shown path uses the platform separator (`~\proj\wt` on Windows).
         assert_eq!(
             Unavailable::FolderMissing.tooltip(&path, home).as_ref(),
-            "~/proj/wt no longer exists"
+            format!("{} no longer exists", display_path(&path, home))
         );
+        let main = PathBuf::from("/home/u/main");
         assert_eq!(
             Unavailable::WorktreeRemoved {
-                main_repo: Some(PathBuf::from("/home/u/main"))
+                main_repo: Some(main.clone())
             }
             .tooltip(&path, home)
             .as_ref(),
-            "The worktree was removed from its repository (~/main)"
+            format!(
+                "The worktree was removed from its repository ({})",
+                display_path(&main, home)
+            )
         );
         assert_eq!(
             Unavailable::Unreadable("Permission denied".into())
