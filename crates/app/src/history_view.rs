@@ -1192,7 +1192,7 @@ enum Pick {
 
 /// Everything the history row menu is built from. The menu is pure data plus
 /// callbacks, so its shape is testable without a window; the pickers and the
-/// "Branch" view replace the open menu's rows in place ([`MenuItem::submenu`]),
+/// "Branch" view replace the open menu's rows in place ([`MenuItem::replace_rows`]),
 /// and "Back" is a submenu item that returns the root rows.
 #[derive(Clone)]
 struct RowMenu {
@@ -1395,7 +1395,7 @@ impl RowMenu {
                     MenuItem::new(ui::t!("history.menu.branch", name = branch.name))
                         .icon(branch_icon(&branch))
                         .shortcut("›")
-                        .submenu(move || this.branch_view(&branch)),
+                        .replace_rows(move || this.branch_view(&branch)),
                 ));
             }
             _ => entries.push(MenuEntry::Item(self.picker_item(
@@ -1439,7 +1439,7 @@ impl RowMenu {
         MenuItem::new(label)
             .icon(icon)
             .shortcut("›")
-            .submenu(move || this.picker(list.clone(), pick))
+            .replace_rows(move || this.picker(list.clone(), pick))
     }
 
     /// "Back" plus a rule, then the branches: the last-picked one first. It
@@ -1472,7 +1472,7 @@ impl RowMenu {
                 }
                 Pick::Menu => {
                     let this = self.clone();
-                    item.submenu(move || {
+                    item.replace_rows(move || {
                         last_picked.replace(Some(name.clone()));
                         this.branch_view(&branch)
                     })
@@ -1500,7 +1500,7 @@ impl RowMenu {
             MenuItem::new(ui::t!("history.menu.back"))
                 .icon(IconName::Undo)
                 .shortcut("‹")
-                .submenu(move || this.entries()),
+                .replace_rows(move || this.entries()),
         )
     }
 }
@@ -5300,7 +5300,7 @@ mod tests {
     /// The rows the item swaps the menu for.
     fn open(entries: &[MenuEntry], label: &str) -> Vec<MenuEntry> {
         let submenu = find(entries, label)
-            .submenu
+            .replace_rows
             .clone()
             .unwrap_or_else(|| panic!("{label:?} is not a submenu"));
         submenu()
@@ -5380,7 +5380,7 @@ mod tests {
             ]
         );
         assert!(!find(&entries, "Show all commits of feat").disabled);
-        assert!(find(&entries, "Branch feat").submenu.is_some());
+        assert!(find(&entries, "Branch feat").replace_rows.is_some());
     }
 
     #[test]

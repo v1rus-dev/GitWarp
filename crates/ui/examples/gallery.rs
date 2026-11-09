@@ -1870,7 +1870,7 @@ fn floating_section(
                                 );
                             }),
                         )
-                        .child("Right-click here for the ref menu (header, hints, filter)"),
+                        .child("Right-click here for the ref menu (header, hints, filter, 3-level cascade)"),
                 )
                 .child(
                     div()
@@ -1993,6 +1993,28 @@ fn ref_menu_entries() -> Vec<MenuEntry> {
                     toast::show(ToastKind::Info, "Pulled main", window, cx);
                 }),
         ),
+        // Three levels: this row -> "Copy" -> "Link". Hover, click, → or Enter opens a level.
+        MenuEntry::Item(MenuItem::new("Copy").icon(IconName::Branch).submenu(|| {
+            let copy = |label: &'static str| {
+                MenuEntry::Item(MenuItem::new(label).action(move |window, cx| {
+                    toast::show(ToastKind::Info, format!("Copied {label}"), window, cx);
+                }))
+            };
+            vec![
+                copy("Branch name"),
+                copy("Commit hash"),
+                MenuEntry::Item(MenuItem::new("Link").submenu(|| {
+                    vec![
+                        MenuEntry::Item(MenuItem::new("Open on GitHub").action(|window, cx| {
+                            toast::show(ToastKind::Info, "Opened on GitHub", window, cx);
+                        })),
+                        MenuEntry::Item(MenuItem::new("Copy link").action(|window, cx| {
+                            toast::show(ToastKind::Info, "Copied link", window, cx);
+                        })),
+                    ]
+                })),
+            ]
+        })),
         MenuEntry::Separator,
         MenuEntry::Header(MenuHeader::new("More refs (6)")),
         MenuEntry::Filter {

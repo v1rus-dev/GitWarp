@@ -196,18 +196,20 @@ fn menu_skips_disabled_items(cx: &mut TestAppContext) {
     assert_eq!(last.get(), 1, "down did not skip the disabled item");
 }
 
-/// The root rows of the submenu test: "Open" swaps in a page whose "Back" swaps the root back.
+/// The root rows of the in-place test: "Open" swaps in a page whose "Back" swaps the root back.
 fn submenu_root(root_hits: &Rc<Cell<u32>>, inner_hits: &Rc<Cell<u32>>) -> Vec<MenuEntry> {
     let root = root_hits.clone();
     let inner = inner_hits.clone();
     let page_root = root_hits.clone();
     let page_inner = inner_hits.clone();
     vec![
-        MenuEntry::Item(MenuItem::new("Open").submenu(move || {
+        MenuEntry::Item(MenuItem::new("Open").replace_rows(move || {
             let root = page_root.clone();
             let inner = page_inner.clone();
             vec![
-                MenuEntry::Item(MenuItem::new("Back").submenu(move || submenu_root(&root, &inner))),
+                MenuEntry::Item(
+                    MenuItem::new("Back").replace_rows(move || submenu_root(&root, &inner)),
+                ),
                 MenuEntry::Separator,
                 menu_item("Inner", true, &page_inner),
             ]
@@ -218,7 +220,7 @@ fn submenu_root(root_hits: &Rc<Cell<u32>>, inner_hits: &Rc<Cell<u32>>) -> Vec<Me
 }
 
 #[gpui::test]
-fn menu_submenu_replaces_the_rows_in_place_and_back_restores_them(cx: &mut TestAppContext) {
+fn menu_replace_rows_swaps_the_rows_in_place_and_back_restores_them(cx: &mut TestAppContext) {
     let (_, cx) = start(cx);
     let root_hits = Rc::new(Cell::new(0));
     let inner_hits = Rc::new(Cell::new(0));
@@ -354,6 +356,202 @@ fn menu_header_tool_runs_its_action_and_closes_the_menu(cx: &mut TestAppContext)
     assert_eq!(tool_hits.get(), 1, "the tool did not run");
     assert_eq!(item_hits.get(), 0);
     assert_eq!(layer_count(cx), 0, "the tool left the menu open");
+}
+
+/// A three-level menu: "Branches" -> "feature" -> "Checkout" / "Delete", with
+/// siblings at each level. Every leaf counts its runs in `hits`.
+fn cascade_entries(hits: &Rc<Cell<u32>>) -> Vec<MenuEntry> {
+    let inner = hits.clone();
+    let outer = hits.clone();
+    vec![
+        MenuEntry::Item(MenuItem::new("Branches").submenu(move || {
+            let inner = inner.clone();
+            vec![
+                MenuEntry::Item(MenuItem::new("feature").submenu(move || {
+                    vec![
+                        menu_item("Checkout", true, &inner),
+                        menu_item("Delete", true, &inner),
+                    ]
+                })),
+                MenuEntry::Item(MenuItem::new("Closed").disabled(true)),
+                MenuEntry::Item(MenuItem::new("main")),
+            ]
+        })),
+        MenuEntry::Item(MenuItem::new("Plain")),
+        menu_item("Leaf", true, &outer),
+    ]
+}
+
+fn open_cascade(cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>, hits: &Rc<Cell<u32>>) {
+    let entries = cascade_entries(hits);
+    cx.update(|window, app| {
+        menu::open_context_menu(at, entries, window, app);
+    });
+    cx.run_until_parked();
+}
+
+fn hover(cx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("no row {selector}"));
+    cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+}
+
+/// Lets the delay pass and the child panel paint (it is placed one frame
+/// after it first appears).
+fn settle(cx: &mut VisualTestContext, delay: Duration) {
+    cx.executor().advance_clock(delay);
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        window.simulate_next_frame(app);
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn a_submenu_opens_after_the_hover_delay_not_before(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    open_cascade(cx, point(px(40.), px(40.)), &hits);
+    assert!(cx.debug_bounds("menu-1-0").is_none(), "child open at start");
+
+    hover(cx, "menu-0-0");
+    settle(cx, Duration::from_millis(100));
+    assert!(
+        cx.debug_bounds("menu-1-0").is_none(),
+        "the submenu opened before the delay"
+    );
+
+    settle(cx, Duration::from_millis(150));
+    let parent = cx.debug_bounds("menu-0-0").expect("parent row");
+    let child = cx
+        .debug_bounds("menu-1-0")
+        .expect("the submenu did not open");
+    assert!(
+        child.left() > parent.left() + px(100.),
+        "the child is not beside the parent"
+    );
+    assert_eq!(layer_count(cx), 1, "the child must share the menu's layer");
+}
+
+#[gpui::test]
+fn moving_to_a_plain_row_closes_the_submenu_after_the_delay(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    open_cascade(cx, point(px(40.), px(40.)), &hits);
+    hover(cx, "menu-0-0");
+    settle(cx, Duration::from_millis(250));
+    assert!(cx.debug_bounds("menu-1-0").is_some());
+
+    // Straight down: outside the safe triangle, so "Plain" takes over.
+    hover(cx, "menu-0-1");
+    settle(cx, Duration::from_millis(100));
+    assert!(cx.debug_bounds("menu-1-0").is_some(), "closed too early");
+    settle(cx, Duration::from_millis(150));
+    assert!(cx.debug_bounds("menu-1-0").is_none(), "child stayed open");
+}
+
+#[gpui::test]
+fn right_and_left_move_between_levels(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    open_cascade(cx, point(px(40.), px(40.)), &hits);
+
+    cx.simulate_keystrokes("down right");
+    cx.update(|window, app| {
+        window.simulate_next_frame(app);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("menu-1-0").is_some(), "right did not open");
+    assert_eq!(layer_count(cx), 1);
+
+    // The first enabled child row ("feature") is highlighted: right again
+    // opens level 2, whose first row is "Checkout".
+    cx.simulate_keystrokes("right");
+    assert!(cx.debug_bounds("menu-2-0").is_some(), "level 2 not open");
+
+    // Left closes level 2 only, then level 1; at the root it does nothing.
+    cx.simulate_keystrokes("left");
+    assert!(cx.debug_bounds("menu-2-0").is_none());
+    assert!(cx.debug_bounds("menu-1-0").is_some());
+    cx.simulate_keystrokes("left");
+    assert!(cx.debug_bounds("menu-1-0").is_none());
+    cx.simulate_keystrokes("left");
+    assert_eq!(layer_count(cx), 1, "left at the root closed the menu");
+
+    // Down in the child skips the disabled "Closed" row: feature -> main.
+    cx.simulate_keystrokes("right down");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(layer_count(cx), 0, "enter on a leaf closes everything");
+}
+
+#[gpui::test]
+fn escape_closes_one_level_at_a_time_then_the_menu(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    open_cascade(cx, point(px(40.), px(40.)), &hits);
+
+    cx.simulate_keystrokes("down right right");
+    assert!(cx.debug_bounds("menu-2-0").is_some());
+
+    cx.simulate_keystrokes("escape");
+    assert!(cx.debug_bounds("menu-2-0").is_none(), "level 2 stayed");
+    assert!(cx.debug_bounds("menu-1-0").is_some(), "level 1 closed too");
+    assert_eq!(layer_count(cx), 1);
+
+    cx.simulate_keystrokes("escape");
+    assert!(cx.debug_bounds("menu-1-0").is_none());
+    assert_eq!(layer_count(cx), 1, "second escape closed the menu");
+
+    cx.simulate_keystrokes("escape");
+    assert_eq!(layer_count(cx), 0, "third escape did not close the menu");
+    assert_eq!(hits.get(), 0);
+}
+
+#[gpui::test]
+fn clicking_a_deep_leaf_runs_it_and_closes_everything(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    open_cascade(cx, point(px(40.), px(40.)), &hits);
+
+    // A click on a submenu row opens it at once, without the hover delay.
+    let row = cx.debug_bounds("menu-0-0").expect("row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, app| {
+        window.simulate_next_frame(app);
+    });
+    cx.run_until_parked();
+    let row = cx.debug_bounds("menu-1-0").expect("click did not open");
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.update(|window, app| {
+        window.simulate_next_frame(app);
+    });
+    cx.run_until_parked();
+    let leaf = cx.debug_bounds("menu-2-1").expect("level 2 not open");
+    assert_eq!(layer_count(cx), 1, "a click inside a child closed the menu");
+
+    cx.simulate_click(leaf.center(), Modifiers::default());
+    assert_eq!(hits.get(), 1, "the leaf did not run");
+    assert_eq!(layer_count(cx), 0, "the leaf left the menu open");
+}
+
+#[gpui::test]
+fn a_submenu_near_the_right_edge_flips_to_the_left(cx: &mut TestAppContext) {
+    let (_, cx) = start(cx);
+    let hits = Rc::new(Cell::new(0));
+    let width = cx.update(|window, _| window.viewport_size().width);
+    open_cascade(cx, point(width - px(300.), px(40.)), &hits);
+    hover(cx, "menu-0-0");
+    settle(cx, Duration::from_millis(250));
+    settle(cx, Duration::from_millis(16));
+
+    let parent = cx.debug_bounds("menu-0-0").expect("parent row");
+    let child = cx.debug_bounds("menu-1-0").expect("child row");
+    assert!(
+        child.right() <= parent.left() + px(20.),
+        "the child did not flip left: child {child:?}, parent {parent:?}"
+    );
+    assert!(child.left() >= px(4.), "the child left the window");
 }
 
 #[gpui::test]
