@@ -1,8 +1,9 @@
 //! The welcome screen: the three actions on the left, the recent repositories
 //! on the right and the Initialize dialog.
 //!
-//! Branches of the recent rows are read in the background, one repository at a
-//! time, and arrive after the list is already on screen.
+//! The state of each recent row (branch, or why it is unavailable) is read in
+//! the background, one repository at a time, and arrives after the list is
+//! already on screen.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,19 +18,20 @@ use gpui::{
     Subscription, UniformListScrollHandle, WeakEntity, Window,
 };
 
-use git_core::{Error, Git, Head, Repo};
+use git_core::{Error, Git, Repo};
 use ui::metrics::{FONT_MONO, FONT_UI, FS_BASE, FS_LG, FS_SM, FS_XL, MONO, R_MD, STATUS};
 use ui::theme::{ActiveTheme, ThemeColors};
 use ui::{
-    dialog, focus, overlay, toast, Banner, BannerKind, Button, Checkbox, Dialog, DialogFocus,
-    DialogHost, EmptyState, Icon, IconName, Kbd, Scrollbar, SearchField, TextInput, TextInputEvent,
-    TextInputSubmit, ToastKind, Tooltip,
+    dialog, focus, overlay, toast, Banner, BannerKind, Button, Checkbox, Chip, Dialog, DialogFocus,
+    DialogHost, EmptyState, Icon, IconName, Kbd, Scrollbar, SearchField, Skeleton, TextInput,
+    TextInputEvent, TextInputSubmit, ToastKind, Tooltip,
 };
 
 use crate::clone_dialog::CloneDialog;
 use crate::format::{display_path, expand_home, home_dir, relative_time};
 use crate::history_view::unix_now;
 use crate::init_flow::{banner_body, details, DialogKind, InitFlow, StatusKind};
+use crate::recent_state::{classify, OpenResult, RowState};
 use crate::settings::RecentRepo;
 use crate::welcome_activity::WelcomeActivity;
 use crate::workspace::{
@@ -55,16 +57,10 @@ struct RecentRow {
     path: PathBuf,
     name: SharedString,
     path_label: SharedString,
-    branch: Option<SharedString>,
+    state: RowState,
+    /// Why the row is unavailable, for its tooltip.
+    tooltip: Option<SharedString>,
     time: SharedString,
-}
-
-/// What is known about a row's branch.
-enum BranchState {
-    /// The background `Repo::open(..).head()` is still running.
-    Loading,
-    /// `Some` for a branch, `None` for detached HEAD or a failed read.
-    Known(Option<SharedString>),
 }
 
 pub struct WelcomeView {
@@ -80,7 +76,8 @@ pub struct WelcomeView {
     filter_text: String,
     /// Index into the filtered rows, never past the end.
     selected: usize,
-    branches: HashMap<PathBuf, BranchState>,
+    /// What the background check found for each recent path.
+    states: HashMap<PathBuf, RowState>,
     list_scroll: UniformListScrollHandle,
     /// The list's focus: the screen starts here so ↑/↓ work at once.
     focus: FocusHandle,
@@ -130,7 +127,7 @@ impl WelcomeView {
             filter,
             filter_text: String::new(),
             selected: 0,
-            branches: HashMap::new(),
+            states: HashMap::new(),
             list_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle().tab_stop(true),
             open_focus: cx.focus_handle().tab_stop(true),
@@ -193,45 +190,33 @@ impl WelcomeView {
             .update(cx, |activity, cx| activity.sync(paths, selected, cx));
     }
 
-    /// Starts one background HEAD read per row that has none yet.
-    fn ensure_branches(&mut self, cx: &mut Context<Self>) {
-        if let Err(error) = &self.git {
-            log::debug!("recent branches are unavailable: {error}");
-            for repo in &self.recent {
-                self.branches
-                    .entry(repo.path.clone())
-                    .or_insert(BranchState::Known(None));
+    /// Starts one background check per row that has none yet. The file-system
+    /// probe needs no git, so it runs even when git could not be found.
+    fn ensure_states(&mut self, cx: &mut Context<Self>) {
+        let git = match &self.git {
+            Ok(git) => Some(git.clone()),
+            Err(error) => {
+                log::debug!("recent branches are unavailable: {error}");
+                None
             }
-            return;
-        }
+        };
         let missing: Vec<PathBuf> = self
             .recent
             .iter()
-            .filter(|repo| !self.branches.contains_key(&repo.path))
+            .filter(|repo| !self.states.contains_key(&repo.path))
             .map(|repo| repo.path.clone())
             .collect();
         for path in missing {
-            let git = match &self.git {
-                Ok(git) => git.clone(),
-                Err(_) => return,
-            };
-            self.branches.insert(path.clone(), BranchState::Loading);
+            self.states.insert(path.clone(), RowState::Checking);
+            let git = git.clone();
             cx.spawn(async move |this, cx| {
                 let read_path = path.clone();
-                let head = cx
+                let state = cx
                     .background_executor()
-                    .spawn(async move {
-                        Repo::open(git, &read_path)
-                            .and_then(|repo| repo.head())
-                            .ok()
-                    })
+                    .spawn(async move { check_recent(git, &read_path) })
                     .await;
-                let name = match head {
-                    Some(Head::Branch { name, .. }) => Some(SharedString::from(name)),
-                    Some(Head::Detached(_)) | None => None,
-                };
                 this.update(cx, |view, cx| {
-                    view.branches.insert(path, BranchState::Known(name));
+                    view.states.insert(path, state);
                     cx.notify();
                 })
                 .ok();
@@ -258,15 +243,20 @@ impl WelcomeView {
             .iter()
             .filter(|repo| self.matches(repo))
             .map(|repo| {
-                let branch = match self.branches.get(&repo.path) {
-                    Some(BranchState::Known(Some(name))) => Some(name.clone()),
-                    _ => None,
-                };
+                let state = self
+                    .states
+                    .get(&repo.path)
+                    .cloned()
+                    .unwrap_or(RowState::Checking);
+                let tooltip = state
+                    .unavailable()
+                    .map(|reason| reason.tooltip(&repo.path, self.home.as_deref()));
                 RecentRow {
                     path: repo.path.clone(),
                     name: recent_name(&repo.path).into(),
                     path_label: display_path(&repo.path, self.home.as_deref()).into(),
-                    branch,
+                    state,
+                    tooltip,
                     time: relative_time(now, repo.last_opened).into(),
                 }
             })
@@ -303,6 +293,12 @@ impl WelcomeView {
         let Some(row) = rows.get(index) else {
             return;
         };
+        // An unavailable row is only selected: opening it would fail (or,
+        // worse, open a parent repository).
+        if row.state.unavailable().is_some() {
+            self.select_row(index, cx);
+            return;
+        }
         let path = row.path.clone();
         if let Some(workspace) = self.workspace.upgrade() {
             workspace.update(cx, |workspace, cx| {
@@ -681,7 +677,7 @@ impl Render for WelcomeView {
         self.activity
             .update(cx, |activity, cx| activity.set_enabled(show_activity, cx));
         self.sync_activity(cx);
-        self.ensure_branches(cx);
+        self.ensure_states(cx);
 
         let client = inline_window_controls(window);
         let colors = cx.theme().colors;
@@ -1341,6 +1337,11 @@ fn render_recent_row(
         })
         .cursor_pointer();
 
+    let unavailable = row.state.unavailable().cloned();
+    if let Some(tip) = row.tooltip.clone() {
+        element = element.tooltip(Tooltip::text(tip));
+    }
+
     if !last {
         element = element.border_b_1().border_color(colors.border);
     }
@@ -1368,7 +1369,7 @@ fn render_recent_row(
                 .flex_none()
                 .flex()
                 .items_center()
-                .child(Icon::new(IconName::Folder).size(px(16.)).color(colors.text)),
+                .child(folder_icon(unavailable.as_ref(), selected, colors)),
         )
         .child(
             div()
@@ -1380,9 +1381,17 @@ fn render_recent_row(
                 .child(
                     div()
                         .truncate()
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(if unavailable.is_some() {
+                            FontWeight::MEDIUM
+                        } else {
+                            FontWeight::SEMIBOLD
+                        })
                         .text_size(FS_BASE)
-                        .text_color(colors.text)
+                        .text_color(if unavailable.is_some() {
+                            colors.muted
+                        } else {
+                            colors.text
+                        })
                         .child(row.name.clone()),
                 )
                 .child(
@@ -1403,15 +1412,7 @@ fn render_recent_row(
                 .gap(px(4.))
                 .text_size(FS_SM)
                 .text_color(colors.muted)
-                .when_some(row.branch.clone(), |this, branch| {
-                    this.child(
-                        Icon::new(IconName::Branch)
-                            .size(px(12.))
-                            .color(colors.muted),
-                    )
-                    .child(div().min_w_0().truncate().child(branch))
-                })
-                .when(row.branch.is_none(), |this| this.child("—")),
+                .child(branch_cell(index, row, unavailable.as_ref(), colors)),
         )
         .child(
             div()
@@ -1422,6 +1423,107 @@ fn render_recent_row(
                 .text_right()
                 .child(row.time.clone()),
         )
+}
+
+/// The folder icon; an unavailable row gets a muted one with a small badge
+/// (error for a missing folder, warning for the other reasons).
+fn folder_icon(
+    unavailable: Option<&crate::recent_state::Unavailable>,
+    selected: bool,
+    colors: ThemeColors,
+) -> impl IntoElement {
+    let Some(reason) = unavailable else {
+        return div()
+            .child(Icon::new(IconName::Folder).size(px(16.)).color(colors.text))
+            .into_any_element();
+    };
+    let missing = reason.chip_kind() == ui::ChipKind::Err;
+    let (tone, glyph) = if missing {
+        (colors.error, IconName::X)
+    } else {
+        (colors.warning, IconName::Warn)
+    };
+    // The ring matches the row background so the badge reads as cut out.
+    let ring = if selected {
+        colors.selection
+    } else {
+        colors.bg
+    };
+    div()
+        .relative()
+        .flex()
+        .child(
+            Icon::new(IconName::Folder)
+                .size(px(16.))
+                .color(colors.muted),
+        )
+        .child(
+            div()
+                .absolute()
+                .right(px(-4.))
+                .bottom(px(-3.))
+                .size(px(11.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(tone)
+                .border_color(ring)
+                .border_2()
+                .child(Icon::new(glyph).size(px(7.)).color(colors.bg)),
+        )
+        .into_any_element()
+}
+
+/// The branch column: the branch, a chip for an unavailable row or a
+/// skeleton while the row is still being checked.
+fn branch_cell(
+    index: usize,
+    row: &RecentRow,
+    unavailable: Option<&crate::recent_state::Unavailable>,
+    colors: ThemeColors,
+) -> gpui::AnyElement {
+    match (&row.state, unavailable) {
+        (_, Some(reason)) => div()
+            .debug_selector(move || format!("recent-chip-{index}"))
+            .child(Chip::new(("recent-chip", index), reason.chip_label()).kind(reason.chip_kind()))
+            .into_any_element(),
+        (RowState::Checking, None) => {
+            Skeleton::new(("recent-skeleton", index), px(60.)).into_any_element()
+        }
+        (
+            RowState::Available {
+                branch: Some(branch),
+            },
+            None,
+        ) => div()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(
+                Icon::new(IconName::Branch)
+                    .size(px(12.))
+                    .color(colors.muted),
+            )
+            .child(div().min_w_0().truncate().child(branch.clone()))
+            .into_any_element(),
+        _ => div().child("—").into_any_element(),
+    }
+}
+
+/// The background check of one recent entry: the file-system probe first,
+/// then (only for a plausible repository, and only when git is available)
+/// opening it and reading HEAD.
+fn check_recent(git: Option<Arc<Git>>, path: &Path) -> RowState {
+    let probe = git_core::probe_repo_path(path);
+    let open: Option<OpenResult> = match (&probe, git) {
+        (git_core::PathProbe::Candidate, Some(git)) => {
+            Some(Repo::open(git, path).map(|repo| (repo.root().to_path_buf(), repo.head().ok())))
+        }
+        _ => None,
+    };
+    classify(path, probe, open)
 }
 
 fn read_recent(cx: &App) -> Vec<RecentRepo> {
@@ -1612,5 +1714,66 @@ mod tests {
             1,
             "Ctrl Shift O did not open the Clone dialog"
         );
+    }
+
+    /// A missing folder shows its chip and a real repository does not; Enter
+    /// on the unavailable row leaves the welcome screen open.
+    #[gpui::test]
+    fn an_unavailable_recent_row_shows_a_chip_and_does_not_open(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("recent-states");
+        let gone = repo.path().join("gone");
+        let settings = crate::settings::Settings {
+            recent: vec![
+                RecentRepo {
+                    path: gone.clone(),
+                    last_opened: 2,
+                },
+                RecentRepo {
+                    path: repo.path().to_path_buf(),
+                    last_opened: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        cx.update(|cx| {
+            cx.set_global(crate::AppSettings {
+                path: None,
+                settings,
+                save_in_flight: false,
+                dirty: false,
+            });
+        });
+        let (mut cx, workspace) =
+            crate::test_support::open_workspace(crate::test_support::git(), cx);
+        // The first render starts the checks; give them time to finish.
+        cx.run_until_parked();
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("recent-chip-0").is_some(),
+            "the missing folder has no chip"
+        );
+        assert!(
+            cx.debug_bounds("recent-chip-1").is_none(),
+            "the real repository has a chip"
+        );
+
+        // Row 0 (the missing folder) is selected: Enter must not open it.
+        cx.update(|window, cx| window.dispatch_action(Box::new(ui::actions::Confirm), cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("recent-filter").is_some(),
+            "an unavailable row left the welcome screen"
+        );
+        assert!(workspace.read_with(&cx, |workspace, _| workspace
+            .repository_for_test()
+            .is_none()));
+
+        // The real repository still opens with Enter.
+        cx.update(|window, cx| window.dispatch_action(Box::new(ui::actions::SelectNext), cx));
+        cx.update(|window, cx| window.dispatch_action(Box::new(ui::actions::Confirm), cx));
+        cx.run_until_parked();
+        assert!(workspace.read_with(&cx, |workspace, _| workspace
+            .repository_for_test()
+            .is_some()));
     }
 }

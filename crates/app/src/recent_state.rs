@@ -2,8 +2,8 @@
 //! (available / checking / unavailable and why), which rows are selected, and
 //! the wording shared by the welcome list and the Activity card.
 
-// Not used outside the tests until the welcome list is wired to it (steps
-// B3 for row states and wording, B5a for the selection).
+// `RecentSelection` and a few helpers are not used outside the tests until
+// the removal UX (B5a) is wired to them.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
