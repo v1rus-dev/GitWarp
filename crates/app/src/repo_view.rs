@@ -820,12 +820,17 @@ impl RepositoryView {
         let name = repo_name(&path);
         let git_label = git_label(&git);
         let git_tooltip = git_tooltip(&git);
-        let action_view = cx.entity();
+        // The history is owned by this view, so its callbacks hold the view weakly: a
+        // strong handle would be a cycle and keep the view (with its watcher and fetch
+        // loop) alive after the window moved on to another repository or the welcome screen.
+        let action_view = cx.weak_entity();
         let on_history_action = Rc::new(
             move |action: RefAction, window: &mut Window, cx: &mut App| {
-                action_view.update(cx, |view, cx| {
-                    view.handle_history_action(action, window, cx);
-                });
+                action_view
+                    .update(cx, |view, cx| {
+                        view.handle_history_action(action, window, cx);
+                    })
+                    .ok();
             },
         );
         let history = cx.new(|cx| {
@@ -837,29 +842,38 @@ impl RepositoryView {
                 cx,
             )
         });
-        let sidebar_view = cx.entity();
+        let sidebar_view = cx.weak_entity();
         history.update(cx, |history, _| {
             history.set_sidebar_action_handler(Rc::new(move |action, window, cx| {
-                sidebar_view.update(cx, |view, cx| view.run_sidebar_action(action, window, cx));
+                sidebar_view
+                    .update(cx, |view, cx| view.run_sidebar_action(action, window, cx))
+                    .ok();
             }));
         });
-        let pr_view = cx.entity();
+        let pr_view = cx.weak_entity();
         history.update(cx, |history, _| {
             history.set_pr_click_handler(Rc::new(move |branch, position, window, cx| {
-                pr_view.update(cx, |view, cx| {
-                    view.open_pr_popover(&branch, position, window, cx)
-                });
+                pr_view
+                    .update(cx, |view, cx| {
+                        view.open_pr_popover(&branch, position, window, cx)
+                    })
+                    .ok();
             }));
         });
-        let service_view = cx.entity();
+        let service_view = cx.weak_entity();
         history.update(cx, |history, _| {
             // The History asks while it is itself being updated, so it hands
             // over its own HEAD and refs instead of being read back.
             history.set_pr_service(Rc::new(move |branch, head, refs, cx| {
-                let view = service_view.read(cx);
-                let targets = view.pr_targets_in(head, refs, cx);
-                let upstream = view.branch_upstream_remote_in(branch, refs);
-                pr_logic::default_target(&targets, upstream.as_deref()).map(|target| target.kind())
+                service_view
+                    .read_with(cx, |view, cx| {
+                        let targets = view.pr_targets_in(head, refs, cx);
+                        let upstream = view.branch_upstream_remote_in(branch, refs);
+                        pr_logic::default_target(&targets, upstream.as_deref())
+                            .map(|target| target.kind())
+                    })
+                    .ok()
+                    .flatten()
             }));
         });
         let history_events =
@@ -1265,7 +1279,7 @@ impl RepositoryView {
                         view.watcher = Some(watcher);
                     }
                     Err(error) => {
-                        log::warn!("file watcher not started, relying on window focus: {error:?}");
+                        log::warn!("file watcher not started, relying on window focus: {error}");
                     }
                 }
             })
@@ -10465,5 +10479,73 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(history.read_with(&cx, |h, _| h.commit_count()), 2);
         assert!(view.read_with(&cx, |view, _| view.watch_pending.is_empty()));
+    }
+
+    /// Only an open repository is watched and fetched: once its window shows the welcome
+    /// screen, the view (with its watcher, fetch loop and tasks) is dropped.
+    #[gpui::test]
+    fn a_repository_view_is_released_when_the_workspace_shows_welcome(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = crate::test_support::TempRepo::new("release-welcome");
+        commit(repo.path(), "a.txt", "one\n");
+        let (mut cx, workspace) =
+            crate::test_support::open_workspace(crate::test_support::git(), cx);
+        let path = repo.path().to_path_buf();
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_repository(path, window, cx)
+            });
+        });
+        cx.run_until_parked();
+        let weak = cx.update(|_, cx| {
+            workspace
+                .read(cx)
+                .repository_for_test()
+                .expect("the repository is open")
+                .downgrade()
+        });
+        assert!(weak.upgrade().is_some());
+
+        cx.update(|window, cx| workspace.update(cx, |ws, cx| ws.show_welcome(window, cx)));
+        cx.run_until_parked();
+        assert!(
+            weak.upgrade().is_none(),
+            "the repository view outlived the switch to Welcome"
+        );
+    }
+
+    /// Opening another repository in the same window drops the previous view too.
+    #[gpui::test]
+    fn a_repository_view_is_released_when_another_repository_opens(cx: &mut gpui::TestAppContext) {
+        let first = crate::test_support::TempRepo::new("release-first");
+        commit(first.path(), "a.txt", "one\n");
+        let second = crate::test_support::TempRepo::new("release-second");
+        commit(second.path(), "b.txt", "two\n");
+        let (mut cx, workspace) =
+            crate::test_support::open_workspace(crate::test_support::git(), cx);
+        let mut weak = None;
+        for path in [first.path(), second.path()] {
+            let path = path.to_path_buf();
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.open_repository(path, window, cx)
+                });
+            });
+            cx.run_until_parked();
+            if weak.is_none() {
+                weak = cx.update(|_, cx| {
+                    workspace
+                        .read(cx)
+                        .repository_for_test()
+                        .map(|view| view.downgrade())
+                });
+            }
+        }
+        let weak = weak.expect("the first view");
+        assert!(
+            weak.upgrade().is_none(),
+            "the first repository view outlived opening another repository"
+        );
     }
 }

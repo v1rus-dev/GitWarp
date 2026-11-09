@@ -3,9 +3,6 @@
 //! folders have to be watched ([`watch_plan`]). No GPUI and no real watcher here; the watcher
 //! itself is added in step S4 and its wiring into the repository view in S5.
 
-// Nothing calls this module yet: S5 (the view wiring) is its user.
-#![allow(dead_code)]
-
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::ops::{BitOr, BitOrAssign};
@@ -52,11 +49,6 @@ impl Kinds {
 
     pub fn intersects(self, other: Kinds) -> bool {
         self.0 & other.0 != 0
-    }
-
-    /// `self` without the bits of `other`.
-    pub fn without(self, other: Kinds) -> Kinds {
-        Kinds(self.0 & !other.0)
     }
 }
 
@@ -367,6 +359,15 @@ pub enum StartError {
     Other(String),
 }
 
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::Limit => f.write_str("OS watch limit reached"),
+            StartError::Other(reason) => f.write_str(reason),
+        }
+    }
+}
+
 /// A running watcher of one repository. Dropping it stops the watcher without blocking.
 pub struct RepoWatcher {
     // Held only for its Drop: it stops the debouncer thread and removes the OS watches.
@@ -377,7 +378,8 @@ pub struct RepoWatcher {
 impl RepoWatcher {
     /// Starts watching `layout` in [`Mode::Normal`], asking the `git` on `PATH` which top-level
     /// folders to skip on Linux. Blocks (the recursive watch walks the tree), so call it only
-    /// from a background thread.
+    /// from a background thread. The view uses [`RepoWatcher::start_in`] with the app's git.
+    #[cfg(test)]
     pub fn start(
         layout: &GitLayout,
         sink: impl FnMut(WatchSignal) + Send + 'static,
@@ -759,7 +761,6 @@ mod tests {
         assert!(k.contains(Kinds::HEAD));
         assert!(!k.contains(Kinds::INDEX));
         assert!(k.intersects(Kinds::REFS | Kinds::INDEX));
-        assert_eq!(k.without(Kinds::HEAD), Kinds::REFS);
         assert!(Kinds::NONE.is_empty());
         let mut m = Kinds::NONE;
         m |= Kinds::STASH;
