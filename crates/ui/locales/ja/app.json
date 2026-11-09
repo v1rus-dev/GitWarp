@@ -32,6 +32,7 @@
   "app.menu.zoom": "拡大/縮小",
   "app.update.apply_failed": "更新をインストールできませんでした: {reason}",
   "app.update.available": "GitWarp {version} が利用できます",
+  "app.update.brew": "GitWarp {version} が利用できます。次のコマンドで更新してください: brew upgrade --cask v1rus-dev/tap/gitwarp",
   "app.update.check_failed": "アップデートを確認できませんでした: {reason}",
   "app.update.ready": "GitWarp {version} をインストールする準備ができました",
   "app.update.restart": "再起動して更新",

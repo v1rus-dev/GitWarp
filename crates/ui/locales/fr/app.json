@@ -32,6 +32,7 @@
   "app.menu.zoom": "Agrandir",
   "app.update.apply_failed": "Impossible d’installer la mise à jour : {reason}",
   "app.update.available": "GitWarp {version} est disponible",
+  "app.update.brew": "GitWarp {version} est disponible. Mettez à jour avec : brew upgrade --cask v1rus-dev/tap/gitwarp",
   "app.update.check_failed": "Impossible de rechercher les mises à jour : {reason}",
   "app.update.ready": "GitWarp {version} est prêt à être installé",
   "app.update.restart": "Redémarrer pour mettre à jour",

@@ -64,6 +64,9 @@ download (the runtime is still downloaded and verified).
   from `packaging/macos/Info.plist`, `Contents/MacOS/gitwarp`,
   `Contents/Resources/gitwarp.icns`, `Contents/Resources/git/`, licences) and an
   `Applications` symlink.
+- `gitwarp-<ver>-macos-aarch64.zip` — `GitWarp.app/` (the same bundle as in the `.dmg`) made with
+  `ditto -c -k --sequesterRsrc --keepParent`, which keeps the ad-hoc signature, symlinks and
+  permissions. The in-app updater downloads and unpacks this file; the name is fixed in `updater.rs`.
 
 `macos/install.sh` is the one-line installer for macOS users (`curl ... | sh`, see the
 top-level README). It downloads the `.dmg` and `SHA256SUMS.txt` of the latest (or

@@ -395,6 +395,8 @@ fn show_update_toast(
     let shown_version = format!("v{version}");
     let ready = staged.is_some();
     let apply = staged.filter(|staged| updater::can_apply(staged.kind));
+    // Homebrew installs are updated by brew; nothing is staged for them.
+    let brew = !ready && updater::detect_install_kind() == updater::InstallKind::MacHomebrew;
     window
         .update(cx, |_, window, cx| {
             let action = match apply {
@@ -405,6 +407,8 @@ fn show_update_toast(
             };
             let text = if ready {
                 ui::t!("app.update.ready", version = shown_version)
+            } else if brew {
+                ui::t!("app.update.brew", version = shown_version)
             } else {
                 ui::t!("app.update.available", version = shown_version)
             };

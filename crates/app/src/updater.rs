@@ -80,13 +80,19 @@ pub fn detect_install_kind() -> InstallKind {
         local_app_data.as_deref(),
         has_uninstaller,
     );
-    // A Homebrew `.app` may be a symlink into the Caskroom.
     if kind == InstallKind::MacApp {
-        if let Ok(resolved) = fs::canonicalize(&exe) {
-            if resolved.to_string_lossy().contains("/Caskroom/") {
-                kind = InstallKind::MacHomebrew;
-            }
-        }
+        // A cask copies the app into /Applications; only the Caskroom folder
+        // of the cask shows that Homebrew manages this copy.
+        let caskroom_exists = MAC_CASKROOMS.iter().any(|dir| Path::new(dir).is_dir());
+        // A Homebrew `.app` may also be a symlink into the Caskroom.
+        let resolved = fs::canonicalize(&exe)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| exe_text.to_string());
+        kind = if classify_mac(&resolved, caskroom_exists) == InstallKind::MacHomebrew {
+            InstallKind::MacHomebrew
+        } else {
+            classify_mac(&exe_text, caskroom_exists)
+        };
     }
     // The release files are built for one architecture per platform.
     let arch = std::env::consts::ARCH;
@@ -102,6 +108,37 @@ pub fn detect_install_kind() -> InstallKind {
     } else {
         InstallKind::Unknown
     }
+}
+
+/// The folders Homebrew keeps the `gitwarp` cask in (Apple Silicon, Intel).
+const MAC_CASKROOMS: [&str; 2] = [
+    "/opt/homebrew/Caskroom/gitwarp",
+    "/usr/local/Caskroom/gitwarp",
+];
+
+/// Pure macOS classification of a path that contains `.app/Contents/MacOS`:
+/// Homebrew when it is inside a Caskroom, or when the cask's Caskroom folder
+/// exists and the bundle sits in `/Applications` (where casks copy it);
+/// otherwise a plain app.
+fn classify_mac(exe: &str, caskroom_exists: bool) -> InstallKind {
+    let path = exe.replace('\\', "/");
+    if path.contains("/Caskroom/") || (caskroom_exists && path.starts_with("/Applications/")) {
+        InstallKind::MacHomebrew
+    } else {
+        InstallKind::MacApp
+    }
+}
+
+/// The `.app` bundle that contains `path` (or is `path`): the nearest
+/// ancestor whose name ends in `.app`.
+fn mac_app_path(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|dir| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.len() > 4 && name.ends_with(".app"))
+        })
+        .map(Path::to_path_buf)
 }
 
 /// Pure classification, on path text so it can be tested on any OS.
@@ -122,11 +159,7 @@ fn classify(
     }
     let path = exe.replace('\\', "/");
     if path.contains(".app/Contents/MacOS") {
-        return if path.contains("/Caskroom/") {
-            InstallKind::MacHomebrew
-        } else {
-            InstallKind::MacApp
-        };
+        return classify_mac(&path, false);
     }
     let lower = path.to_ascii_lowercase();
     let windows_path = lower.as_bytes().get(1) == Some(&b':') || lower.starts_with("//");
@@ -463,6 +496,11 @@ fn can_apply_with(
     match kind {
         InstallKind::WindowsInstaller => exe_dir.is_some_and(writable),
         InstallKind::LinuxAppImage => appimage.and_then(Path::parent).is_some_and(writable),
+        // The folder that holds the bundle: the swap renames inside it.
+        InstallKind::MacApp => exe_dir
+            .and_then(mac_app_path)
+            .and_then(|app| app.parent().map(Path::to_path_buf))
+            .is_some_and(|dir| writable(&dir)),
         _ => false,
     }
 }
@@ -506,6 +544,12 @@ pub enum ApplyPlan {
         new_file: PathBuf,
         target: PathBuf,
         relaunch: bool,
+    },
+    /// A detached `/bin/sh` helper that waits for us to exit, unpacks the zip
+    /// next to the bundle, swaps it in (with rollback) and optionally opens it.
+    MacHelper {
+        program: &'static str,
+        args: Vec<String>,
     },
     /// This kind of installation cannot apply updates.
     Unsupported,
@@ -553,10 +597,57 @@ fn windows_script(pid: u32, installer: &Path, exe: &Path, relaunch: bool) -> Str
     script
 }
 
+/// Quotes `text` as a POSIX shell single-quoted string (`'` becomes `'\''`).
+fn sh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The helper's `sh` script: in the background, wait for process `pid` (at most
+/// 60 s; the update is skipped if it is still running), unpack `zip` into a
+/// fresh folder next to `app`, check the new executable, swap the bundles
+/// (rolling back when the second move fails) and, when `relaunch`, open `app`
+/// (also after a failed update, so the user is never left without the app).
+fn mac_script(pid: u32, zip: &Path, app: &Path, relaunch: bool) -> String {
+    let mut script = format!(
+        r#"set -u
+pid={pid}
+zip={zip}
+app={app}
+(
+  n=0
+  while kill -0 "$pid" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -gt 300 ]; then exit 0; fi
+    sleep 0.2
+  done
+  tmp=$(mktemp -d "$(dirname "$app")/.GitWarp-update.XXXXXX") || tmp=''
+  if [ -n "$tmp" ] && ditto -x -k "$zip" "$tmp" && [ -x "$tmp/GitWarp.app/Contents/MacOS/gitwarp" ]; then
+    rm -rf "$app.old"
+    if mv "$app" "$app.old"; then
+      if mv "$tmp/GitWarp.app" "$app"; then
+        rm -rf "$app.old"
+      else
+        mv "$app.old" "$app"
+      fi
+    fi
+  fi
+  if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
+"#,
+        zip = sh_quote(&zip.to_string_lossy()),
+        app = sh_quote(&app.to_string_lossy()),
+    );
+    if relaunch {
+        script.push_str("  open \"$app\"\n");
+    }
+    script.push_str(") &\nexit 0\n");
+    script
+}
+
 /// Decides what applying `staged` does. Pure: nothing is touched.
 ///
 /// * `pid`: this process (the helper waits for it to exit).
-/// * `exe`: the running executable (restarted by the Windows helper).
+/// * `exe`: the running executable (restarted by the Windows helper; its
+///   `.app` bundle is replaced on macOS).
 /// * `appimage`: the running AppImage file (Linux).
 pub fn plan(
     staged: &StagedUpdate,
@@ -591,6 +682,16 @@ pub fn plan(
                     relaunch,
                 }
             }
+            None => ApplyPlan::Unsupported,
+        },
+        InstallKind::MacApp => match mac_app_path(exe) {
+            Some(app) => ApplyPlan::MacHelper {
+                program: "/bin/sh",
+                args: vec![
+                    "-c".to_string(),
+                    mac_script(pid, &staged.path, &app, relaunch),
+                ],
+            },
             None => ApplyPlan::Unsupported,
         },
         _ => ApplyPlan::Unsupported,
@@ -654,12 +755,34 @@ fn spawn_helper(_program: &str, _args: &[String]) -> std::io::Result<()> {
     ))
 }
 
+#[cfg(target_os = "macos")]
+fn spawn_mac_helper(program: &str, args: &[String]) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    // The script backgrounds its own work, so it outlives this process.
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_mac_helper(_program: &str, _args: &[String]) -> std::io::Result<()> {
+    Err(std::io::Error::other("the macOS helper only runs on macOS"))
+}
+
 /// Carries out a plan. The caller quits the app afterwards.
 fn execute(plan: &ApplyPlan) -> Result<(), UpdateError> {
     match plan {
         ApplyPlan::WindowsHelper { program, args } => {
             log::info!("update: starting the installer helper");
             spawn_helper(program, args).map_err(io_error)
+        }
+        ApplyPlan::MacHelper { program, args } => {
+            log::info!("update: starting the macOS helper");
+            spawn_mac_helper(program, args).map_err(io_error)
         }
         ApplyPlan::LinuxReplace {
             source,
@@ -1164,6 +1287,166 @@ mod tests {
         // The probe gets the directory of the AppImage / the executable.
         assert!(can_apply_with(LinuxAppImage, None, Some(appimage), |p| p == dir));
         assert!(can_apply_with(WindowsInstaller, Some(dir), None, |p| p == dir));
+    }
+
+    #[test]
+    fn classify_mac_table() {
+        use InstallKind::*;
+        let cases = [
+            (
+                "/Applications/GitWarp.app/Contents/MacOS/gitwarp",
+                false,
+                MacApp,
+            ),
+            (
+                "/Applications/GitWarp.app/Contents/MacOS/gitwarp",
+                true,
+                MacHomebrew,
+            ),
+            (
+                "/Users/me/Applications/GitWarp.app/Contents/MacOS/gitwarp",
+                true,
+                MacApp,
+            ),
+            (
+                "/Users/me/Downloads/GitWarp.app/Contents/MacOS/gitwarp",
+                false,
+                MacApp,
+            ),
+            (
+                "/opt/homebrew/Caskroom/gitwarp/1.0/GitWarp.app/Contents/MacOS/gitwarp",
+                false,
+                MacHomebrew,
+            ),
+            (
+                "/usr/local/Caskroom/gitwarp/1.0/GitWarp.app/Contents/MacOS/gitwarp",
+                true,
+                MacHomebrew,
+            ),
+        ];
+        for (path, caskroom, expected) in cases {
+            assert_eq!(classify_mac(path, caskroom), expected, "{path} {caskroom}");
+        }
+    }
+
+    #[test]
+    fn mac_app_path_finds_the_bundle() {
+        let exe = Path::new("/Applications/GitWarp.app/Contents/MacOS/gitwarp");
+        assert_eq!(
+            mac_app_path(exe),
+            Some(PathBuf::from("/Applications/GitWarp.app"))
+        );
+        assert_eq!(
+            mac_app_path(exe.parent().unwrap()),
+            Some(PathBuf::from("/Applications/GitWarp.app"))
+        );
+        assert_eq!(mac_app_path(Path::new("/usr/bin/gitwarp")), None);
+        assert_eq!(mac_app_path(Path::new("/x/.app/gitwarp")), None);
+    }
+
+    #[test]
+    fn mac_app_can_apply_when_the_bundle_folder_is_writable() {
+        let macos = Path::new("/Applications/GitWarp.app/Contents/MacOS");
+        let apps = Path::new("/Applications");
+        let mac = InstallKind::MacApp;
+        assert!(can_apply_with(mac, Some(macos), None, |p| p == apps));
+        assert!(!can_apply_with(mac, Some(macos), None, |_| false));
+        assert!(!can_apply_with(
+            mac,
+            Some(Path::new("/opt/x")),
+            None,
+            |_| true
+        ));
+        assert!(!can_apply_with(mac, None, None, |_| true));
+        let brew = InstallKind::MacHomebrew;
+        assert!(!can_apply_with(brew, Some(macos), None, |_| true));
+    }
+
+    #[test]
+    fn sh_quote_escapes_single_quotes() {
+        assert_eq!(sh_quote("/a/b"), "'/a/b'");
+        assert_eq!(sh_quote("/My Apps/x"), "'/My Apps/x'");
+        assert_eq!(sh_quote("it's"), r"'it'\''s'");
+        assert_eq!(sh_quote("'; rm -rf /; '"), r"''\''; rm -rf /; '\'''");
+        assert_eq!(sh_quote("Ünï/日本"), "'Ünï/日本'");
+        assert_eq!(sh_quote(""), "''");
+    }
+
+    #[test]
+    fn mac_script_swaps_with_rollback_and_quotes_paths() {
+        let zip = Path::new("/cfg/updates/1.2.3/gitwarp-1.2.3-macos-aarch64.zip");
+        let app = Path::new("/Users/O'Brien/My Apps/GitWarp.app");
+        let script = mac_script(4242, zip, app, true);
+        assert!(script.starts_with("set -u\n"));
+        assert!(script.contains("pid=4242\n"));
+        assert!(script.contains("zip='/cfg/updates/1.2.3/gitwarp-1.2.3-macos-aarch64.zip'\n"));
+        assert!(script.contains(r"app='/Users/O'\''Brien/My Apps/GitWarp.app'"));
+        assert!(script.contains(r#"mv "$app.old" "$app""#));
+        assert!(script.contains(r#"mv "$tmp/GitWarp.app" "$app""#));
+        assert!(script.contains("ditto -x -k"));
+        assert!(script.contains("kill -0"));
+        assert!(!script.contains("eval"));
+        assert!(script.contains("  open \"$app\"\n"));
+        let no_relaunch = mac_script(1, zip, app, false);
+        assert!(!no_relaunch.contains("open "));
+        assert!(no_relaunch.ends_with(") &\nexit 0\n"));
+    }
+
+    #[test]
+    fn mac_script_parses_with_sh() {
+        let probe = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .status();
+        if !probe.is_ok_and(|status| status.success()) {
+            return; // no POSIX shell on this machine
+        }
+        for relaunch in [true, false] {
+            let script = mac_script(
+                7,
+                Path::new("/a b/it's.zip"),
+                Path::new("/Apps/Ünï 'x'/GitWarp.app"),
+                relaunch,
+            );
+            let status = std::process::Command::new("sh")
+                .arg("-n")
+                .arg("-c")
+                .arg(&script)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{script}");
+        }
+    }
+
+    #[test]
+    fn mac_plan_runs_the_script_with_sh() {
+        let exe = Path::new("/Applications/GitWarp.app/Contents/MacOS/gitwarp");
+        let zip = "/cfg/updates/1.2.3/gitwarp-1.2.3-macos-aarch64.zip";
+        let update = staged(InstallKind::MacApp, zip);
+        let ApplyPlan::MacHelper { program, args } = plan(&update, true, 99, exe, None) else {
+            panic!("expected a macOS helper");
+        };
+        assert_eq!(program, "/bin/sh");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "-c");
+        assert_eq!(
+            args[1],
+            mac_script(
+                99,
+                Path::new(zip),
+                Path::new("/Applications/GitWarp.app"),
+                true
+            )
+        );
+        // Homebrew copies are never updated by us; a path without a bundle has no plan.
+        assert_eq!(
+            plan(&staged(InstallKind::MacHomebrew, "/f"), true, 1, exe, None),
+            ApplyPlan::Unsupported
+        );
+        assert_eq!(
+            plan(&update, true, 1, Path::new("/x/gitwarp"), None),
+            ApplyPlan::Unsupported
+        );
     }
 
     #[test]
