@@ -108,9 +108,9 @@
   const chrome = () => {
     const nb = rec.filter(bad).length, cb = win.querySelector('#cbar'), h = win.querySelector('#hint');
     cb.hidden = !nb;
-    if (nb) cb.innerHTML = `${ic('warn', 14)}<span>${esc(plural(nb, '{n} repository is no longer available', '{n} repositories are no longer available'))}</span><span class="od-fill"></span><button class="btn btn-sm" id="conly">${onlyBad ? 'Show all' : 'Show only these'}</button><button class="btn btn-sm btn-danger" id="crm">${esc('Remove ' + nb)}</button>`;
+    if (nb) cb.innerHTML = `${ic('warn', 14)}<span>${esc(plural(nb, '{n} repository is no longer available', '{n} repositories are no longer available'))}</span><span class="od-fill"></span><button class="btn btn-sm" id="conly">${onlyBad ? 'Show all' : 'Show only these'}</button><button class="btn btn-sm" id="crm">${esc('Remove ' + nb + ' from list')}</button>`;
     if (!h.dataset.def) h.dataset.def = h.innerHTML;
-    h.innerHTML = S.size >= 2 ? `${S.size} selected · <button class="lnk" data-hrm>Remove ${S.size}</button> · <button class="lnk" data-hclr>Clear selection</button>` : h.dataset.def;
+    h.innerHTML = S.size >= 2 ? `${S.size} selected · <button class="lnk" data-hrm>Remove ${S.size} from list</button> · <button class="lnk" data-hclr>Clear selection</button>` : h.dataset.def;
   };
   const draw = () => {
     const v = view(), f = win.querySelector('#flt').value.trim(), top = list.scrollTop;
