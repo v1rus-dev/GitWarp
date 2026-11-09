@@ -26,6 +26,7 @@ mod history_view;
 mod host_key_dialog;
 mod hosting_status;
 mod init_flow;
+mod menu_bar;
 mod menu_model;
 mod merge_dialog;
 mod network_ops;
