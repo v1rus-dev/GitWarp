@@ -62,9 +62,11 @@ mod worktrees_model;
 mod worktrees_view;
 
 use gpui::{
-    prelude::*, px, size, App, Bounds, Global, KeyBinding, TitlebarOptions,
-    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
+    actions, prelude::*, px, size, App, Bounds, Global, KeyBinding, Menu, MenuItem,
+    TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
+
+actions!(app, [Quit]);
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -387,8 +389,18 @@ fn main() {
                 ui::actions::key_binding(cx, "secondary-z", welcome::UndoRemoval, Some("welcome")),
                 KeyBinding::new("shift-down", welcome::ExtendNext, Some("welcome")),
                 KeyBinding::new("shift-up", welcome::ExtendPrev, Some("welcome")),
+                // gpui has no default Cmd+Q, so quit must be bound explicitly.
+                ui::actions::key_binding(cx, "secondary-q", Quit, None),
             ];
             cx.bind_keys(shortcuts);
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            if cfg!(target_os = "macos") {
+                cx.set_menus([Menu {
+                    name: "GitWarp".into(),
+                    items: vec![MenuItem::action("Quit GitWarp", Quit)],
+                    disabled: false,
+                }]);
+            }
             // The search field's own keys (Shift+Enter, F3, Esc, ↓) live in
             // its key context.
             repo_view::bind_search_keys(cx);
