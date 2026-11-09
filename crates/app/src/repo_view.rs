@@ -3639,7 +3639,12 @@ impl RepositoryView {
                 Err(error) => {
                     window_handle
                         .update(cx, |_, window, cx| {
-                            toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+                            toast::show(
+                                ui::ToastKind::Error,
+                                ui::t!("history.refmenu.message_failed", error = error.to_string()),
+                                window,
+                                cx,
+                            );
                         })
                         .ok();
                 }

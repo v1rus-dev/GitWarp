@@ -961,7 +961,9 @@ impl MenuView {
                             index,
                             highlighted,
                             open: state.open_row == Some(index),
-                            ring: highlighted && self.keyboard,
+                            // Only the deepest active level shows the ring: a parent row keeps
+                            // its open fill while its submenu holds the focus.
+                            ring: highlighted && self.keyboard && level == self.active_level,
                             bounds: state.row_bounds.clone(),
                         },
                         colors,

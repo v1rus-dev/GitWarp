@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex};
 
 use gpui::prelude::*;
 use gpui::{
-    actions, canvas, container_query, div, px, uniform_list, AnyElement, App, AsyncApp, ClickEvent,
-    ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView, EventEmitter, FocusHandle,
-    FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render,
-    ScrollStrategy, SharedString, StyledText, Task, TextRun, TextStyle, UniformListScrollHandle,
-    WeakEntity, Window,
+    actions, canvas, container_query, div, point, px, uniform_list, AnyElement, App, AsyncApp,
+    Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Div, DragMoveEvent, EmptyView,
+    EventEmitter, FocusHandle, FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseUpEvent,
+    Pixels, Point, Render, ScrollStrategy, SharedString, StyledText, Task, TextRun, TextStyle,
+    UniformListScrollHandle, WeakEntity, Window,
 };
 
 use forge::ServiceKind;
@@ -145,7 +145,8 @@ actions!(
         PageDownCommits,
         PageUpCommits,
         CopyCommitHash,
-        CreateBranchHere
+        CreateBranchHere,
+        OpenRowMenu
     ]
 );
 
@@ -175,6 +176,9 @@ pub(crate) fn bind_history_keys(cx: &mut App, settings: &crate::settings::Settin
         ui::actions::key_binding(cx, "pageup", PageUpCommits, Some("history-list")),
         ui::actions::key_binding(cx, "secondary-c", CopyCommitHash, Some("history-list")),
         ui::actions::key_binding(cx, "b", CreateBranchHere, Some("history-list")),
+        // The keyboard route to the row's context menu (right-click has none).
+        ui::actions::key_binding(cx, "menu", OpenRowMenu, Some("history-list")),
+        ui::actions::key_binding(cx, "shift-f10", OpenRowMenu, Some("history-list")),
     ]);
 }
 
@@ -956,6 +960,9 @@ pub struct HistoryView {
     /// The virtualized list's scroll state, so a selection moved by the
     /// keyboard can be scrolled minimally into view.
     scroll: UniformListScrollHandle,
+    /// Where the selected row's graph cell was last painted: the row menu
+    /// opened from the keyboard anchors to it (left of the summary, below).
+    selected_cell: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     /// Whether the user picked a row themselves. Until then the selection
     /// follows the HEAD row as it arrives instead of staying on row 0.
     user_selected: bool,
@@ -1414,6 +1421,7 @@ impl HistoryView {
             hovered: None,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
+            selected_cell: Rc::default(),
             user_selected: false,
             pending_reveal: PendingReveal::default(),
             commit_graph_task: None,
@@ -2351,6 +2359,16 @@ impl HistoryView {
             on_sidebar: self.sidebar_action.clone(),
         };
         menu::open_context_menu(position, menu.entries(), window, cx);
+    }
+
+    /// Shift+F10 / the Menu key: the row menu of the selected row, anchored
+    /// below it, left of the summary cell. Nothing when the row is not drawn.
+    fn open_selected_row_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(index), Some(cell)) = (self.selected, self.selected_cell.get()) else {
+            return;
+        };
+        let position = point(cell.right() + px(COL_GAP), cell.bottom());
+        self.open_row_menu(index, position, window, cx);
     }
 
     /// Installs how the shell finds the service "Create pull request…" names
@@ -3564,6 +3582,7 @@ impl HistoryView {
         let badges = &self.badges;
         let hosting = self.hosting.clone();
         let badge_widths = &mut self.badge_widths;
+        let selected_cell = self.selected_cell.clone();
         let search_matches = &self.search_matches;
         range
             .map(|ix| {
@@ -3601,6 +3620,7 @@ impl HistoryView {
                 let stub = merged_from.is_some();
                 let row_theme = ui_theme.clone();
                 let row_geometry = geometry.clone();
+                let row_cell = selected_cell.clone();
                 let summary_ranges = fields.map(|f| f.summary.as_slice()).unwrap_or(&[]);
                 let author_ranges = fields.map(|f| f.author_name.as_slice()).unwrap_or(&[]);
 
@@ -3664,6 +3684,9 @@ impl HistoryView {
                         canvas(
                             |_, _, _| {},
                             move |bounds, _, window, _| {
+                                if selected {
+                                    row_cell.set(Some(bounds));
+                                }
                                 // Clip to the graph column so lanes past its
                                 // edge are cut instead of drawn over Summary.
                                 // The mask is 1 px taller at top and bottom so
@@ -4010,6 +4033,9 @@ impl HistoryView {
         .on_action(cx.listener(|view, _: &PageDownCommits, _, cx| view.page_selection(true, cx)))
         .on_action(cx.listener(|view, _: &PageUpCommits, _, cx| view.page_selection(false, cx)))
         .on_action(cx.listener(|view, _: &CopyCommitHash, _, cx| view.copy_selected_hash(cx)))
+        .on_action(cx.listener(|view, _: &OpenRowMenu, window, cx| {
+            view.open_selected_row_menu(window, cx);
+        }))
         .on_action(cx.listener(|view, _: &CreateBranchHere, window, cx| {
             view.create_branch_selected(window, cx);
         }));
@@ -6157,6 +6183,64 @@ mod tests {
                 0,
                 "the row menu stayed open after its item was clicked"
             );
+        });
+    }
+
+    /// Shift+F10 and the Menu key open the selected row's menu below the row
+    /// and left of the summary; the action closes it and the list keeps focus.
+    #[gpui::test]
+    fn shift_f10_opens_the_row_menu_and_focus_returns_to_the_list(cx: &mut gpui::TestAppContext) {
+        let repo = crate::test_support::TempRepo::new("history-row-menu-key");
+        commit(repo.path(), "a.txt", "A");
+        let b = commit(repo.path(), "b.txt", "B");
+        commit(repo.path(), "c.txt", "C");
+
+        let (mut cx, history) = open_history(&repo, cx);
+        history.update_in(&mut cx, |view, window, cx| {
+            window.focus(&view.focus, cx);
+            view.select_row(1, cx);
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("shift-f10");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(
+                ui::overlay::layer_count(window, cx),
+                1,
+                "Shift+F10 opened no menu"
+            );
+        });
+        // Menu key: closes with Escape, then opens again.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("menu");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(
+                ui::overlay::layer_count(window, cx),
+                1,
+                "the Menu key opened no menu"
+            );
+        });
+        // The commit has no ref: Up selects "Copy ›", Enter opens it, Enter copies.
+        cx.simulate_keystrokes("up enter enter");
+        // The overlay restores focus on the key-up of the Enter that closed it.
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").expect("a valid keystroke"),
+        });
+        cx.run_until_parked();
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some(b.as_str()));
+        cx.update(|window, cx| {
+            assert_eq!(ui::overlay::layer_count(window, cx), 0);
+        });
+        history.read_with(&cx, |view, _| {
+            assert_eq!(view.selected, Some(1));
+        });
+        cx.update(|window, cx| {
+            let focused = history.read(cx).focus.is_focused(window);
+            assert!(focused, "the list lost focus after the submenu action");
         });
     }
 
