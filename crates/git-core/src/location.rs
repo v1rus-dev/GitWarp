@@ -101,10 +101,10 @@ fn is_worktree_gitdir_shape(gitdir: &Path) -> bool {
         return false;
     };
     parent.file_name().is_some_and(|name| name == "worktrees")
-        && !parent
+        && parent
             .parent()
             .and_then(Path::file_name)
-            .is_some_and(|name| name == "modules")
+            .is_none_or(|name| name != "modules")
 }
 
 /// Resolves the `gitdir:` line of a `.git` pointer file's `text` against `path`
