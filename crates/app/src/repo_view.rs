@@ -667,7 +667,7 @@ fn follow_with_push(job: &Job, then_push: bool) -> bool {
 /// or remote-branch delete has no branch to pull.
 fn error_dialog_remedy(known: &KnownError, job: &Job) -> Option<bool> {
     match known {
-        KnownError::PushRejected => Some(matches!(job, Job::Push)),
+        KnownError::PushRejected => Some(matches!(job, Job::Push { branch: None })),
         KnownError::PullNotFastForward if matches!(job, Job::Pull) => Some(false),
         _ => None,
     }
@@ -1783,6 +1783,22 @@ impl RepositoryView {
                     cx,
                 );
             }
+            SidebarAction::PushBranch(branch) => {
+                // The checked-out branch goes through the toolbar's path
+                // (`None`) so a rejected push still offers "Pull, then push".
+                let is_head = matches!(
+                    self.history.read(cx).head(),
+                    Some(Head::Branch { name, .. }) if *name == branch
+                );
+                let branch = (!is_head).then_some(branch);
+                self.start_network_job(Job::Push { branch }, window, cx);
+            }
+            SidebarAction::Pull => self.pull_branch(window, cx),
+            SidebarAction::CreateTagAt(oid) => {
+                let card = self.card_for(oid, cx);
+                self.open_ref_dialog(RefDialogKind::CreateTag { card }, window, cx);
+            }
+            SidebarAction::CopyCommitMessage(oid) => self.copy_commit_message(oid, window, cx),
             SidebarAction::PushTag(tag) => {
                 let remote = self.default_remote_name();
                 self.start_network_job(Job::PushTag { remote, tag }, window, cx);
@@ -3118,6 +3134,9 @@ impl RepositoryView {
             Job::PushTag { tag, .. } => tag.clone(),
             Job::PushTags { .. } => ui::t!("network.push.subject_tags").to_string(),
             Job::DeleteRemoteBranch { branch, .. } => branch.clone(),
+            Job::Push {
+                branch: Some(branch),
+            } => branch.clone(),
             _ => match self.history.read(cx).head() {
                 Some(git_core::Head::Branch { name, .. }) => name.clone(),
                 _ => String::new(),
@@ -3574,12 +3593,53 @@ impl RepositoryView {
         );
     }
 
+    /// Copies `oid`'s full message; `CommitInfo` carries only the subject, so
+    /// the body is read in the background.
+    fn copy_commit_message(&mut self, oid: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let git = match &self.git {
+            Ok(git) => git.clone(),
+            Err(error) => {
+                toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+                return;
+            }
+        };
+        let root = self.root.clone();
+        let window_handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = Repo::open(git, &root)?;
+                    repo.commit_details(oid)
+                })
+                .await;
+            cx.update(|cx| match result {
+                Ok(details) => {
+                    let text = if details.body.is_empty() {
+                        details.summary
+                    } else {
+                        format!("{}\n\n{}", details.summary, details.body)
+                    };
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                Err(error) => {
+                    window_handle
+                        .update(cx, |_, window, cx| {
+                            toast::show(ui::ToastKind::Error, error.to_string(), window, cx);
+                        })
+                        .ok();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn pull_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.start_network_job(Job::Pull, window, cx);
     }
 
     pub(crate) fn push_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_network_job(Job::Push, window, cx);
+        self.start_network_job(Job::Push { branch: None }, window, cx);
     }
 
     /// Starts the sidebar's background load when the history first reports a
@@ -9532,7 +9592,7 @@ mod tests {
         assert!(follow_with_push(&Job::Pull, true));
         assert!(!follow_with_push(&Job::Pull, false));
         // Any later job, including a plain pull, must not inherit the intent.
-        assert!(!follow_with_push(&Job::Push, true));
+        assert!(!follow_with_push(&Job::Push { branch: None }, true));
         assert!(!follow_with_push(
             &Job::Fetch(FetchOptions::default()),
             true
@@ -9542,7 +9602,7 @@ mod tests {
     #[test]
     fn only_a_branch_push_offers_pull_then_push() {
         assert_eq!(
-            error_dialog_remedy(&KnownError::PushRejected, &Job::Push),
+            error_dialog_remedy(&KnownError::PushRejected, &Job::Push { branch: None }),
             Some(true)
         );
         for job in [
@@ -9569,7 +9629,7 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            error_dialog_remedy(&KnownError::PullNotFastForward, &Job::Push),
+            error_dialog_remedy(&KnownError::PullNotFastForward, &Job::Push { branch: None }),
             None
         );
         assert_eq!(

@@ -23,8 +23,11 @@ pub enum Job {
     Fetch(FetchOptions),
     /// Pull the current branch, fast-forward only.
     Pull,
-    /// Push the current branch; the first push creates its upstream.
-    Push,
+    /// Push `branch` (`None` = the current branch); the first push creates its
+    /// upstream.
+    Push {
+        branch: Option<String>,
+    },
     PushTag {
         remote: String,
         tag: String,
@@ -58,7 +61,7 @@ impl Job {
         match self {
             Job::Fetch(_) | Job::FetchPullRequest { .. } => ui::t!("network.verb.fetching"),
             Job::Pull => ui::t!("network.verb.pulling"),
-            Job::Push => ui::t!("network.verb.pushing"),
+            Job::Push { .. } => ui::t!("network.verb.pushing"),
             Job::PushTag { .. } | Job::PushTags { .. } => ui::t!("network.verb.pushing_tags"),
             Job::DeleteRemoteBranch { .. } => ui::t!("network.verb.deleting_remote_branch"),
             Job::UpdateSubmodule { .. } => ui::t!("network.verb.updating_submodule"),
@@ -79,7 +82,10 @@ impl Job {
                 ui::t!("network.done.up_to_date").to_string()
             }
             Job::Pull => ui::t!("network.done.pull").to_string(),
-            Job::Push => ui::t!("network.done.push").to_string(),
+            Job::Push { branch: None } => ui::t!("network.done.push").to_string(),
+            Job::Push {
+                branch: Some(branch),
+            } => ui::t!("network.done.push_branch", branch = branch).to_string(),
             Job::PushTag { tag, .. } => ui::t!("network.done.push_tag", tag = tag).to_string(),
             Job::PushTags { .. } => ui::t!("network.done.push_tags").to_string(),
             Job::DeleteRemoteBranch { branch, .. } => {
@@ -123,11 +129,16 @@ impl Job {
                     on_progress,
                 )
             }
-            Job::Push => {
-                let branch = current_branch(repo)?;
+            Job::Push { branch } => {
+                let branch = match branch {
+                    Some(branch) => branch.clone(),
+                    None => current_branch(repo)?,
+                };
                 let upstream = upstream(repo, &branch)?;
                 let (remote, refspec, set_upstream) = match upstream {
-                    Some((remote, upstream_branch)) => (remote, upstream_branch, false),
+                    Some((remote, upstream_branch)) => {
+                        (remote, branch_refspec(&branch, &upstream_branch), false)
+                    }
                     None => {
                         let Some(remote) = network::default_remote(repo)? else {
                             return Err(Error::Git {
@@ -168,6 +179,17 @@ impl Job {
                 remote, refspec, ..
             } => fetch_refspec(repo, remote, refspec, context, asker, cancel, on_progress),
         }
+    }
+}
+
+/// The refspec that pushes local `branch` to `upstream_branch`. A bare name
+/// means src = dst for git, so a branch tracking a differently named remote
+/// branch needs the explicit `src:dst` form or it would push the wrong ref.
+fn branch_refspec(branch: &str, upstream_branch: &str) -> String {
+    if branch == upstream_branch {
+        upstream_branch.to_owned()
+    } else {
+        format!("{branch}:{upstream_branch}")
     }
 }
 
@@ -215,13 +237,16 @@ pub fn job_remote_uses(
             direction,
         }]
     };
-    let upstream_remote = || {
-        let Some(git_core::Head::Branch { name, .. }) = head else {
-            return None;
+    // The remote `branch` tracks; `None` means the checked-out branch.
+    let upstream_remote = |branch: Option<&str>| {
+        let name = match (branch, head) {
+            (Some(name), _) => name,
+            (None, Some(git_core::Head::Branch { name, .. })) => name.as_str(),
+            (None, _) => return None,
         };
         refs?
             .iter()
-            .find(|r| r.kind == git_core::RefKind::LocalBranch && r.name == *name)?
+            .find(|r| r.kind == git_core::RefKind::LocalBranch && r.name == name)?
             .upstream
             .as_deref()?
             .split_once('/')
@@ -238,12 +263,12 @@ pub fn job_remote_uses(
                 })
                 .collect(),
         },
-        Job::Pull => upstream_remote()
+        Job::Pull => upstream_remote(None)
             .map(|remote| one(&remote, Direction::Fetch))
             .unwrap_or_default(),
-        Job::Push => {
+        Job::Push { branch } => {
             // Without an upstream the push goes to `origin`, else the first.
-            let remote = upstream_remote().or_else(|| {
+            let remote = upstream_remote(branch.as_deref()).or_else(|| {
                 remotes
                     .iter()
                     .find(|remote| remote.as_str() == "origin")
@@ -680,15 +705,19 @@ mod tests {
         assert!(uses_of(&Job::Pull, None, &["origin"]).is_empty());
         // Push: the upstream's remote, else origin, else the first remote.
         assert_eq!(
-            uses_of(&Job::Push, Some("up/main"), &["origin", "up"]),
+            uses_of(
+                &Job::Push { branch: None },
+                Some("up/main"),
+                &["origin", "up"]
+            ),
             [("up".to_owned(), Direction::Push)]
         );
         assert_eq!(
-            uses_of(&Job::Push, None, &["up", "origin"]),
+            uses_of(&Job::Push { branch: None }, None, &["up", "origin"]),
             [("origin".to_owned(), Direction::Push)]
         );
         assert_eq!(
-            uses_of(&Job::Push, None, &["up", "other"]),
+            uses_of(&Job::Push { branch: None }, None, &["up", "other"]),
             [("up".to_owned(), Direction::Push)]
         );
         let tags = Job::PushTags {
@@ -700,6 +729,39 @@ mod tests {
         );
         let sub = Job::UpdateSubmodule { path: "x".into() };
         assert!(uses_of(&sub, None, &["origin"]).is_empty());
+    }
+
+    #[test]
+    fn pushing_a_non_current_branch_uses_that_branchs_upstream() {
+        let head = git_core::Head::Branch {
+            name: "main".to_owned(),
+            target: None,
+        };
+        let refs = [
+            local("main", Some("origin/main")),
+            local("feat", Some("up/feat")),
+            local("loose", None),
+        ];
+        let remotes = ["up".to_owned(), "origin".to_owned()];
+        let uses = |branch: &str| {
+            let job = Job::Push {
+                branch: Some(branch.to_owned()),
+            };
+            job_remote_uses(&job, Some(&head), Some(&refs), &remotes)
+                .into_iter()
+                .map(|u| (u.remote, u.direction))
+                .collect::<Vec<_>>()
+        };
+        // `feat` tracks `up`, not the checked-out branch's `origin`.
+        assert_eq!(uses("feat"), [("up".to_owned(), Direction::Push)]);
+        // No upstream: the default remote, as for the current branch.
+        assert_eq!(uses("loose"), [("origin".to_owned(), Direction::Push)]);
+    }
+
+    #[test]
+    fn push_refspec_is_explicit_only_when_the_names_differ() {
+        assert_eq!(branch_refspec("main", "main"), "main");
+        assert_eq!(branch_refspec("feat", "feature-x"), "feat:feature-x");
     }
 
     #[test]

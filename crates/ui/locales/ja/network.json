@@ -5,6 +5,7 @@
   "network.done.fetch": "フェッチが完了しました",
   "network.done.pull": "プルが完了しました",
   "network.done.push": "現在のブランチをプッシュしました",
+  "network.done.push_branch": "{branch} をプッシュしました",
   "network.done.push_tag": "タグ {tag} をプッシュしました",
   "network.done.push_tags": "すべてのタグをプッシュしました",
   "network.done.up_to_date": "既に最新です",

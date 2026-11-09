@@ -5,6 +5,7 @@
   "network.done.fetch": "Récupération terminée",
   "network.done.pull": "Tirage terminé",
   "network.done.push": "Branche actuelle poussée",
+  "network.done.push_branch": "Branche {branch} poussée",
   "network.done.push_tag": "Étiquette {tag} poussée",
   "network.done.push_tags": "Toutes les étiquettes ont été poussées",
   "network.done.up_to_date": "Déjà à jour",

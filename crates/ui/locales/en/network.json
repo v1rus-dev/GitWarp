@@ -5,6 +5,7 @@
   "network.done.fetch": "Fetch complete",
   "network.done.pull": "Pull complete",
   "network.done.push": "Pushed the current branch",
+  "network.done.push_branch": "Pushed {branch}",
   "network.done.push_tag": "Pushed tag {tag}",
   "network.done.push_tags": "Pushed all tags",
   "network.done.up_to_date": "Already up to date",
