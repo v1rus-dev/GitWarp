@@ -1,4 +1,10 @@
 {
+  "dialogs.about.close": "Close",
+  "dialogs.about.copied": "Copied",
+  "dialogs.about.copy": "Copy details",
+  "dialogs.about.legal": "Legal",
+  "dialogs.about.title": "About GitWarp",
+  "dialogs.about.version": "Version {version}",
   "dialogs.account_picker.detail": "@{login} · {method}",
   "dialogs.account_picker.fallback_title": "Account",
   "dialogs.account_picker.help": "Remembered for this repository. Change it later from the remote’s menu: Account…",

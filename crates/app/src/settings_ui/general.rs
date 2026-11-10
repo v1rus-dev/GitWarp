@@ -146,6 +146,20 @@ pub(super) fn render(
         )
     };
 
+    let auto_install_switch = {
+        let entity = cx.entity();
+        form::switch(
+            "settings-auto-install".into(),
+            settings.auto_install_updates,
+            !settings.check_updates,
+            move |checked, _, cx| {
+                entity.update(cx, |view, cx| {
+                    view.change(cx, |settings| settings.auto_install_updates = checked);
+                });
+            },
+        )
+    };
+
     let fetch_switch = {
         let entity = cx.entity();
         form::switch(
@@ -213,6 +227,13 @@ pub(super) fn render(
                     ui::t!("settings.general.channel.desc_off")
                 },
                 channel,
+                !settings.check_updates,
+            ),
+            form::row(
+                "settings-auto-install-row",
+                ui::t!("settings.general.auto_install.title"),
+                ui::t!("settings.general.auto_install.desc"),
+                auto_install_switch,
                 !settings.check_updates,
             ),
         ],

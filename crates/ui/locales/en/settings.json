@@ -213,6 +213,8 @@
   "settings.form.increase": "Increase",
   "settings.general.activity.desc": "The commit heatmap on the Welcome screen and above History. Hiding it does not delete any data.",
   "settings.general.activity.title": "Show activity statistics",
+  "settings.general.auto_install.desc": "A downloaded update is installed when you quit the app.",
+  "settings.general.auto_install.title": "Install updates when GitWarp quits",
   "settings.general.channel.beta": "Beta",
   "settings.general.channel.desc_off": "Turn on update checks to pick a channel.",
   "settings.general.channel.desc_on": "Beta also notifies about pre-release builds, which may contain regressions.",

@@ -880,3 +880,137 @@ fn list_releases_decodes_and_sends_github_headers() {
         .header("/repos/o/r/releases", "authorization")
         .is_none());
 }
+
+#[test]
+fn releases_decode_assets_and_default_to_none() {
+    let stub = Stub::start(vec![(
+        "/repos/o/r/releases?per_page=100",
+        ok(r#"[
+            {"tag_name":"v1.0.0","prerelease":false,"draft":false,"assets":[
+                {"name":"a.zip","size":12,"browser_download_url":"https://example.test/a.zip","id":3}
+            ]},
+            {"tag_name":"v0.9.0","prerelease":false,"draft":false}
+        ]"#),
+    )]);
+    let releases = Client::for_tests()
+        .list_releases_at(&stub.base, "o", "r")
+        .unwrap();
+    assert_eq!(releases[0].assets.len(), 1);
+    assert_eq!(releases[0].assets[0].name, "a.zip");
+    assert_eq!(releases[0].assets[0].size, 12);
+    assert_eq!(
+        releases[0].assets[0].browser_download_url,
+        "https://example.test/a.zip"
+    );
+    assert!(releases[1].assets.is_empty());
+}
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("gitwarp-forge-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+#[test]
+fn download_writes_the_file_reports_progress_and_removes_the_part_file() {
+    let stub = Stub::start(vec![("/file.bin", ok("hello world"))]);
+    let dir = temp_dir("dl-ok");
+    let dest = dir.join("sub").join("file.bin");
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut calls = Vec::new();
+    Client::for_tests()
+        .download_inner(
+            &format!("{}/file.bin", stub.base),
+            &dest,
+            |done, total| calls.push((done, total)),
+            &cancel,
+            true,
+        )
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "hello world");
+    assert!(!dir.join("sub").join("file.bin.part").exists());
+    assert_eq!(calls.last(), Some(&(11, Some(11))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn download_rejects_plain_http_and_maps_missing_files() {
+    let stub = Stub::start(vec![]);
+    let dir = temp_dir("dl-reject");
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let url = format!("{}/file.bin", stub.base);
+    let dest = dir.join("file.bin");
+    let err = Client::for_tests()
+        .download(&url, &dest, |_, _| {}, &cancel)
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Rejected(_)), "{err:?}");
+    assert!(stub.seen.lock().unwrap().is_empty());
+    let err = Client::for_tests()
+        .download_inner(&url, &dest, |_, _| {}, &cancel, true)
+        .unwrap_err();
+    assert_eq!(err, ApiError::NotFound);
+    assert!(!dest.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn download_honours_cancel_and_leaves_nothing_behind() {
+    let body: &'static str = Box::leak("x".repeat(300 * 1024).into_boxed_str());
+    let stub = Stub::start(vec![("/big.bin", ok(body))]);
+    let dir = temp_dir("dl-cancel");
+    let dest = dir.join("big.bin");
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let err = Client::for_tests()
+        .download_inner(
+            &format!("{}/big.bin", stub.base),
+            &dest,
+            |done, _| {
+                if done > 0 {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+            &cancel,
+            true,
+        )
+        .unwrap_err();
+    assert_eq!(err, ApiError::Unreachable("download cancelled".to_string()));
+    assert!(!dest.exists());
+    assert!(!dir.join("big.bin.part").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn download_follows_redirects_and_rejects_a_redirect_to_plain_http() {
+    let stub = Stub::start(vec![
+        ("/old", (302, vec![("Location", "{base}/new")], "")),
+        ("/new", ok("moved")),
+        (
+            "/bad",
+            (302, vec![("Location", "ftp://example.test/x")], ""),
+        ),
+    ]);
+    let dir = temp_dir("dl-redirect");
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let dest = dir.join("f");
+    Client::for_tests()
+        .download_inner(
+            &format!("{}/old", stub.base),
+            &dest,
+            |_, _| {},
+            &cancel,
+            true,
+        )
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "moved");
+    let err = Client::for_tests()
+        .download_inner(
+            &format!("{}/bad", stub.base),
+            &dir.join("g"),
+            |_, _| {},
+            &cancel,
+            true,
+        )
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Rejected(_)), "{err:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -16,9 +16,9 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, canvas, div, point, px, size, App, AppContext, Bounds, Context, CursorStyle,
     Decorations, Div, Entity, HitboxBehavior, InteractiveElement, IntoElement, MouseButton,
-    MouseMoveEvent, ParentElement, Pixels, Point, Render, ResizeEdge, SharedString, Styled,
-    Subscription, Task, Tiling, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowDecorations, WindowOptions,
+    MouseMoveEvent, ParentElement, Pixels, Point, Render, RenderOnce, ResizeEdge, SharedString,
+    Styled, Subscription, Task, Tiling, TitlebarOptions, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowDecorations, WindowOptions,
 };
 
 use git_core::{Error, Git, GitChoice};
@@ -45,7 +45,16 @@ actions!(
         OpenRepositoryDialog,
         OpenCloneDialog,
         OpenSettings,
-        OpenGitSettings
+        ShowAbout,
+        ShowKeyboardShortcuts,
+        OpenReleaseNotes,
+        OpenIssueTracker,
+        CheckForUpdates,
+        OpenGitSettings,
+        CloseWindow,
+        MinimizeWindow,
+        ZoomWindow,
+        CloseRepository
     ]
 );
 
@@ -457,6 +466,12 @@ impl Workspace {
     }
 
     /// Runs `f` on the open repository, if there is one.
+    /// Whether a repository (not the welcome screen) is shown; the menu bar
+    /// greys out File > Close Repository otherwise.
+    pub(crate) fn shows_repository(&self) -> bool {
+        matches!(self.content, Content::Repository(_))
+    }
+
     fn with_repository<R>(
         &self,
         cx: &mut App,
@@ -551,38 +566,68 @@ pub fn titlebar_fill() -> Div {
         })
 }
 
-/// Whether the toolbar itself ends with the minimise/maximise/close buttons.
-///
-/// Only Linux client-side decorations put them there. Windows draws no native
-/// title bar either, but its buttons live in the dedicated [`title_strip`] above
-/// the toolbar, so the toolbar gets none; `window_decorations()` reports `Server`
-/// on Windows, so the check below already excludes it. macOS also reports `Server`
-/// (gpui's `PlatformWindow::window_decorations` default, not overridden by the macOS
-/// backend), and the native traffic lights cover that case.
+/// Whether the dedicated top strip (menu bar, title, window buttons) exists on
+/// a platform. Windows and Linux have it; macOS has the native menu bar and
+/// traffic lights instead.
+fn strip_shown(windows: bool, linux: bool) -> bool {
+    windows || linux
+}
+
+/// Whether the toolbar itself ends with the minimise/maximise/close buttons:
+/// only with client-side decorations and no strip, which holds the buttons
+/// whenever it is shown. macOS reports `Server` decorations (the native
+/// traffic lights cover it), as does Windows.
+fn toolbar_has_controls(client: bool, strip: bool) -> bool {
+    client && !strip
+}
+
+/// Whether the strip carries the window buttons: Windows always (no native
+/// title bar), Linux only with client-side decorations (otherwise the
+/// compositor draws its own).
+fn strip_has_controls(windows: bool, client: bool) -> bool {
+    windows || client
+}
+
+/// Whether the toolbar itself ends with the window buttons.
 pub fn inline_window_controls(window: &Window) -> bool {
-    matches!(window.window_decorations(), Decorations::Client { .. })
+    let client = matches!(window.window_decorations(), Decorations::Client { .. });
+    toolbar_has_controls(client, uses_title_strip())
 }
 
-/// Whether to show the dedicated drag strip above the toolbar.
+/// Whether to show the dedicated top strip above the toolbar.
 ///
-/// Windows has no native title bar and the toolbar is too packed to grab, so a
-/// slim strip (like Fork's) gives a wide drag area and holds the window buttons.
+/// It holds the menu bar and gives a wide drag area (the toolbar is too packed
+/// to grab), like Fork's.
 pub fn uses_title_strip() -> bool {
-    cfg!(target_os = "windows")
+    strip_shown(
+        cfg!(target_os = "windows"),
+        cfg!(any(target_os = "linux", target_os = "freebsd")),
+    )
 }
 
-/// The height of the Windows drag strip.
+/// The height of the top strip.
 const STRIP: Pixels = px(30.);
 
-/// The slim drag strip shown above the toolbar on Windows: a wide
-/// `WindowControlArea::Drag` region with the window buttons at its right end and
-/// the window title centred between them. Call it only when [`uses_title_strip`]
-/// is true.
+/// The window buttons at the strip's right end, when the platform wants them.
+#[derive(IntoElement)]
+struct StripControls;
+
+impl RenderOnce for StripControls {
+    fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let client = matches!(window.window_decorations(), Decorations::Client { .. });
+        div().flex_none().h_full().when(
+            strip_has_controls(cfg!(target_os = "windows"), client),
+            |d| d.child(WindowControls::new("window-controls").height(STRIP)),
+        )
+    }
+}
+
+/// The slim strip shown above the toolbar on Windows and Linux: the menu bar at
+/// the left, the window title centred in the draggable stretch after it, the
+/// window buttons at the right end. Call it only when [`uses_title_strip`] is
+/// true.
 pub fn title_strip(title: SharedString, cx: &App) -> Div {
     let colors = cx.theme().colors;
-    // A left spacer the width of the controls (8px margin + 3×32px) keeps the
-    // title centred over the window rather than over the drag region alone.
-    let controls_w = px(8. + 3. * 32.);
     div()
         .h(STRIP)
         .w_full()
@@ -592,27 +637,17 @@ pub fn title_strip(title: SharedString, cx: &App) -> Div {
         .bg(colors.bg)
         .border_b_1()
         .border_color(colors.border)
+        .child(crate::menu_bar::MenuBar)
         .child(
-            div()
-                .w(controls_w)
-                .h_full()
-                .flex_none()
-                .window_control_area(WindowControlArea::Drag),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
+            titlebar_fill()
                 .flex()
                 .items_center()
                 .justify_center()
-                .window_control_area(WindowControlArea::Drag)
                 .text_size(FS_BASE)
                 .text_color(colors.muted)
                 .child(div().truncate().child(title)),
         )
-        .child(WindowControls::new("window-controls").height(STRIP))
+        .child(StripControls)
 }
 
 /// Appends the window controls when the toolbar draws its own title bar end
@@ -814,8 +849,37 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.open_settings(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ShowAbout, window, cx| {
+                crate::about_dialog::open(git_label(&this.git), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShowKeyboardShortcuts, window, cx| {
+                this.open_settings_at(Page::Keybindings, window, cx);
+            }))
+            .on_action(cx.listener(|_, _: &OpenReleaseNotes, _, cx| {
+                cx.open_url(&crate::update_check::release_notes_url());
+            }))
+            .on_action(cx.listener(|_, _: &OpenIssueTracker, _, cx| {
+                cx.open_url(&crate::update_check::issue_tracker_url());
+            }))
+            .on_action(cx.listener(|_, _: &CheckForUpdates, window, cx| {
+                crate::update_check::check_now(window.window_handle(), cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenGitSettings, window, cx| {
                 this.open_settings_at(Page::Git, window, cx);
+            }))
+            .on_action(cx.listener(|_, _: &CloseWindow, window, _| {
+                window.remove_window();
+            }))
+            .on_action(cx.listener(|_, _: &MinimizeWindow, window, _| {
+                window.minimize_window();
+            }))
+            .on_action(cx.listener(|_, _: &ZoomWindow, window, _| {
+                window.zoom_window();
+            }))
+            .on_action(cx.listener(|this, _: &CloseRepository, window, cx| {
+                if matches!(this.content, Content::Repository(_)) {
+                    this.show_welcome(window, cx);
+                }
             }));
 
         ui::focus::track_pointer(ui::actions::tab_navigation(root))
@@ -935,6 +999,35 @@ pub fn repo_name(path: &Path) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_exists_on_windows_and_linux_only() {
+        assert!(strip_shown(true, false));
+        assert!(strip_shown(false, true));
+        assert!(!strip_shown(false, false));
+    }
+
+    #[test]
+    fn window_buttons_live_in_exactly_one_place() {
+        // (windows, linux, mac) x client decorations
+        for (windows, linux) in [(true, false), (false, true), (false, false)] {
+            for client in [false, true] {
+                let strip = strip_shown(windows, linux);
+                let in_strip = strip && strip_has_controls(windows, client);
+                let in_toolbar = toolbar_has_controls(client, strip);
+                assert!(!(in_strip && in_toolbar), "{windows} {linux} {client}");
+            }
+        }
+        // Linux with client decorations: buttons in the strip, none in the toolbar.
+        assert!(strip_has_controls(false, true));
+        assert!(!toolbar_has_controls(true, true));
+        // Linux with server decorations: the compositor draws them.
+        assert!(!strip_has_controls(false, false));
+        // Windows reports server decorations but still needs its own buttons.
+        assert!(strip_has_controls(true, false));
+        // macOS: no strip, native lights, nothing inline.
+        assert!(!toolbar_has_controls(false, false));
+    }
     use gpui::{px, size};
 
     #[test]

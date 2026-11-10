@@ -215,6 +215,8 @@
   "settings.form.increase": "Увеличить",
   "settings.general.activity.desc": "Тепловая карта коммитов на экране приветствия и над историей. Скрытие не удаляет никаких данных.",
   "settings.general.activity.title": "Показывать статистику активности",
+  "settings.general.auto_install.desc": "Загруженное обновление устанавливается при выходе из GitWarp.",
+  "settings.general.auto_install.title": "Устанавливать обновления при выходе",
   "settings.general.channel.beta": "Бета",
   "settings.general.channel.desc_off": "Включите проверку обновлений, чтобы выбрать канал.",
   "settings.general.channel.desc_on": "Бета также сообщает о пререлизных сборках, в них возможны регрессии.",

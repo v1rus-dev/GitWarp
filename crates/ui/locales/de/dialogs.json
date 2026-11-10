@@ -1,4 +1,10 @@
 {
+  "dialogs.about.close": "Schließen",
+  "dialogs.about.copied": "Kopiert",
+  "dialogs.about.copy": "Details kopieren",
+  "dialogs.about.legal": "Rechtliches",
+  "dialogs.about.title": "Über GitWarp",
+  "dialogs.about.version": "Version {version}",
   "dialogs.account_picker.detail": "@{login} · {method}",
   "dialogs.account_picker.fallback_title": "Konto",
   "dialogs.account_picker.help": "Wird für dieses Repository gemerkt. Später im Menü des Remotes ändern: Konto…",

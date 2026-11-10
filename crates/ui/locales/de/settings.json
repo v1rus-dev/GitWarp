@@ -213,6 +213,8 @@
   "settings.form.increase": "Erhöhen",
   "settings.general.activity.desc": "Die Commit-Heatmap auf dem Startbildschirm und über dem Verlauf. Das Ausblenden löscht keine Daten.",
   "settings.general.activity.title": "Aktivitätsstatistik anzeigen",
+  "settings.general.auto_install.desc": "Ein heruntergeladenes Update wird beim Beenden von GitWarp installiert.",
+  "settings.general.auto_install.title": "Updates beim Beenden installieren",
   "settings.general.channel.beta": "Beta",
   "settings.general.channel.desc_off": "Aktiviere die Update-Prüfung, um einen Kanal zu wählen.",
   "settings.general.channel.desc_on": "Beta meldet auch Vorabversionen, die Regressionen enthalten können.",

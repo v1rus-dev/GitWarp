@@ -296,6 +296,14 @@ case "$os" in
         rm -f "$archive"
         hdiutil create -volname "GitWarp" -srcfolder "$dmg_stage" -format UDZO -ov "$archive" >/dev/null
         artifacts+=("$archive")
+
+        # The in-app updater downloads this zip. ditto (not zip) keeps the ad-hoc signature,
+        # symlinks, permissions and extended attributes; the top-level entry is GitWarp.app/.
+        zip_archive="$out_dir/$name.zip"
+        rm -f "$zip_archive"
+        ditto -c -k --sequesterRsrc --keepParent "$app" "$zip_archive"
+        [ -f "$zip_archive" ] || die "ditto did not produce $zip_archive"
+        artifacts+=("$zip_archive")
         ;;
 esac
 
