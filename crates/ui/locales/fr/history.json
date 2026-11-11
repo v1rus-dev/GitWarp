@@ -111,5 +111,12 @@
   "history.strip.incomplete": "L’historique est incomplet",
   "history.strip.generic": "L’historique est incomplet : {message}",
   "history.branch_bar.with_merges": "{commits} · {merges}",
-  "history.load.with_folded": "{loading} · {folded}"
+  "history.load.with_folded": "{loading} · {folded}",
+  "history.checkout_confirm.body_branch": "Votre copie de travail basculera sur la branche « {name} ».",
+  "history.checkout_confirm.body_commit": "HEAD sera détaché au commit {name}. Vous pourrez ensuite créer une branche à partir de celui-ci.",
+  "history.checkout_confirm.body_remote": "« {name} » sera extraite comme branche locale qui la suit ; si cette branche locale existe déjà, on bascule dessus et elle est mise à jour.",
+  "history.checkout_confirm.confirm_switch": "Basculer",
+  "history.checkout_confirm.confirm_checkout": "Extraire",
+  "history.checkout_confirm.body_tag": "HEAD sera détaché au tag « {name} ».",
+  "history.checkout_confirm.body_pr": "La pull request #{number} sera récupérée dans la branche locale « {name} » puis extraite."
 }

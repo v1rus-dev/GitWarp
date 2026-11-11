@@ -111,5 +111,12 @@
   "history.strip.incomplete": "El historial está incompleto",
   "history.strip.generic": "El historial está incompleto: {message}",
   "history.branch_bar.with_merges": "{commits} · {merges}",
-  "history.load.with_folded": "{loading} · {folded}"
+  "history.load.with_folded": "{loading} · {folded}",
+  "history.checkout_confirm.body_branch": "Tu copia de trabajo cambiará a la rama «{name}».",
+  "history.checkout_confirm.body_commit": "HEAD quedará desacoplado en el commit {name}. Después podrás crear una rama a partir de él.",
+  "history.checkout_confirm.body_remote": "«{name}» se obtendrá como una rama local que la sigue; si esa rama local ya existe, se cambiará a ella y se actualizará.",
+  "history.checkout_confirm.confirm_switch": "Cambiar",
+  "history.checkout_confirm.confirm_checkout": "Cambiar a",
+  "history.checkout_confirm.body_tag": "HEAD quedará desacoplado en la etiqueta «{name}».",
+  "history.checkout_confirm.body_pr": "La pull request #{number} se descargará en la rama local «{name}» y se cambiará a ella."
 }
