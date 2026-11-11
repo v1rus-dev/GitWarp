@@ -10,11 +10,19 @@
 
 ## Cutting a release
 
-1. Merge everything for the release into `main`.
-2. On an up-to-date, clean `main` run `scripts/release.sh 0.2.0`. It bumps `[workspace.package] version`, refreshes
-   `Cargo.lock`, commits `Release v0.2.0` and creates the annotated tag `v0.2.0`. It never pushes.
-3. Push the commit and the tag with the command the script prints: `git push origin main v0.2.0`.
-4. Watch Actions -> Release. When all jobs are green, the GitHub Release `GitWarp 0.2.0` appears with three archives
+`main` is protected (pull requests only, required checks), so a release goes through a PR.
+
+1. Merge everything for the release into `develop`.
+2. On an up-to-date, clean `develop` run `scripts/release.sh 0.2.0` (add `--dry-run` to only run the checks and
+   print the steps). It creates `release/v0.2.0`, bumps `[workspace.package] version`, refreshes `Cargo.lock`,
+   commits `Release v0.2.0`, pushes the branch, opens a PR into `main` and enables auto-merge, then returns to
+   `develop`. It never tags and never touches `main` locally. `develop` must already contain `main`.
+3. The PR merges automatically once the required checks are green (if auto-merge is disabled in the repo settings,
+   the script warns and you merge the PR manually).
+4. The merge triggers `.github/workflows/tag-release.yml`: it creates the annotated tag `v0.2.0` on the merge
+   commit, starts the Release workflow on that tag, and opens a PR `main -> develop` with the bump. Merge that PR
+   afterwards so `develop` gets the release commit (CI does not run on that PR; it runs on push after the merge).
+5. Watch Actions -> Release. When all jobs are green, the GitHub Release `GitWarp 0.2.0` appears with three archives
    (Linux, Windows, macOS) and `SHA256SUMS.txt`.
 
 The workflow fails if the tag does not match the version in `Cargo.toml`.
@@ -35,15 +43,25 @@ workflow artifacts; no GitHub Release is created. The same dry run starts on its
 
 ## When a release job fails
 
-Nothing is published until every build job succeeds. Delete the tag locally and on origin, fix the problem on `main`,
-and cut the release again:
+Nothing is published until every build job succeeds. The tag already exists at that point, and `tag-release.yml`
+skips versions whose tag exists, so do not reuse the version without deleting the tag. Delete the tag locally and
+on origin, and fix the problem on `develop`:
 
 ```sh
 git tag -d v0.2.0
 git push origin :refs/tags/v0.2.0
 ```
 
-If the release commit itself needs to change, also revert or amend it on `main` before re-running `scripts/release.sh`.
+Then cut a new patch release (`scripts/release.sh 0.2.1`). `main` already carries the `v0.2.0` bump, so the next
+release is a normal version bump on top of it. To reuse `0.2.0` exactly, the version bump on `main` would have to be
+changed through a PR first, and `scripts/release.sh` refuses to run while branch `release/v0.2.0` (locally or on
+origin) or tag `v0.2.0` exists, so delete them first:
+
+```sh
+git branch -D release/v0.2.0
+git push origin --delete release/v0.2.0
+```
+
 If the failure was only in the workflow, a dry run is the cheapest way to verify the fix.
 
 ## Update signing
