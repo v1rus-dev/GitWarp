@@ -80,14 +80,15 @@ Bitbucket and Azure DevOps support accounts, git over HTTPS and opening links on
 
 ## Download and install
 
-Pick the file for your system from the [latest release](https://github.com/v1rus-dev/GitWarp/releases/latest).
+On Linux and Windows pick the file for your system from the [latest release](https://github.com/v1rus-dev/GitWarp/releases/latest).
+On macOS install with Homebrew, see [below](#macos-install).
 Git is bundled, so you do not need to install it separately.
 
 | OS | Files | Requirements |
 |---|---|---|
 | Linux | `gitwarp_<version>_amd64.deb`, `gitwarp-<version>-x86_64.AppImage`, `gitwarp-<version>-linux-x86_64.tar.gz` | x86_64, glibc 2.35 or newer; a GPU with Vulkan support |
 | Windows | `gitwarp-<version>-windows-x86_64-setup.exe` (installer), `gitwarp-<version>-windows-x86_64.zip` (portable) | x86_64 |
-| macOS | `gitwarp-<version>-macos-aarch64.dmg` | Apple Silicon, macOS 11 or newer |
+| macOS | install with Homebrew, see below | Apple Silicon, macOS 11 or newer |
 
 **Linux**
 
@@ -112,6 +113,8 @@ Run the setup program (it installs for the current user, no administrator rights
 unzip the portable archive and run `gitwarp.exe`. The build is not signed, so SmartScreen
 may warn about an unknown publisher: click **More info**, then **Run anyway**.
 
+<a id="macos-install"></a>
+
 **macOS**
 
 Install with [Homebrew](https://brew.sh):
@@ -124,14 +127,9 @@ open -a GitWarp
 Update with `brew upgrade --cask gitwarp`; GitWarp does not update itself when it was
 installed through Homebrew.
 
-Alternatively, open the downloaded `.dmg` and drag GitWarp to Applications. The app is not signed
-with a developer certificate or notarized, so macOS blocks the first launch. Open
-**System Settings → Privacy & Security** and click **Open Anyway** next to the GitWarp message,
-or remove the quarantine flag in a terminal:
-
-```sh
-xattr -dr com.apple.quarantine /Applications/GitWarp.app
-```
+Do not download the `.dmg` or `.zip` from the release page: the app is not notarized, so macOS
+refuses to open a build downloaded in a browser. Those files are used by Homebrew and by the
+in-app updater.
 
 **Checksums**
 
