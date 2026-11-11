@@ -68,13 +68,6 @@ download (the runtime is still downloaded and verified).
   `ditto -c -k --sequesterRsrc --keepParent`, which keeps the ad-hoc signature, symlinks and
   permissions. The in-app updater downloads and unpacks this file; the name is fixed in `updater.rs`.
 
-`macos/install.sh` is the one-line installer for macOS users (`curl ... | sh`, see the
-top-level README). It downloads the `.dmg` and `SHA256SUMS.txt` of the latest (or
-`GITWARP_VERSION`) release with curl, verifies the checksum and copies `GitWarp.app` to
-`/Applications` or `~/Applications`. Going through curl avoids the quarantine flag that
-blocks the non-notarized app when the `.dmg` is downloaded in a browser. It depends on the
-`-macos-aarch64.dmg` asset name and the `SHA256SUMS.txt` format produced by the release workflow.
-
 `release-notes.md` holds the install instructions that the release workflow
 puts in front of the generated GitHub release notes.
 
