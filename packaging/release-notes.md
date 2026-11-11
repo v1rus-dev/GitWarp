@@ -9,11 +9,11 @@ certificate, so macOS and Windows show a warning on first launch.
 | Windows (x86_64) | `gitwarp-<version>-windows-x86_64-setup.exe` (or the portable `.zip`) |
 | Linux (x86_64, glibc 2.35+) | `gitwarp_<version>_amd64.deb`, `gitwarp-<version>-x86_64.AppImage` or `gitwarp-<version>-linux-x86_64.tar.gz` |
 
-**macOS:** the easiest way is the install script. Files fetched with `curl` are not quarantined,
-so GitWarp starts without any Gatekeeper prompt (`GITWARP_VERSION=X.Y.Z` pins a release):
+**macOS:** install with Homebrew:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/v1rus-dev/GitWarp/main/packaging/macos/install.sh | sh
+brew install --cask v1rus-dev/tap/gitwarp
+open -a GitWarp
 ```
 
 Or open the downloaded `.dmg` and drag GitWarp to Applications. The app is not notarized, so macOS
