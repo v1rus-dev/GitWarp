@@ -2207,7 +2207,10 @@ impl HistoryView {
                 RefAction::CheckoutCommit(card)
             }
         };
-        (self.on_action)(action, window, cx);
+        // Deferred: the handler reads this view (the checkout confirmation
+        // checks HEAD), and this runs inside its update, so a direct call panics.
+        let on_action = self.on_action.clone();
+        window.defer(cx, move |window, cx| on_action(action, window, cx));
     }
 
     /// Installs what the shell does with a sidebar action chosen from a ref's
