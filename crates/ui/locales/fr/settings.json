@@ -213,6 +213,8 @@
   "settings.form.increase": "Augmenter",
   "settings.general.activity.desc": "La carte thermique des commits sur l’écran d’accueil et au-dessus de l’historique. La masquer ne supprime aucune donnée.",
   "settings.general.activity.title": "Afficher les statistiques d’activité",
+  "settings.general.auto_install.desc": "Une mise à jour téléchargée est installée lorsque vous quittez GitWarp.",
+  "settings.general.auto_install.title": "Installer les mises à jour à la fermeture",
   "settings.general.channel.beta": "Bêta",
   "settings.general.channel.desc_off": "Activez la vérification des mises à jour pour choisir un canal.",
   "settings.general.channel.desc_on": "La bêta signale aussi les préversions, qui peuvent contenir des régressions.",

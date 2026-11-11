@@ -94,6 +94,7 @@ actions!(
         OpenWorktreeSwitcher,
         StashChanges,
         FetchAll,
+        Refresh,
         PullBranch,
         PushBranch
     ]
@@ -7495,6 +7496,9 @@ impl Render for RepositoryView {
             }))
             .on_action(cx.listener(|view, _: &FetchAll, window, cx| {
                 view.fetch_remotes(window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &Refresh, _, cx| {
+                view.refresh(cx);
             }))
             .on_action(cx.listener(|view, _: &PullBranch, window, cx| {
                 view.pull_branch(window, cx);

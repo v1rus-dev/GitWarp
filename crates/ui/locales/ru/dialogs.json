@@ -1,4 +1,10 @@
 {
+  "dialogs.about.close": "Закрыть",
+  "dialogs.about.copied": "Скопировано",
+  "dialogs.about.copy": "Копировать сведения",
+  "dialogs.about.legal": "Правовая информация",
+  "dialogs.about.title": "О GitWarp",
+  "dialogs.about.version": "Версия {version}",
   "dialogs.checkout.bring_changes": "Перенести изменения",
   "dialogs.checkout.carry_hint": "Перенос изменений не удастся, если другая ветка меняет те же строки.",
   "dialogs.checkout.discard": "Отменить",

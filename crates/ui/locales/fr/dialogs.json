@@ -1,4 +1,10 @@
 {
+  "dialogs.about.close": "Fermer",
+  "dialogs.about.copied": "Copié",
+  "dialogs.about.copy": "Copier les détails",
+  "dialogs.about.legal": "Mentions légales",
+  "dialogs.about.title": "À propos de GitWarp",
+  "dialogs.about.version": "Version {version}",
   "dialogs.account_picker.detail": "@{login} · {method}",
   "dialogs.account_picker.fallback_title": "Compte",
   "dialogs.account_picker.help": "Mémorisé pour ce dépôt. Modifiable plus tard depuis le menu du remote : Compte…",

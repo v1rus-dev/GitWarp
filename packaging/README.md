@@ -64,6 +64,9 @@ download (the runtime is still downloaded and verified).
   from `packaging/macos/Info.plist`, `Contents/MacOS/gitwarp`,
   `Contents/Resources/gitwarp.icns`, `Contents/Resources/git/`, licences) and an
   `Applications` symlink.
+- `gitwarp-<ver>-macos-aarch64.zip` — `GitWarp.app/` (the same bundle as in the `.dmg`) made with
+  `ditto -c -k --sequesterRsrc --keepParent`, which keeps the ad-hoc signature, symlinks and
+  permissions. The in-app updater downloads and unpacks this file; the name is fixed in `updater.rs`.
 
 `macos/install.sh` is the one-line installer for macOS users (`curl ... | sh`, see the
 top-level README). It downloads the `.dmg` and `SHA256SUMS.txt` of the latest (or
@@ -74,6 +77,13 @@ blocks the non-notarized app when the `.dmg` is downloaded in a browser. It depe
 
 `release-notes.md` holds the install instructions that the release workflow
 puts in front of the generated GitHub release notes.
+
+## Update signing
+
+The release workflow signs `SHA256SUMS.txt` with minisign and uploads the signature as `SHA256SUMS.txt.minisig`
+next to the artifacts. The in-app updater only installs a download whose checksum file verifies against
+`packaging/update-key.pub`, the single place that holds the public key (the app embeds it at compile time and CI
+verifies against it before publishing). Key setup and rotation are described in `RELEASING.md`.
 
 ## Signing
 
