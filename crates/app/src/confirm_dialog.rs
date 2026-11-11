@@ -18,6 +18,7 @@ pub(crate) struct ConfirmDialog {
     title: SharedString,
     body: SharedString,
     primary: SharedString,
+    danger: bool,
     action: ConfirmAction,
     cancel_focus: gpui::FocusHandle,
     primary_focus: gpui::FocusHandle,
@@ -49,12 +50,38 @@ pub(crate) fn open(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<ConfirmDialog> {
+    open_styled(true, title, body, primary, action, window, cx)
+}
+
+/// Like [`open`], for an action that is not destructive: the primary button
+/// keeps the regular accent style.
+pub(crate) fn open_neutral(
+    title: impl Into<SharedString>,
+    body: impl Into<SharedString>,
+    primary: impl Into<SharedString>,
+    action: impl Fn(&mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ConfirmDialog> {
+    open_styled(false, title, body, primary, action, window, cx)
+}
+
+fn open_styled(
+    danger: bool,
+    title: impl Into<SharedString>,
+    body: impl Into<SharedString>,
+    primary: impl Into<SharedString>,
+    action: impl Fn(&mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ConfirmDialog> {
     let dialog = cx.new(|cx| ConfirmDialog {
         layer: None,
         host: None,
         title: title.into(),
         body: body.into(),
         primary: primary.into(),
+        danger,
         action: Rc::new(action),
         cancel_focus: cx.focus_handle().tab_stop(true),
         primary_focus: cx.focus_handle().tab_stop(true),
@@ -68,7 +95,26 @@ pub(crate) fn open(
         dialog.layer = Some(layer);
         dialog.host = Some(host);
     });
+    #[cfg(test)]
+    LAST_OPENED.with(|last| *last.borrow_mut() = Some(dialog.downgrade()));
     dialog
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_OPENED: std::cell::RefCell<Option<gpui::WeakEntity<ConfirmDialog>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Presses the primary button of the dialog opened last on this thread, for
+/// tests whose window does not render the overlay layer.
+#[cfg(test)]
+pub(crate) fn confirm_last_for_test(window: &mut Window, cx: &mut App) {
+    let dialog = LAST_OPENED
+        .with(|last| last.borrow_mut().take())
+        .and_then(|dialog| dialog.upgrade())
+        .expect("a confirm dialog was opened");
+    dialog.update(cx, |dialog, cx| dialog.confirm(window, cx));
 }
 
 fn build(state: &Entity<ConfirmDialog>, cx: &App) -> Dialog {
@@ -90,6 +136,11 @@ fn build(state: &Entity<ConfirmDialog>, cx: &App) -> Dialog {
 
     let body = div().text_color(colors.text).child(dialog.body.clone());
 
+    let primary_button = if dialog.danger {
+        Button::danger("confirm-primary")
+    } else {
+        Button::primary("confirm-primary")
+    };
     let footer = div()
         .flex()
         .items_center()
@@ -102,7 +153,7 @@ fn build(state: &Entity<ConfirmDialog>, cx: &App) -> Dialog {
                 .on_click(cancel),
         )
         .child(
-            Button::danger("confirm-primary")
+            primary_button
                 .label(dialog.primary.clone())
                 .min_width(px(96.))
                 .focus_handle(dialog.primary_focus.clone())
@@ -110,7 +161,11 @@ fn build(state: &Entity<ConfirmDialog>, cx: &App) -> Dialog {
         );
 
     Dialog::new(dialog.title.clone())
-        .icon(IconName::Warn)
+        .icon(if dialog.danger {
+            IconName::Warn
+        } else {
+            IconName::Info
+        })
         .width(px(440.))
         .compact_body()
         .body(body)
@@ -121,5 +176,5 @@ fn build(state: &Entity<ConfirmDialog>, cx: &App) -> Dialog {
         ])
         .autofocus(dialog.cancel_focus.clone())
         .default_button(dialog.primary_focus.clone())
-        .default_danger(true)
+        .default_danger(dialog.danger)
 }
