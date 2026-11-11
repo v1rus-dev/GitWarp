@@ -675,6 +675,10 @@ mod tests {
 
         open_palette(&mut cx);
         pick(&mut cx, "zzfeat");
+        // The checkout asks first; Cancel is focused, Tab moves to confirm.
+        cx.simulate_keystrokes("tab enter");
+        cx.run_until_parked();
+        cx.run_until_parked();
 
         assert_eq!(
             run_git(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),

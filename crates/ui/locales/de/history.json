@@ -111,5 +111,12 @@
   "history.strip.incomplete": "Verlauf ist unvollständig",
   "history.strip.generic": "Verlauf ist unvollständig: {message}",
   "history.branch_bar.with_merges": "{commits} · {merges}",
-  "history.load.with_folded": "{loading} · {folded}"
+  "history.load.with_folded": "{loading} · {folded}",
+  "history.checkout_confirm.body_branch": "Deine Arbeitskopie wechselt auf den Branch „{name}“.",
+  "history.checkout_confirm.body_commit": "HEAD wird bei Commit {name} abgetrennt. Du kannst danach einen Branch davon erstellen.",
+  "history.checkout_confirm.body_remote": "„{name}“ wird als lokaler Branch ausgecheckt, der ihm folgt; existiert dieser Branch schon lokal, wird zu ihm gewechselt und er aktualisiert.",
+  "history.checkout_confirm.confirm_switch": "Wechseln",
+  "history.checkout_confirm.confirm_checkout": "Auschecken",
+  "history.checkout_confirm.body_tag": "HEAD wird am Tag „{name}“ abgetrennt.",
+  "history.checkout_confirm.body_pr": "Pull Request #{number} wird in den lokalen Branch „{name}“ geholt und ausgecheckt."
 }

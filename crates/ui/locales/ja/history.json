@@ -106,5 +106,12 @@
   "history.strip.incomplete": "履歴が不完全です",
   "history.strip.generic": "履歴が不完全です: {message}",
   "history.branch_bar.with_merges": "{commits} · {merges}",
-  "history.load.with_folded": "{loading} · {folded}"
+  "history.load.with_folded": "{loading} · {folded}",
+  "history.checkout_confirm.body_branch": "作業コピーはブランチ「{name}」に切り替わります。",
+  "history.checkout_confirm.body_commit": "HEAD はコミット {name} で切り離されます。あとでそこからブランチを作成できます。",
+  "history.checkout_confirm.body_remote": "「{name}」を追跡するローカルブランチとしてチェックアウトします。同名のローカルブランチが既にある場合はそれに切り替えて更新します。",
+  "history.checkout_confirm.confirm_switch": "切り替え",
+  "history.checkout_confirm.confirm_checkout": "チェックアウト",
+  "history.checkout_confirm.body_tag": "HEAD はタグ「{name}」で切り離されます。",
+  "history.checkout_confirm.body_pr": "プルリクエスト #{number} をローカルブランチ「{name}」に取得してチェックアウトします。"
 }

@@ -2028,21 +2028,30 @@ impl RepositoryView {
                     .update(cx, |worktrees, cx| worktrees.refresh(cx));
             }
             SidebarAction::CheckoutBranch(name) => {
-                self.checkout_branch(name, window, cx);
+                self.confirm_checkout_branch(name, window, cx);
             }
             SidebarAction::CreatePullRequest(branch) => {
                 self.open_create_pr(Some(branch), window, cx);
             }
             SidebarAction::CheckoutRemoteBranch(remote) => {
                 let label = remote.clone();
-                self.checkout_guarded(
-                    ui::t!("repo.checkout.title", name = label).to_string(),
-                    move |repo| {
-                        repo.checkout_remote(&remote)?;
-                        Ok((
-                            ui::ToastKind::Ok,
-                            ui::t!("repo.checkout.done", name = label).to_string(),
-                        ))
+                self.confirm_checkout(
+                    ui::t!("repo.checkout.title", name = label),
+                    ui::t!("history.checkout_confirm.body_remote", name = label),
+                    ui::t!("history.checkout_confirm.confirm_checkout"),
+                    move |view, window, cx| {
+                        view.checkout_guarded(
+                            ui::t!("repo.checkout.title", name = label).to_string(),
+                            move |repo| {
+                                repo.checkout_remote(&remote)?;
+                                Ok((
+                                    ui::ToastKind::Ok,
+                                    ui::t!("repo.checkout.done", name = label).to_string(),
+                                ))
+                            },
+                            window,
+                            cx,
+                        );
                     },
                     window,
                     cx,
@@ -2067,14 +2076,23 @@ impl RepositoryView {
                     return;
                 };
                 let label = name.clone();
-                self.checkout_guarded(
-                    ui::t!("repo.checkout.tag_title", name = label).to_string(),
-                    move |repo| {
-                        repo.checkout_detached(target)?;
-                        Ok((
-                            ui::ToastKind::Ok,
-                            ui::t!("repo.checkout.tag_done", name = label).to_string(),
-                        ))
+                self.confirm_checkout(
+                    ui::t!("repo.checkout.tag_title", name = label),
+                    ui::t!("history.checkout_confirm.body_tag", name = label),
+                    ui::t!("history.checkout_confirm.confirm_checkout"),
+                    move |view, window, cx| {
+                        view.checkout_guarded(
+                            ui::t!("repo.checkout.tag_title", name = label).to_string(),
+                            move |repo| {
+                                repo.checkout_detached(target)?;
+                                Ok((
+                                    ui::ToastKind::Ok,
+                                    ui::t!("repo.checkout.tag_done", name = label).to_string(),
+                                ))
+                            },
+                            window,
+                            cx,
+                        );
                     },
                     window,
                     cx,
@@ -2776,18 +2794,27 @@ impl RepositoryView {
     ) {
         match action {
             RefAction::CheckoutBranch(name) => {
-                self.checkout_branch(name, window, cx);
+                self.confirm_checkout_branch(name, window, cx);
             }
             RefAction::CheckoutCommit(card) => {
                 let short = card.short.clone();
-                self.checkout_guarded(
-                    ui::t!("repo.checkout.title", name = short).to_string(),
-                    move |repo| {
-                        repo.checkout_detached(card.oid)?;
-                        Ok((
-                            ui::ToastKind::Ok,
-                            ui::t!("repo.checkout.commit_done", name = short).to_string(),
-                        ))
+                self.confirm_checkout(
+                    ui::t!("repo.checkout.title", name = short),
+                    ui::t!("history.checkout_confirm.body_commit", name = short),
+                    ui::t!("history.checkout_confirm.confirm_checkout"),
+                    move |view, window, cx| {
+                        view.checkout_guarded(
+                            ui::t!("repo.checkout.title", name = short).to_string(),
+                            move |repo| {
+                                repo.checkout_detached(card.oid)?;
+                                Ok((
+                                    ui::ToastKind::Ok,
+                                    ui::t!("repo.checkout.commit_done", name = short).to_string(),
+                                ))
+                            },
+                            window,
+                            cx,
+                        );
                     },
                     window,
                     cx,
@@ -2962,6 +2989,64 @@ impl RepositoryView {
             cx,
         );
         self.merge_dialog = Some(dialog);
+    }
+
+    /// Asks before a user-initiated checkout; `run` starts it once confirmed.
+    /// Every user entry point (sidebar, ref menus, history rows, palette,
+    /// branch switcher, pull request panel) goes through here, while internal
+    /// follow-ups call `checkout_guarded` directly and stay silent.
+    fn confirm_checkout(
+        &mut self,
+        title: SharedString,
+        body: SharedString,
+        primary: SharedString,
+        run: impl FnOnce(&mut RepositoryView, &mut Window, &mut Context<RepositoryView>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ref_action_running {
+            return;
+        }
+        let view = cx.entity();
+        let run = RefCell::new(Some(run));
+        crate::confirm_dialog::open_neutral(
+            title,
+            body,
+            primary,
+            move |window, cx| {
+                if let Some(run) = run.borrow_mut().take() {
+                    view.update(cx, |view, cx| run(view, window, cx));
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// `checkout_branch` behind the confirmation. A branch that is already
+    /// checked out skips it: the checkout changes nothing.
+    fn confirm_checkout_branch(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_head = matches!(
+            self.history.read(cx).head(),
+            Some(Head::Branch { name: head, .. }) if *head == name
+        );
+        if is_head {
+            self.checkout_branch(name, window, cx);
+            return;
+        }
+        self.confirm_checkout(
+            ui::t!("repo.checkout.switch_title", name = name),
+            ui::t!("history.checkout_confirm.body_branch", name = name),
+            ui::t!("history.checkout_confirm.confirm_switch"),
+            move |view, window, cx| view.checkout_branch(name, window, cx),
+            window,
+            cx,
+        );
     }
 
     /// Checks out a local branch, asking first when the work tree is dirty.
@@ -7145,12 +7230,28 @@ impl RepositoryView {
         let Ok(refspec) = hosting_status::checkout_refspec(kind, pr.number, &branch) else {
             return;
         };
-        self.start_network_job(
-            Job::FetchPullRequest {
-                remote,
-                refspec,
-                branch,
-                number: pr.number,
+        let number = pr.number;
+        // Only this user-initiated start asks; the checkout that follows the
+        // fetch (`checkout_pr_branch`) does not.
+        self.confirm_checkout(
+            ui::t!("repo.checkout.switch_title", name = branch),
+            ui::t!(
+                "history.checkout_confirm.body_pr",
+                number = number,
+                name = branch
+            ),
+            ui::t!("history.checkout_confirm.confirm_checkout"),
+            move |view, window, cx| {
+                view.start_network_job(
+                    Job::FetchPullRequest {
+                        remote,
+                        refspec,
+                        branch,
+                        number,
+                    },
+                    window,
+                    cx,
+                );
             },
             window,
             cx,
@@ -9383,6 +9484,8 @@ mod tests {
             });
         });
         cx.run_until_parked();
+        cx.update(crate::confirm_dialog::confirm_last_for_test);
+        cx.run_until_parked();
         cx.run_until_parked();
 
         let repo = git_core::Repo::open(crate::test_support::git(), repo.path()).unwrap();
@@ -9576,6 +9679,8 @@ mod tests {
         click_sidebar_row(&mut cx, &view, "local:feature");
 
         cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.update(crate::confirm_dialog::confirm_last_for_test);
         cx.run_until_parked();
         cx.run_until_parked();
         let repo = git_core::Repo::open(crate::test_support::git(), repo.path()).unwrap();
